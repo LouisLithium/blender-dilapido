@@ -10689,6 +10689,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeFilletCurve");
   define("GeometryNode", "GeometryNodeFilterList");
   define("GeometryNode", "GeometryNodeFlipFaces");
+  define("GeometryNode", "GeometryNodeFractureCluster");
   define("GeometryNode", "GeometryNodeForeachGeometryElementInput", def_geo_foreach_geometry_element_input);
   define("GeometryNode", "GeometryNodeForeachGeometryElementOutput", def_geo_foreach_geometry_element_output);
   define("GeometryNode", "GeometryNodeGeometryToInstance");
@@ -10724,6 +10725,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeImportVDB");
   define("GeometryNode", "GeometryNodeIndexOfNearest");
   define("GeometryNode", "GeometryNodeIndexSwitch", def_geo_index_switch);
+  define("GeometryNode", "GeometryNodeInitRigidBody");
   define("GeometryNode", "GeometryNodeInputActiveCamera");
   define("GeometryNode", "GeometryNodeInputCollection", def_geo_input_collection);
   define("GeometryNode", "GeometryNodeInputCurveHandlePositions");
@@ -10800,6 +10802,10 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodePointsToVolume");
   define("GeometryNode", "GeometryNodeProximity");
   define("GeometryNode", "GeometryNodeRaycast");
+  define("GeometryNode", "GeometryNodeRBDCollider");
+  define("GeometryNode", "GeometryNodeRBDConstraintFromPieces");
+  define("GeometryNode", "GeometryNodeRBDConstraintLines");
+  define("GeometryNode", "GeometryNodeRegexRemoveNamedAttribute");
   define("GeometryNode", "GeometryNodeRealizeInstances");
   define("GeometryNode", "GeometryNodeRemoveAttribute");
   define("GeometryNode", "GeometryNodeRenameAttribute");
@@ -10808,6 +10814,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeReplaceMaterial");
   define("GeometryNode", "GeometryNodeResampleCurve");
   define("GeometryNode", "GeometryNodeReverseCurve");
+  define("GeometryNode", "GeometryNodeRigidBodySolver");
   define("GeometryNode", "GeometryNodeRotateInstances");
   define("GeometryNode", "GeometryNodeSampleCurve", def_geo_curve_sample);
   define("GeometryNode", "GeometryNodeSampleGrid");
@@ -10889,6 +10896,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeViewportTransform");
   define("GeometryNode", "GeometryNodeVolumeCube");
   define("GeometryNode", "GeometryNodeVolumeToMesh");
+  define("GeometryNode", "GeometryNodeVoronoiFracture");
   define("GeometryNode", "GeometryNodeWarning");
   define("GeometryNode", "GeometryNodeXPBDSolver");
 

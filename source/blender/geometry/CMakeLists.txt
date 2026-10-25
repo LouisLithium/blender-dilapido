@@ -4,6 +4,7 @@
 
 set(INC
   PUBLIC .
+  PUBLIC rigid_body
   PUBLIC xpbd
   ../makesrna
   ../../../intern/eigen
@@ -61,6 +62,8 @@ set(SRC
   intern/uv_parametrizer.cc
   intern/volume_grid_resample.cc
 
+  rigid_body/GEO_rigid_body_solver.cc
+
   xpbd/intern/xpbd_constraint_coloring.cc
 
   GEO_add_curves_on_mesh.hh
@@ -108,6 +111,8 @@ set(SRC
   GEO_uv_parametrizer.hh
   GEO_volume_grid_resample.hh
 
+  rigid_body/GEO_rigid_body_solver.hh
+
   xpbd/GEO_xpbd_constraint_align_rotations.hh
   xpbd/GEO_xpbd_constraint_collision_edge.hh
   xpbd/GEO_xpbd_constraint_collision_face.hh
@@ -145,6 +150,7 @@ set(LIB
   PRIVATE bf::intern::guardedalloc
   PRIVATE bf::intern::profile
   PRIVATE bf::extern::curve_fit_nd
+  PRIVATE bf::extern::jolt
   PRIVATE bf::dependencies::optional::manifold
   PRIVATE bf::dependencies::optional::gmp
 )

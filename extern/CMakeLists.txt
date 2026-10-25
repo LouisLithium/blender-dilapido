@@ -107,3 +107,6 @@ endif()
 if(WITH_TRACY)
   add_subdirectory(tracy_profiler)
 endif()
+
+# Jolt physics engine, used by the geometry nodes rigid body solver. Always enabled.
+add_subdirectory(jolt)

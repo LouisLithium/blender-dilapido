@@ -22,6 +22,7 @@ class NODE_MT_gn_attribute_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeBlurAttribute")
         self.node_operator(layout, "GeometryNodeCaptureAttribute")
         self.node_operator(layout, "GeometryNodeRemoveAttribute")
+        self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         self.node_operator(layout, "GeometryNodeRenameAttribute")
         self.node_operator(layout, "GeometryNodeStoreNamedAttribute", search_weight=1.0)
         self.node_operator(layout, "GeometryNodeTransferAttributes")
@@ -1072,6 +1073,7 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "Volume")
         layout.separator()
         self.draw_menu(layout, "Simulation")
+        self.draw_menu(layout, "Rigid Body")
         layout.separator()
         self.draw_menu(layout, "Color")
         self.draw_menu(layout, "Texture")
@@ -1081,6 +1083,22 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         layout.separator()
         self.draw_menu(layout, "Group")
         self.draw_menu(layout, "Layout")
+
+
+class NODE_MT_gn_rigid_body_base(node_add_menu.NodeMenu):
+    bl_label = "Rigid Body"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeVoronoiFracture")
+        self.node_operator(layout, "GeometryNodeRBDConstraintFromPieces")
+        self.node_operator(layout, "GeometryNodeRBDConstraintLines")
+        self.node_operator(layout, "GeometryNodeFractureCluster")
+        layout.separator()
+        self.node_operator(layout, "GeometryNodeInitRigidBody")
+        self.node_operator(layout, "GeometryNodeRigidBodySolver")
+        layout.separator()
+        self.node_operator(layout, "GeometryNodeRBDCollider")
 
 
 add_menus = {
@@ -1120,6 +1138,7 @@ add_menus = {
     "NODE_MT_category_GEO_UV": NODE_MT_gn_mesh_primitives_base,
     "NODE_MT_category_GEO_POINT": NODE_MT_gn_point_base,
     "NODE_MT_category_simulation": NODE_MT_gn_simulation_base,
+    "NODE_MT_geometry_node_GEO_RIGID_BODY": NODE_MT_gn_rigid_body_base,
     "NODE_MT_category_GEO_VOLUME": NODE_MT_gn_volume_base,
     "NODE_MT_geometry_node_GEO_VOLUME_READ": NODE_MT_gn_volume_read_base,
     "NODE_MT_geometry_node_volume_sample": NODE_MT_gn_volume_sample_base,

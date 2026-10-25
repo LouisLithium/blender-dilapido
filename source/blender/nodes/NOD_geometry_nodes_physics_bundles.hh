@@ -16,6 +16,16 @@ class MeshColliderBundle {
   static const FlatBundleTypePtr &get_bundle_type();
 };
 
+/**
+ * A collider that is a solid box around the bounds of its geometry. Triangle meshes are shells, so a
+ * fragment that sinks into one can never be pushed back out; a box is solid and recovers.
+ */
+class BoxColliderBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.Collider.Box";
+  static const FlatBundleTypePtr &get_bundle_type();
+};
+
 class CollisionContactsBundle {
  public:
   static constexpr StringRefNull name = "Blender.CollisionContacts";

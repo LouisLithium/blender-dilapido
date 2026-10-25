@@ -1780,6 +1780,9 @@ void blo_do_versions_userdef(UserDef *userdef)
     userdef->asset_flag |= USER_ASSETS_USE_ONLINE_ESSENTIALS;
   }
 
+  /* This fork ships a small helper add-on for the Jolt rigid body nodes: always on. */
+  BKE_addon_ensure(&userdef->addons, "dilapido_assist");
+
   if (!USER_VERSION_ATLEAST(502, 45)) {
     const char *remapped_paths[][2] = {
         {"Camera & Lens Effects", "Compositing/Camera & Lens Effects"},

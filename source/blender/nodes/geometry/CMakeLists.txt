@@ -97,6 +97,7 @@ set(SRC
   nodes/node_geo_filter_list.cc
   nodes/node_geo_field_variance.cc
   nodes/node_geo_flip_faces.cc
+  nodes/node_geo_fracture_cluster.cc
   nodes/node_geo_foreach_geometry_element.cc
   nodes/node_geo_geometry_to_instance.cc
   nodes/node_geo_get_attribute_names.cc
@@ -134,6 +135,7 @@ set(SRC
   nodes/node_geo_import_vdb.cc
   nodes/node_geo_index_of_nearest.cc
   nodes/node_geo_index_switch.cc
+  nodes/node_geo_init_rigid_body.cc
   nodes/node_geo_input_active_camera.cc
   nodes/node_geo_input_collection.cc
   nodes/node_geo_input_curve_handles.cc
@@ -219,10 +221,15 @@ set(SRC
   nodes/node_geo_points_to_volume.cc
   nodes/node_geo_proximity.cc
   nodes/node_geo_raycast.cc
+  nodes/node_geo_rbd_collider.cc
+  nodes/node_geo_rbd_constraint_lines.cc
+  nodes/node_geo_rbd_constraint_from_pieces.cc
   nodes/node_geo_realize_instances.cc
+  nodes/node_geo_regex_remove_named_attribute.cc
   nodes/node_geo_remove_attribute.cc
   nodes/node_geo_rename_attribute.cc
   nodes/node_geo_repeat.cc
+  nodes/node_geo_rigid_body_solver.cc
   nodes/node_geo_rotate_instances.cc
   nodes/node_geo_sample_grid.cc
   nodes/node_geo_sample_grid_index.cc
@@ -296,6 +303,7 @@ set(SRC
   nodes/node_geo_viewport_transform.cc
   nodes/node_geo_volume_cube.cc
   nodes/node_geo_volume_to_mesh.cc
+  nodes/node_geo_voronoi_fracture.cc
   nodes/node_geo_warning.cc
   nodes/node_geo_xpbd_solver.cc
 
