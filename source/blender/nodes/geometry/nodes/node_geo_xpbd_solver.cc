@@ -300,6 +300,8 @@ struct FluidConstraint {
   float particle_radius = 0.05f;
   bool boundary_particles = true;
   float boundary_friction = 0.5f;
+  /** Strength of the two way coupling with the other simulated geometries in the world. */
+  float coupling = 1.0f;
   float error_threshold = 1e-2f;
 };
 
@@ -322,12 +324,46 @@ struct FluidChunkData {
 
   /**
    * Particles sampled on the colliders that the fluid can reach. They are rebuilt once per frame
-   * and act as the solid boundary of the fluid.
+   * and act as the solid boundary of the fluid (only used where `puncliga_boundary_particles` is
+   * set).
    */
   bool boundary_active = false;
   Vector<float3> boundary_positions;
   Vector<float> boundary_masses;
   xpbd::FluidParticleGrid boundary_grid;
+
+  /**
+   * Particles of the other simulated geometries of the world (cloth, soft bodies). They are part
+   * of the density estimate like the collider samples and they are moved by the fluid pressure,
+   * which is the two way coupling. They are refreshed from the solver positions every substep,
+   * because the solids move during the solve.
+   *
+   * A particle is either a sample on a triangle of the solid (with barycentric weights, so the
+   * reaction is spread over the vertices) or, for geometries without faces, one of its points.
+   */
+  bool has_coupled = false;
+  Vector<float3> coupled_positions;
+  Vector<float> coupled_masses;
+  Vector<float> coupled_inv_masses;
+  /** Source of each particle: the geometry, the vertices it belongs to and their weights. */
+  Vector<int> coupled_geometry;
+  Vector<int3> coupled_vertices;
+  Vector<float3> coupled_weights;
+  /** Position change of the coupled particles, computed by the reaction pass. */
+  Array<float3> coupled_corrections;
+  /**
+   * Per coupled geometry scratch space for the reaction: the correction is accumulated per vertex
+   * (weighted by the barycentric weights) and then divided by the accumulated weight, so the
+   * displacement of a vertex does not depend on how many samples happen to touch it.
+   */
+  struct CoupledVertexScratch {
+    int geometry_i = -1;
+    Array<float3> correction_sums;
+    Array<float> weight_sums;
+  };
+  Vector<CoupledVertexScratch> coupled_scratch;
+  xpbd::FluidParticleGrid coupled_grid;
+
   /** Fraction of the density of each particle that comes from the boundary particles. */
   Array<float> solid_fractions;
 };
@@ -456,6 +492,8 @@ struct GeometryData {
   Array<float> fluid_boundary_friction;
   Array<float> fluid_negative_pressure_limit;
   Array<bool> fluid_use_boundary;
+  /** Per point strength of the two way coupling with the other simulated geometries. */
+  Array<float> fluid_coupling;
 
   GeometryData(const bke::MutableAttributeAccessor attributes) : attributes(attributes) {}
 };
@@ -947,6 +985,8 @@ class XpbdSolverStep {
           bundle.lookup<float>(*BundleKey::from_str("boundary_friction")).value_or(0.5f),
           0.0f,
           1.0f);
+      fluid.coupling = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("coupling")).value_or(1.0f), 0.0f, 1.0f);
       fluid.negative_pressure_limit = math::clamp(
           bundle.lookup<float>(*BundleKey::from_str("negative_pressure_limit")).value_or(0.0f),
           0.0f,
@@ -1038,6 +1078,12 @@ class XpbdSolverStep {
                                      "puncliga_boundary_particles",
                                      fluid_params.boundary_particles,
                                      geo_data.fluid_use_boundary);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_coupling",
+                                      fluid_params.coupling,
+                                      0.0f,
+                                      1.0f,
+                                      geo_data.fluid_coupling);
 
         float max_radius = 0.0f;
         for (const float radius : geo_data.fluid_radii) {
@@ -2784,6 +2830,9 @@ class XpbdSolverStep {
         this->simulate__reset_forces();
         for ([[maybe_unused]] const int iter_i : IndexRange(constraint_iterations_)) {
           this->simulate__position_solve__single_iteration(solver_refs_i, average_error_squared);
+          /* The fluid pushes the coupled cloth and soft bodies with the multipliers of this
+           * iteration. Applied after the parallel solve so no chunk writes into another one. */
+          this->simulate__fluid_boundary_reaction(solver_refs_i);
         }
         this->parallel_for_each_chunk(16, [&](const int chunk_i) {
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
@@ -2804,6 +2853,13 @@ class XpbdSolverStep {
     for (const int data_key_i : geometries_.data_keys.index_range()) {
       const GeometryData &geo_data = *geometries_.data[data_key_i];
       if (!geo_data.static_constraints.is_empty()) {
+        return false;
+      }
+    }
+    /* The two way fluid coupling needs the extra reaction phase between the constraint iterations,
+     * which only the multi chunk path has. */
+    for (const ChunkData &chunk_data : chunks_data_) {
+      if (chunk_data.fluid.active && chunk_data.fluid.has_coupled) {
         return false;
       }
     }
@@ -2966,6 +3022,8 @@ class XpbdSolverStep {
     fluid.grid.build(positions, fluid.support_radius);
     fluid.lambdas.fill(0.0f);
 
+    this->simulate__update_fluid_boundary__chunk(chunk_i, solver_refs_i);
+
     if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
       for (const int i : IndexRange(positions.size())) {
         const float3 &p = positions[i];
@@ -2981,6 +3039,31 @@ class XpbdSolverStep {
         }
       }
     }
+  }
+
+  /**
+   * Refreshes the boundary particles that belong to other simulated geometries and rebuilds the
+   * boundary grid. The collider samples are static for the whole frame, but the cloth and the soft
+   * bodies move, so their positions have to be copied from the solver state every substep.
+   */
+  void simulate__update_fluid_boundary__chunk(const int chunk_i, const int solver_refs_i)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.has_coupled) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int i : fluid.coupled_geometry.index_range()) {
+      const Span<float3> positions = refs[fluid.coupled_geometry[i]].positions;
+      const int3 &verts = fluid.coupled_vertices[i];
+      const float3 &weights = fluid.coupled_weights[i];
+      /* A sample follows its triangle, so a deforming solid moves it without resampling. */
+      fluid.coupled_positions[i] = positions[verts[0]] * weights.x +
+                                   positions[verts[1]] * weights.y +
+                                   positions[verts[2]] * weights.z;
+    }
+    fluid.coupled_grid.build(fluid.coupled_positions, fluid.support_radius);
+    fluid.coupled_corrections.fill(float3(0.0f));
   }
 
   /**
@@ -3060,17 +3143,24 @@ class XpbdSolverStep {
   void prepare_fluid_boundary__chunk(const int chunk_i)
   {
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
     fluid.boundary_positions.clear();
     fluid.boundary_masses.clear();
     fluid.boundary_grid.build(Span<float3>(), 0.0f);
-    if (!fluid.active || !fluid.boundary_active) {
+    fluid.coupled_positions.clear();
+    fluid.coupled_masses.clear();
+    fluid.coupled_inv_masses.clear();
+    fluid.coupled_geometry.clear();
+    fluid.coupled_vertices.clear();
+    fluid.coupled_weights.clear();
+    fluid.coupled_corrections.reinitialize(0);
+    fluid.coupled_scratch.clear();
+    fluid.coupled_grid.build(Span<float3>(), 0.0f);
+    fluid.has_coupled = false;
+    if (!fluid.active) {
       return;
     }
-    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
     const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
-    if (geo_data.mesh_colliders.is_empty()) {
-      return;
-    }
 
     /* Bounds of the fluid, expanded by the support radius. */
     float3 bounds_min(FLT_MAX, FLT_MAX, FLT_MAX);
@@ -3087,8 +3177,48 @@ class XpbdSolverStep {
     bounds_max += float3(margin);
 
     const float spacing = 0.5f * fluid.support_radius;
-    const float density = constraints_.fluid_constraints[fluid.constraint_i].rest_density;
+    if (fluid.boundary_active) {
+      const float density = constraints_.fluid_constraints[fluid.constraint_i].rest_density;
+      this->prepare_fluid_boundary__colliders(
+          fluid, geo_data, spacing, density, bounds_min, bounds_max);
+      /* The samples are spaced at half the support radius, but the grid is queried over the whole
+       * kernel support, like the fluid grid itself. */
+      fluid.boundary_grid.build(fluid.boundary_positions, fluid.support_radius);
+    }
 
+    const int coupled_num = this->prepare_fluid_boundary__solids(
+        fluid, chunk, bounds_min, bounds_max);
+    fluid.has_coupled = coupled_num > 0;
+    if (fluid.has_coupled) {
+      fluid.coupled_corrections.reinitialize(fluid.coupled_positions.size());
+      fluid.coupled_corrections.fill(float3(0.0f));
+      /* Full kernel support: the coupled particles have to contribute to the density exactly like
+
+       * * the fluid particles do, otherwise a coarse cloth cannot hold any water at all. */
+      fluid.coupled_grid.build(fluid.coupled_positions, fluid.support_radius);
+    }
+
+    if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
+      printf(
+          "FLUID_DEBUG boundary: %d collider samples, %d coupled particles (spacing %.4f) for %d "
+          "colliders\n",
+          int(fluid.boundary_positions.size()),
+          coupled_num,
+          double(spacing),
+          int(geo_data.mesh_colliders.size()));
+    }
+  }
+
+  /**
+   * Samples the collider meshes the fluid can reach as (static) boundary particles.
+   */
+  void prepare_fluid_boundary__colliders(FluidChunkData &fluid,
+                                         const GeometryData &geo_data,
+                                         const float spacing,
+                                         const float density,
+                                         const float3 &bounds_min,
+                                         const float3 &bounds_max)
+  {
     /* Samples of one triangle, collected before they are added so they can share the same mass. */
     Vector<float3> positions;
     Vector<float> areas;
@@ -3132,10 +3262,11 @@ class XpbdSolverStep {
           area_sum += area;
         }
         /* Each boundary particle represents a patch of the surface with the fluid volume behind
-         * it, so the boundary mass is the rest density times the sampled volume. The shell has to
-         * be thin: the bottom layer of a settled fluid is much less under-dense than the free
-         * surface (measured with the test setups), so a full thickness of one particle spacing
-         * over-corrects the density and inflates the fluid. */
+         * it, so its mass is the rest density times the sampled volume. The shell has to be thin:
+         * a settled fluid one spacing above the floor already has almost the rest density from its
+         * own particles, so a full thickness of a particle spacing over-supplies the density and
+         * inflates the fluid (measured, see M56). The coupled cloth uses a different rule
+         * (`prepare_fluid_boundary__solids`) because water sits directly on it. */
         constexpr float thickness_factor = 0.25f;
         const float point_mass = density * (area_sum * thickness_factor * spacing) /
                                  positions.size();
@@ -3145,15 +3276,222 @@ class XpbdSolverStep {
         }
       }
     }
+  }
 
-    fluid.boundary_grid.build(fluid.boundary_positions, spacing);
-
-    if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
-      printf("FLUID_DEBUG boundary: %d particles (spacing %.4f) for %d colliders\n",
-             int(fluid.boundary_positions.size()),
-             double(spacing),
-             int(geo_data.mesh_colliders.size()));
+  /**
+   * Adds the surface of the other simulated geometries of the world (cloth, soft bodies) that the
+   * fluid can reach to the boundary particles. They take part in the density estimate like the
+   * collider samples, but they have an inverse mass and are moved by the reaction pass, which is
+   * what couples the fluid and the solids in both directions.
+   *
+   * The particles are *not* the points of the solid: its triangles are sampled at half the support
+   * radius of the fluid (the same density the collider sampler uses), so a coarse cloth behaves
+   * like a continuous sheet instead of a net, and a fine one does not cost more than the fluid
+   * needs. Each sample keeps the barycentric weights of its triangle, which is how the reaction is
+   * spread over the vertices again (see #simulate__fluid_boundary_reaction).
+   *
+   * Geometries without faces (a point cloud, a curve) fall back to one particle per point.
+   *
+   * \return The number of particles that were added.
+   */
+  int prepare_fluid_boundary__solids(FluidChunkData &fluid,
+                                     const GeometryDataChunk &chunk,
+                                     const float3 &bounds_min,
+                                     const float3 &bounds_max)
+  {
+    const FluidConstraint &constraint = constraints_.fluid_constraints[fluid.constraint_i];
+    if (!(constraint.coupling > 0.0f)) {
+      return 0;
     }
+    /* Samples spaced half a support radius apart. The mass of a sample comes from the area it
+     * stands for, so the surface density the fluid sees is the same no matter how dense the
+     * sampling turns out to be (the subdivision of a triangle does not land on an exact grid). The
+     * factor makes a flat patch supply the density of a solid half space: a plane at distance 0
+     * integrates `1.2305 / h` of the poly6 kernel, so `mass = area * rest_density * h / 1.2305`
+     * (measured to be the value that actually holds water, see M60). */
+    const float spacing = 0.5f * fluid.support_radius;
+    const float mass_per_area = constraint.rest_density * fluid.support_radius / 1.2305f;
+    if (!(mass_per_area > 0.0f)) {
+      return 0;
+    }
+
+    int coupled_num = 0;
+    Vector<float3> samples;
+    Vector<float> areas;
+    const int self_data_key_i = chunk.data_key_i;
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      if (data_key_i == self_data_key_i) {
+        continue;
+      }
+      const GeometryData &other = *geometries_.data[data_key_i];
+      /* Only point clouds, meshes and curve points: those are the particle based simulations. */
+      if (other.domain != bke::AttrDomain::Point) {
+        continue;
+      }
+      /* Fluids couple to the fluid solve instead. */
+      if (other.fluid_constraint_i >= 0) {
+        continue;
+      }
+      if (other.size == 0 || other.inv_masses.size() != other.size) {
+        continue;
+      }
+      const Span<float3> positions = other.position_attr.span;
+      const Span<float> inv_masses = other.inv_masses;
+      const Mesh *mesh = geometries_.geometry_sets[geometries_.data_keys[data_key_i].geo_bundle_i]
+                             .geometry.get_mesh();
+      const Span<int3> corner_tris = mesh != nullptr ? mesh->corner_tris() : Span<int3>();
+
+      if (!corner_tris.is_empty()) {
+        /* A surface: sample it, so the resolution of the solid does not matter. */
+        const Span<int> corner_verts = mesh->corner_verts();
+        for (const int3 &tri : corner_tris) {
+          const int3 verts(corner_verts[tri[0]], corner_verts[tri[1]], corner_verts[tri[2]]);
+          const float3 v0 = positions[verts[0]];
+          const float3 v1 = positions[verts[1]];
+          const float3 v2 = positions[verts[2]];
+          if (!bounds_overlap(v0, v1, v2, bounds_min, bounds_max)) {
+            continue;
+          }
+          samples.clear();
+          areas.clear();
+          sample_boundary_triangle(v0, v1, v2, spacing, bounds_min, bounds_max, samples, areas, 0);
+          for (const int sample_i : samples.index_range()) {
+            const float3 &sample = samples[sample_i];
+            const float3 weights = triangle_weights(v0, v1, v2, sample);
+            fluid.coupled_positions.append(sample);
+            fluid.coupled_masses.append(areas[sample_i] * mass_per_area);
+            fluid.coupled_inv_masses.append(inv_masses[verts[0]] * weights.x +
+                                            inv_masses[verts[1]] * weights.y +
+                                            inv_masses[verts[2]] * weights.z);
+            fluid.coupled_geometry.append(data_key_i);
+            fluid.coupled_vertices.append(verts);
+            fluid.coupled_weights.append(weights);
+            coupled_num += 1;
+          }
+        }
+        continue;
+      }
+
+      /* No faces: one particle per point. Its mass has to come from the point spacing, because the
+       * points stand in for the solid volume the fluid would otherwise occupy. A locally flat
+       * layer of points spaced `s` contributes `~0.31 / s^3 * m` to the density estimate, so `1.6
+       * * rest_density * s^3` makes the solid provide the missing half of the density at its
+       * surface. Too light and the fluid simply falls through (measured). */
+      const float point_spacing = estimate_point_spacing(positions);
+      const float point_mass = 1.6f * constraint.rest_density * point_spacing * point_spacing *
+                               point_spacing;
+      if (!(point_mass > 0.0f)) {
+        continue;
+      }
+      for (const int i : IndexRange(other.size)) {
+        const float3 &pos = positions[i];
+        if (!bounds_contains(pos, bounds_min, bounds_max)) {
+          continue;
+        }
+        /* Pinned points still take part in the density estimate (like the collider samples), they
+         * just cannot be moved by the reaction. */
+        fluid.coupled_positions.append(pos);
+        fluid.coupled_masses.append(point_mass);
+        fluid.coupled_inv_masses.append(inv_masses[i]);
+        fluid.coupled_geometry.append(data_key_i);
+        fluid.coupled_vertices.append(int3(i, i, i));
+        fluid.coupled_weights.append(float3(1.0f, 0.0f, 0.0f));
+        if (inv_masses[i] > 0.0f) {
+          coupled_num += 1;
+        }
+      }
+    }
+
+    /* One scratch buffer per coupled geometry, for the per vertex accumulation of the reaction. */
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      if (fluid.coupled_geometry.first_index_of_try(data_key_i) < 0) {
+        continue;
+      }
+      fluid.coupled_scratch.append({});
+      FluidChunkData::CoupledVertexScratch &scratch = fluid.coupled_scratch.last();
+      scratch.geometry_i = data_key_i;
+      scratch.correction_sums.reinitialize(geometries_.data[data_key_i]->size);
+      scratch.correction_sums.fill(float3(0.0f));
+      scratch.weight_sums.reinitialize(geometries_.data[data_key_i]->size);
+      scratch.weight_sums.fill(0.0f);
+    }
+    return coupled_num;
+  }
+
+  /** Barycentric weights of a point inside a triangle, clamped to the triangle. */
+  static float3 triangle_weights(const float3 &v0,
+                                 const float3 &v1,
+                                 const float3 &v2,
+                                 const float3 &point)
+  {
+    const float3 e0 = v1 - v0;
+    const float3 e1 = v2 - v0;
+    const float3 offset = point - v0;
+    const float d00 = math::dot(e0, e0);
+    const float d01 = math::dot(e0, e1);
+    const float d11 = math::dot(e1, e1);
+    const float d20 = math::dot(offset, e0);
+    const float d21 = math::dot(offset, e1);
+    const float denominator = d00 * d11 - d01 * d01;
+    if (std::abs(denominator) < 1e-16f) {
+      return float3(1.0f, 0.0f, 0.0f);
+    }
+    const float b = (d11 * d20 - d01 * d21) / denominator;
+    const float c = (d00 * d21 - d01 * d20) / denominator;
+    const float a = 1.0f - b - c;
+    float3 weights(
+        math::clamp(a, 0.0f, 1.0f), math::clamp(b, 0.0f, 1.0f), math::clamp(c, 0.0f, 1.0f));
+    const float sum = weights.x + weights.y + weights.z;
+    if (!(sum > 0.0f)) {
+      return float3(1.0f, 0.0f, 0.0f);
+    }
+    weights /= sum;
+    return weights;
+  }
+
+  /**
+   * Rough point spacing of a point set, from its bounds and its size. Assumes that the points are
+   * evenly distributed, which holds for the meshes and grids the solver deals with.
+   */
+  static float estimate_point_spacing(const Span<float3> positions)
+  {
+    if (positions.size() < 2) {
+      return 0.0f;
+    }
+    float3 min(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 max(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    for (const float3 &pos : positions) {
+      min = math::min(min, pos);
+      max = math::max(max, pos);
+    }
+    float extents[3] = {max.x - min.x, max.y - min.y, max.z - min.z};
+    std::sort(extents, extents + 3);
+    const float largest = extents[2];
+    if (!(largest > 0.0f)) {
+      return 0.0f;
+    }
+    const float points_num = float(positions.size());
+    if (extents[0] < 0.3f * largest) {
+      /* A sheet (cloth, surface). */
+      if (extents[1] > 0.0f) {
+        return std::sqrt(extents[1] * largest / points_num);
+      }
+      /* A line (rod, hair). */
+      return largest / points_num;
+    }
+    return std::cbrt(extents[0] * extents[1] * largest / points_num);
+  }
+
+  static bool bounds_contains(const float3 &pos,
+                              const float3 &bounds_min,
+                              const float3 &bounds_max)
+  {
+    for (const int axis : IndexRange(3)) {
+      if (pos[axis] < bounds_min[axis] || pos[axis] > bounds_max[axis]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void simulate__fluid_position_solve__chunk(const int chunk_i,
@@ -3182,6 +3520,13 @@ class XpbdSolverStep {
       boundary.positions = fluid.boundary_positions;
       boundary.masses = fluid.boundary_masses;
     }
+    xpbd::FluidBoundary coupled;
+    if (fluid.has_coupled) {
+      coupled.grid = &fluid.coupled_grid;
+      coupled.positions = fluid.coupled_positions;
+      coupled.masses = fluid.coupled_masses;
+      coupled.inv_masses = fluid.coupled_inv_masses;
+    }
     const xpbd::FluidDensityStats stats = xpbd::fluid_solve_density_iteration(
         fluid.grid,
         xpbd::FluidKernel(fluid.support_radius),
@@ -3197,7 +3542,8 @@ class XpbdSolverStep {
         fluid.neighbor_counts,
         fluid.corrections,
         fluid.solid_fractions,
-        boundary);
+        boundary,
+        coupled);
     updater.add_residual_error(geo_i,
                                stats.average_error_squared *
                                    error_scale_from_threshold(constraint.error_threshold));
@@ -3211,6 +3557,109 @@ class XpbdSolverStep {
           double(stats.max_correction),
           stats.max_neighbors,
           double(fluid.support_radius));
+    }
+
+    this->simulate__fluid_boundary_reaction__chunk(chunk_i, solve_params);
+  }
+
+  /**
+   * Computes the reaction of the fluid pressure on the boundary particles that belong to other
+   * simulated geometries. The result is stored in the chunk, #simulate__fluid_boundary_reaction
+   * applies it. Splitting the two steps keeps the write to the positions of another chunk out of
+   * the parallel loop.
+   */
+  void simulate__fluid_boundary_reaction__chunk(const int chunk_i,
+                                                const xpbd::ConstraintSetParams &solve_params)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.active || !fluid.has_coupled || fluid.grid.is_empty()) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const int geo_i = chunk.data_key_i;
+    const GeometryData &geo_data = *geometries_.data[geo_i];
+    const IndexRange points = chunk.points_range;
+
+    xpbd::FluidBoundary coupled;
+    coupled.grid = &fluid.coupled_grid;
+    coupled.positions = fluid.coupled_positions;
+    coupled.masses = fluid.coupled_masses;
+    coupled.inv_masses = fluid.coupled_inv_masses;
+
+    xpbd::fluid_apply_boundary_reaction(
+        fluid.grid,
+        xpbd::FluidKernel(fluid.support_radius),
+        solve_params.geometry_refs()[geo_i].positions.slice(points),
+        geo_data.fluid_masses.as_span().slice(points),
+        geo_data.fluid_rest_density.as_span().slice(points),
+        fluid.lambdas,
+        geo_data.fluid_coupling.as_span().slice(points),
+        coupled,
+        0.1f * fluid.support_radius,
+        fluid.coupled_corrections);
+  }
+
+  /**
+   * Applies the reactions that the fluids computed during the last position solve iteration to the
+   * geometries they are coupled with. This runs after the parallel solve, so two fluids that touch
+   * the same solid cannot lose each other's correction.
+   *
+   * The correction of a sample is spread over the vertices of its triangle with the barycentric
+   * weights and *averaged* there (divided by the accumulated weight), so moving a vertex by the
+   * correction of one sample does not depend on the resolution of the solid. Pinned vertices are
+   * skipped, so a sample whose corners are all pinned does not move anything.
+   */
+  void simulate__fluid_boundary_reaction(const int solver_refs_i)
+  {
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int chunk_i : geometries_.chunks.index_range()) {
+      FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+      if (!fluid.active || !fluid.has_coupled) {
+        continue;
+      }
+      for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+        scratch.correction_sums.fill(float3(0.0f));
+        scratch.weight_sums.fill(0.0f);
+      }
+      for (const int i : fluid.coupled_geometry.index_range()) {
+        const float3 &correction = fluid.coupled_corrections[i];
+        if (correction.x == 0.0f && correction.y == 0.0f && correction.z == 0.0f) {
+          continue;
+        }
+        const int geometry_i = fluid.coupled_geometry[i];
+        FluidChunkData::CoupledVertexScratch *scratch = nullptr;
+        for (FluidChunkData::CoupledVertexScratch &candidate : fluid.coupled_scratch) {
+          if (candidate.geometry_i == geometry_i) {
+            scratch = &candidate;
+            break;
+          }
+        }
+        if (scratch == nullptr) {
+          continue;
+        }
+        const int3 &verts = fluid.coupled_vertices[i];
+        const float3 &weights = fluid.coupled_weights[i];
+        const Span<float> inv_masses = geometries_.data[geometry_i]->inv_masses;
+        for (const int k : IndexRange(3)) {
+          const int vertex_i = verts[k];
+          const float weight = weights[k];
+          if (weight <= 0.0f || inv_masses[vertex_i] <= 0.0f) {
+            continue;
+          }
+          scratch->correction_sums[vertex_i] += correction * weight;
+          scratch->weight_sums[vertex_i] += weight;
+        }
+      }
+      for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+        const MutableSpan<float3> positions = refs[scratch.geometry_i].positions;
+        for (const int vertex_i : scratch.weight_sums.index_range()) {
+          const float weight_sum = scratch.weight_sums[vertex_i];
+          if (weight_sum <= 0.0f) {
+            continue;
+          }
+          positions[vertex_i] += scratch.correction_sums[vertex_i] / weight_sum;
+        }
+      }
     }
   }
 

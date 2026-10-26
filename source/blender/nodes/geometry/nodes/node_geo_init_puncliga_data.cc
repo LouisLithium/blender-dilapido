@@ -63,6 +63,7 @@ constexpr StringRefNull vorticity = "puncliga_vorticity";
 constexpr StringRefNull surface_tension = "puncliga_surface_tension";
 constexpr StringRefNull boundary_friction = "puncliga_boundary_friction";
 constexpr StringRefNull negative_pressure_limit = "puncliga_negative_pressure_limit";
+constexpr StringRefNull coupling = "puncliga_coupling";
 constexpr StringRefNull boundary_particles = "puncliga_boundary_particles";
 constexpr StringRefNull stretchiness = "puncliga_stretchiness";
 constexpr StringRefNull bendiness = "puncliga_bendiness";
@@ -169,6 +170,14 @@ static void node_declare(NodeDeclarationBuilder &b)
         .max(1.0f)
         .usage_by_menu("Type"_ustr, fluid)
         .description("0 solves only compression (stable default)");
+    panel.add_input<decl::Float>("Coupling"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, fluid)
+        .description(
+            "How strongly this fluid pushes the other simulated geometries of the same simulation "
+            "(cloth, soft bodies); 0 disables the two way coupling");
   }
   {
     auto &panel = b.add_panel("Shared"_ustr).default_closed(true);
@@ -322,6 +331,10 @@ static void node_geo_exec(GeoNodeExecParams params)
                            attribute_names::negative_pressure_limit,
                            bke::AttrDomain::Point,
                            params.get_input<float>("Negative Pressure Limit"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::coupling,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Coupling"_ustr));
       write_uniform<bool>(geometry,
                           attribute_names::boundary_particles,
                           bke::AttrDomain::Point,

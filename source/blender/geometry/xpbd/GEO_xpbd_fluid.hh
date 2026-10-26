@@ -198,9 +198,36 @@ class FluidParticleGrid {
     if (table_size_ == 0) {
       return;
     }
+    this->foreach_neighbor_in_cell(cells_[i], positions[i], positions, fn);
+  }
+
+  /**
+   * Same as #foreach_neighbor, but for a query point that is not part of the grid. Used to find
+   * the particles around a boundary particle, which lives in a separate point set.
+   *
+   * \param positions: Positions of the particles the grid was built from.
+   */
+  template<typename Fn>
+  void foreach_neighbor_at(const float3 &query, const Span<float3> positions, Fn &&fn) const
+  {
+    if (table_size_ == 0) {
+      return;
+    }
+    const float inv_cell_size = 1.0f / cell_size_;
+    const int3 cell(int(std::floor(query.x * inv_cell_size)),
+                    int(std::floor(query.y * inv_cell_size)),
+                    int(std::floor(query.z * inv_cell_size)));
+    this->foreach_neighbor_in_cell(cell, query, positions, fn);
+  }
+
+ private:
+  template<typename Fn>
+  void foreach_neighbor_in_cell(const int3 &cell,
+                                const float3 &query,
+                                const Span<float3> positions,
+                                Fn &&fn) const
+  {
     const int mask = table_size_ - 1;
-    const int3 cell = cells_[i];
-    const float3 &pos_i = positions[i];
     const float r_sq_max = cell_size_ * cell_size_;
     for (int dz = -1; dz <= 1; ++dz) {
       for (int dy = -1; dy <= 1; ++dy) {
@@ -214,7 +241,7 @@ class FluidParticleGrid {
             if (cells_[j] != neighbor_cell) {
               continue;
             }
-            const float3 r_vec = pos_i - positions[j];
+            const float3 r_vec = query - positions[j];
             const float r_sq = math::length_squared(r_vec);
             if (r_sq >= r_sq_max) {
               continue;
@@ -239,19 +266,22 @@ struct FluidDensitySettings {
 };
 
 /**
- * Static particles sampled on the solid boundary, following Akinci et al. 2012 ("Versatile
- * Rigid-Fluid Coupling for Incompressible SPH"). Without them the SPH density estimate of a fluid
- * particle at a wall is truncated and only half of the rest density is seen, which is what makes
- * the fluid stick to walls and gives it a wrong pressure at the boundary.
+ * Particles on the solid boundary, following Akinci et al. 2012 ("Versatile Rigid-Fluid Coupling
+ * for Incompressible SPH"). Without them the SPH density estimate of a fluid particle at a wall is
+ * truncated and only half of the rest density is seen, which is what makes the fluid stick to
+ * walls and gives it a wrong pressure at the boundary.
  *
- * The boundary particles take part in the density estimate and push the fluid away, but they are
- * never moved themselves (their multiplier is zero, so only `lambda` of the fluid particle
- * contributes to the correction).
+ * They take part in the density estimate and push the fluid away. A boundary particle with a
+ * non-zero inverse mass belongs to another *simulated* geometry (cloth, soft body) and is moved by
+ * the pressure as well, see #fluid_apply_boundary_reaction. Collider samples have an inverse mass
+ * of zero and never move.
  */
 struct FluidBoundary {
   const FluidParticleGrid *grid = nullptr;
   Span<float3> positions;
   Span<float> masses;
+  /** Inverse mass per boundary particle, empty or 0 for particles that cannot move. */
+  Span<float> inv_masses;
 
   bool is_valid() const
   {
@@ -291,6 +321,88 @@ inline void fluid_apply_boundary_friction(const MutableSpan<float3> velocities,
 }
 
 /**
+ * Reaction of the fluid pressure on the boundary particles that can move, i.e. the two way
+ * coupling with the cloth and soft body geometries in the same world.
+ *
+ * A fluid particle \a i and a boundary particle \a j share the density constraint of \a i. The
+ * pressure applies
+ *     dm_i = lambda_i * m_j * grad_i W_ij / rho0_i
+ * to the fluid particle (see #fluid_solve_density_iteration), so the conjugate position change of
+ * the boundary particle is
+ *     dm_j = -lambda_i * m_i * grad_i W_ij / rho0_i
+ * which makes `m_i * dm_i + m_j * dm_j` zero for the pair, i.e. the momentum is conserved no
+ * matter how much the masses of the fluid and the solid differ. That is what keeps the coupling
+ * stable: the cloth pushes back exactly as hard as the water presses on it.
+ *
+ * \param fluid_positions, fluid_masses, fluid_rest_density, fluid_lambdas: Per particle data of
+ * the fluid, indexed like the grid.
+ * \param coupling: Per fluid particle strength of the reaction, 0 disables the coupling.
+ * \param boundary: The boundary particles, only the ones with a positive inverse mass are moved.
+ * \param max_correction: Maximum length of the position change of one boundary particle per
+ *   iteration, 0 means unlimited.
+ * \param r_corrections: Position change of each boundary particle, 0 for static ones.
+ */
+inline void fluid_apply_boundary_reaction(const FluidParticleGrid &fluid_grid,
+                                          const FluidKernel &kernel,
+                                          const Span<float3> fluid_positions,
+                                          const Span<float> fluid_masses,
+                                          const Span<float> fluid_rest_density,
+                                          const Span<float> fluid_lambdas,
+                                          const Span<float> coupling,
+                                          const FluidBoundary &boundary,
+                                          const float max_correction,
+                                          const MutableSpan<float3> r_corrections)
+{
+  const int boundary_num = int(boundary.positions.size());
+  if (boundary_num == 0 || fluid_grid.is_empty() || boundary.inv_masses.is_empty()) {
+    return;
+  }
+  if (r_corrections.size() != boundary_num) {
+    return;
+  }
+  threading::parallel_for(IndexRange(boundary_num), 256, [&](const IndexRange range) {
+    for (const int j : range) {
+      r_corrections[j] = float3(0.0f);
+      if (boundary.inv_masses[j] <= 0.0f) {
+        continue;
+      }
+      float3 correction = float3(0.0f);
+      fluid_grid.foreach_neighbor_at(boundary.positions[j],
+                                     fluid_positions,
+                                     [&](const int i, const float3 &r_vec, const float r_sq) {
+                                       if (UNLIKELY(r_sq < 1e-12f)) {
+                                         return;
+                                       }
+                                       const float lambda_i = fluid_lambdas[i] * coupling[i];
+                                       if (lambda_i == 0.0f) {
+                                         return;
+                                       }
+                                       const float r = math::sqrt(r_sq);
+                                       /* r_vec is the boundary position minus the fluid position,
+                                        * so this is the gradient of the kernel with respect to the
+                                        * boundary particle. */
+                                       correction += lambda_i * fluid_masses[i] *
+                                                     (-(kernel.spiky_gradient_length(r) / r) *
+                                                      r_vec) *
+                                                     math::safe_rcp(fluid_rest_density[i]);
+                                     });
+      if (max_correction > 0.0f) {
+        const float length = math::length(correction);
+        if (length > max_correction) {
+          correction *= max_correction / length;
+        }
+      }
+      if (UNLIKELY(!(std::isfinite(correction.x) && std::isfinite(correction.y) &&
+                     std::isfinite(correction.z))))
+      {
+        correction = float3(0.0f);
+      }
+      r_corrections[j] = correction;
+    }
+  });
+}
+
+/**
  * Runs one density constraint iteration.
  *
  * \param positions: Read and written positions of the particles. The correction is applied at the
@@ -302,8 +414,14 @@ inline void fluid_apply_boundary_friction(const MutableSpan<float3> velocities,
  * \param r_errors: Scratch buffer for the squared relative density error of each particle.
  * \param r_neighbor_counts: Scratch buffer for the number of neighbors of each particle.
  * \param r_corrections: Scratch buffer for the position corrections.
- * \param boundary: Optional boundary particles. They are part of the density estimate and push the
- *   fluid away, but they are never moved.
+ * \param r_solid_fractions: Fraction of the density estimate of each particle that comes from the
+ *   boundary and the coupled particles, used for the no-slip friction.
+ * \param boundary: Optional boundary particles sampled on the colliders. They are part of the
+ *   density estimate and push the fluid away, but they are never moved. They are only used for the
+ *   particles where `use_boundary` is set.
+ * \param coupled: Optional particles of the other simulated geometries of the world. They are
+ *   always part of the density estimate (they are what makes the coupling work at all) and they
+ * are moved by #fluid_apply_boundary_reaction.
  */
 inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &grid,
                                                        const FluidKernel &kernel,
@@ -319,7 +437,8 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
                                                        const MutableSpan<int> r_neighbor_counts,
                                                        const MutableSpan<float3> r_corrections,
                                                        const MutableSpan<float> r_solid_fractions,
-                                                       const FluidBoundary &boundary)
+                                                       const FluidBoundary &boundary,
+                                                       const FluidBoundary &coupled)
 {
   const int points_num = int(positions.size());
   if (points_num == 0 || grid.is_empty()) {
@@ -343,8 +462,14 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
       int neighbors = 0;
       float3 sum_gradient = float3(0.0f);
       float sum_gradient_sq = 0.0f;
+      /* Mass free kernel weight of the fluid neighbors, used to measure which fraction of the
+       * neighborhood is solid for the no-slip friction. Mass free, because the friction should
+       * depend on how much of the neighborhood is wall and not on how the boundary mass happens to
+       * be calibrated for the density estimate. */
+      float fluid_weight = 0.0f;
       grid.foreach_neighbor(i, positions, [&](const int j, const float3 &r_vec, const float r_sq) {
         density += masses[j] * kernel.poly6(r_sq);
+        fluid_weight += kernel.poly6(r_sq);
         neighbors += 1;
         if (j == i) {
           return;
@@ -359,27 +484,40 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
         sum_gradient += masses[j] * (-(gradient_length / r) * r_vec);
         sum_gradient_sq += math::square(masses[j] * gradient_length);
       });
-      if (boundary.is_valid() && use_boundary[i]) {
-        /* Boundary particles are part of the density estimate and of the gradient w.r.t. the fluid
-         * particle, but since they cannot move they are not part of the per neighbor gradient
-         * terms of the denominator. */
-        float boundary_density = 0.0f;
-        boundary.grid->foreach_neighbor(
-            i, boundary.positions, [&](const int j, const float3 &r_vec, const float r_sq) {
-              boundary_density += boundary.masses[j] * kernel.poly6(r_sq);
+      /* Boundary particles are part of the density estimate and of the gradient w.r.t. the fluid
+       * particle, but since they cannot move they are not part of the per neighbor gradient terms
+       * of the denominator. */
+      float boundary_density = 0.0f;
+      float boundary_weight = 0.0f;
+      const auto accumulate_boundary = [&](const FluidBoundary &boundary_particles) {
+        if (!boundary_particles.is_valid()) {
+          return;
+        }
+        /* The boundary particles live in their own point set, so the query has to use the position
+         * of the fluid particle instead of an index into the boundary grid. */
+        boundary_particles.grid->foreach_neighbor_at(
+            positions[i],
+            boundary_particles.positions,
+            [&](const int j, const float3 &r_vec, const float r_sq) {
+              const float weight = kernel.poly6(r_sq);
+              boundary_density += boundary_particles.masses[j] * weight;
+              boundary_weight += weight;
               if (UNLIKELY(r_sq < 1e-12f)) {
                 return;
               }
               const float r = math::sqrt(r_sq);
-              sum_gradient += boundary.masses[j] *
+              sum_gradient += boundary_particles.masses[j] *
                               (-(kernel.spiky_gradient_length(r) / r) * r_vec);
             });
-        density += boundary_density;
-        r_solid_fractions[i] = boundary_density * math::safe_rcp(density);
+      };
+      if (use_boundary[i]) {
+        accumulate_boundary(boundary);
       }
-      else {
-        r_solid_fractions[i] = 0.0f;
-      }
+      /* The particles of the coupled solids are always part of the density estimate, otherwise the
+       * fluid would see a free surface inside the cloth and push through it. */
+      accumulate_boundary(coupled);
+      density += boundary_density;
+      r_solid_fractions[i] = boundary_weight * math::safe_rcp(boundary_weight + fluid_weight);
 
       const float constraint = density * inv_rest_density - 1.0f;
       /* Only compression is solved by default, see #FluidDensitySettings. */
@@ -429,17 +567,29 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
         }
         correction += weight * masses[j] * (-(kernel.spiky_gradient_length(r) / r) * r_vec);
       });
-      if (boundary.is_valid() && lambda_i != 0.0f) {
-        /* A boundary particle never moves, so only the multiplier of the fluid particle pushes. */
-        boundary.grid->foreach_neighbor(
-            i, boundary.positions, [&](const int j, const float3 &r_vec, const float r_sq) {
-              if (UNLIKELY(r_sq < 1e-12f)) {
-                return;
-              }
-              const float r = math::sqrt(r_sq);
-              correction += lambda_i * boundary.masses[j] *
-                            (-(kernel.spiky_gradient_length(r) / r) * r_vec);
-            });
+      if (lambda_i != 0.0f) {
+        /* The boundary and the coupled particles never have a multiplier of their own, so only the
+         * multiplier of the fluid particle pushes here. */
+        const auto accumulate_boundary = [&](const FluidBoundary &boundary_particles) {
+          if (!boundary_particles.is_valid()) {
+            return;
+          }
+          boundary_particles.grid->foreach_neighbor_at(
+              positions[i],
+              boundary_particles.positions,
+              [&](const int j, const float3 &r_vec, const float r_sq) {
+                if (UNLIKELY(r_sq < 1e-12f)) {
+                  return;
+                }
+                const float r = math::sqrt(r_sq);
+                correction += lambda_i * boundary_particles.masses[j] *
+                              (-(kernel.spiky_gradient_length(r) / r) * r_vec);
+              });
+        };
+        accumulate_boundary(coupled);
+        if (use_boundary[i]) {
+          accumulate_boundary(boundary);
+        }
       }
       correction *= math::safe_rcp(rest_density[i]);
       if (settings.max_correction > 0.0f) {

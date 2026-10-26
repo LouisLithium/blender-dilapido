@@ -220,6 +220,13 @@ const FlatBundleTypePtr &FluidBundle::get_bundle_type()
         .description("No-slip damping of the velocity next to boundary particles");
     b.add<decl::Float>("negative_pressure_limit"_ustr).default_value(0.0f).min(0.0f).max(1.0f);
     b.add<decl::Float>("artificial_pressure"_ustr).default_value(0.0f).min(0.0f);
+    b.add<decl::Float>("coupling"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .description(
+            "How strongly the fluid pushes the other simulated geometries of the same world "
+            "(cloth, soft bodies); 0 disables the two way coupling");
     b.add<decl::Float>("error_threshold"_ustr).default_value(1e-2f).min(1e-5f);
     const FlatBundleTypePtr bundle_type = b.build();
     BundleTypeRegistry::register_type(bundle_type);
