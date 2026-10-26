@@ -68,6 +68,16 @@ class EdgeLengthConstraintBundle {
   static const FlatBundleTypePtr &get_bundle_type();
 };
 
+/**
+ * Turns the points of a geometry into a position based fluid. The density constraint is solved
+ * between all particles of the geometry that are within the support radius of each other.
+ */
+class FluidBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.Fluid";
+  static const FlatBundleTypePtr &get_bundle_type();
+};
+
 class CrossEdgeLengthConstraintBundle {
  public:
   static constexpr StringRefNull name = "Blender.Constraint.CrossEdgeLength";

@@ -2,6 +2,8 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <cstdlib>
+
 #include "BKE_bvhutils.hh"
 #include "BKE_curves.hh"
 #include "BKE_geometry_fields.hh"
@@ -32,6 +34,7 @@
 #include "GEO_xpbd_constraint_pin_rotation.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
+#include "GEO_xpbd_fluid.hh"
 
 #include "NOD_geo_tag_filter.hh"
 #include "NOD_geometry_nodes_bundle.hh"
@@ -95,6 +98,7 @@ static NestedBundleTypePtr make_world_type()
   types.append(PinRotationBundle::get_bundle_type());
   types.append(EdgeLengthConstraintBundle::get_bundle_type());
   types.append(CrossEdgeLengthConstraintBundle::get_bundle_type());
+  types.append(FluidBundle::get_bundle_type());
 
   /* Not actually used by the node but only registered here. */
   ForceBundle::get_bundle_type();
@@ -281,6 +285,53 @@ struct CrossEdgeLengthConstraintUsage {
   xpbd::ConstraintColoring coloring;
 };
 
+/** Fluid parameters, gathered from a `Blender.Fluid` bundle in the world. */
+struct FluidConstraint {
+  std::string path;
+  float rest_density = 1000.0f;
+  float compliance = 0.0f;
+  float viscosity = 0.0f;
+  float damping = 0.0f;
+  float vorticity = 0.0f;
+  float surface_tension = 0.0f;
+  float negative_pressure_limit = 0.0f;
+  float artificial_pressure = 0.0f;
+  /** Used when the geometry has no `radius` attribute. */
+  float particle_radius = 0.05f;
+  bool boundary_particles = true;
+  float boundary_friction = 0.5f;
+  float error_threshold = 1e-2f;
+};
+
+/** Per chunk state of the fluid solve pass. */
+struct FluidChunkData {
+  bool active = false;
+  int constraint_i = -1;
+  /** Support radius of the kernel, twice the particle radius. */
+  float support_radius = 0.0f;
+  xpbd::FluidParticleGrid grid;
+  /** Accumulated lagrange multipliers, reset every substep. */
+  Array<float> lambdas;
+  /** Scratch buffers, sized like the chunk. */
+  Array<float> errors;
+  Array<int> neighbor_counts;
+  Array<float3> corrections;
+  /** Only used when vorticity confinement is enabled. */
+  Array<float3> omegas;
+  Array<float> omega_magnitudes;
+
+  /**
+   * Particles sampled on the colliders that the fluid can reach. They are rebuilt once per frame
+   * and act as the solid boundary of the fluid.
+   */
+  bool boundary_active = false;
+  Vector<float3> boundary_positions;
+  Vector<float> boundary_masses;
+  xpbd::FluidParticleGrid boundary_grid;
+  /** Fraction of the density of each particle that comes from the boundary particles. */
+  Array<float> solid_fractions;
+};
+
 struct StaticMeshInfo {
   const Mesh *mesh;
   bke::BVHTreeFromMesh corner_tris_bvh;
@@ -383,6 +434,15 @@ struct GeometryData {
   Vector<RodBendTwistConstraintUsage> rod_bend_twist_constraints;
 
   Vector<ConstraintWithColoring> static_constraints;
+
+  /** Index into #ConstraintsInfo::fluid_constraints, -1 when this geometry is not a fluid. */
+  int fluid_constraint_i = -1;
+  /** Materialized mass per point, only initialized for fluids. */
+  Array<float> fluid_masses;
+  /** Materialized particle radius per point, only initialized for fluids. */
+  Array<float> fluid_radii;
+  /** Support radius of the fluid kernel. */
+  float fluid_support_radius = 0.0f;
 
   GeometryData(const bke::MutableAttributeAccessor attributes) : attributes(attributes) {}
 };
@@ -537,6 +597,8 @@ struct ChunkData {
 
   ExternalFaceContacts external_face_contacts;
   ExternalEdgeContacts external_edge_contacts;
+
+  FluidChunkData fluid;
 };
 
 struct ConstraintsInfo {
@@ -549,6 +611,7 @@ struct ConstraintsInfo {
   Vector<PinRotationConstraint> pin_rotation_constraints;
   Vector<EdgeLengthConstraint> edge_length_constraints;
   Vector<CrossEdgeLengthConstraint> cross_edge_length_constraints;
+  Vector<FluidConstraint> fluid_constraints;
 };
 
 class XpbdSolverStep {
@@ -624,9 +687,11 @@ class XpbdSolverStep {
   {
     this->gather_nested_bundle_paths();
     this->gather_from_world__geometries();
+    this->gather_from_world__fluids();
     this->prepare_geometry_chunks();
     this->prepare_inverse_masses();
     this->prepare_inverse_moments_of_inertia();
+    this->prepare_chunk_fluids();
 
     this->gather_from_world__mesh_colliders();
     this->gather_from_world__stretch_shear_constraints();
@@ -647,8 +712,9 @@ class XpbdSolverStep {
       this->create_chunk_constraints__pin_rotations(tls, chunk_i);
     });
 
-    result_ = this->do_simulation();
+    this->prepare_fluid_boundaries();
 
+    result_ = this->do_simulation();
     this->write_back__pin_positions();
     this->write_back__rod_stretch_shear();
 
@@ -814,14 +880,150 @@ class XpbdSolverStep {
     });
   }
 
-  void ensure_radius_loaded(const int data_key_i)
+  void ensure_radius_loaded(const int data_key_i, const float default_radius = 0.0f)
   {
     GeometryData &geo_data = *geometries_.data[data_key_i];
     geo_data.load_radius_mutex.ensure([&]() {
-      geo_data.radii = this->lookup_attribute_default<float>(
-          data_key_i, attribute_names::radius, geo_data.domain, 0.0f);
+      if (default_radius <= 0.0f) {
+        geo_data.radii = this->lookup_attribute_default<float>(
+            data_key_i, attribute_names::radius, geo_data.domain, 0.0f);
+      }
+      else {
+        /* Fluids get their radius from the fluid bundle, so a missing attribute is not a
+         * problem and should not produce a warning. */
+        const VArray<float> radius_attr = *geo_data.attributes.lookup<float>(
+            attribute_names::radius, geo_data.domain);
+        geo_data.radii = radius_attr ? radius_attr :
+                                       VArray<float>::from_single(default_radius, geo_data.size);
+      }
       geo_data.prev_radii = geo_data.radii;
     });
+  }
+
+  /**
+   * Gathers `Blender.Fluid` bundles from the world. Every geometry that the bundle applies to
+   * (based on its tag filter) is turned into a position based fluid.
+   */
+  void gather_from_world__fluids()
+  {
+    const Span<std::string> paths = nested_bundle_paths_.lookup_as(FluidBundle::name);
+    for (const StringRef path : paths) {
+      const BundlePtr *bundle_ptr = world_.lookup_path_ptr<BundlePtr>(path);
+      if (!bundle_ptr || !*bundle_ptr) {
+        continue;
+      }
+      const Bundle &bundle = **bundle_ptr;
+
+      FluidConstraint fluid;
+      fluid.path = path;
+      fluid.rest_density =
+          bundle.lookup<float>(*BundleKey::from_str("rest_density")).value_or(1000.0f);
+      fluid.compliance = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("compliance")).value_or(0.0f));
+      fluid.viscosity = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("viscosity")).value_or(0.0f));
+      fluid.damping = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("damping")).value_or(1.0f));
+      fluid.vorticity = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("vorticity")).value_or(0.0f));
+      fluid.surface_tension = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("surface_tension")).value_or(0.0f));
+      fluid.boundary_particles =
+          bundle.lookup<bool>(*BundleKey::from_str("boundary_particles")).value_or(true);
+      fluid.boundary_friction = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("boundary_friction")).value_or(0.5f),
+          0.0f,
+          1.0f);
+      fluid.negative_pressure_limit = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("negative_pressure_limit")).value_or(0.0f),
+          0.0f,
+          1.0f);
+      fluid.artificial_pressure = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("artificial_pressure")).value_or(0.0f));
+      fluid.particle_radius =
+          bundle.lookup<float>(*BundleKey::from_str("particle_radius")).value_or(0.05f);
+      fluid.error_threshold =
+          bundle.lookup<float>(*BundleKey::from_str("error_threshold")).value_or(1e-2f);
+      if (!(fluid.rest_density > 0.0f)) {
+        this->report(NodeWarningType::Error,
+                     fmt::format("Fluid \"{}\" has a rest density of zero, ignoring it", path));
+        continue;
+      }
+
+      const int constraint_i = constraints_.fluid_constraints.append_and_get_index(
+          std::move(fluid));
+      const FluidConstraint &fluid_params = constraints_.fluid_constraints[constraint_i];
+
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        if (!this->effector_applies_to_geometry(path, bundle, data_key_i)) {
+          continue;
+        }
+        const std::string &geometry_path =
+            geometries_.geometry_sets[geometries_.data_keys[data_key_i].geo_bundle_i].path;
+        if (geo_data.fluid_constraint_i >= 0) {
+          this->report(
+              NodeWarningType::Warning,
+              fmt::format("Geometry \"{}\" is affected by more than one fluid, ignoring \"{}\"",
+                          geometry_path,
+                          path));
+          continue;
+        }
+
+        this->ensure_radius_loaded(data_key_i, fluid_params.particle_radius);
+        /* Materialize the per point arrays once, they are accessed for every neighbor lookup. */
+        geo_data.fluid_radii.reinitialize(geo_data.size);
+        geo_data.radii.materialize(geo_data.fluid_radii);
+        geo_data.fluid_masses.reinitialize(geo_data.size);
+        geo_data.masses.materialize(geo_data.fluid_masses);
+
+        float max_radius = 0.0f;
+        for (const float radius : geo_data.fluid_radii) {
+          max_radius = std::max(max_radius, radius);
+        }
+        /* Support radius of the kernel is twice the particle radius, as usual in SPH. */
+        geo_data.fluid_support_radius = 2.0f * max_radius;
+        if (!(geo_data.fluid_support_radius > 0.0f)) {
+          this->report(NodeWarningType::Error,
+                       fmt::format("Fluid \"{}\" has a particle radius of zero on \"{}\", "
+                                   "set the radius attribute or the particle radius of the fluid",
+                                   path,
+                                   geometry_path));
+          continue;
+        }
+        geo_data.fluid_constraint_i = constraint_i;
+      }
+    }
+  }
+
+  void prepare_chunk_fluids()
+  {
+    for (const int chunk_i : geometries_.chunks.index_range()) {
+      const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+      const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+      if (geo_data.fluid_constraint_i < 0) {
+        continue;
+      }
+      const int points_num = chunk.points_range.size();
+      if (points_num < 2) {
+        continue;
+      }
+      FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+      fluid.active = true;
+      fluid.constraint_i = geo_data.fluid_constraint_i;
+      fluid.support_radius = geo_data.fluid_support_radius;
+      fluid.boundary_active =
+          constraints_.fluid_constraints[geo_data.fluid_constraint_i].boundary_particles;
+      fluid.lambdas.reinitialize(points_num);
+      fluid.lambdas.fill(0.0f);
+      fluid.errors.reinitialize(points_num);
+      fluid.neighbor_counts.reinitialize(points_num);
+      fluid.corrections.reinitialize(points_num);
+      fluid.omegas.reinitialize(points_num);
+      fluid.omega_magnitudes.reinitialize(points_num);
+      fluid.solid_fractions.reinitialize(points_num);
+      fluid.solid_fractions.fill(0.0f);
+    }
   }
 
   void gather_from_world__mesh_colliders()
@@ -1034,6 +1236,21 @@ class XpbdSolverStep {
                                                         contact->face_nor *
                                                         (collider.is_boundary ? -1.0f : 1.0f) :
                                                     collision_axis);
+      if (!(std::isfinite(valid_axis.x) && std::isfinite(valid_axis.y) &&
+            std::isfinite(valid_axis.z)) ||
+          math::is_zero(valid_axis))
+      {
+        /* A degenerate contact (e.g. a point exactly on the surface with an invalid normal) would
+         * write NaN into the point positions and poison the whole simulation. */
+        if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
+          printf("XPBD_DEBUG degenerate contact normal (%f %f %f), is_inside=%d\n",
+                 double(valid_axis.x),
+                 double(valid_axis.y),
+                 double(valid_axis.z),
+                 int(contact->is_inside));
+        }
+        continue;
+      }
 
       const float static_friction = this->compute_contact_friction(
           geo_data.static_frictions[point_i], collider.friction);
@@ -1498,7 +1715,12 @@ class XpbdSolverStep {
       }
       const int old_chunks_num = geometries_.chunks.size();
 
-      if (geo_data.curves) {
+      if (geo_data.fluid_constraint_i >= 0) {
+        /* Neighbors of a fluid particle can be anywhere in the geometry, so a fluid is always a
+         * single chunk. Splitting it would silently drop all neighbors across chunk boundaries. */
+        geometries_.chunks.append({data_key_i, IndexRange(geo_data.size)});
+      }
+      else if (geo_data.curves) {
         /* For curve data, align the ranges with curve boundaries. */
         const bke::CurvesGeometry &curves = *geo_data.curves;
         const OffsetIndices<int> points_by_curve = curves.points_by_curve();
@@ -2625,6 +2847,331 @@ class XpbdSolverStep {
     }
     chunk_data.external_face_contacts = std::move(new_face_contacts);
     chunk_data.external_edge_contacts = std::move(new_edge_contacts);
+
+    this->simulate__update_fluid_neighborhood__chunk(chunk_i, solver_refs_i);
+  }
+
+  /**
+   * Rebuilds the neighbor grid of the fluid once per substep. The grid is not rebuilt for every
+   * constraint iteration because particles only move a fraction of the support radius per
+   * iteration.
+   */
+  void simulate__update_fluid_neighborhood__chunk(const int chunk_i, const int solver_refs_i)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.active) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const Span<float3> positions = geometries_.solver_refs[solver_refs_i][chunk.data_key_i]
+                                       .positions.slice(chunk.points_range);
+    fluid.grid.build(positions, fluid.support_radius);
+    fluid.lambdas.fill(0.0f);
+
+    if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
+      for (const int i : IndexRange(positions.size())) {
+        const float3 &p = positions[i];
+        if (!(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))) {
+          printf(
+              "XPBD_DEBUG non-finite fluid position before the density solve at %d: "
+              "(%.3f %.3f %.3f)\n",
+              int(i + chunk.points_range.start()),
+              double(p.x),
+              double(p.y),
+              double(p.z));
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Samples boundary particles on the collider meshes that the fluid can reach. The sampling is
+   * clipped to the bounding box of the fluid (plus the support radius), so a large ground plane
+   * only contributes the part the fluid can touch.
+   *
+   * This is a per frame operation: the colliders are sampled at their end pose of the frame. The
+   * grid is reused for all substeps of the frame.
+   */
+  void prepare_fluid_boundaries()
+  {
+    this->parallel_for_each_chunk(
+        8, [&](const int chunk_i) { this->prepare_fluid_boundary__chunk(chunk_i); });
+  }
+
+  static bool bounds_overlap(const float3 &v0,
+                             const float3 &v1,
+                             const float3 &v2,
+                             const float3 &bounds_min,
+                             const float3 &bounds_max)
+  {
+    for (const int axis : IndexRange(3)) {
+      const float tri_min = std::min({v0[axis], v1[axis], v2[axis]});
+      const float tri_max = std::max({v0[axis], v1[axis], v2[axis]});
+      if (tri_max < bounds_min[axis] || tri_min > bounds_max[axis]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Appends one boundary particle per sub triangle, recursively splitting until the triangles are
+   * smaller than the particle spacing. Triangles outside the bounds are skipped early, so the cost
+   * is proportional to the area that the fluid can reach instead of the whole collider.
+   */
+  static void sample_boundary_triangle(const float3 &v0,
+                                       const float3 &v1,
+                                       const float3 &v2,
+                                       const float spacing,
+                                       const float3 &bounds_min,
+                                       const float3 &bounds_max,
+                                       Vector<float3> &r_positions,
+                                       Vector<float> &r_areas,
+                                       const int depth)
+  {
+    if (depth >= 16 || !bounds_overlap(v0, v1, v2, bounds_min, bounds_max)) {
+      return;
+    }
+    const float max_edge = std::max(
+        {math::length(v1 - v0), math::length(v2 - v1), math::length(v0 - v2)});
+    if (max_edge > spacing) {
+      const float3 v01 = (v0 + v1) * 0.5f;
+      const float3 v12 = (v1 + v2) * 0.5f;
+      const float3 v20 = (v2 + v0) * 0.5f;
+      sample_boundary_triangle(
+          v0, v01, v20, spacing, bounds_min, bounds_max, r_positions, r_areas, depth + 1);
+      sample_boundary_triangle(
+          v01, v1, v12, spacing, bounds_min, bounds_max, r_positions, r_areas, depth + 1);
+      sample_boundary_triangle(
+          v20, v12, v2, spacing, bounds_min, bounds_max, r_positions, r_areas, depth + 1);
+      sample_boundary_triangle(
+          v01, v12, v20, spacing, bounds_min, bounds_max, r_positions, r_areas, depth + 1);
+      return;
+    }
+    const float3 center = (v0 + v1 + v2) * (1.0f / 3.0f);
+    if (center.x < bounds_min.x || center.x > bounds_max.x || center.y < bounds_min.y ||
+        center.y > bounds_max.y || center.z < bounds_min.z || center.z > bounds_max.z)
+    {
+      return;
+    }
+    r_positions.append(center);
+    r_areas.append(0.5f * math::length(math::cross(v1 - v0, v2 - v0)));
+  }
+
+  void prepare_fluid_boundary__chunk(const int chunk_i)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    fluid.boundary_positions.clear();
+    fluid.boundary_masses.clear();
+    fluid.boundary_grid.build(Span<float3>(), 0.0f);
+    if (!fluid.active || !fluid.boundary_active) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    if (geo_data.mesh_colliders.is_empty()) {
+      return;
+    }
+
+    /* Bounds of the fluid, expanded by the support radius. */
+    float3 bounds_min(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 bounds_max(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    for (const float3 &pos : geo_data.position_attr.span) {
+      bounds_min = math::min(bounds_min, pos);
+      bounds_max = math::max(bounds_max, pos);
+    }
+    if (bounds_min.x > bounds_max.x) {
+      return;
+    }
+    const float margin = 2.0f * fluid.support_radius;
+    bounds_min -= float3(margin);
+    bounds_max += float3(margin);
+
+    const float spacing = 0.5f * fluid.support_radius;
+    const float density = constraints_.fluid_constraints[fluid.constraint_i].rest_density;
+
+    /* Samples of one triangle, collected before they are added so they can share the same mass. */
+    Vector<float3> positions;
+    Vector<float> areas;
+
+    for (const MeshColliderUsage &collider_usage : geo_data.mesh_colliders) {
+      const MeshCollider &collider = constraints_.mesh_colliders[collider_usage.constraint_i];
+      const Mesh *mesh = nullptr;
+      if (std::holds_alternative<StaticMeshInfo>(collider.mesh)) {
+        mesh = std::get<StaticMeshInfo>(collider.mesh).mesh;
+      }
+      else if (std::holds_alternative<DeformingMeshInfo>(collider.mesh)) {
+        const auto &deforming = std::get<DeformingMeshInfo>(collider.mesh);
+        mesh = deforming.substep_meshes.last();
+      }
+      if (mesh == nullptr) {
+        continue;
+      }
+      const float4x4 &mesh_to_local = collider.end_transform;
+      const Span<int3> corner_tris = mesh->corner_tris();
+      const Span<int> corner_verts = mesh->corner_verts();
+      const Span<float3> vert_positions = mesh->vert_positions();
+
+      for (const int3 &tri : corner_tris) {
+        const float3 v0 = math::transform_point(mesh_to_local,
+                                                vert_positions[corner_verts[tri[0]]]);
+        const float3 v1 = math::transform_point(mesh_to_local,
+                                                vert_positions[corner_verts[tri[1]]]);
+        const float3 v2 = math::transform_point(mesh_to_local,
+                                                vert_positions[corner_verts[tri[2]]]);
+        if (!bounds_overlap(v0, v1, v2, bounds_min, bounds_max)) {
+          continue;
+        }
+        positions.clear();
+        areas.clear();
+        sample_boundary_triangle(v0, v1, v2, spacing, bounds_min, bounds_max, positions, areas, 0);
+        if (positions.is_empty()) {
+          continue;
+        }
+        float area_sum = 0.0f;
+        for (const float area : areas) {
+          area_sum += area;
+        }
+        /* Each boundary particle represents a patch of the surface with the fluid volume behind
+         * it, so the boundary mass is the rest density times the sampled volume. The shell has to
+         * be thin: the bottom layer of a settled fluid is much less under-dense than the free
+         * surface (measured with the test setups), so a full thickness of one particle spacing
+         * over-corrects the density and inflates the fluid. */
+        constexpr float thickness_factor = 0.25f;
+        const float point_mass = density * (area_sum * thickness_factor * spacing) /
+                                 positions.size();
+        for (const int i : positions.index_range()) {
+          fluid.boundary_positions.append(positions[i]);
+          fluid.boundary_masses.append(point_mass);
+        }
+      }
+    }
+
+    fluid.boundary_grid.build(fluid.boundary_positions, spacing);
+
+    if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
+      printf("FLUID_DEBUG boundary: %d particles (spacing %.4f) for %d colliders\n",
+             int(fluid.boundary_positions.size()),
+             double(spacing),
+             int(geo_data.mesh_colliders.size()));
+    }
+  }
+
+  void simulate__fluid_position_solve__chunk(const int chunk_i,
+                                             const xpbd::ConstraintSetParams &solve_params,
+                                             xpbd::GaussSeidelUpdater &updater)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.active || fluid.grid.is_empty()) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const int geo_i = chunk.data_key_i;
+    const GeometryData &geo_data = *geometries_.data[geo_i];
+    const FluidConstraint &constraint = constraints_.fluid_constraints[fluid.constraint_i];
+
+    xpbd::FluidDensitySettings settings;
+    settings.rest_density = constraint.rest_density;
+    settings.compliance_term = constraint.compliance * solve_params.compliance_term_factor;
+    settings.negative_pressure_limit = constraint.negative_pressure_limit;
+    settings.artificial_pressure = constraint.artificial_pressure;
+    /* Maximum positional correction of one particle per iteration. */
+    settings.max_correction = 0.1f * fluid.support_radius;
+
+    const IndexRange points = chunk.points_range;
+    xpbd::FluidBoundary boundary;
+    if (fluid.boundary_active) {
+      boundary.grid = &fluid.boundary_grid;
+      boundary.positions = fluid.boundary_positions;
+      boundary.masses = fluid.boundary_masses;
+    }
+    const xpbd::FluidDensityStats stats = xpbd::fluid_solve_density_iteration(
+        fluid.grid,
+        xpbd::FluidKernel(fluid.support_radius),
+        solve_params.geometry_refs()[geo_i].positions.slice(points),
+        geo_data.fluid_masses.as_span().slice(points),
+        geo_data.inv_masses.as_span().slice(points),
+        settings,
+        fluid.lambdas,
+        fluid.errors,
+        fluid.neighbor_counts,
+        fluid.corrections,
+        fluid.solid_fractions,
+        boundary);
+    updater.add_residual_error(geo_i,
+                               stats.average_error_squared *
+                                   error_scale_from_threshold(constraint.error_threshold));
+
+    if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
+      printf(
+          "FLUID_DEBUG density: avg_err=%.4f max_err=%.4f max_correction=%.5f "
+          "max_neighbors=%d h=%.4f\n",
+          double(stats.average_error_squared),
+          double(stats.max_abs_error),
+          double(stats.max_correction),
+          stats.max_neighbors,
+          double(fluid.support_radius));
+    }
+  }
+
+  void simulate__fluid_velocity_solve__chunk(const int chunk_i, const int solver_refs_i)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.active || fluid.grid.is_empty()) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const int geo_i = chunk.data_key_i;
+    const GeometryData &geo_data = *geometries_.data[geo_i];
+    const FluidConstraint &constraint = constraints_.fluid_constraints[fluid.constraint_i];
+    const IndexRange points = chunk.points_range;
+    const xpbd::FluidKernel kernel(fluid.support_radius);
+    const Span<float3> positions = geometries_.solver_refs[solver_refs_i][geo_i].positions.slice(
+        points);
+    const Span<float> masses = geo_data.fluid_masses.as_span().slice(points);
+    MutableSpan<float3> velocities = geo_data.velocity_attr.span.slice(points);
+
+    /* Added velocity from vorticity confinement and surface tension, on top of the velocities that
+     * the position solve produced. */
+    if (constraint.vorticity > 0.0f) {
+      xpbd::fluid_apply_vorticity_confinement(fluid.grid,
+                                              kernel,
+                                              positions,
+                                              masses,
+                                              constraint.rest_density,
+                                              constraint.vorticity,
+                                              sub_delta_time_,
+                                              velocities,
+                                              fluid.omegas,
+                                              fluid.omega_magnitudes,
+                                              fluid.corrections);
+    }
+    if (constraint.surface_tension > 0.0f) {
+      xpbd::fluid_apply_surface_tension(fluid.grid,
+                                        positions,
+                                        masses,
+                                        fluid.support_radius,
+                                        constraint.surface_tension,
+                                        sub_delta_time_,
+                                        velocities,
+                                        fluid.corrections);
+    }
+    if (constraint.viscosity > 0.0f) {
+      xpbd::fluid_apply_xsph_viscosity(fluid.grid,
+                                       kernel,
+                                       positions,
+                                       masses,
+                                       constraint.rest_density,
+                                       constraint.viscosity,
+                                       velocities,
+                                       fluid.corrections);
+    }
+    if (fluid.boundary_active && constraint.boundary_friction > 0.0f) {
+      xpbd::fluid_apply_boundary_friction(
+          velocities, fluid.solid_fractions.as_span().slice(points), constraint.boundary_friction);
+    }
+    xpbd::fluid_apply_velocity_damping(constraint.damping, sub_delta_time_, velocities);
   }
 
   void simulate__reset_forces()
@@ -2703,6 +3250,8 @@ class XpbdSolverStep {
     for (xpbd::ConstraintSet *constraint : chunk_data.static_constraints) {
       constraint->solve_sequential_all(solve_params, updater);
     }
+
+    this->simulate__fluid_position_solve__chunk(chunk_i, solve_params, updater);
 
     if (!chunk_data.external_face_contacts.points.is_empty()) {
       ExternalFaceContacts &contacts = chunk_data.external_face_contacts;
@@ -2785,6 +3334,8 @@ class XpbdSolverStep {
     for (xpbd::VelocityConstraintSet *constraint : chunk_data.static_velocity_constraints) {
       constraint->solve_sequential(params, velocity_updater);
     }
+
+    this->simulate__fluid_velocity_solve__chunk(chunk_i, solver_refs_i);
 
     if (!chunk_data.external_face_contacts.points.is_empty()) {
       ExternalFaceContacts &contacts = chunk_data.external_face_contacts;

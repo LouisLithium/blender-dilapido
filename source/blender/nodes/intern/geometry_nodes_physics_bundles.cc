@@ -184,6 +184,50 @@ const FlatBundleTypePtr &CrossEdgeLengthConstraintBundle::get_bundle_type()
   return bundle_type;
 }
 
+const FlatBundleTypePtr &FluidBundle::get_bundle_type()
+{
+  static const FlatBundleTypePtr bundle_type = []() {
+    FlatBundleTypeBuilder b(FluidBundle::name);
+    add_filter(b);
+    b.add<decl::Float>("rest_density"_ustr).default_value(1000.0f).min(1e-4f);
+    b.add<decl::Float>("particle_radius"_ustr)
+        .default_value(0.05f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE);
+    b.add<decl::Float>("compliance"_ustr).default_value(0.0f).min(0.0f);
+    b.add<decl::Float>("viscosity"_ustr).default_value(0.02f).min(0.0f);
+    b.add<decl::Float>("damping"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .description("Velocity damping in 1/s, damps bulk motion of the fluid");
+    b.add<decl::Float>("vorticity"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description("Vorticity confinement strength, re-injects small scale rotation");
+    b.add<decl::Float>("surface_tension"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description("Cohesion strength between the particles, pulls the surface layer together");
+    b.add<decl::Bool>("boundary_particles"_ustr)
+        .default_value(true)
+        .description(
+            "Sample the colliders as solid boundary particles so the density estimate is correct "
+            "at walls (Akinci et al. 2012)");
+    b.add<decl::Float>("boundary_friction"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .max(1.0f)
+        .description("No-slip damping of the velocity next to boundary particles");
+    b.add<decl::Float>("negative_pressure_limit"_ustr).default_value(0.0f).min(0.0f).max(1.0f);
+    b.add<decl::Float>("artificial_pressure"_ustr).default_value(0.0f).min(0.0f);
+    b.add<decl::Float>("error_threshold"_ustr).default_value(1e-2f).min(1e-5f);
+    const FlatBundleTypePtr bundle_type = b.build();
+    BundleTypeRegistry::register_type(bundle_type);
+    return bundle_type;
+  }();
+  return bundle_type;
+}
+
 const FlatBundleTypePtr &ForceBundle::get_bundle_type()
 {
   static const FlatBundleTypePtr bundle_type = []() {
