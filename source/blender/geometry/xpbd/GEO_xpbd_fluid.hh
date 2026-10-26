@@ -228,17 +228,8 @@ class FluidParticleGrid {
 };
 
 struct FluidDensitySettings {
-  /** Target density of the fluid in kg/m³. */
-  float rest_density = 1000.0f;
   /** XPBD compliance of the density constraint, already divided by the time step squared. */
   float compliance_term = 0.0f;
-  /**
-   * How much negative density constraint is allowed, i.e. how strongly under-dense regions (like
-   * the surface of the fluid) pull particles together. PBF would use 1.0 here, but the SPH density
-   * estimate is only half of the rest density at the surface, which makes small particle counts
-   * implode. 0 disables cohesion entirely, which is the stable default.
-   */
-  float negative_pressure_limit = 0.0f;
   /** Akinci et al. artificial pressure, counteracts particle clumping at the surface. */
   float artificial_pressure = 0.0f;
   /** Radius of the artificial pressure kernel relative to the support radius. */
@@ -286,15 +277,12 @@ struct FluidDensityStats {
  */
 inline void fluid_apply_boundary_friction(const MutableSpan<float3> velocities,
                                           const Span<float> solid_fractions,
-                                          const float friction)
+                                          const Span<float> friction)
 {
-  if (friction <= 0.0f) {
-    return;
-  }
   const int points_num = int(velocities.size());
   threading::parallel_for(IndexRange(points_num), 2048, [&](const IndexRange range) {
     for (const int i : range) {
-      const float factor = 1.0f - friction * solid_fractions[i];
+      const float factor = 1.0f - friction[i] * solid_fractions[i];
       if (factor < 1.0f) {
         velocities[i] *= std::max(factor, 0.0f);
       }
@@ -322,6 +310,9 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
                                                        const MutableSpan<float3> positions,
                                                        const Span<float> masses,
                                                        const Span<float> inv_masses,
+                                                       const Span<float> rest_density,
+                                                       const Span<float> negative_pressure_limit,
+                                                       const Span<bool> use_boundary,
                                                        const FluidDensitySettings &settings,
                                                        const MutableSpan<float> r_lambdas,
                                                        const MutableSpan<float> r_errors,
@@ -331,12 +322,10 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
                                                        const FluidBoundary &boundary)
 {
   const int points_num = int(positions.size());
-  if (points_num == 0 || grid.is_empty() || settings.rest_density <= 0.0f) {
+  if (points_num == 0 || grid.is_empty()) {
     return {};
   }
 
-  const float inv_rest_density = math::safe_rcp(settings.rest_density);
-  const float inv_rest_density_sq = inv_rest_density * inv_rest_density;
   const float artificial_pressure = settings.artificial_pressure;
   const float inv_artificial_pressure_reference = [&]() {
     if (artificial_pressure <= 0.0f) {
@@ -349,6 +338,7 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
   /* Compute the density constraint and its lagrange multiplier for every particle. */
   threading::parallel_for(IndexRange(points_num), 256, [&](const IndexRange range) {
     for (const int i : range) {
+      const float inv_rest_density = math::safe_rcp(rest_density[i]);
       float density = 0.0f;
       int neighbors = 0;
       float3 sum_gradient = float3(0.0f);
@@ -369,7 +359,7 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
         sum_gradient += masses[j] * (-(gradient_length / r) * r_vec);
         sum_gradient_sq += math::square(masses[j] * gradient_length);
       });
-      if (boundary.is_valid()) {
+      if (boundary.is_valid() && use_boundary[i]) {
         /* Boundary particles are part of the density estimate and of the gradient w.r.t. the fluid
          * particle, but since they cannot move they are not part of the per neighbor gradient
          * terms of the denominator. */
@@ -392,9 +382,8 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
       }
 
       const float constraint = density * inv_rest_density - 1.0f;
-      /* Only compression is solved by default, see #FluidDensitySettings::negative_pressure_limit.
-       */
-      const float solved_constraint = std::max(constraint, -settings.negative_pressure_limit);
+      /* Only compression is solved by default, see #FluidDensitySettings. */
+      const float solved_constraint = std::max(constraint, -negative_pressure_limit[i]);
       r_errors[i] = math::square(solved_constraint);
       r_neighbor_counts[i] = neighbors;
       if (inv_masses[i] <= 0.0f) {
@@ -403,14 +392,14 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
         continue;
       }
       const float denominator = (math::length_squared(sum_gradient) + sum_gradient_sq) *
-                                    inv_rest_density_sq +
+                                    inv_rest_density * inv_rest_density +
                                 settings.compliance_term + 1e-12f;
       /* The multiplier is not accumulated over the iterations: the correction below uses the
        * multipliers of all neighbors, so reusing the accumulated value would apply the same
        * correction again in every iteration (the fluid would keep expanding / churning).
        * The density constraint is also unilateral: clamping the multiplier keeps the solver from
        * pulling particles together, which would make the surface of the fluid implode. */
-      const float max_lambda = settings.negative_pressure_limit / denominator;
+      const float max_lambda = negative_pressure_limit[i] / denominator;
       r_lambdas[i] = math::min(-solved_constraint / denominator, max_lambda);
     }
   });
@@ -452,7 +441,7 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
                             (-(kernel.spiky_gradient_length(r) / r) * r_vec);
             });
       }
-      correction *= inv_rest_density;
+      correction *= math::safe_rcp(rest_density[i]);
       if (settings.max_correction > 0.0f) {
         const float length = math::length(correction);
         if (length > settings.max_correction) {
@@ -502,16 +491,15 @@ inline void fluid_apply_xsph_viscosity(const FluidParticleGrid &grid,
                                        const FluidKernel &kernel,
                                        const Span<float3> positions,
                                        const Span<float> masses,
-                                       const float rest_density,
-                                       const float viscosity,
+                                       const Span<float> rest_density,
+                                       const Span<float> viscosity,
                                        const MutableSpan<float3> velocities,
                                        const MutableSpan<float3> r_scratch)
 {
   const int points_num = int(velocities.size());
-  if (points_num == 0 || grid.is_empty() || viscosity <= 0.0f || rest_density <= 0.0f) {
+  if (points_num == 0 || grid.is_empty()) {
     return;
   }
-  const float inv_rest_density = math::safe_rcp(rest_density);
 
   threading::parallel_for(IndexRange(points_num), 256, [&](const IndexRange range) {
     for (const int i : range) {
@@ -524,7 +512,7 @@ inline void fluid_apply_xsph_viscosity(const FluidParticleGrid &grid,
             }
             sum += masses[j] * (velocities[j] - velocity_i) * kernel.poly6(r_sq);
           });
-      r_scratch[i] = velocity_i + (viscosity * inv_rest_density) * sum;
+      r_scratch[i] = velocity_i + (viscosity[i] * math::safe_rcp(rest_density[i])) * sum;
     }
   });
 
@@ -544,17 +532,16 @@ inline void fluid_apply_xsph_viscosity(const FluidParticleGrid &grid,
  *
  * \param damping: Damping in 1/s, 0 disables it.
  */
-inline void fluid_apply_velocity_damping(const float damping,
+inline void fluid_apply_velocity_damping(const Span<float> damping,
                                          const float delta_time,
                                          const MutableSpan<float3> velocities)
 {
-  if (damping <= 0.0f || delta_time <= 0.0f) {
+  if (delta_time <= 0.0f) {
     return;
   }
-  const float factor = math::safe_rcp(1.0f + damping * delta_time);
   threading::parallel_for(IndexRange(int(velocities.size())), 2048, [&](const IndexRange range) {
     for (const int i : range) {
-      velocities[i] *= factor;
+      velocities[i] *= math::safe_rcp(1.0f + damping[i] * delta_time);
     }
   });
 }
@@ -574,8 +561,8 @@ inline void fluid_apply_vorticity_confinement(const FluidParticleGrid &grid,
                                               const FluidKernel &kernel,
                                               const Span<float3> positions,
                                               const Span<float> masses,
-                                              const float rest_density,
-                                              const float strength,
+                                              const Span<float> rest_density,
+                                              const Span<float> strength,
                                               const float delta_time,
                                               const MutableSpan<float3> velocities,
                                               const MutableSpan<float3> r_omegas,
@@ -583,12 +570,9 @@ inline void fluid_apply_vorticity_confinement(const FluidParticleGrid &grid,
                                               const MutableSpan<float3> r_scratch)
 {
   const int points_num = int(velocities.size());
-  if (points_num == 0 || grid.is_empty() || strength <= 0.0f || delta_time <= 0.0f ||
-      rest_density <= 0.0f)
-  {
+  if (points_num == 0 || grid.is_empty() || delta_time <= 0.0f) {
     return;
   }
-  const float inv_rest_density = math::safe_rcp(rest_density);
 
   /* omega_i = curl(v) at the particle. */
   threading::parallel_for(IndexRange(points_num), 256, [&](const IndexRange range) {
@@ -603,7 +587,7 @@ inline void fluid_apply_vorticity_confinement(const FluidParticleGrid &grid,
         omega += masses[j] *
                  math::cross(velocities[j] - velocity_i, kernel.spiky_gradient(r_vec, r));
       });
-      omega *= inv_rest_density;
+      omega *= math::safe_rcp(rest_density[i]);
       r_omegas[i] = omega;
       r_omega_magnitudes[i] = math::length(omega);
     }
@@ -629,7 +613,8 @@ inline void fluid_apply_vorticity_confinement(const FluidParticleGrid &grid,
         continue;
       }
       const float3 direction = gradient / gradient_length;
-      float3 change = (strength * kernel.h() * delta_time) * math::cross(direction, r_omegas[i]);
+      float3 change = (strength[i] * kernel.h() * delta_time) *
+                      math::cross(direction, r_omegas[i]);
       const float change_length = math::length(change);
       if (change_length > max_velocity_change) {
         change *= max_velocity_change / change_length;
@@ -679,13 +664,13 @@ inline void fluid_apply_surface_tension(const FluidParticleGrid &grid,
                                         const Span<float3> positions,
                                         const Span<float> masses,
                                         const float h,
-                                        const float strength,
+                                        const Span<float> strength,
                                         const float delta_time,
                                         const MutableSpan<float3> velocities,
                                         const MutableSpan<float3> r_scratch)
 {
   const int points_num = int(velocities.size());
-  if (points_num == 0 || grid.is_empty() || strength <= 0.0f || delta_time <= 0.0f) {
+  if (points_num == 0 || grid.is_empty() || delta_time <= 0.0f) {
     return;
   }
 
@@ -711,7 +696,7 @@ inline void fluid_apply_surface_tension(const FluidParticleGrid &grid,
       {
         change = float3(0.0f);
       }
-      r_scratch[i] = (strength * delta_time) * change;
+      r_scratch[i] = (strength[i] * delta_time) * change;
     }
   });
 

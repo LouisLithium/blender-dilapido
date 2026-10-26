@@ -1099,6 +1099,8 @@ class NODE_MT_gn_rigid_body_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeRigidBodySolver")
         layout.separator()
         self.node_operator(layout, "GeometryNodeRBDCollider")
+        layout.separator()
+        self.node_operator(layout, "GeometryNodeInitPuncligaData")
 
 
 add_menus = {

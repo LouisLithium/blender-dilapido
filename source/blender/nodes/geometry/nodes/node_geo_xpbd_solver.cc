@@ -443,6 +443,19 @@ struct GeometryData {
   Array<float> fluid_radii;
   /** Support radius of the fluid kernel. */
   float fluid_support_radius = 0.0f;
+  /**
+   * Materialized fluid parameters per point. They come from the `puncliga_*` attributes that
+   * `Init Puncliga Data` writes, so several fluids with different settings can be simulated in one
+   * world; the bundle values are only the fallback.
+   */
+  Array<float> fluid_rest_density;
+  Array<float> fluid_viscosity;
+  Array<float> fluid_damping;
+  Array<float> fluid_vorticity;
+  Array<float> fluid_surface_tension;
+  Array<float> fluid_boundary_friction;
+  Array<float> fluid_negative_pressure_limit;
+  Array<bool> fluid_use_boundary;
 
   GeometryData(const bke::MutableAttributeAccessor attributes) : attributes(attributes) {}
 };
@@ -977,6 +990,55 @@ class XpbdSolverStep {
         geo_data.fluid_masses.reinitialize(geo_data.size);
         geo_data.masses.materialize(geo_data.fluid_masses);
 
+        /* Per point parameters, so several fluids with different settings can live in one world.
+         * The bundle values are the fallback for geometries without the attributes. */
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_rest_density",
+                                      fluid_params.rest_density,
+                                      1e-3f,
+                                      FLT_MAX,
+                                      geo_data.fluid_rest_density);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_viscosity",
+                                      fluid_params.viscosity,
+                                      0.0f,
+                                      FLT_MAX,
+                                      geo_data.fluid_viscosity);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_damping",
+                                      fluid_params.damping,
+                                      0.0f,
+                                      FLT_MAX,
+                                      geo_data.fluid_damping);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_vorticity",
+                                      fluid_params.vorticity,
+                                      0.0f,
+                                      FLT_MAX,
+                                      geo_data.fluid_vorticity);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_surface_tension",
+                                      fluid_params.surface_tension,
+                                      0.0f,
+                                      FLT_MAX,
+                                      geo_data.fluid_surface_tension);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_boundary_friction",
+                                      fluid_params.boundary_friction,
+                                      0.0f,
+                                      1.0f,
+                                      geo_data.fluid_boundary_friction);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_negative_pressure_limit",
+                                      fluid_params.negative_pressure_limit,
+                                      0.0f,
+                                      1.0f,
+                                      geo_data.fluid_negative_pressure_limit);
+        this->materialize_bool_param(data_key_i,
+                                     "puncliga_boundary_particles",
+                                     fluid_params.boundary_particles,
+                                     geo_data.fluid_use_boundary);
+
         float max_radius = 0.0f;
         for (const float radius : geo_data.fluid_radii) {
           max_radius = std::max(max_radius, radius);
@@ -994,6 +1056,42 @@ class XpbdSolverStep {
         geo_data.fluid_constraint_i = constraint_i;
       }
     }
+  }
+
+  /** Materializes a float attribute into a per point array, with a clamped uniform fallback. */
+  void materialize_float_param(const int data_key_i,
+                               const StringRef name,
+                               const float fallback,
+                               const float min_value,
+                               const float max_value,
+                               Array<float> &r_values)
+  {
+    GeometryData &geo_data = *geometries_.data[data_key_i];
+    r_values.reinitialize(geo_data.size);
+    const VArray<float> values = *geo_data.attributes.lookup<float>(name, geo_data.domain);
+    if (!values) {
+      r_values.fill(math::clamp(fallback, min_value, max_value));
+      return;
+    }
+    values.materialize(r_values);
+    for (float &value : r_values) {
+      value = math::clamp(value, min_value, max_value);
+    }
+  }
+
+  void materialize_bool_param(const int data_key_i,
+                              const StringRef name,
+                              const bool fallback,
+                              Array<bool> &r_values)
+  {
+    GeometryData &geo_data = *geometries_.data[data_key_i];
+    r_values.reinitialize(geo_data.size);
+    const VArray<bool> values = *geo_data.attributes.lookup<bool>(name, geo_data.domain);
+    if (!values) {
+      r_values.fill(fallback);
+      return;
+    }
+    values.materialize(r_values);
   }
 
   void prepare_chunk_fluids()
@@ -3072,9 +3170,7 @@ class XpbdSolverStep {
     const FluidConstraint &constraint = constraints_.fluid_constraints[fluid.constraint_i];
 
     xpbd::FluidDensitySettings settings;
-    settings.rest_density = constraint.rest_density;
     settings.compliance_term = constraint.compliance * solve_params.compliance_term_factor;
-    settings.negative_pressure_limit = constraint.negative_pressure_limit;
     settings.artificial_pressure = constraint.artificial_pressure;
     /* Maximum positional correction of one particle per iteration. */
     settings.max_correction = 0.1f * fluid.support_radius;
@@ -3092,6 +3188,9 @@ class XpbdSolverStep {
         solve_params.geometry_refs()[geo_i].positions.slice(points),
         geo_data.fluid_masses.as_span().slice(points),
         geo_data.inv_masses.as_span().slice(points),
+        geo_data.fluid_rest_density.as_span().slice(points),
+        geo_data.fluid_negative_pressure_limit.as_span().slice(points),
+        geo_data.fluid_use_boundary.as_span().slice(points),
         settings,
         fluid.lambdas,
         fluid.errors,
@@ -3131,47 +3230,47 @@ class XpbdSolverStep {
         points);
     const Span<float> masses = geo_data.fluid_masses.as_span().slice(points);
     MutableSpan<float3> velocities = geo_data.velocity_attr.span.slice(points);
+    const Span<float> rest_density = geo_data.fluid_rest_density.as_span().slice(points);
+    const Span<float> viscosity = geo_data.fluid_viscosity.as_span().slice(points);
+    const Span<float> damping = geo_data.fluid_damping.as_span().slice(points);
+    const Span<float> vorticity = geo_data.fluid_vorticity.as_span().slice(points);
+    const Span<float> surface_tension = geo_data.fluid_surface_tension.as_span().slice(points);
+    const Span<float> boundary_friction = geo_data.fluid_boundary_friction.as_span().slice(points);
 
     /* Added velocity from vorticity confinement and surface tension, on top of the velocities that
      * the position solve produced. */
-    if (constraint.vorticity > 0.0f) {
-      xpbd::fluid_apply_vorticity_confinement(fluid.grid,
-                                              kernel,
-                                              positions,
-                                              masses,
-                                              constraint.rest_density,
-                                              constraint.vorticity,
-                                              sub_delta_time_,
-                                              velocities,
-                                              fluid.omegas,
-                                              fluid.omega_magnitudes,
-                                              fluid.corrections);
-    }
-    if (constraint.surface_tension > 0.0f) {
-      xpbd::fluid_apply_surface_tension(fluid.grid,
-                                        positions,
-                                        masses,
-                                        fluid.support_radius,
-                                        constraint.surface_tension,
-                                        sub_delta_time_,
-                                        velocities,
-                                        fluid.corrections);
-    }
-    if (constraint.viscosity > 0.0f) {
-      xpbd::fluid_apply_xsph_viscosity(fluid.grid,
-                                       kernel,
-                                       positions,
-                                       masses,
-                                       constraint.rest_density,
-                                       constraint.viscosity,
-                                       velocities,
-                                       fluid.corrections);
-    }
-    if (fluid.boundary_active && constraint.boundary_friction > 0.0f) {
+    xpbd::fluid_apply_vorticity_confinement(fluid.grid,
+                                            kernel,
+                                            positions,
+                                            masses,
+                                            rest_density,
+                                            vorticity,
+                                            sub_delta_time_,
+                                            velocities,
+                                            fluid.omegas,
+                                            fluid.omega_magnitudes,
+                                            fluid.corrections);
+    xpbd::fluid_apply_surface_tension(fluid.grid,
+                                      positions,
+                                      masses,
+                                      fluid.support_radius,
+                                      surface_tension,
+                                      sub_delta_time_,
+                                      velocities,
+                                      fluid.corrections);
+    xpbd::fluid_apply_xsph_viscosity(fluid.grid,
+                                     kernel,
+                                     positions,
+                                     masses,
+                                     rest_density,
+                                     viscosity,
+                                     velocities,
+                                     fluid.corrections);
+    if (fluid.boundary_active) {
       xpbd::fluid_apply_boundary_friction(
-          velocities, fluid.solid_fractions.as_span().slice(points), constraint.boundary_friction);
+          velocities, fluid.solid_fractions.as_span().slice(points), boundary_friction);
     }
-    xpbd::fluid_apply_velocity_damping(constraint.damping, sub_delta_time_, velocities);
+    xpbd::fluid_apply_velocity_damping(damping, sub_delta_time_, velocities);
   }
 
   void simulate__reset_forces()
