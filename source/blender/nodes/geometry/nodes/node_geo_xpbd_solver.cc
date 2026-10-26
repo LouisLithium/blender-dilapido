@@ -532,6 +532,21 @@ struct Geometries {
   std::array<Array<xpbd::GeometryRef>, 2> solver_refs;
 };
 
+/**
+ * One of the other simulated geometries of the world (a cloth, a soft body), prepared as a
+ * collision surface for the fluid. The mesh is a copy that only shares the topology with the world
+ * geometry: its positions are written from the solver state every substep, and the BVH is rebuilt
+ * with them, so the fluid can collide with the triangles however coarse or fine the mesh is.
+ */
+struct CoupledSurface {
+  int geometry_i = -1;
+  /** Owned copy of the mesh, only used for the topology and the positions of the BVH. */
+  Mesh *mesh = nullptr;
+  bke::BVHTreeFromMesh bvh;
+  /** Positions of the previous substep, to know how fast the surface moves in a contact. */
+  Array<float3> prev_positions;
+};
+
 struct SubstepInterval {
   int current_i;
   float interpolate_begin;
@@ -639,6 +654,36 @@ struct ExternalEdgeContacts {
   }
 };
 
+/**
+ * Contacts between the fluid points and the triangles of the coupled simulated geometries (a cloth
+ * or a soft body that is part of the same simulation). The contacts themselves are plain
+ * `ExternalFaceContacts`, solved by the same constraint set as the contacts with a collider mesh.
+ *
+ * The extra arrays say which triangle produced the contact and where on it the closest point is,
+ * so the impulse can be given back to the vertices of the triangle after the solve.
+ */
+struct CoupledFaceContacts {
+  ExternalFaceContacts contacts;
+  /** Vertices of the triangle of each contact, -1 when the contact has no triangle. */
+  Vector<int3> face_vertices;
+  Vector<float3> face_barycentric;
+  Vector<int> face_geometry;
+  /**
+   * Part of the normal multiplier that was already given back to the surface, so the reaction only
+   * applies the difference (the multiplier accumulates over the iterations of a substep).
+   */
+  Vector<float> applied_lambdas;
+
+  void clear()
+  {
+    contacts = {};
+    face_vertices.clear();
+    face_barycentric.clear();
+    face_geometry.clear();
+    applied_lambdas.clear();
+  }
+};
+
 struct ChunkData {
   Vector<xpbd::ConstraintSet *> static_constraints;
   Vector<xpbd::VelocityConstraintSet *> static_velocity_constraints;
@@ -648,6 +693,13 @@ struct ChunkData {
 
   ExternalFaceContacts external_face_contacts;
   ExternalEdgeContacts external_edge_contacts;
+
+  /**
+   * Contacts between the fluid points and the triangles of the coupled simulated geometries. They
+   * are solved like the contacts with a collider mesh, but the triangles move with the simulation,
+   * so the impulse has to be given back to their vertices (see `CoupledFaceContacts`).
+   */
+  CoupledFaceContacts coupled_face_contacts;
 
   FluidChunkData fluid;
 };
@@ -704,6 +756,13 @@ class XpbdSolverStep {
   Geometries geometries_;
   ConstraintsInfo constraints_;
   Array<ChunkData> chunks_data_;
+
+  /**
+   * The other simulated geometries of the world (cloth, soft bodies), prepared as collision
+   * surfaces for the fluid. The meshes are copies that only share the topology with the world
+   * geometries; their positions are updated from the solver every substep.
+   */
+  Vector<CoupledSurface> coupled_surfaces_;
 
   Mutex field_evaluators_mutex_;
 
@@ -764,10 +823,13 @@ class XpbdSolverStep {
     });
 
     this->prepare_fluid_boundaries();
+    this->prepare_coupled_surfaces();
 
     result_ = this->do_simulation();
     this->write_back__pin_positions();
     this->write_back__rod_stretch_shear();
+
+    this->free_coupled_surfaces();
 
     this->finish_common_attribute_writers();
     this->write_back_geometries_to_world();
@@ -2826,6 +2888,9 @@ class XpbdSolverStep {
           this->simulate__update_pins__chunk(chunk_i, substep);
           this->simulate__inertial_update__chunk(chunk_i, solver_refs_i);
         });
+        /* The collision surfaces of the coupled solids move with the simulation, so their BVH has
+         * to be rebuilt before the contacts of this substep are gathered. */
+        this->simulate__update_coupled_surfaces(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
         for ([[maybe_unused]] const int iter_i : IndexRange(constraint_iterations_)) {
@@ -3003,6 +3068,10 @@ class XpbdSolverStep {
     chunk_data.external_edge_contacts = std::move(new_edge_contacts);
 
     this->simulate__update_fluid_neighborhood__chunk(chunk_i, solver_refs_i);
+
+    /* Contacts with the triangles of the coupled geometries (cloth, soft bodies). */
+    this->gather_contacts__coupled_surfaces(
+        chunk_i, max_distance, solver_refs_i, substep, chunk_data.coupled_face_contacts);
   }
 
   /**
@@ -3494,6 +3563,221 @@ class XpbdSolverStep {
     return true;
   }
 
+  /**
+   * Creates a collision surface for every geometry that a fluid is coupled with, so the fluid can
+   * also collide with the *triangles* of the cloth and the soft bodies (one sided, with the
+   * friction of a real contact). The samples in `prepare_fluid_boundary__solids` handle the
+   * density of a surface; these contacts handle fast or lone particles that a density estimate
+   * cannot stop.
+   */
+  void prepare_coupled_surfaces()
+  {
+    VectorSet<int> geometry_ids;
+    for (const ChunkData &chunk_data : chunks_data_) {
+      if (!chunk_data.fluid.has_coupled) {
+        continue;
+      }
+      for (const int geometry_i : chunk_data.fluid.coupled_geometry) {
+        geometry_ids.add(geometry_i);
+      }
+    }
+    for (const int geometry_i : geometry_ids) {
+      const GeometryData &geo_data = *geometries_.data[geometry_i];
+      const Mesh *mesh = geometries_.geometry_sets[geometries_.data_keys[geometry_i].geo_bundle_i]
+                             .geometry.get_mesh();
+      if (mesh == nullptr || mesh->corner_tris().is_empty() || mesh->verts_num != geo_data.size) {
+        continue;
+      }
+      coupled_surfaces_.append({});
+      CoupledSurface &surface = coupled_surfaces_.last();
+      surface.geometry_i = geometry_i;
+      surface.mesh = BKE_mesh_copy_for_eval(*mesh);
+      surface.prev_positions.reinitialize(mesh->verts_num);
+      surface.prev_positions.as_mutable_span().copy_from(mesh->vert_positions());
+    }
+  }
+
+  void free_coupled_surfaces()
+  {
+    for (CoupledSurface &surface : coupled_surfaces_) {
+      if (surface.mesh != nullptr) {
+        BKE_id_free(nullptr, surface.mesh);
+        surface.mesh = nullptr;
+      }
+    }
+    coupled_surfaces_.clear();
+  }
+
+  /**
+   * Writes the current solver positions into the collision surfaces and rebuilds their BVH trees.
+   * Runs once per substep, before the contacts of the substep are gathered.
+   */
+  void simulate__update_coupled_surfaces(const int solver_refs_i)
+  {
+    if (coupled_surfaces_.is_empty()) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (CoupledSurface &surface : coupled_surfaces_) {
+      const Span<float3> positions = refs[surface.geometry_i].positions;
+      if (positions.size() != surface.mesh->verts_num) {
+        continue;
+      }
+      surface.prev_positions.as_mutable_span().copy_from(surface.mesh->vert_positions());
+      MutableSpan<float3> surface_positions = surface.mesh->vert_positions_for_write();
+      surface_positions.copy_from(positions);
+      surface.mesh->tag_positions_changed();
+      surface.bvh = surface.mesh->bvh_corner_tris();
+    }
+  }
+
+  /**
+   * Gathers the contacts between the fluid points of a chunk and the triangles of the coupled
+   * surfaces. This mirrors the contacts with a collider mesh, but the surface moves with the
+   * simulation: the velocity of the closest point comes from the positions of the previous
+   * substep, and the triangle (and where on it the contact is) is stored so the impulse can be
+   * given back.
+   */
+  void gather_contacts__coupled_surfaces(const int chunk_i,
+                                         const float max_distance,
+                                         const int solver_refs_i,
+                                         const SubstepInterval &substep,
+                                         CoupledFaceContacts &r_contacts)
+  {
+    r_contacts.clear();
+    if (coupled_surfaces_.is_empty()) {
+      return;
+    }
+    if (std::getenv("BLENDER_NO_COUPLED_CONTACTS") != nullptr) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    if (geo_data.fluid_constraint_i < 0 || !chunks_data_[chunk_i].fluid.has_coupled) {
+      return;
+    }
+    /* The friction of the point is only loaded for geometries that collide with a collider. */
+    this->ensure_friction_loaded(chunk.data_key_i);
+    const Span<float3> positions =
+        geometries_.solver_refs[solver_refs_i][chunk.data_key_i].positions;
+    const Span<float3> prev_positions =
+        geometries_.solver_refs[solver_refs_i][chunk.data_key_i].prev_positions;
+
+    for (const CoupledSurface &surface : coupled_surfaces_) {
+      const Mesh &mesh = *surface.mesh;
+      const Span<float3> vert_positions = mesh.vert_positions();
+      const Span<int3> corner_tris = mesh.corner_tris();
+      const Span<int> corner_verts = mesh.corner_verts();
+      if (corner_tris.is_empty()) {
+        continue;
+      }
+      const GeometryData &other = *geometries_.data[surface.geometry_i];
+      const VArray<float> other_static_frictions =
+          other.attributes
+              .lookup_or_default<float>("static_friction", bke::AttrDomain::Point, 0.5f)
+              .varray;
+      const VArray<float> other_dynamic_frictions =
+          other.attributes
+              .lookup_or_default<float>("dynamic_friction", bke::AttrDomain::Point, 0.5f)
+              .varray;
+
+      for (const int point_i : chunk.points_range) {
+        if (geo_data.is_hard_pinned[point_i]) {
+          continue;
+        }
+        const float3 &pos = positions[point_i];
+        const float radius = math::interpolate(
+            geo_data.prev_radii[point_i], geo_data.radii[point_i], substep.interpolate_end);
+        /* The contact only has to catch what the samples cannot hold: a particle that got deep
+         * into the surface (a fast drop, a lone particle). With the full particle radius a resting
+         * fluid pushes against both the samples and the contact, which makes the surface jump
+         * around and counts the weight of the water twice. */
+        const float contact_radius = 0.5f * radius;
+        const std::optional<ClosestMeshFaceContact> contact = this->get_closest_mesh_face_contact(
+            pos,
+            surface.bvh,
+            corner_tris,
+            corner_verts,
+            vert_positions,
+            max_distance + contact_radius);
+        if (!contact) {
+          continue;
+        }
+        const int3 &tri = corner_tris[contact->tri_i];
+        const int3 verts(corner_verts[tri[0]], corner_verts[tri[1]], corner_verts[tri[2]]);
+
+        /* Where the closest point was in the previous substep, to know how the surface moves. */
+        const float3 prev_pos_on_face = bke::attribute_math::mix3(
+            contact->bary_coords,
+            surface.prev_positions[verts[0]],
+            surface.prev_positions[verts[1]],
+            surface.prev_positions[verts[2]]);
+        const float3 motion = contact->nearest_pos - prev_pos_on_face;
+
+        /* Direction to move the point out of the surface.
+         *
+         * This has to be the *surface normal*, not the direction from the closest point to the
+         * particle: at the border of an open sheet the closest point is on the edge, so that
+         * direction is almost parallel to the sheet and a particle touching the rim would be shot
+         * sideways (measured: 65 m/s off the rim of a cloth).
+         *
+         * A sheet has no inside, so the side is decided by where the particle came from: if it
+         * crossed the surface within this substep it is pushed back to the side it started on,
+         * which is what stops a fast particle that jumped through the sheet in one step. Otherwise
+         * it is pushed further away from the side it is on (a particle that is behind the sheet
+         * for good is not teleported through it again). */
+        float3 normal = contact->face_nor;
+        const float normal_length = math::length(normal);
+        float3 axis = float3(0.0f);
+        if (normal_length > 1e-6f) {
+          normal /= normal_length;
+          const float side_now = math::dot(pos - contact->nearest_pos, normal);
+          const float side_prev = math::dot(prev_positions[point_i] - contact->nearest_pos,
+                                            normal);
+          const bool crossed = (side_now >= 0.0f) != (side_prev >= 0.0f);
+          const bool positive_side = crossed ? (side_prev >= 0.0f) : (side_now >= 0.0f);
+          axis = positive_side ? normal : -normal;
+        }
+        else {
+          /* Degenerate normal: fall back to the geometric direction. */
+          const float3 direction = pos - contact->nearest_pos;
+          if (!math::is_zero(direction, 1e-6f)) {
+            axis = math::normalize(direction);
+          }
+        }
+        if (!(std::isfinite(axis.x) && std::isfinite(axis.y) && std::isfinite(axis.z)) ||
+            math::is_zero(axis))
+        {
+          continue;
+        }
+        const float other_static_friction = other_static_frictions[verts[0]];
+        const float other_dynamic_friction = other_dynamic_frictions[verts[0]];
+        const float static_friction = this->compute_contact_friction(
+            geo_data.static_frictions[point_i], other_static_friction);
+        const float dynamic_friction = this->compute_contact_friction(
+            geo_data.dynamic_frictions[point_i], other_dynamic_friction);
+
+        r_contacts.contacts.points.append(point_i);
+        r_contacts.contacts.point_radii.append(contact_radius);
+        r_contacts.contacts.positions_on_face.append(contact->nearest_pos);
+        r_contacts.contacts.collider_motion.append(motion);
+        r_contacts.contacts.face_normals.append(axis);
+        r_contacts.contacts.face_margins.append(0.0f);
+        r_contacts.contacts.static_frictions.append(static_friction);
+        r_contacts.contacts.dynamic_frictions.append(dynamic_friction);
+        r_contacts.contacts.compliance_terms.append(0.0f);
+        r_contacts.contacts.error_scales.append(error_scale_from_threshold(1e-2f));
+        r_contacts.contacts.active_states.append(false);
+        r_contacts.contacts.lambdas_normal.append(0.0f);
+        r_contacts.contacts.lambdas_friction.append(0.0f);
+
+        r_contacts.face_vertices.append(verts);
+        r_contacts.face_barycentric.append(contact->bary_coords);
+        r_contacts.face_geometry.append(surface.geometry_i);
+      }
+    }
+  }
+
   void simulate__fluid_position_solve__chunk(const int chunk_i,
                                              const xpbd::ConstraintSetParams &solve_params,
                                              xpbd::GaussSeidelUpdater &updater)
@@ -3659,6 +3943,79 @@ class XpbdSolverStep {
           }
           positions[vertex_i] += scratch.correction_sums[vertex_i] / weight_sum;
         }
+      }
+
+      this->simulate__coupled_contact_reaction__chunk(chunk_i, refs);
+    }
+  }
+
+  /**
+   * Gives the contact impulses of a chunk back to the triangles of the coupled surfaces. The
+   * normal multiplier of a contact is the impulse that stopped the fluid point (in position units,
+   * so the momentum of the surface is `-lambda * normal`), which is spread over the three vertices
+   * with the barycentric weights, weighted by their inverse mass. Unlike the density reaction
+   * there is no division by the accumulated weight: every contact is an independent impulse, so a
+   * vertex that is touched by more water is pushed more, which is what a real surface feels.
+   *
+   * Only the part of the multiplier that was not applied yet is used, because it accumulates over
+   * the constraint iterations of a substep.
+   */
+  void simulate__coupled_contact_reaction__chunk(const int chunk_i,
+                                                 const Span<xpbd::GeometryRef> refs)
+  {
+    CoupledFaceContacts &contacts = chunks_data_[chunk_i].coupled_face_contacts;
+    if (contacts.contacts.points.is_empty()) {
+      return;
+    }
+    const int contacts_num = int(contacts.contacts.points.size());
+    if (contacts.applied_lambdas.size() != contacts_num) {
+      contacts.applied_lambdas.reinitialize(contacts_num);
+      contacts.applied_lambdas.fill(0.0f);
+    }
+    const float max_correction = 0.1f * chunks_data_[chunk_i].fluid.support_radius;
+    for (const int contact_i : IndexRange(contacts_num)) {
+      const float lambda = contacts.contacts.lambdas_normal[contact_i];
+      const float delta = lambda - contacts.applied_lambdas[contact_i];
+      if (delta == 0.0f) {
+        continue;
+      }
+      contacts.applied_lambdas[contact_i] = lambda;
+      const int geometry_i = contacts.face_geometry[contact_i];
+      if (geometry_i < 0) {
+        continue;
+      }
+      /* The `Coupling` of the fluid particle says how much it should push the surface at all, the
+       * same attribute that drives the density reaction. */
+      const int point_i = contacts.contacts.points[contact_i];
+      const GeometryData &fluid_data = *geometries_.data[geometries_.chunks[chunk_i].data_key_i];
+      const float coupling = point_i < fluid_data.fluid_coupling.size() ?
+                                 fluid_data.fluid_coupling[point_i] :
+                                 1.0f;
+      if (!(coupling > 0.0f)) {
+        continue;
+      }
+      const Span<float> inv_masses = geometries_.data[geometry_i]->inv_masses;
+      const MutableSpan<float3> positions = refs[geometry_i].positions;
+      const int3 &verts = contacts.face_vertices[contact_i];
+      const float3 &weights = contacts.face_barycentric[contact_i];
+      const float3 &normal = contacts.contacts.face_normals[contact_i];
+      for (const int k : IndexRange(3)) {
+        const int vertex_i = verts[k];
+        const float weight = weights[k];
+        if (weight <= 0.0f || inv_masses[vertex_i] <= 0.0f) {
+          continue;
+        }
+        float3 offset = -delta * coupling * inv_masses[vertex_i] * weight * normal;
+        const float length = math::length(offset);
+        if (length > max_correction) {
+          offset *= max_correction / length;
+        }
+        if (UNLIKELY(
+                !(std::isfinite(offset.x) && std::isfinite(offset.y) && std::isfinite(offset.z))))
+        {
+          continue;
+        }
+        positions[vertex_i] += offset;
       }
     }
   }
@@ -3834,6 +4191,23 @@ class XpbdSolverStep {
                                                   contacts.error_scales,
                                                   contacts.active_states,
                                                   contacts.point_mix_factors,
+                                                  contacts.lambdas_normal);
+      constraint.solve_sequential_all(solve_params, updater);
+    }
+    if (!chunk_data.coupled_face_contacts.contacts.points.is_empty()) {
+      ExternalFaceContacts &contacts = chunk_data.coupled_face_contacts.contacts;
+      xpbd::CollisionFaceConstraintSet constraint(chunk.data_key_i,
+                                                  contacts.points,
+                                                  contacts.point_radii,
+                                                  contacts.positions_on_face,
+                                                  contacts.collider_motion,
+                                                  contacts.face_normals,
+                                                  contacts.face_margins,
+                                                  contacts.compliance_terms,
+                                                  contacts.static_frictions,
+                                                  contacts.dynamic_frictions,
+                                                  contacts.error_scales,
+                                                  contacts.active_states,
                                                   contacts.lambdas_normal);
       constraint.solve_sequential_all(solve_params, updater);
     }
