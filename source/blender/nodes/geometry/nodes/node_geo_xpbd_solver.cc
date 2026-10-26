@@ -3752,6 +3752,30 @@ class XpbdSolverStep {
         if (!contact) {
           continue;
         }
+        /* A sheet has no volume, so a particle that is *beside* the surface (the closest point is
+         * on the border of the triangle) is not inside it: the normal distance there is nearly
+         * zero only because the offset is along the sheet, not across it. The contact constraint
+         * would push such a particle onto the plane of the sheet and hold it there, which makes a
+         * "plate" of particles hovering next to every fold and border. Those particles are handled
+         * by the density samples instead. */
+        /* A sheet has no volume, so the normal distance to a triangle *border* is almost zero for
+         * a particle that is beside the sheet rather than above or below it: the offset is along
+         * the sheet, not across it. The contact constraint would push such a particle onto the
+         * plane of the sheet and hold it there, which makes a "plate" of particles hovering next
+         * to every border and fold (the contact search reaches 1.25 m, so the plate was not even
+         * limited to the support radius). Only skip those: a particle that is above or below the
+         * border (its offset is mostly along the normal) is a real contact. */
+        if (this->is_bary_coord_close_to_edge(contact->bary_coords)) {
+          const float3 normal = contact->face_nor;
+          const float3 offset = pos - contact->nearest_pos;
+          const float distance = math::length(offset);
+          const float normal_length = math::length(normal);
+          if (distance > 1e-6f && normal_length > 1e-6f &&
+              std::abs(math::dot(offset, normal)) < 0.5f * distance * normal_length)
+          {
+            continue;
+          }
+        }
         const int3 &tri = corner_tris[contact->tri_i];
         const int3 verts(corner_verts[tri[0]], corner_verts[tri[1]], corner_verts[tri[2]]);
 
