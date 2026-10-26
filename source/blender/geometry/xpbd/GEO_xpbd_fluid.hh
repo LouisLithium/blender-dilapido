@@ -295,6 +295,16 @@ struct FluidDensityStats {
   float max_abs_error = 0.0f;
   float max_correction = 0.0f;
   int max_neighbors = 0;
+  /**
+   * Signed relative density error `density / rest_density - 1`, averaged over the particles. It is
+   * negative when the particles are too far apart for their radius (the density constraint is
+   * unilateral, so an under-dense fluid is not solved at all and behaves like loose sand). The
+   * clamped error above is always zero in that case, which makes this the number to look at when a
+   * fluid "does not behave like a fluid".
+   */
+  float average_density_error = 0.0f;
+  float min_density_error = 0.0f;
+  int under_dense_num = 0;
 };
 
 /**
@@ -434,6 +444,7 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
                                                        const FluidDensitySettings &settings,
                                                        const MutableSpan<float> r_lambdas,
                                                        const MutableSpan<float> r_errors,
+                                                       const MutableSpan<float> r_density_errors,
                                                        const MutableSpan<int> r_neighbor_counts,
                                                        const MutableSpan<float3> r_corrections,
                                                        const MutableSpan<float> r_solid_fractions,
@@ -523,6 +534,7 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
       /* Only compression is solved by default, see #FluidDensitySettings. */
       const float solved_constraint = std::max(constraint, -negative_pressure_limit[i]);
       r_errors[i] = math::square(solved_constraint);
+      r_density_errors[i] = constraint;
       r_neighbor_counts[i] = neighbors;
       if (inv_masses[i] <= 0.0f) {
         /* Pinned particles are part of the density estimate but are not solved for. */
@@ -610,12 +622,19 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidParticleGrid &
 
   FluidDensityStats stats;
   float error_sum = 0.0f;
+  float density_error_sum = 0.0f;
   for (const int i : IndexRange(points_num)) {
     error_sum += r_errors[i];
     stats.max_abs_error = std::max(stats.max_abs_error, math::sqrt(r_errors[i]));
     stats.max_correction = std::max(stats.max_correction, math::length(r_corrections[i]));
     stats.max_neighbors = std::max(stats.max_neighbors, r_neighbor_counts[i]);
+    density_error_sum += r_density_errors[i];
+    stats.min_density_error = std::min(stats.min_density_error, r_density_errors[i]);
+    if (r_density_errors[i] < -0.05f) {
+      stats.under_dense_num += 1;
+    }
   }
+  stats.average_density_error = density_error_sum / points_num;
 
   threading::parallel_for(IndexRange(points_num), 2048, [&](const IndexRange range) {
     for (const int i : range) {

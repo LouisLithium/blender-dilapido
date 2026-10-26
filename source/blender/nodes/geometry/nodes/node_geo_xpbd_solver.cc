@@ -316,6 +316,10 @@ struct FluidChunkData {
   Array<float> lambdas;
   /** Scratch buffers, sized like the chunk. */
   Array<float> errors;
+  /** Signed relative density error per particle, negative when the particles are too far apart. */
+  Array<float> density_errors;
+  /** Mean of the signed density error of the last solved substep, used for the node warning. */
+  float last_density_error_mean = 0.0f;
   Array<int> neighbor_counts;
   Array<float3> corrections;
   /** Only used when vorticity confinement is enabled. */
@@ -826,6 +830,7 @@ class XpbdSolverStep {
     this->prepare_coupled_surfaces();
 
     result_ = this->do_simulation();
+    this->report_fluid_density_warnings();
     this->write_back__pin_positions();
     this->write_back__rod_stretch_shear();
 
@@ -841,7 +846,6 @@ class XpbdSolverStep {
   {
     return result_;
   }
-
   Span<std::pair<NodeWarningType, std::string>> warnings() const
   {
     return warnings_;
@@ -1027,6 +1031,13 @@ class XpbdSolverStep {
       }
       const Bundle &bundle = **bundle_ptr;
 
+      if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
+        const std::string filter =
+            bundle.lookup<std::string>(*BundleKey::from_str("filter")).value_or("");
+        printf(
+            "FLUID_DEBUG bundle at '%s' filter '%s'\n", std::string(path).c_str(), filter.c_str());
+      }
+
       FluidConstraint fluid;
       fluid.path = path;
       fluid.rest_density =
@@ -1207,6 +1218,16 @@ class XpbdSolverStep {
     for (const int chunk_i : geometries_.chunks.index_range()) {
       const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
       const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+      if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
+        const std::string &path =
+            geometries_.geometry_sets[geometries_.data_keys[chunk.data_key_i].geo_bundle_i].path;
+        printf("FLUID_DEBUG chunk %d: geometry '%s' size %d points %d fluid %d\n",
+               chunk_i,
+               path.c_str(),
+               int(geo_data.size),
+               int(chunk.points_range.size()),
+               geo_data.fluid_constraint_i);
+      }
       if (geo_data.fluid_constraint_i < 0) {
         continue;
       }
@@ -1223,6 +1244,7 @@ class XpbdSolverStep {
       fluid.lambdas.reinitialize(points_num);
       fluid.lambdas.fill(0.0f);
       fluid.errors.reinitialize(points_num);
+      fluid.density_errors.reinitialize(points_num);
       fluid.neighbor_counts.reinitialize(points_num);
       fluid.corrections.reinitialize(points_num);
       fluid.omegas.reinitialize(points_num);
@@ -3149,6 +3171,33 @@ class XpbdSolverStep {
         8, [&](const int chunk_i) { this->prepare_fluid_boundary__chunk(chunk_i); });
   }
 
+  /**
+   * Warns about a fluid whose particles are much further apart than their radius allows. The
+   * density constraint is unilateral (it only solves compression), so an under-dense fluid gets no
+   * correction at all and behaves like loose sand: the particles drift, hover and never settle
+   * like a liquid, which is easy to mistake for a problem in the solver.
+   */
+  void report_fluid_density_warnings()
+  {
+    for (const int chunk_i : geometries_.chunks.index_range()) {
+      const FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+      if (!fluid.active || fluid.last_density_error_mean > -0.05f) {
+        continue;
+      }
+      const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+      const std::string &path =
+          geometries_.geometry_sets[geometries_.data_keys[chunk.data_key_i].geo_bundle_i].path;
+      this->report(NodeWarningType::Warning,
+                   fmt::format("Fluid \"{}\": the particles are about {:.0f}% below the rest "
+                               "density, so they are further apart than their radius allows. Only "
+                               "compression is solved, so nothing is solved and the fluid behaves "
+                               "like loose sand instead of a liquid. Use a particle spacing of "
+                               "about one particle radius.",
+                               path,
+                               double(-100.0f * fluid.last_density_error_mean)));
+    }
+  }
+
   static bool bounds_overlap(const float3 &v0,
                              const float3 &v1,
                              const float3 &v2,
@@ -3823,6 +3872,7 @@ class XpbdSolverStep {
         settings,
         fluid.lambdas,
         fluid.errors,
+        fluid.density_errors,
         fluid.neighbor_counts,
         fluid.corrections,
         fluid.solid_fractions,
@@ -3831,16 +3881,21 @@ class XpbdSolverStep {
     updater.add_residual_error(geo_i,
                                stats.average_error_squared *
                                    error_scale_from_threshold(constraint.error_threshold));
+    fluid.last_density_error_mean = stats.average_density_error;
 
     if (std::getenv("BLENDER_FLUID_DEBUG") != nullptr) {
       printf(
           "FLUID_DEBUG density: avg_err=%.4f max_err=%.4f max_correction=%.5f "
-          "max_neighbors=%d h=%.4f\n",
+          "max_neighbors=%d h=%.4f | density error mean %+.3f min %+.3f, under dense %d/%d\n",
           double(stats.average_error_squared),
           double(stats.max_abs_error),
           double(stats.max_correction),
           stats.max_neighbors,
-          double(fluid.support_radius));
+          double(fluid.support_radius),
+          double(stats.average_density_error),
+          double(stats.min_density_error),
+          stats.under_dense_num,
+          int(fluid.lambdas.size()));
     }
 
     this->simulate__fluid_boundary_reaction__chunk(chunk_i, solve_params);
@@ -4450,8 +4505,7 @@ class XpbdSolverStep {
 
     const std::string filter =
         effector.lookup<std::string>(*BundleKey::from_str("filter")).value_or("");
-    const bool match = tag_filter_matches(filter, geo_set_data.tags);
-    return match;
+    return tag_filter_matches(filter, geo_set_data.tags);
   }
 
   void parallel_for_each_chunk(const int grain_size, const FunctionRef<void(int chunk_i)> fn)
