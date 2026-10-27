@@ -1119,7 +1119,7 @@ class NODE_MT_gn_dilapido_ignis_base(node_add_menu.NodeMenu):
 
     def draw(self, context):
         layout = self.layout
-        self.node_operator(layout, "GeometryNodeIgnisSource")
+        self.node_operator(layout, "GeometryNodeInitIgnisData")
         self.node_operator(layout, "GeometryNodeIgnisSolver")
 
 

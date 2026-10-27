@@ -50,30 +50,6 @@ constexpr StringRefNull pressure = "pressure";
 constexpr StringRefNull divergence = "divergence";
 }  // namespace grids
 
-/** Attribute names written by `Ignis Source` and read by the solver. */
-namespace attributes {
-constexpr StringRefNull density = "ignis_density";
-constexpr StringRefNull temperature = "ignis_temperature";
-constexpr StringRefNull fuel = "ignis_fuel";
-constexpr StringRefNull velocity = "ignis_velocity";
-constexpr StringRefNull radius = "ignis_radius";
-constexpr StringRefNull surface = "ignis_surface";
-}  // namespace attributes
-
-/** The emitters of one frame, gathered from the attributes of `Ignis Source`. */
-struct SourceData {
-  Span<float3> positions;
-  Span<float3> velocity;
-  Span<float> density;
-  Span<float> temperature;
-  Span<float> fuel;
-  Span<float> radius;
-  /** Sample the triangles below instead of the points (a burning surface rather than sparks). */
-  bool sample_surface = false;
-  Span<int3> corner_tris;
-  Span<int> corner_verts;
-};
-
 /** Matches `openvdb::tools::Scheme`: the integrators the official `Grid Advect` node exposes. */
 enum class AdvectionScheme : int {
   SemiLagrangian = 0,
@@ -152,13 +128,15 @@ struct Stats {
  * Advance the solver by one frame.
  *
  * \param previous: the state of the previous frame, or null on the first frame.
- * \param sources: the emitters of this frame.
+ * \param sources: the rasterized emitters of this frame (the volumes of `Init Ignis Data`), sampled
+ *                 at the voxel centers of the state, so the source and the solver may use different
+ *                 resolutions.
  * \param r_stats: timing and diagnostics, also used to report a clamped CFL.
  * \return the new state (a new #Volume, the caller owns it) or null when there is nothing to do.
  * The density isosurface is written to \a r_surface when `Settings::make_surface` is set.
  */
 Volume *solve_frame(const Volume *previous,
-                    Span<const SourceData> sources,
+                    Span<const Volume *> sources,
                     const Settings &settings,
                     float delta_time,
                     Mesh **r_surface,

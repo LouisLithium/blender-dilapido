@@ -226,171 +226,125 @@ openvdb::FloatTree smoke_tree(const State &state, const int layers)
 /** \{ */
 
 /* -------------------------------------------------------------------- */
-/** \name Source rasterization
+/** \name Source volumes
  * \{ */
 
-struct SplatAccessors {
-  openvdb::FloatGrid::Accessor density;
-  openvdb::FloatGrid::Accessor temperature;
-  openvdb::FloatGrid::Accessor fuel;
-  openvdb::Vec3fGrid::Accessor velocity;
-};
-
 /**
- * Calls `fn(coord, weight)` for every voxel the kernel of a particle covers. The weight is one at
- * the center and falls to zero at the radius, smoothly, so a source does not show the voxel grid.
+ * Adds a rasterized emitter (the volume of `Init Ignis Data`) to the state.
+ *
+ * The source may use a different resolution than the solver, so it is sampled at the voxel centers of
+ * the state instead of being copied. Density, temperature and fuel keep the larger of the two values
+ * (a steady emitter holds its region at its own level instead of piling up until the simulation
+ * explodes), and the velocity is blended in by the strength of the source.
  */
-template<typename Function>
-void foreach_kernel_voxel(const openvdb::math::Transform &transform,
-                          const float3 position,
-                          const float radius,
-                          const Function &fn)
+void add_source_volume(State &state, const Volume &source_volume)
 {
-  if (radius <= 0.0f) {
+  const bke::VolumeGridData *density_data = BKE_volume_grid_find(&source_volume, grids::density);
+  if (density_data == nullptr) {
     return;
   }
-  const double voxel = transform.voxelSize()[0];
-  const openvdb::Vec3d center = transform.worldToIndex(
-      openvdb::Vec3d(double(position.x), double(position.y), double(position.z)));
-  const double radius_in_voxels = double(radius) / voxel;
-  const int reach = int(std::ceil(radius_in_voxels)) + 1;
-  const int base_i = int(std::floor(center.x()));
-  const int base_j = int(std::floor(center.y()));
-  const int base_k = int(std::floor(center.z()));
-  const double radius_sq = double(radius) * double(radius);
-  for (int k = base_k - reach; k <= base_k + reach; k++) {
-    const double dz = (double(k) - center.z()) * voxel;
-    for (int j = base_j - reach; j <= base_j + reach; j++) {
-      const double dy = (double(j) - center.y()) * voxel;
-      const double dyz_sq = dy * dy + dz * dz;
-      if (dyz_sq >= radius_sq) {
-        continue;
-      }
-      for (int i = base_i - reach; i <= base_i + reach; i++) {
-        const double dx = (double(i) - center.x()) * voxel;
-        const double distance_sq = dyz_sq + dx * dx;
-        if (distance_sq >= radius_sq) {
+  bke::VolumeTreeAccessToken density_token;
+  const openvdb::GridBase &density_base = density_data->grid(density_token);
+  if (density_base.type() != openvdb::FloatGrid::gridType()) {
+    return;
+  }
+  const openvdb::FloatGrid &source_density = static_cast<const openvdb::FloatGrid &>(density_base);
+  if (source_density.activeVoxelCount() == 0) {
+    return;
+  }
+
+  const openvdb::FloatGrid *source_temperature = nullptr;
+  const openvdb::FloatGrid *source_fuel = nullptr;
+  const openvdb::Vec3fGrid *source_velocity = nullptr;
+  bke::VolumeTreeAccessToken temperature_token;
+  bke::VolumeTreeAccessToken fuel_token;
+  bke::VolumeTreeAccessToken velocity_token;
+  if (const bke::VolumeGridData *data = BKE_volume_grid_find(&source_volume,
+                                                             grids::temperature))
+  {
+    const openvdb::GridBase &base = data->grid(temperature_token);
+    if (base.type() == openvdb::FloatGrid::gridType()) {
+      source_temperature = static_cast<const openvdb::FloatGrid *>(&base);
+    }
+  }
+  if (const bke::VolumeGridData *data = BKE_volume_grid_find(&source_volume, grids::fuel)) {
+    const openvdb::GridBase &base = data->grid(fuel_token);
+    if (base.type() == openvdb::FloatGrid::gridType()) {
+      source_fuel = static_cast<const openvdb::FloatGrid *>(&base);
+    }
+  }
+  if (const bke::VolumeGridData *data = BKE_volume_grid_find(&source_volume, grids::velocity)) {
+    const openvdb::GridBase &base = data->grid(velocity_token);
+    if (base.type() == openvdb::Vec3fGrid::gridType()) {
+      source_velocity = static_cast<const openvdb::Vec3fGrid *>(&base);
+    }
+  }
+
+  openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> density_sampler(
+      source_density);
+  std::optional<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>
+      temperature_sampler;
+  std::optional<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>
+      fuel_sampler;
+  std::optional<openvdb::tools::GridSampler<openvdb::Vec3fGrid, openvdb::tools::BoxSampler>>
+      velocity_sampler;
+  if (source_temperature != nullptr) {
+    temperature_sampler.emplace(*source_temperature);
+  }
+  if (source_fuel != nullptr) {
+    fuel_sampler.emplace(*source_fuel);
+  }
+  if (source_velocity != nullptr) {
+    velocity_sampler.emplace(*source_velocity);
+  }
+
+  /* Iterate the voxels of the *state* that the source can reach, so the sampling is right in both
+   * directions: a coarse source is interpolated and a fine one is subsampled. */
+  const openvdb::CoordBBox source_bbox = source_density.evalActiveVoxelBoundingBox();
+  const openvdb::Vec3d min_world = source_density.transform().indexToWorld(source_bbox.min());
+  const openvdb::Vec3d max_world = source_density.transform().indexToWorld(source_bbox.max());
+  const openvdb::CoordBBox state_bbox = state.density->transform().worldToIndexCellCentered(
+      openvdb::BBoxd(min_world, max_world));
+
+  openvdb::FloatGrid::Accessor density = state.density->getAccessor();
+  openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
+  openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
+  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+
+  for (int k = state_bbox.min().z(); k <= state_bbox.max().z(); k++) {
+    for (int j = state_bbox.min().y(); j <= state_bbox.max().y(); j++) {
+      for (int i = state_bbox.min().x(); i <= state_bbox.max().x(); i++) {
+        const Coord coord(i, j, k);
+        const openvdb::Vec3d world = state.density->transform().indexToWorld(coord);
+        const float source_value = density_sampler.wsSample(world);
+        if (source_value <= 0.0f) {
           continue;
         }
-        const double falloff = 1.0 - distance_sq / radius_sq;
-        fn(Coord(i, j, k), float(falloff * falloff));
+        density.setValue(coord, std::max(density.getValue(coord), source_value));
+        if (temperature_sampler.has_value()) {
+          const float value = temperature_sampler->wsSample(world);
+          if (value > 0.0f) {
+            temperature.setValue(coord, std::max(temperature.getValue(coord), value));
+          }
+        }
+        if (fuel_sampler.has_value()) {
+          const float value = fuel_sampler->wsSample(world);
+          if (value > 0.0f) {
+            fuel.setValue(coord, std::max(fuel.getValue(coord), value));
+          }
+        }
+        if (velocity_sampler.has_value()) {
+          const openvdb::Vec3f incoming = velocity_sampler->wsSample(world);
+          if (incoming.lengthSqr() > 0.0f) {
+            const float weight = std::clamp(source_value, 0.0f, 1.0f);
+            const openvdb::Vec3f current = velocity.getValue(coord);
+            velocity.setValue(coord, current + (incoming - current) * weight);
+          }
+        }
       }
     }
   }
 }
-
-/** A source value is a *target*, not an addition: a steady emitter holds its region at its own
- * value instead of piling up until the simulation explodes. */
-void splat_value(openvdb::FloatGrid::Accessor &accessor,
-                 const Coord &coord,
-                 const float value,
-                 const float weight)
-{
-  const float incoming = value * weight;
-  if (incoming <= 0.0f) {
-    return;
-  }
-  accessor.setValue(coord, std::max(accessor.getValue(coord), incoming));
-}
-
-void splat_source_point(SplatAccessors &accessors,
-                        const openvdb::math::Transform &transform,
-                        const float3 position,
-                        const float radius,
-                        const float density,
-                        const float temperature,
-                        const float fuel,
-                        const float3 velocity)
-{
-  const bool has_velocity = math::length_squared(velocity) > 0.0f;
-  foreach_kernel_voxel(transform, position, radius, [&](const Coord &coord, const float weight) {
-    splat_value(accessors.density, coord, density, weight);
-    splat_value(accessors.temperature, coord, temperature, weight);
-    splat_value(accessors.fuel, coord, fuel, weight);
-    if (has_velocity) {
-      const openvdb::Vec3f current = accessors.velocity.getValue(coord);
-      accessors.velocity.setValue(coord, current + (to_vdb(velocity) - current) * weight);
-    }
-  });
-}
-
-/**
- * Samples the triangles of a mesh at roughly half a voxel, so a mesh source emits from its whole
- * surface instead of only from its vertices. The attributes are interpolated with the barycentric
- * weights of the sample.
- */
-void rasterize_surface(const SourceData &source,
-                       SplatAccessors &accessors,
-                       const openvdb::math::Transform &transform,
-                       const float voxel)
-{
-  const float spacing = std::max(voxel * 0.5f, 1e-5f);
-  for (const int3 &tri : source.corner_tris) {
-    const int index_a = source.corner_verts[tri.x];
-    const int index_b = source.corner_verts[tri.y];
-    const int index_c = source.corner_verts[tri.z];
-    const float3 a = source.positions[index_a];
-    const float3 b = source.positions[index_b];
-    const float3 c = source.positions[index_c];
-    const float longest = std::max(
-        {math::distance(a, b), math::distance(b, c), math::distance(c, a)});
-    const int steps = std::max(1, int(std::ceil(longest / spacing)));
-    const float step = 1.0f / float(steps);
-    for (int i = 0; i <= steps; i++) {
-      for (int j = 0; j <= steps - i; j++) {
-        const float u = float(i) * step;
-        const float v = float(j) * step;
-        const float w = 1.0f - u - v;
-        splat_source_point(accessors,
-                           transform,
-                           a * u + b * v + c * w,
-                           source.radius[index_a] * u + source.radius[index_b] * v +
-                               source.radius[index_c] * w,
-                           source.density[index_a] * u + source.density[index_b] * v +
-                               source.density[index_c] * w,
-                           source.temperature[index_a] * u + source.temperature[index_b] * v +
-                               source.temperature[index_c] * w,
-                           source.fuel[index_a] * u + source.fuel[index_b] * v +
-                               source.fuel[index_c] * w,
-                           source.velocity[index_a] * u + source.velocity[index_b] * v +
-                               source.velocity[index_c] * w);
-      }
-    }
-  }
-}
-
-void rasterize_sources(const Span<const SourceData> sources, State &state)
-{
-  SplatAccessors accessors{state.density->getAccessor(),
-                           state.temperature->getAccessor(),
-                           state.fuel->getAccessor(),
-                           state.velocity->getAccessor()};
-  const openvdb::math::Transform &transform = state.density->transform();
-  const float voxel = state.voxel_size();
-  for (const SourceData &source : sources) {
-    const int points_num = source.positions.size();
-    if (points_num == 0) {
-      continue;
-    }
-    if (source.sample_surface && !source.corner_tris.is_empty()) {
-      rasterize_surface(source, accessors, transform, voxel);
-      continue;
-    }
-    for (const int i : IndexRange(points_num)) {
-      const float radius = source.radius[i] > 0.0f ? source.radius[i] : voxel;
-      splat_source_point(accessors,
-                         transform,
-                         source.positions[i],
-                         radius,
-                         source.density[i],
-                         source.temperature[i],
-                         source.fuel[i],
-                         source.velocity[i]);
-    }
-  }
-}
-
-/** \{ */
 
 /* -------------------------------------------------------------------- */
 /** \name Transport
@@ -909,7 +863,7 @@ Mesh *build_surface(const State &state, const Settings &settings)
 }  // namespace
 
 Volume *solve_frame(const Volume *previous,
-                    const Span<const SourceData> sources,
+                    const Span<const Volume *> sources,
                     const Settings &settings,
                     const float delta_time,
                     Mesh **r_surface,
@@ -935,7 +889,11 @@ Volume *solve_frame(const Volume *previous,
   const float dt = std::max(0.0f, delta_time);
   if (dt <= 0.0f) {
     /* First frame or a paused frame: only show the sources, do not integrate. */
-    rasterize_sources(sources, state);
+    for (const Volume *source : sources) {
+      if (source != nullptr) {
+        add_source_volume(state, *source);
+      }
+    }
     ensure_velocity_topology(state);
     update_flame(state, settings);
     state.density->tree().prune(1e-5f);
@@ -970,7 +928,11 @@ Volume *solve_frame(const Volume *previous,
   r_stats.substeps_used = substeps;
 
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
-    rasterize_sources(sources, state);
+    for (const Volume *source : sources) {
+      if (source != nullptr) {
+        add_source_volume(state, *source);
+      }
+    }
     ensure_velocity_topology(state);
     apply_forces(state, settings, step_dt);
     apply_vorticity(state, settings, step_dt);
@@ -1056,7 +1018,7 @@ Volume *solve_frame(const Volume *previous,
 #else /* WITH_OPENVDB */
 
 Volume *solve_frame(const Volume * /*previous*/,
-                    const Span<const SourceData> /*sources*/,
+                    const Span<const Volume *> /*sources*/,
                     const Settings & /*settings*/,
                     const float /*delta_time*/,
                     Mesh **r_surface,

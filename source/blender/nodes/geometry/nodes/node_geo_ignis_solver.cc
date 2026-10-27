@@ -21,13 +21,14 @@
 
 #include "NOD_geometry_nodes_bundle.hh"
 
+#include "BKE_volume.hh"
+
 #include "node_geometry_util.hh"
 
 #include "GEO_ignis_solver.hh"
 
 namespace blender::nodes::node_geo_ignis_solver_cc {
 
-using geometry::ignis::SourceData;
 using geometry::ignis::Stats;
 
 namespace {
@@ -91,101 +92,43 @@ static const EnumPropertyItem advection_limiter_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
-/** The emitters of one component, in the layout the solver wants. */
-struct GatheredSource {
-  Vector<float3> positions;
-  Vector<float3> velocity;
-  Vector<float> density;
-  Vector<float> temperature;
-  Vector<float> fuel;
-  Vector<float> radius;
-  bool sample_surface = false;
-  Vector<int3> corner_tris;
-  Vector<int> corner_verts;
-};
+/** Name of the bundle type `Init Ignis Data` produces. */
+constexpr StringRef IGNIS_SOURCE_TYPE = "Blender.IgnisSource";
 
-void gather_component(const GeometryComponent &component, Vector<GatheredSource> &r_sources)
+/** Appends the volume of one source bundle. */
+void append_source_volume(const Bundle &bundle, Vector<const Volume *> &r_volumes)
 {
-  const int points_num = component.attribute_domain_size(AttrDomain::Point);
-  if (points_num == 0) {
+  const GeometrySet *geometry = bundle.lookup_ptr<GeometrySet>(*BundleKey::from_str("geometry"));
+  if (geometry == nullptr) {
     return;
   }
-  const std::optional<bke::AttributeAccessor> attributes = component.attributes();
-  if (!attributes) {
-    return;
-  }
-  const VArray<float3> positions = *attributes->lookup<float3>("position", AttrDomain::Point);
-  if (!positions) {
-    return;
-  }
-  const VArray<float3> velocity = attributes
-                                      ->lookup_or_default<float3>(geometry::ignis::attributes::velocity,
-                                                                  AttrDomain::Point,
-                                                                  float3(0.0f))
-                                      .varray;
-  const VArray<float> density = attributes
-                                    ->lookup_or_default<float>(geometry::ignis::attributes::density,
-                                                               AttrDomain::Point,
-                                                               0.0f)
-                                    .varray;
-  const VArray<float> temperature =
-      attributes
-          ->lookup_or_default<float>(geometry::ignis::attributes::temperature, AttrDomain::Point, 0.0f)
-          .varray;
-  const VArray<float> fuel = attributes
-                                 ->lookup_or_default<float>(geometry::ignis::attributes::fuel,
-                                                            AttrDomain::Point,
-                                                            0.0f)
-                                 .varray;
-  const VArray<float> radius = attributes
-                                   ->lookup_or_default<float>(geometry::ignis::attributes::radius,
-                                                              AttrDomain::Point,
-                                                              0.0f)
-                                   .varray;
-  const VArray<bool> surface = attributes
-                                   ->lookup_or_default<bool>(geometry::ignis::attributes::surface,
-                                                             AttrDomain::Point,
-                                                             false)
-                                   .varray;
-  r_sources.append(GatheredSource());
-  GatheredSource &source = r_sources.last();
-  source.positions.reinitialize(points_num);
-  positions.materialize(source.positions.as_mutable_span());
-  source.velocity.reinitialize(points_num);
-  velocity.materialize(source.velocity.as_mutable_span());
-  source.density.reinitialize(points_num);
-  density.materialize(source.density.as_mutable_span());
-  source.temperature.reinitialize(points_num);
-  temperature.materialize(source.temperature.as_mutable_span());
-  source.fuel.reinitialize(points_num);
-  fuel.materialize(source.fuel.as_mutable_span());
-  source.radius.reinitialize(points_num);
-  radius.materialize(source.radius.as_mutable_span());
-
-  /* A mesh in `Surface` mode emits from its triangles instead of its vertices. */
-  if (surface[0] && component.type() == GeometryComponent::Type::Mesh) {
-    const Mesh &mesh = *static_cast<const MeshComponent &>(component).get();
-    const Span<int3> corner_tris = mesh.corner_tris();
-    if (!corner_tris.is_empty()) {
-      source.sample_surface = true;
-      source.corner_tris.reinitialize(corner_tris.size());
-      source.corner_tris.as_mutable_span().copy_from(corner_tris);
-      source.corner_verts.reinitialize(mesh.corner_verts().size());
-      source.corner_verts.as_mutable_span().copy_from(mesh.corner_verts());
-    }
+  if (const Volume *volume = geometry->get_volume()) {
+    r_volumes.append(volume);
   }
 }
 
-void gather_sources(const GeometrySet &geometry, Vector<GatheredSource> &r_sources)
+/**
+ * Collects the volumes of the sources in the input bundle.
+ *
+ * The bundle may *be* one source (the output of a single `Init Ignis Data`) or contain several of
+ * them as nested bundles (nested with `Combine Bundle`), so both are handled.
+ */
+void gather_sources(const Bundle &sources, Vector<const Volume *> &r_volumes)
 {
-  for (const GeometryComponent::Type type : {GeometryComponent::Type::Mesh,
-                                             GeometryComponent::Type::PointCloud,
-                                             GeometryComponent::Type::Curve})
-  {
-    const GeometryComponent *component = geometry.get_component(type);
-    if (component != nullptr) {
-      gather_component(*component, r_sources);
+  if (const std::optional<StringRef> type = sources.type()) {
+    if (*type == IGNIS_SOURCE_TYPE) {
+      append_source_volume(sources, r_volumes);
+      return;
     }
+  }
+  const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(
+      sources, [](const StringRef type) { return type == IGNIS_SOURCE_TYPE; });
+  for (const StringRef path : paths) {
+    const BundlePtr *bundle_ptr = sources.lookup_path_ptr<BundlePtr>(path);
+    if (!bundle_ptr || !*bundle_ptr) {
+      continue;
+    }
+    append_source_volume(**bundle_ptr, r_volumes);
   }
 }
 
@@ -213,8 +156,10 @@ static void node_declare(NodeDeclarationBuilder &b)
           "The state of the previous frame (one grid per field). Leave it unconnected to start a "
           "new simulation; the output has to be fed back into the next frame inside a simulation "
           "zone");
-  b.add_input<decl::Geometry>("Sources"_ustr)
-      .description("Geometry marked with `Ignis Source`: the emitters of this frame");
+  b.add_input<decl::Bundle>("Sources"_ustr)
+      .description(
+          "The rasterized emitters of this frame: the `Source` bundles of `Init Ignis Data`, nested "
+          "with `Combine Bundle`");
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 24.0f)
       .min(0.0f)
@@ -374,7 +319,7 @@ static void node_declare(NodeDeclarationBuilder &b)
 static void node_geo_exec(GeoNodeExecParams params)
 {
   const GeometrySet state_geometry = params.extract_input<GeometrySet>("State"_ustr);
-  const GeometrySet sources_geometry = params.extract_input<GeometrySet>("Sources"_ustr);
+  const BundlePtr sources_bundle = params.extract_input<BundlePtr>("Sources"_ustr);
   const float delta_time = params.extract_input<float>("Delta Time"_ustr);
 
   geometry::ignis::Settings settings;
@@ -410,22 +355,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.iso_level = params.extract_input<float>("Iso Level"_ustr);
   settings.adaptivity = params.extract_input<float>("Adaptivity"_ustr);
 
-  Vector<GatheredSource> gathered;
-  gather_sources(sources_geometry, gathered);
-
-  Array<SourceData> sources(gathered.size());
-  for (const int i : gathered.index_range()) {
-    const GatheredSource &source = gathered[i];
-    SourceData &data = sources[i];
-    data.positions = source.positions;
-    data.velocity = source.velocity;
-    data.density = source.density;
-    data.temperature = source.temperature;
-    data.fuel = source.fuel;
-    data.radius = source.radius;
-    data.sample_surface = source.sample_surface;
-    data.corner_tris = source.corner_tris;
-    data.corner_verts = source.corner_verts;
+  Vector<const Volume *> sources;
+  if (sources_bundle) {
+    gather_sources(*sources_bundle, sources);
   }
 
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
@@ -436,13 +368,12 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
   Stats stats;
   Mesh *surface = nullptr;
-  Volume *volume = geometry::ignis::solve_frame(
-      state_geometry.get_volume(),
-      Span<const SourceData>(sources.data(), sources.size()),
-      settings,
-      delta_time,
-      &surface,
-      stats);
+  Volume *volume = geometry::ignis::solve_frame(state_geometry.get_volume(),
+                                               sources,
+                                               settings,
+                                               delta_time,
+                                               &surface,
+                                               stats);
 
   GeometrySet state_output;
   if (volume != nullptr) {

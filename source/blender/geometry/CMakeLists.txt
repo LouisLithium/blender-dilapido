@@ -64,6 +64,7 @@ set(SRC
   intern/volume_grid_resample.cc
 
   ignis/GEO_ignis_solver.cc
+  ignis/GEO_ignis_source.cc
 
   rigid_body/GEO_rigid_body_solver.cc
 
@@ -115,6 +116,7 @@ set(SRC
   GEO_volume_grid_resample.hh
 
   ignis/GEO_ignis_solver.hh
+  ignis/GEO_ignis_source.hh
   rigid_body/GEO_rigid_body_solver.hh
 
   xpbd/GEO_xpbd_constraint_align_rotations.hh
