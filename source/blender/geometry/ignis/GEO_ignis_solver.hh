@@ -74,6 +74,20 @@ struct SourceData {
   Span<int> corner_verts;
 };
 
+/** Matches `openvdb::tools::Scheme`: the integrators the official `Grid Advect` node exposes. */
+enum class AdvectionScheme : int {
+  SemiLagrangian = 0,
+  Midpoint = 1,
+  MacCormack = 2,
+  Bfecc = 3,
+};
+
+enum class AdvectionLimiter : int {
+  None = 0,
+  Clamp = 1,
+  Revert = 2,
+};
+
 struct Settings {
   /* Domain. */
   float voxel_size = 0.05f;
@@ -98,6 +112,11 @@ struct Settings {
   float dissipation = 0.0f;
   float velocity_damping = 0.0f;
   int extrapolate = 4;
+  /** Voxels of air around the smoke that take part in the pressure solve. A thin band cannot hold the
+   * return flow of a rising plume and drags the smoke back down (see M66). */
+  int domain_padding = 10;
+  AdvectionScheme advection_scheme = AdvectionScheme::MacCormack;
+  AdvectionLimiter advection_limiter = AdvectionLimiter::Clamp;
 
   /* Combustion. */
   float burn_rate = 0.0f;
@@ -121,6 +140,9 @@ struct Stats {
   int substeps_used = 0;
   int pressure_iterations = 0;
   float residual = 0.0f;
+  /** L2 norm of the velocity divergence before and after the projection, in 1/s. */
+  float divergence_before = 0.0f;
+  float divergence_after = 0.0f;
   bool cfl_limited = false;
   bool resized = false;
   double milliseconds = 0.0;

@@ -32,6 +32,65 @@ using geometry::ignis::Stats;
 
 namespace {
 
+/** Same integrators as the official `Grid Advect` node, which uses `openvdb::tools::VolumeAdvection`. */
+enum class AdvectionScheme : int {
+  SemiLagrangian = 0,
+  Midpoint = 1,
+  MacCormack = 2,
+  Bfecc = 3,
+};
+
+enum class AdvectionLimiter : int {
+  None = 0,
+  Clamp = 1,
+  Revert = 2,
+};
+
+static const EnumPropertyItem advection_scheme_items[] = {
+    {int(AdvectionScheme::SemiLagrangian),
+     "SEMI",
+     0,
+     N_("Semi-Lagrangian"),
+     N_("First order, cheapest and most diffusive")},
+    {int(AdvectionScheme::Midpoint),
+     "MID",
+     0,
+     N_("Midpoint"),
+     N_("Second order midpoint integration: a good compromise for most cases")},
+    {int(AdvectionScheme::MacCormack),
+     "MAC",
+     0,
+     N_("MacCormack"),
+     N_("Second order MacCormack with a limiter: much less dissipation than Semi-Lagrangian, so "
+        "the smoke keeps its shape and its detail")},
+    {int(AdvectionScheme::Bfecc),
+     "BFECC",
+     0,
+     N_("BFECC"),
+     N_("Back and forth error compensation and correction: the least dissipative scheme, and the "
+        "most expensive")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
+static const EnumPropertyItem advection_limiter_items[] = {
+    {int(AdvectionLimiter::None),
+     "NONE",
+     0,
+     N_("None"),
+     N_("No limiting: fastest, but the higher order schemes can overshoot")},
+    {int(AdvectionLimiter::Clamp),
+     "CLAMP",
+     0,
+     N_("Clamp"),
+     N_("Clamp the result to the range of the neighbourhood, which removes the overshoot")},
+    {int(AdvectionLimiter::Revert),
+     "REVERT",
+     0,
+     N_("Revert"),
+     N_("Fall back to first order where clamping would be needed")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 /** The emitters of one component, in the layout the solver wants. */
 struct GatheredSource {
   Vector<float3> positions;
@@ -196,6 +255,14 @@ static void node_declare(NodeDeclarationBuilder &b)
         .min(0.1f)
         .max(20.0f)
         .description("How many voxels a particle may travel per substep");
+    panel.add_input<decl::Menu>("Advection"_ustr)
+        .static_items(advection_scheme_items)
+        .default_value(MenuValue(int(AdvectionScheme::MacCormack)))
+        .description("Integrator of the advection step (the same set as `Grid Advect`)");
+    panel.add_input<decl::Menu>("Limiter"_ustr)
+        .static_items(advection_limiter_items)
+        .default_value(MenuValue(int(AdvectionLimiter::Clamp)))
+        .description("What the higher order schemes do where they would overshoot");
   }
   {
     auto &panel = b.add_panel("Physics"_ustr).default_closed(false);
@@ -234,6 +301,13 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0.0f)
         .min(0.0f)
         .description("Exponential decay of the density, in 1/s");
+    panel.add_input<decl::Int>("Domain Padding"_ustr)
+        .default_value(16)
+        .min(2)
+        .max(64)
+        .description(
+            "Voxels of air around the smoke that take part in the pressure solve. The rising plume "
+            "needs room for the air that flows back down, otherwise the pressure drags it back down");
     panel.add_input<decl::Int>("Extrapolate"_ustr)
         .default_value(4)
         .min(0)
@@ -321,6 +395,11 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.cooling = params.extract_input<float>("Cooling"_ustr);
   settings.dissipation = params.extract_input<float>("Dissipation"_ustr);
   settings.extrapolate = params.extract_input<int>("Extrapolate"_ustr);
+  settings.domain_padding = params.extract_input<int>("Domain Padding"_ustr);
+  settings.advection_scheme = geometry::ignis::AdvectionScheme(
+      params.extract_input<int>("Advection"_ustr));
+  settings.advection_limiter = geometry::ignis::AdvectionLimiter(
+      params.extract_input<int>("Limiter"_ustr));
   settings.burn_rate = params.extract_input<float>("Burn Rate"_ustr);
   settings.heat_release = params.extract_input<float>("Heat Release"_ustr);
   settings.smoke_per_burn = params.extract_input<float>("Smoke per Burn"_ustr);
