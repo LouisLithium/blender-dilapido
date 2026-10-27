@@ -1285,6 +1285,37 @@ class XpbdSolverStep {
       if (!geometry) {
         continue;
       }
+
+      /* Per substep sweeping: the geometry in the bundle is already baked with the transform of
+       * the `transform` item, so the motion between the previous and the current frame is
+       * `previous * current^-1` in the space of that geometry. Starting the substeps at the
+       * previous pose and ending at the identity makes the contact solve follow the collider
+       * through the frame instead of teleporting it once per frame. Without this a collider that
+       * moves further than a particle radius per frame passes through the fluid in one step. */
+      const bool sweep = bundle.lookup<bool>(*BundleKey::from_str("sweep")).value_or(true);
+      float4x4 begin_transform = world_to_simulation_;
+      const float4x4 *transform_ptr = bundle.lookup_ptr<float4x4>(
+          *BundleKey::from_str("transform"));
+      if (sweep && transform_ptr != nullptr) {
+        const float4x4 *prev_transform_ptr = previous_bundle ?
+                                                 previous_bundle->lookup_ptr<float4x4>(
+                                                     *BundleKey::from_str("transform")) :
+                                                 nullptr;
+        if (prev_transform_ptr != nullptr) {
+          const float4x4 swept = world_to_simulation_ * (*prev_transform_ptr) *
+                                 math::invert(*transform_ptr);
+          bool finite = true;
+          for (const int column : IndexRange(4)) {
+            for (const int row : IndexRange(4)) {
+              finite &= std::isfinite(swept[column][row]);
+            }
+          }
+          if (finite) {
+            begin_transform = swept;
+          }
+        }
+      }
+
       Vector<int> affected_data;
       for (const int data_key_i : geometries_.data_keys.index_range()) {
         if (this->effector_applies_to_geometry(path, bundle, data_key_i)) {
@@ -1296,7 +1327,7 @@ class XpbdSolverStep {
       Vector<int> instance_id_stack;
       this->gather_colliders_in_geometry(path,
                                          world_to_simulation_,
-                                         world_to_simulation_,
+                                         begin_transform,
                                          *geometry,
                                          prev_geometry,
                                          margin,

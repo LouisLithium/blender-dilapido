@@ -1074,6 +1074,7 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         layout.separator()
         self.draw_menu(layout, "Simulation")
         self.draw_menu(layout, "Rigid Body")
+        self.draw_menu(layout, "Dilapido")
         layout.separator()
         self.draw_menu(layout, "Color")
         self.draw_menu(layout, "Texture")
@@ -1097,9 +1098,16 @@ class NODE_MT_gn_rigid_body_base(node_add_menu.NodeMenu):
         layout.separator()
         self.node_operator(layout, "GeometryNodeInitRigidBody")
         self.node_operator(layout, "GeometryNodeRigidBodySolver")
-        layout.separator()
+
+
+class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
+    """Nodes that are shared by the Dilapido solvers (rigid body, XPBD, ...)."""
+
+    bl_label = "Dilapido"
+
+    def draw(self, context):
+        layout = self.layout
         self.node_operator(layout, "GeometryNodeRBDCollider")
-        layout.separator()
         self.node_operator(layout, "GeometryNodeInitPuncligaData")
 
 
@@ -1141,6 +1149,7 @@ add_menus = {
     "NODE_MT_category_GEO_POINT": NODE_MT_gn_point_base,
     "NODE_MT_category_simulation": NODE_MT_gn_simulation_base,
     "NODE_MT_geometry_node_GEO_RIGID_BODY": NODE_MT_gn_rigid_body_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO": NODE_MT_gn_dilapido_base,
     "NODE_MT_category_GEO_VOLUME": NODE_MT_gn_volume_base,
     "NODE_MT_geometry_node_GEO_VOLUME_READ": NODE_MT_gn_volume_read_base,
     "NODE_MT_geometry_node_volume_sample": NODE_MT_gn_volume_sample_base,
