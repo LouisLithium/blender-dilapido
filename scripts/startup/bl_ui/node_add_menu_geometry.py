@@ -22,7 +22,6 @@ class NODE_MT_gn_attribute_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeBlurAttribute")
         self.node_operator(layout, "GeometryNodeCaptureAttribute")
         self.node_operator(layout, "GeometryNodeRemoveAttribute")
-        self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         self.node_operator(layout, "GeometryNodeRenameAttribute")
         self.node_operator(layout, "GeometryNodeStoreNamedAttribute", search_weight=1.0)
         self.node_operator(layout, "GeometryNodeTransferAttributes")
@@ -1073,7 +1072,6 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "Volume")
         layout.separator()
         self.draw_menu(layout, "Simulation")
-        self.draw_menu(layout, "Rigid Body")
         self.draw_menu(layout, "Dilapido")
         layout.separator()
         self.draw_menu(layout, "Color")
@@ -1086,8 +1084,10 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "Layout")
 
 
-class NODE_MT_gn_rigid_body_base(node_add_menu.NodeMenu):
-    bl_label = "Rigid Body"
+class NODE_MT_gn_dilapido_rbd_base(node_add_menu.NodeMenu):
+    """Rigid bodies: fracture, constraints and the Jolt solver."""
+
+    bl_label = "RBD"
 
     def draw(self, context):
         layout = self.layout
@@ -1100,17 +1100,42 @@ class NODE_MT_gn_rigid_body_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeRigidBodySolver")
 
 
+class NODE_MT_gn_dilapido_puncliga_base(node_add_menu.NodeMenu):
+    """The XPBD solver: cloth, fluids and soft bodies."""
+
+    bl_label = "Puncliga"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeInitPuncligaData")
+        layout.separator()
+        self.node_operator(layout, "GeometryNodeFluidSurface")
+
+
+class NODE_MT_gn_dilapido_ignis_base(node_add_menu.NodeMenu):
+    """The sparse smoke and fire solver."""
+
+    bl_label = "Ignis"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeIgnisSource")
+        self.node_operator(layout, "GeometryNodeIgnisSolver")
+
+
 class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
-    """Nodes that are shared by the Dilapido solvers (rigid body, XPBD, ...)."""
+    """Everything the Dilapido solvers share, plus one submenu per solver."""
 
     bl_label = "Dilapido"
 
     def draw(self, context):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeRBDCollider")
-        self.node_operator(layout, "GeometryNodeInitPuncligaData")
+        self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         layout.separator()
-        self.node_operator(layout, "GeometryNodeFluidSurface")
+        self.draw_menu(layout, "RBD")
+        self.draw_menu(layout, "Puncliga")
+        self.draw_menu(layout, "Ignis")
 
 
 add_menus = {
@@ -1150,8 +1175,10 @@ add_menus = {
     "NODE_MT_category_GEO_UV": NODE_MT_gn_mesh_primitives_base,
     "NODE_MT_category_GEO_POINT": NODE_MT_gn_point_base,
     "NODE_MT_category_simulation": NODE_MT_gn_simulation_base,
-    "NODE_MT_geometry_node_GEO_RIGID_BODY": NODE_MT_gn_rigid_body_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO": NODE_MT_gn_dilapido_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_RBD": NODE_MT_gn_dilapido_rbd_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_PUNCLIGA": NODE_MT_gn_dilapido_puncliga_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_IGNIS": NODE_MT_gn_dilapido_ignis_base,
     "NODE_MT_category_GEO_VOLUME": NODE_MT_gn_volume_base,
     "NODE_MT_geometry_node_GEO_VOLUME_READ": NODE_MT_gn_volume_read_base,
     "NODE_MT_geometry_node_volume_sample": NODE_MT_gn_volume_sample_base,

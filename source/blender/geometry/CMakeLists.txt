@@ -4,6 +4,7 @@
 
 set(INC
   PUBLIC .
+  PUBLIC ignis
   PUBLIC rigid_body
   PUBLIC xpbd
   ../makesrna
@@ -62,6 +63,8 @@ set(SRC
   intern/uv_parametrizer.cc
   intern/volume_grid_resample.cc
 
+  ignis/GEO_ignis_solver.cc
+
   rigid_body/GEO_rigid_body_solver.cc
 
   xpbd/intern/xpbd_constraint_coloring.cc
@@ -111,6 +114,7 @@ set(SRC
   GEO_uv_parametrizer.hh
   GEO_volume_grid_resample.hh
 
+  ignis/GEO_ignis_solver.hh
   rigid_body/GEO_rigid_body_solver.hh
 
   xpbd/GEO_xpbd_constraint_align_rotations.hh
