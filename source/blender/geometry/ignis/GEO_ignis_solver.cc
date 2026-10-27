@@ -765,6 +765,7 @@ void combust_and_decay(State &state, const Settings &settings, const float delta
   openvdb::FloatGrid::Accessor density = state.density->getAccessor();
   openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
   openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
+  openvdb::FloatGrid::Accessor flame = state.flame->getAccessor();
 
   const float density_decay = std::exp(-std::max(0.0f, settings.dissipation) * dt);
   const float temperature_decay = std::exp(-std::max(0.0f, settings.cooling) * dt);
@@ -780,9 +781,15 @@ void combust_and_decay(State &state, const Settings &settings, const float delta
       const float burned = std::min(available, burn_rate * dt);
       fuel.setValue(coord, available - burned);
       if (burned > 0.0f) {
-        temperature.setValue(coord,
-                             temperature.getValue(coord) + burned * settings.heat_release);
+        const float heat = burned * settings.heat_release;
+        temperature.setValue(coord, temperature.getValue(coord) + heat);
         density.setValue(coord, density.getValue(coord) + burned * settings.smoke_per_burn);
+        if (heat > 0.0f) {
+          /* `flame` is the *rate* of the reaction, not the temperature: it marks the voxels where the
+           * fuel actually burns, so the material can glow there and leave the smoke above it dark. A
+           * voxel that burns in several substeps keeps the strongest rate of the frame. */
+          flame.setValue(coord, std::max(flame.getValue(coord), heat / dt));
+        }
       }
     }
   }
@@ -799,17 +806,43 @@ void combust_and_decay(State &state, const Settings &settings, const float delta
   }
 }
 
-/** `flame` is a render only field: the parts that are hotter than the threshold glow. */
-void update_flame(State &state, const Settings &settings)
+/**
+ * Removes the weak reactions from the render only `flame` field.
+ *
+ * `flame` is filled by the combustion step with the *rate* at which the fuel burns (in K/s), so it
+ * marks the voxels where the fire actually is, and the smoke that the fire pushed up stays dark.
+ * `Flame Threshold` drops the smouldering tail of the reaction so thin wisps do not glow.
+ */
+void filter_flame(State &state, const Settings &settings)
 {
-  state.flame = create_float_grid(state.density->transformPtr());
-  openvdb::FloatGrid::Accessor flame = state.flame->getAccessor();
-  const float threshold = settings.flame_threshold;
-  for (auto iter = state.temperature->cbeginValueOn(); iter; ++iter) {
-    const float value = iter.getValue() - threshold;
-    if (value > 0.0f) {
-      flame.setValue(iter.getCoord(), value);
+  const float threshold = std::max(0.0f, settings.flame_threshold);
+  if (threshold > 0.0f) {
+    for (auto iter = state.flame->beginValueOn(); iter; ++iter) {
+      iter.setValue(std::max(0.0f, iter.getValue() - threshold));
     }
+  }
+
+  if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
+    float max_flame = 0.0f;
+    float z_min = 1e30f;
+    float z_max = -1e30f;
+    const openvdb::math::Transform &transform = state.flame->transform();
+    for (auto iter = state.flame->cbeginValueOn(); iter; ++iter) {
+      const float value = iter.getValue();
+      if (value <= 0.0f) {
+        continue;
+      }
+      max_flame = std::max(max_flame, value);
+      const openvdb::Vec3d position = transform.indexToWorld(iter.getCoord().asVec3d());
+      z_min = math::min(z_min, float(position.z()));
+      z_max = math::max(z_max, float(position.z()));
+    }
+    printf("IGNIS_DEBUG flame: %lld voxels max %.3f z %.3f..%.3f (threshold %.3f)\n",
+           (long long)state.flame->activeVoxelCount(),
+           double(max_flame),
+           max_flame > 0.0f ? double(z_min) : 0.0,
+           max_flame > 0.0f ? double(z_max) : 0.0,
+           double(threshold));
   }
 }
 
@@ -895,7 +928,8 @@ Volume *solve_frame(const Volume *previous,
       }
     }
     ensure_velocity_topology(state);
-    update_flame(state, settings);
+    state.flame = create_float_grid(state.density->transformPtr());
+    filter_flame(state, settings);
     state.density->tree().prune(1e-5f);
     r_stats.active_voxels = int(state.density->activeVoxelCount());
     Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
@@ -926,6 +960,8 @@ Volume *solve_frame(const Volume *previous,
   }
   const float step_dt = dt / float(substeps);
   r_stats.substeps_used = substeps;
+  /* The flame of a frame is the reaction of that frame only, so it starts empty. */
+  state.flame = create_float_grid(state.density->transformPtr());
 
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
     for (const Volume *source : sources) {
@@ -952,7 +988,7 @@ Volume *solve_frame(const Volume *previous,
     limit_and_extrapolate_velocity(state, settings);
   }
 
-  update_flame(state, settings);
+  filter_flame(state, settings);
   state.density->tree().prune(1e-5f);
   state.temperature->tree().prune(1e-5f);
   state.fuel->tree().prune(1e-5f);

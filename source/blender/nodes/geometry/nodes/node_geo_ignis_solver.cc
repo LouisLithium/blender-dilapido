@@ -278,7 +278,9 @@ static void node_declare(NodeDeclarationBuilder &b)
     panel.add_input<decl::Float>("Flame Threshold"_ustr)
         .default_value(0.05f)
         .min(0.0f)
-        .description("Temperature above which the render only `flame` grid is filled");
+        .description(
+            "The `flame` grid holds the rate at which the fuel burns, in K/s. Reactions weaker than "
+            "this are dropped, so the smouldering tail of the fire does not glow");
   }
   {
     auto &panel = b.add_panel("Projection"_ustr).default_closed(true);
