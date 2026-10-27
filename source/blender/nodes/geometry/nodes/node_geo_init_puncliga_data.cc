@@ -34,6 +34,19 @@ enum class PuncligaType : int {
   SoftBody = 2,
 };
 
+/**
+ * How the geometry of a fluid is fed into the simulation.
+ *
+ * The asset keeps the particles of the previous frame in the simulation state, so a plain fluid is
+ * seeded once and then simulated. With an emission mode the asset injects the *current* geometry
+ * again in every frame instead, which turns the input into an emitter (a nozzle, a moving hose).
+ */
+enum class PuncligaEmission : int {
+  None = 0,
+  PerFrame = 1,
+  PerSubstep = 2,
+};
+
 static const EnumPropertyItem puncliga_type_items[] = {
     {int(PuncligaType::Cloth),
      "CLOTH",
@@ -54,8 +67,32 @@ static const EnumPropertyItem puncliga_type_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
+static const EnumPropertyItem puncliga_emission_items[] = {
+    {int(PuncligaEmission::None),
+     "NONE",
+     0,
+     N_("None"),
+     N_("The geometry is the initial state of the fluid: it is put into the simulation once and "
+        "then only simulated")},
+    {int(PuncligaEmission::PerFrame),
+     "PER_FRAME",
+     0,
+     N_("Per Frame"),
+     N_("The geometry is emitted again in every frame, so it becomes a source of new particles. "
+        "The particles inherit the motion of the emitter")},
+    {int(PuncligaEmission::PerSubstep),
+     "PER_SUBSTEP",
+     0,
+     N_("Per Substep"),
+     N_("Like Per Frame, but the particles are spread over the substeps of the frame, between the "
+        "pose of the previous and of the current frame. This fills the gaps of a fast moving "
+        "emitter instead of leaving one clump per frame")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 namespace attribute_names {
 constexpr StringRefNull type = "puncliga_type";
+constexpr StringRefNull emission = "puncliga_emission";
 constexpr StringRefNull rest_density = "puncliga_rest_density";
 constexpr StringRefNull viscosity = "puncliga_viscosity";
 constexpr StringRefNull damping = "puncliga_damping";
@@ -80,6 +117,12 @@ static void node_declare(NodeDeclarationBuilder &b)
       .static_items(puncliga_type_items)
       .default_value(MenuValue(int(PuncligaType::Fluid)))
       .description("How this piece of geometry is simulated");
+  b.add_input<decl::Menu>("Emission"_ustr)
+      .static_items(puncliga_emission_items)
+      .default_value(MenuValue(int(PuncligaEmission::None)))
+      .description(
+          "Whether the geometry of a fluid is only the initial state, or a source that emits new "
+          "particles (see the items for the difference between the two modes)");
 
   /* Every type specific socket is only used by one type, so the others are hidden.
    * `.usage_by_menu` feeds the socket usage inference, which is what drives the visibility of the
@@ -269,6 +312,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet geometry = params.extract_input<GeometrySet>("Geometry"_ustr);
   const int type = params.extract_input<int>("Type"_ustr);
+  const int emission = params.extract_input<int>("Emission"_ustr);
 
   const float radius = params.get_input<float>("Collision Radius"_ustr);
   const float friction = params.get_input<float>("Friction"_ustr);
@@ -280,6 +324,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   write_uniform<int>(geometry, attribute_names::type, bke::AttrDomain::Point, type);
+  write_uniform<int>(geometry, attribute_names::emission, bke::AttrDomain::Point, emission);
   write_uniform<float>(geometry, "radius", bke::AttrDomain::Point, radius);
   write_uniform<float>(geometry, "mass", bke::AttrDomain::Point, mass);
   write_uniform<float>(geometry, "static_friction", bke::AttrDomain::Point, friction);

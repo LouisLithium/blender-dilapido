@@ -1109,6 +1109,8 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeRBDCollider")
         self.node_operator(layout, "GeometryNodeInitPuncligaData")
+        layout.separator()
+        self.node_operator(layout, "GeometryNodeFluidSurface")
 
 
 add_menus = {

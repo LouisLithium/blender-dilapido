@@ -10689,6 +10689,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeFilletCurve");
   define("GeometryNode", "GeometryNodeFilterList");
   define("GeometryNode", "GeometryNodeFlipFaces");
+  define("GeometryNode", "GeometryNodeFluidSurface");
   define("GeometryNode", "GeometryNodeFractureCluster");
   define("GeometryNode", "GeometryNodeForeachGeometryElementInput", def_geo_foreach_geometry_element_input);
   define("GeometryNode", "GeometryNodeForeachGeometryElementOutput", def_geo_foreach_geometry_element_output);

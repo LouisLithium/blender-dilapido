@@ -97,6 +97,7 @@ set(SRC
   nodes/node_geo_filter_list.cc
   nodes/node_geo_field_variance.cc
   nodes/node_geo_flip_faces.cc
+  nodes/node_geo_fluid_surface.cc
   nodes/node_geo_fracture_cluster.cc
   nodes/node_geo_foreach_geometry_element.cc
   nodes/node_geo_geometry_to_instance.cc
