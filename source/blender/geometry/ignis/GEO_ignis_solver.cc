@@ -21,6 +21,8 @@
 
 #include "BLI_array.hh"
 #include "BLI_math_base.hh"
+#include "BLI_math_geom.h"
+#include "BLI_math_matrix.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_task.hh"
 
@@ -457,6 +459,231 @@ void apply_vorticity(State &state, const Settings &settings, const float delta_t
 /** \{ */
 
 /* -------------------------------------------------------------------- */
+/** \name Colliders
+ * \{ */
+
+/**
+ * A thin wall around the surface of the colliders, on a dense box around the smoke.
+ *
+ * Only the surface is marked, not the inside of a closed mesh: the smoke cannot cross a shell
+ * either, and it lets an open mesh (a ground plane) and a closed one (a rock) take the same code
+ * path with no inside/outside test, which is what makes it cheap enough to rebuild every frame.
+ */
+struct SolidMask {
+  Coord min{0, 0, 0};
+  Coord max{-1, -1, -1};
+  Array<int8_t> cells;
+
+  bool empty() const
+  {
+    return cells.is_empty();
+  }
+
+  bool contains(const Coord &coord) const
+  {
+    return coord.x() >= min.x() && coord.x() <= max.x() && coord.y() >= min.y() &&
+           coord.y() <= max.y() && coord.z() >= min.z() && coord.z() <= max.z();
+  }
+
+  bool is_solid(const Coord &coord) const
+  {
+    if (cells.is_empty() || !this->contains(coord)) {
+      return false;
+    }
+    const int64_t x = coord.x() - min.x();
+    const int64_t y = coord.y() - min.y();
+    const int64_t z = coord.z() - min.z();
+    return cells[int64_t(x) + int64_t(max.x() - min.x() + 1) *
+                                   (int64_t(y) + int64_t(max.y() - min.y() + 1) * int64_t(z))] != 0;
+  }
+
+  int64_t count() const
+  {
+    int64_t total = 0;
+    for (const int8_t value : cells) {
+      total += value != 0 ? 1 : 0;
+    }
+    return total;
+  }
+};
+
+/** Marks the voxels whose center is within \a radius of the triangle \a a \a b \a c. */
+void mark_triangle(SolidMask &mask,
+                   const openvdb::math::Transform &transform,
+                   const float3 a,
+                   const float3 b,
+                   const float3 c,
+                   const float radius)
+{
+  const float voxel = float(transform.voxelSize()[0]);
+  const float3 grow(radius + voxel);
+  const float3 lo = math::min(math::min(a, b), c) - grow;
+  const float3 hi = math::max(math::max(a, b), c) + grow;
+  const Coord bmin = transform.worldToIndexCellCentered(openvdb::Vec3d(lo.x, lo.y, lo.z));
+  const Coord bmax = transform.worldToIndexCellCentered(openvdb::Vec3d(hi.x, hi.y, hi.z));
+  /* Only the part of the triangle that is inside the mask is visited: a 20 m ground plane costs the
+   * same as a small one. */
+  const int x0 = std::max(bmin.x(), mask.min.x());
+  const int y0 = std::max(bmin.y(), mask.min.y());
+  const int z0 = std::max(bmin.z(), mask.min.z());
+  const int x1 = std::min(bmax.x(), mask.max.x());
+  const int y1 = std::min(bmax.y(), mask.max.y());
+  const int z1 = std::min(bmax.z(), mask.max.z());
+  if (x0 > x1 || y0 > y1 || z0 > z1) {
+    return;
+  }
+  const int dim_x = mask.max.x() - mask.min.x() + 1;
+  const int dim_y = mask.max.y() - mask.min.y() + 1;
+  const float a3[3] = {a.x, a.y, a.z};
+  const float b3[3] = {b.x, b.y, b.z};
+  const float c3[3] = {c.x, c.y, c.z};
+  const float radius_sq = radius * radius;
+  for (int z = z0; z <= z1; z++) {
+    for (int y = y0; y <= y1; y++) {
+      for (int x = x0; x <= x1; x++) {
+        const openvdb::Vec3d world = transform.indexToWorld(Coord(x, y, z));
+        const float point[3] = {float(world.x()), float(world.y()), float(world.z())};
+        float closest[3];
+        closest_on_tri_to_point_v3(closest, point, a3, b3, c3);
+        const float dx = point[0] - closest[0];
+        const float dy = point[1] - closest[1];
+        const float dz = point[2] - closest[2];
+        if (dx * dx + dy * dy + dz * dz > radius_sq) {
+          continue;
+        }
+        const int64_t ix = x - mask.min.x();
+        const int64_t iy = y - mask.min.y();
+        const int64_t iz = z - mask.min.z();
+        mask.cells[ix + int64_t(dim_x) * (iy + int64_t(dim_y) * iz)] = 1;
+      }
+    }
+  }
+}
+
+/** The box the smoke is in, grown by the room it can reach in one frame. */
+openvdb::CoordBBox solid_region(const State &state, const Settings &settings)
+{
+  openvdb::CoordBBox box = state.density->evalActiveVoxelBoundingBox();
+  if (box.empty()) {
+    return box;
+  }
+  const int pad = std::max({settings.domain_padding, settings.extrapolate + 2, 4}) + 2;
+  box.expand(pad);
+  return box;
+}
+
+/** Rasterizes the colliders into the solid mask of the frame. */
+SolidMask build_solid_mask(const openvdb::math::Transform &transform,
+                           const Span<const Collider> colliders,
+                           const openvdb::CoordBBox &region)
+{
+  SolidMask mask;
+  if (colliders.is_empty() || region.empty()) {
+    return mask;
+  }
+  mask.min = region.min();
+  mask.max = region.max();
+  const int dim_x = mask.max.x() - mask.min.x() + 1;
+  const int dim_y = mask.max.y() - mask.min.y() + 1;
+  const int dim_z = mask.max.z() - mask.min.z() + 1;
+  mask.cells = Array<int8_t>(int64_t(dim_x) * dim_y * dim_z, 0);
+
+  /* A voxel is solid when its center is within half a voxel diagonal of the surface, so the shell
+   * has no holes even where a triangle is smaller than a voxel. */
+  const float radius = float(transform.voxelSize()[0]) * 0.9f;
+  for (const Collider &collider : colliders) {
+    if (collider.mesh == nullptr) {
+      continue;
+    }
+    const Span<float3> positions = collider.mesh->vert_positions();
+    const Span<int> corner_verts = collider.mesh->corner_verts();
+    const Span<int3> corner_tris = collider.mesh->corner_tris();
+    if (positions.is_empty() || corner_tris.is_empty()) {
+      continue;
+    }
+    for (const int3 &tri : corner_tris) {
+      mark_triangle(mask,
+                    transform,
+                    positions[corner_verts[tri.x]],
+                    positions[corner_verts[tri.y]],
+                    positions[corner_verts[tri.z]],
+                    radius);
+    }
+  }
+  return mask;
+}
+
+/** Removes the smoke and stops the velocity inside the colliders. */
+void carve_solids(State &state, const SolidMask &mask)
+{
+  if (mask.empty()) {
+    return;
+  }
+  openvdb::FloatGrid::Accessor density = state.density->getAccessor();
+  openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
+  openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
+  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+  for (auto iter = state.density->beginValueOn(); iter; ++iter) {
+    const Coord coord = iter.getCoord();
+    if (!mask.is_solid(coord)) {
+      continue;
+    }
+    iter.setValue(0.0f);
+    temperature.setValue(coord, 0.0f);
+    fuel.setValue(coord, 0.0f);
+    velocity.setValue(coord, openvdb::Vec3f(0.0f));
+  }
+  for (auto iter = state.velocity->beginValueOn(); iter; ++iter) {
+    if (mask.is_solid(iter.getCoord())) {
+      iter.setValue(openvdb::Vec3f(0.0f));
+    }
+  }
+}
+
+/**
+ * Stops the velocity from pointing into a collider.
+ *
+ * The pressure solve treats a solid as `p = 0`, i.e. as a wall, but the collocated velocity has no
+ * face to project onto, so the component that pushes the smoke into the wall is simply clipped: the
+ * smoke slides along the surface instead of being eaten by the carve.
+ */
+void clamp_velocity_at_solids(State &state, const SolidMask &mask)
+{
+  if (mask.empty()) {
+    return;
+  }
+  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+  for (auto iter = state.velocity->beginValueOn(); iter; ++iter) {
+    const Coord coord = iter.getCoord();
+    openvdb::Vec3f value = iter.getValue();
+    if (mask.is_solid(coord)) {
+      iter.setValue(openvdb::Vec3f(0.0f));
+      continue;
+    }
+    if (mask.is_solid(coord.offsetBy(1, 0, 0))) {
+      value.x() = std::min(value.x(), 0.0f);
+    }
+    if (mask.is_solid(coord.offsetBy(-1, 0, 0))) {
+      value.x() = std::max(value.x(), 0.0f);
+    }
+    if (mask.is_solid(coord.offsetBy(0, 1, 0))) {
+      value.y() = std::min(value.y(), 0.0f);
+    }
+    if (mask.is_solid(coord.offsetBy(0, -1, 0))) {
+      value.y() = std::max(value.y(), 0.0f);
+    }
+    if (mask.is_solid(coord.offsetBy(0, 0, 1))) {
+      value.z() = std::min(value.z(), 0.0f);
+    }
+    if (mask.is_solid(coord.offsetBy(0, 0, -1))) {
+      value.z() = std::max(value.z(), 0.0f);
+    }
+    iter.setValue(value);
+  }
+}
+
+/** \} */
+
 /** \name Pressure projection
  * \{ */
 
@@ -468,7 +695,10 @@ void apply_vorticity(State &state, const Settings &settings, const float delta_t
  * checkerboard pressure. The region boundary is a free surface (`p = 0`), which is what openvdb's
  * Poisson solver assumes for voxels that are not in the domain.
  */
-void project_velocity(State &state, const Settings &settings, Stats &r_stats)
+void project_velocity(State &state,
+                      const Settings &settings,
+                      Stats &r_stats,
+                      const SolidMask &solids)
 {
   if (state.velocity->activeVoxelCount() == 0 || state.density->activeVoxelCount() == 0) {
     return;
@@ -497,6 +727,11 @@ void project_velocity(State &state, const Settings &settings, Stats &r_stats)
   Vector<Coord> coords;
   coords.reserve(int(domain.activeVoxelCount()));
   for (auto iter = domain.cbeginValueOn(); iter; ++iter) {
+    if (solids.is_solid(iter.getCoord())) {
+      /* A collider is a wall: it is not part of the fluid, so the pressure is zero there and the
+       * cells next to it see the same free surface a domain boundary would give them. */
+      continue;
+    }
     index.setValue(iter.getCoord(), int(coords.size()));
     coords.append(iter.getCoord());
   }
@@ -897,6 +1132,7 @@ Mesh *build_surface(const State &state, const Settings &settings)
 
 Volume *solve_frame(const Volume *previous,
                     const Span<const Volume *> sources,
+                    const Span<const Collider> colliders,
                     const Settings &settings,
                     const float delta_time,
                     Mesh **r_surface,
@@ -930,6 +1166,12 @@ Volume *solve_frame(const Volume *previous,
     ensure_velocity_topology(state);
     state.flame = create_float_grid(state.density->transformPtr());
     filter_flame(state, settings);
+    if (!colliders.is_empty()) {
+      const SolidMask solids = build_solid_mask(
+          *state.density->transformPtr(), colliders, solid_region(state, settings));
+      r_stats.solid_voxels = int(solids.count());
+      carve_solids(state, solids);
+    }
     state.density->tree().prune(1e-5f);
     r_stats.active_voxels = int(state.density->activeVoxelCount());
     Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
@@ -963,6 +1205,11 @@ Volume *solve_frame(const Volume *previous,
   /* The flame of a frame is the reaction of that frame only, so it starts empty. */
   state.flame = create_float_grid(state.density->transformPtr());
 
+  /* The wall of the colliders is rebuilt once per frame. The region is the smoke of the previous
+   * frame grown by the room the smoke can reach, so a collider outside it costs nothing. */
+  SolidMask solids;
+  bool solids_built = colliders.is_empty();
+
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
     for (const Volume *source : sources) {
       if (source != nullptr) {
@@ -970,13 +1217,19 @@ Volume *solve_frame(const Volume *previous,
       }
     }
     ensure_velocity_topology(state);
+    if (!solids_built) {
+      solids = build_solid_mask(*state.density->transformPtr(), colliders, solid_region(state, settings));
+      solids_built = true;
+      r_stats.solid_voxels = int(solids.count());
+    }
     apply_forces(state, settings, step_dt);
     apply_vorticity(state, settings, step_dt);
     if (state.velocity->activeVoxelCount() > 0) {
       state.velocity = advect_with_velocity<openvdb::Vec3fGrid>(
           *state.velocity, *state.velocity, step_dt, settings);
     }
-    project_velocity(state, settings, r_stats);
+    project_velocity(state, settings, r_stats, solids);
+    clamp_velocity_at_solids(state, solids);
     state.density = advect_with_velocity<openvdb::FloatGrid>(
         *state.density, *state.velocity, step_dt, settings);
     state.temperature = advect_with_velocity<openvdb::FloatGrid>(
@@ -986,6 +1239,7 @@ Volume *solve_frame(const Volume *previous,
     combust_and_decay(state, settings, step_dt);
     clip_to_bounds(state, settings);
     limit_and_extrapolate_velocity(state, settings);
+    carve_solids(state, solids);
   }
 
   filter_flame(state, settings);

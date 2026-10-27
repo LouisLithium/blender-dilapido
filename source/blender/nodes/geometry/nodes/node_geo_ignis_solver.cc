@@ -95,6 +95,10 @@ static const EnumPropertyItem advection_limiter_items[] = {
 /** Name of the bundle type `Init Ignis Data` produces. */
 constexpr StringRef IGNIS_SOURCE_TYPE = "Blender.IgnisSource";
 
+/** Bundle types of `Dilapido Collider`, whose `geometry` is a mesh in world space. */
+constexpr StringRef COLLIDER_MESH_TYPE = "Blender.Collider.Mesh";
+constexpr StringRef COLLIDER_BOX_TYPE = "Blender.Collider.Box";
+
 /** Appends the volume of one source bundle. */
 void append_source_volume(const Bundle &bundle, Vector<const Volume *> &r_volumes)
 {
@@ -132,6 +136,49 @@ void gather_sources(const Bundle &sources, Vector<const Volume *> &r_volumes)
   }
 }
 
+/** Appends the mesh of one collider bundle. `Dilapido Collider` bakes the transform in already. */
+void append_collider(const Bundle &bundle, Vector<geometry::ignis::Collider> &r_colliders)
+{
+  const GeometrySet *geometry = bundle.lookup_ptr<GeometrySet>(*BundleKey::from_str("geometry"));
+  if (geometry == nullptr) {
+    return;
+  }
+  const Mesh *mesh = geometry->get_mesh();
+  if (mesh == nullptr) {
+    return;
+  }
+  geometry::ignis::Collider collider;
+  collider.mesh = mesh;
+  r_colliders.append(collider);
+}
+
+/**
+ * Collects the colliders of the input bundle.
+ *
+ * Like `Sources`, the bundle may be one collider or contain several nested with `Combine Bundle`,
+ * so both are handled.
+ */
+void gather_colliders(const Bundle &colliders, Vector<geometry::ignis::Collider> &r_colliders)
+{
+  auto is_collider = [](const StringRef type) {
+    return type == COLLIDER_MESH_TYPE || type == COLLIDER_BOX_TYPE;
+  };
+  if (const std::optional<StringRef> type = colliders.type()) {
+    if (is_collider(*type)) {
+      append_collider(colliders, r_colliders);
+      return;
+    }
+  }
+  const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(colliders, is_collider);
+  for (const StringRef path : paths) {
+    const BundlePtr *bundle_ptr = colliders.lookup_path_ptr<BundlePtr>(path);
+    if (!bundle_ptr || !*bundle_ptr) {
+      continue;
+    }
+    append_collider(**bundle_ptr, r_colliders);
+  }
+}
+
 BundlePtr stats_to_bundle(const Stats &stats)
 {
   BundlePtr bundle_ptr = Bundle::create();
@@ -140,6 +187,9 @@ BundlePtr stats_to_bundle(const Stats &stats)
   bundle.add(*BundleKey::from_str("substeps"), stats.substeps_used);
   bundle.add(*BundleKey::from_str("pressure_iterations"), stats.pressure_iterations);
   bundle.add(*BundleKey::from_str("residual"), stats.residual);
+  bundle.add(*BundleKey::from_str("divergence_before"), float(stats.divergence_before));
+  bundle.add(*BundleKey::from_str("divergence_after"), float(stats.divergence_after));
+  bundle.add(*BundleKey::from_str("solid_voxels"), stats.solid_voxels);
   bundle.add(*BundleKey::from_str("cfl_limited"), stats.cfl_limited);
   bundle.add(*BundleKey::from_str("resized"), stats.resized);
   bundle.add(*BundleKey::from_str("milliseconds"), float(stats.milliseconds));
@@ -160,6 +210,12 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "The rasterized emitters of this frame: the `Source` bundles of `Init Ignis Data`, nested "
           "with `Combine Bundle`");
+  b.add_input<decl::Bundle>("Colliders"_ustr)
+      .description(
+          "The meshes the smoke cannot go through: the `Collider` bundles of `Dilapido Collider`, "
+          "nested with `Combine Bundle`. The surface becomes a wall of about one voxel, so a ground "
+          "plane and a closed obstacle both work; a collider that moves more than a voxel per frame "
+          "can be jumped over");
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 24.0f)
       .min(0.0f)
@@ -362,16 +418,25 @@ static void node_geo_exec(GeoNodeExecParams params)
     gather_sources(*sources_bundle, sources);
   }
 
+  const BundlePtr colliders_bundle = params.extract_input<BundlePtr>("Colliders"_ustr);
+  Vector<geometry::ignis::Collider> colliders;
+  if (colliders_bundle) {
+    gather_colliders(*colliders_bundle, colliders);
+  }
+
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
-    printf("IGNIS_DEBUG exec: sources %d, dt %.4f, state volume %s\n",
+    printf("IGNIS_DEBUG exec: sources %d, colliders %d, dt %.4f, state volume %s\n",
            int(sources.size()),
+           int(colliders.size()),
            delta_time,
            state_geometry.get_volume() ? "yes" : "no");
   }
   Stats stats;
   Mesh *surface = nullptr;
-  Volume *volume = geometry::ignis::solve_frame(state_geometry.get_volume(),
-                                               sources,
+  Volume *volume = geometry::ignis::solve_frame(
+      state_geometry.get_volume(),
+      sources,
+      Span<const geometry::ignis::Collider>(colliders.data(), colliders.size()),
                                                settings,
                                                delta_time,
                                                &surface,

@@ -119,9 +119,27 @@ struct Stats {
   /** L2 norm of the velocity divergence before and after the projection, in 1/s. */
   float divergence_before = 0.0f;
   float divergence_after = 0.0f;
+  /** Voxels of the frame that ended up inside a collider and were removed. */
+  int solid_voxels = 0;
   bool cfl_limited = false;
   bool resized = false;
   double milliseconds = 0.0;
+};
+
+/**
+ * A collider of the frame: a mesh in world space.
+ *
+ * The solver rasterizes the surface into a thin solid shell and treats it as a wall: the smoke is
+ * removed where it would be inside, the velocity may not point into it and the pressure is zero on
+ * it. The mesh is expected to be closed for a volumetric obstacle; an open mesh (a ground plane)
+ * works as a thin wall of one voxel.
+ *
+ * \note `Dilapido Collider` bakes its `Transform` into the geometry, so the mesh arrives here already
+ * posed. A collider that moves more than one voxel per frame can be jumped over, because the surface
+ * is sampled once per frame (the limitation the PBD solver had before it learned to sweep).
+ */
+struct Collider {
+  const Mesh *mesh = nullptr;
 };
 
 /**
@@ -131,12 +149,14 @@ struct Stats {
  * \param sources: the rasterized emitters of this frame (the volumes of `Init Ignis Data`), sampled
  *                 at the voxel centers of the state, so the source and the solver may use different
  *                 resolutions.
+ * \param colliders: the meshes the smoke cannot go through, already posed in world space.
  * \param r_stats: timing and diagnostics, also used to report a clamped CFL.
  * \return the new state (a new #Volume, the caller owns it) or null when there is nothing to do.
  * The density isosurface is written to \a r_surface when `Settings::make_surface` is set.
  */
 Volume *solve_frame(const Volume *previous,
                     Span<const Volume *> sources,
+                    Span<const Collider> colliders,
                     const Settings &settings,
                     float delta_time,
                     Mesh **r_surface,
