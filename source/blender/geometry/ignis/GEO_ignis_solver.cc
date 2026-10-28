@@ -470,6 +470,18 @@ void apply_vorticity(State &state, const Settings &settings, const float delta_t
 /** \{ */
 
 /* -------------------------------------------------------------------- */
+/** Accumulates milliseconds into a phase, for the `BLENDER_IGNIS_DEBUG` profile. */
+struct ScopedTimer {
+  double &target;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  explicit ScopedTimer(double &target) : target(target) {}
+  ~ScopedTimer()
+  {
+    target += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                  .count();
+  }
+};
+
 /** \name Colliders
  * \{ */
 
@@ -1200,34 +1212,63 @@ Volume *solve_frame(const Volume *previous,
   SolidMask solids;
   bool solids_built = colliders.is_empty();
 
+  double ms_sources = 0.0;
+  double ms_colliders = 0.0;
+  double ms_forces = 0.0;
+  double ms_velocity = 0.0;
+  double ms_projection = 0.0;
+  double ms_scalars = 0.0;
+  double ms_combustion = 0.0;
+  double ms_solids = 0.0;
+
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
     if (source != nullptr) {
+      ScopedTimer timer(ms_sources);
       add_source_volume(state, *source);
     }
     ensure_velocity_topology(state);
     if (!solids_built) {
+      ScopedTimer timer(ms_colliders);
       solids = build_solid_mask(*state.density->transformPtr(), colliders, solid_region(state, settings));
       solids_built = true;
       r_stats.solid_voxels = int(solids.count());
     }
-    apply_forces(state, settings, step_dt);
-    apply_vorticity(state, settings, step_dt);
-    if (state.velocity->activeVoxelCount() > 0) {
-      state.velocity = advect_with_velocity<openvdb::Vec3fGrid>(
-          *state.velocity, *state.velocity, step_dt, settings);
+    {
+      ScopedTimer timer(ms_forces);
+      apply_forces(state, settings, step_dt);
+      apply_vorticity(state, settings, step_dt);
     }
-    project_velocity(state, settings, r_stats, solids);
-    clamp_velocity_at_solids(state, solids);
-    state.density = advect_with_velocity<openvdb::FloatGrid>(
-        *state.density, *state.velocity, step_dt, settings);
-    state.temperature = advect_with_velocity<openvdb::FloatGrid>(
-        *state.temperature, *state.velocity, step_dt, settings);
-    state.fuel = advect_with_velocity<openvdb::FloatGrid>(
-        *state.fuel, *state.velocity, step_dt, settings);
-    combust_and_decay(state, settings, step_dt);
-    clip_to_bounds(state, settings);
-    limit_and_extrapolate_velocity(state, settings);
-    carve_solids(state, solids);
+    {
+      ScopedTimer timer(ms_velocity);
+      if (state.velocity->activeVoxelCount() > 0) {
+        state.velocity = advect_with_velocity<openvdb::Vec3fGrid>(
+            *state.velocity, *state.velocity, step_dt, settings);
+      }
+    }
+    {
+      ScopedTimer timer(ms_projection);
+      project_velocity(state, settings, r_stats, solids);
+      clamp_velocity_at_solids(state, solids);
+    }
+    {
+      ScopedTimer timer(ms_scalars);
+      state.density = advect_with_velocity<openvdb::FloatGrid>(
+          *state.density, *state.velocity, step_dt, settings);
+      state.temperature = advect_with_velocity<openvdb::FloatGrid>(
+          *state.temperature, *state.velocity, step_dt, settings);
+      state.fuel = advect_with_velocity<openvdb::FloatGrid>(
+          *state.fuel, *state.velocity, step_dt, settings);
+    }
+    {
+      ScopedTimer timer(ms_combustion);
+      combust_and_decay(state, settings, step_dt);
+      clip_to_bounds(state, settings);
+    }
+    {
+      ScopedTimer timer(ms_solids);
+      limit_and_extrapolate_velocity(state, settings);
+      carve_solids(state, solids);
+    }
   }
 
   filter_flame(state, settings);
@@ -1269,6 +1310,18 @@ Volume *solve_frame(const Volume *previous,
            bbox_min.z(),
            bbox_max.z(),
            weight_sum > 0.0 ? weighted_vz / weight_sum : 0.0);
+    printf("IGNIS_DEBUG profile s=%.1f coll=%.1f forces=%.1f vel=%.1f proj=%.1f scal=%.1f "
+           "burn=%.1f tail=%.1f ms=%.1f\n",
+           ms_sources,
+           ms_colliders,
+           ms_forces,
+           ms_velocity,
+           ms_projection,
+           ms_scalars,
+           ms_combustion,
+           ms_solids,
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+               .count());
     printf("IGNIS_DEBUG step: density=%lld velocity=%lld max_v=%.3f div %.4f -> %.4f "
            "(%.1f%%) substeps=%d pressure=%d residual=%.5f cfl=%d\n",
            (long long)state.density->activeVoxelCount(),
