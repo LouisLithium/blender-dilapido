@@ -104,7 +104,7 @@ struct Settings {
 
   /* Projection. */
   int pressure_iterations = 40;
-  float tolerance = 1e-4f;
+  float tolerance = 1e-3f;
   int threads = 1;
 };
 

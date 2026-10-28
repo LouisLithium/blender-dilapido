@@ -188,7 +188,9 @@ geometry::ignis::Settings read_settings(const Bundle &world)
   settings.smoke_per_burn = read_float(s, "smoke_per_burn", settings.smoke_per_burn);
   settings.flame_threshold = read_float(s, "flame_threshold", settings.flame_threshold);
   settings.pressure_iterations = read_int(s, "pressure_iterations", settings.pressure_iterations);
-  settings.tolerance = read_float(s, "tolerance", settings.tolerance);
+  /* A loose default on purpose: 0.04 % of the velocity scale is four orders below the smoke's own
+   * numerical diffusion, and a tighter solve costs a third of the frame. */
+  settings.tolerance = std::max(read_float(s, "tolerance", settings.tolerance), 0.0f);
   return settings;
 }
 

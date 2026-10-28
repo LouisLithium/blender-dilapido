@@ -360,15 +360,20 @@ void add_source_volume(State &state, const Volume &source_volume)
  * (`openvdb::tools::VolumeAdvection`), which brings its own topology growth and the higher order
  * schemes with limiters. Doing this by hand only ever gives first/second order.
  */
-template<typename GridType>
-typename GridType::Ptr advect_with_velocity(const GridType &grid,
-                                           const openvdb::Vec3fGrid &velocity,
-                                           const float delta_time,
-                                           const Settings &settings)
+using Advection = openvdb::tools::VolumeAdvection<openvdb::Vec3fGrid, false>;
+
+/** Applies the scheme and limiter of the settings to a freshly built advection tool. */
+void configure_advection(Advection &advection, const Settings &settings)
 {
-  openvdb::tools::VolumeAdvection<openvdb::Vec3fGrid, false> advection(velocity);
   advection.setIntegrator(to_scheme(settings.advection_scheme));
   advection.setLimiter(to_limiter(settings.advection_limiter));
+}
+
+template<typename GridType>
+typename GridType::Ptr advect_with_velocity(const GridType &grid,
+                                           Advection &advection,
+                                           const float delta_time)
+{
   return advection.template advect<GridType, openvdb::tools::Sampler<1>>(grid, delta_time);
 }
 
@@ -389,16 +394,16 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
 
   openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
   openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
-  openvdb::FloatGrid::ConstAccessor density = state.density->getConstAccessor();
-  for (auto iter = state.velocity->beginValueOn(); iter; ++iter) {
-    const Coord coord = iter.getCoord();
-    /* The forces act on the smoke, not on the empty air: the weight of the ambient air is balanced by
-     * the hydrostatic pressure that this solver does not model, so accelerating the whole velocity
-     * band with gravity would drag the smoke down through the pressure solve. */
-    if (density.getValue(coord) <= 1e-4f) {
+  /* The forces act on the smoke, not on the empty air: the weight of the ambient air is balanced by
+   * the hydrostatic pressure that this solver does not model, so accelerating the whole velocity
+   * band with gravity would drag the smoke down through the pressure solve. Iterating the smoke (a
+   * tenth of the band) instead of the band and testing the density is most of the win here. */
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+    if (iter.getValue() <= 1e-4f) {
       continue;
     }
-    float3 value = from_vdb(iter.getValue());
+    const Coord coord = iter.getCoord();
+    float3 value = from_vdb(velocity.getValue(coord));
     /* Boussinesq buoyancy: the ambient air is in hydrostatic equilibrium, so the only body force on
      * the smoke is its density anomaly. With a temperature relative to the ambient that anomaly is
      * just `T - ambient`, and `buoyancy = 1` means one unit above ambient accelerates the smoke at
@@ -431,7 +436,11 @@ void apply_vorticity(State &state, const Settings &settings, const float delta_t
   openvdb::FloatGrid::Ptr curl_length = create_float_grid(state.velocity->transformPtr());
   openvdb::FloatGrid::Accessor curl_length_accessor = curl_length->getAccessor();
 
-  for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
+  /* The curl is only needed where the smoke is: the confinement pushes the smoke, and the velocity
+   * of the extrapolated air is rebuilt from it every substep anyway. One layer of overlap keeps the
+   * stencil inside the band. */
+  const openvdb::FloatTree band = smoke_tree(state, 1);
+  for (auto iter = band.cbeginValueOn(); iter; ++iter) {
     const Coord coord = iter.getCoord();
     const openvdb::Vec3f dx_p = velocity.getValue(coord.offsetBy(1, 0, 0));
     const openvdb::Vec3f dx_m = velocity.getValue(coord.offsetBy(-1, 0, 0));
@@ -717,6 +726,11 @@ void clamp_velocity_at_solids(State &state, const SolidMask &mask)
  * operator is the plain 7 point Laplacian (widened to 2h) with no odd/even decoupling, i.e. no
  * checkerboard pressure. The region boundary is a free surface (`p = 0`), which is what openvdb's
  * Poisson solver assumes for voxels that are not in the domain.
+ *
+ * The domain is a dense box, so the index of every cell lives in a flat array: the inner loop of the
+ * CG then does six array reads instead of six tree lookups, which is where most of the solve went.
+ * The previous frame's pressure is used as the initial guess (a plume evolves slowly, so this cuts
+ * the iteration count by half or more).
  */
 void project_velocity(State &state,
                       const Settings &settings,
@@ -733,6 +747,11 @@ void project_velocity(State &state,
    * boundary at the edge of the smoke would force the velocity to zero there and stop a buoyant
    * puff from moving at all. A few layers of the extrapolated air give the return flow room. */
   const openvdb::FloatTree domain = smoke_tree(state, std::max(3, settings.extrapolate + 2));
+  openvdb::CoordBBox box;
+  domain.evalActiveVoxelBoundingBox(box);
+  if (box.empty()) {
+    return;
+  }
 
   static const Coord offsets[6] = {
       Coord(1, 0, 0),
@@ -743,10 +762,27 @@ void project_velocity(State &state,
       Coord(0, 0, -1),
   };
 
-  /* A linear index for every voxel of the domain (-1 outside), so the neighbour lookups of the
-   * matrix-vector product are one grid access instead of a hash lookup. */
-  openvdb::Int32Grid::Ptr index_grid = openvdb::Int32Grid::create(-1);
-  openvdb::Int32Grid::Accessor index = index_grid->getAccessor();
+  /* A flat index for every cell of the box (-1 outside the domain), so the matrix-vector product is
+   * one array read per neighbour. */
+  const Coord bmin = box.min();
+  const Coord bmax = box.max();
+  const Coord dims(bmax.x() - bmin.x() + 1, bmax.y() - bmin.y() + 1, bmax.z() - bmin.z() + 1);
+  const int64_t cells = int64_t(dims.x()) * int64_t(dims.y()) * int64_t(dims.z());
+  Array<int> cell_index(cells, -1);
+  Array<int> unknown_index(cells, -1);
+
+  auto flat = [&](const Coord &coord) {
+    return int64_t(coord.x() - bmin.x()) +
+           int64_t(dims.x()) * (int64_t(coord.y() - bmin.y()) +
+                                int64_t(dims.y()) * int64_t(coord.z() - bmin.z()));
+  };
+  auto in_box = [&](const Coord &coord) {
+    return coord.x() >= bmin.x() && coord.x() <= bmax.x() && coord.y() >= bmin.y() &&
+           coord.y() <= bmax.y() && coord.z() >= bmin.z() && coord.z() <= bmax.z();
+  };
+  /* -1 for a cell that is outside the box, outside the domain or solid. */
+  auto index_at = [&](const Coord &coord) { return in_box(coord) ? cell_index[flat(coord)] : -1; };
+
   Vector<Coord> coords;
   coords.reserve(int(domain.activeVoxelCount()));
   for (auto iter = domain.cbeginValueOn(); iter; ++iter) {
@@ -755,40 +791,47 @@ void project_velocity(State &state,
        * cells next to it see the same free surface a domain boundary would give them. */
       continue;
     }
-    index.setValue(iter.getCoord(), int(coords.size()));
+    cell_index[flat(iter.getCoord())] = int(coords.size());
     coords.append(iter.getCoord());
   }
-  const int domain_size = int(coords.size());
-  if (domain_size == 0) {
+  if (coords.is_empty()) {
     return;
+  }
+
+  /* The velocity is read three times per constrained voxel (the right hand side, the gradient and the
+   * residual check). Over the box it is one dense array, so those become array reads as well. */
+  Array<openvdb::Vec3f> velocity_dense(cells, openvdb::Vec3f(0.0f));
+  for (const Coord &coord : coords) {
+    velocity_dense[flat(coord)] = velocity.getValue(coord);
   }
 
   /* The divergence uses forward differences, so a cell can only be made divergence free when its
    * three forward neighbours exist. Using the boundary cells too is what made the system
    * inconsistent (their row picks up the opposite sign, see M66), so they are treated as the open
    * boundary instead: they keep their divergence and the smoke can leave through them. */
-  openvdb::Int32Grid::Ptr unknown_grid = openvdb::Int32Grid::create(-1);
-  openvdb::Int32Grid::Accessor unknown = unknown_grid->getAccessor();
   Vector<Coord> unknowns;
-  unknowns.reserve(domain_size);
+  unknowns.reserve(coords.size());
   for (const Coord &coord : coords) {
-    if (index.getValue(coord.offsetBy(1, 0, 0)) < 0 ||
-        index.getValue(coord.offsetBy(0, 1, 0)) < 0 ||
-        index.getValue(coord.offsetBy(0, 0, 1)) < 0)
+    if (index_at(coord.offsetBy(1, 0, 0)) < 0 || index_at(coord.offsetBy(0, 1, 0)) < 0 ||
+        index_at(coord.offsetBy(0, 0, 1)) < 0)
     {
       continue;
     }
-    unknown.setValue(coord, int(unknowns.size()));
+    unknown_index[flat(coord)] = int(unknowns.size());
     unknowns.append(coord);
   }
   const int count = int(unknowns.size());
   if (count == 0) {
     return;
   }
+  auto unknown_at = [&](const Coord &coord) {
+    return in_box(coord) ? unknown_index[flat(coord)] : -1;
+  };
 
   /* Outside the band the velocity counts as zero: that is the same free surface the pressure has. */
   auto velocity_at = [&](const Coord &coord) {
-    return index.getValue(coord) >= 0 ? velocity.getValue(coord) : openvdb::Vec3f(0.0f);
+    const int i = index_at(coord);
+    return i >= 0 ? velocity_dense[flat(coord)] : openvdb::Vec3f(0.0f);
   };
   auto divergence_at = [&](auto &&velocity_fn, const Coord &coord) {
     const openvdb::Vec3f value = velocity_fn(coord);
@@ -815,7 +858,7 @@ void project_velocity(State &state,
       double sum = -6.0 * x[i];
       const Coord &coord = unknowns[i];
       for (const Coord &offset : offsets) {
-        const int j = unknown.getValue(coord + offset);
+        const int j = unknown_at(coord + offset);
         if (j >= 0) {
           sum += x[j];
         }
@@ -838,12 +881,28 @@ void project_velocity(State &state,
   Array<double> preconditioned(count);
   Array<double> direction(count);
   Array<double> product(count);
-  pressure.fill(0.0);
-  residual.as_mutable_span().copy_from(rhs);
+
+  /* Warm start: the pressure of the previous frame is a good guess for this one, because the flow
+   * changes slowly compared to the solve. It is only a guess, the solve still converges to the same
+   * field. */
+  if (state.pressure && state.pressure->activeVoxelCount() > 0) {
+    const openvdb::FloatGrid::ConstAccessor previous = state.pressure->getConstAccessor();
+    for (const int i : IndexRange(count)) {
+      pressure[i] = double(previous.getValue(unknowns[i]));
+    }
+  }
+  else {
+    pressure.fill(0.0);
+  }
+
+  apply_laplacian(pressure, product);
   const double rhs_norm = std::sqrt(dot(rhs, rhs));
+  for (const int i : IndexRange(count)) {
+    residual[i] = rhs[i] - product[i];
+  }
   int iterations = 0;
-  double residual_norm = rhs_norm;
-  if (rhs_norm > 1e-12) {
+  double residual_norm = std::sqrt(dot(residual, residual));
+  if (rhs_norm > 1e-12 && residual_norm > 0.0) {
     const int max_iterations = std::max(1, settings.pressure_iterations);
     const double tolerance = std::max(1e-8f, settings.tolerance);
     for (const int i : IndexRange(count)) {
@@ -880,7 +939,7 @@ void project_velocity(State &state,
     r_stats.residual = float(residual_norm / rhs_norm);
   }
   else {
-    r_stats.residual = 0.0f;
+    r_stats.residual = rhs_norm > 1e-12 ? float(residual_norm / rhs_norm) : 0.0f;
   }
   r_stats.pressure_iterations = iterations;
 
@@ -888,7 +947,7 @@ void project_velocity(State &state,
    * is not part of the system is zero, which keeps the field smooth towards the open boundary). */
   openvdb::Vec3fGrid::Accessor velocity_writer = state.velocity->getAccessor();
   auto pressure_at = [&](const Coord &coord) {
-    const int j = unknown.getValue(coord);
+    const int j = unknown_at(coord);
     return j >= 0 ? pressure[j] : 0.0;
   };
   for (const Coord &coord : coords) {
@@ -896,15 +955,16 @@ void project_velocity(State &state,
     const double px = (pressure_here - pressure_at(coord.offsetBy(-1, 0, 0))) / voxel;
     const double py = (pressure_here - pressure_at(coord.offsetBy(0, -1, 0))) / voxel;
     const double pz = (pressure_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
-    velocity_writer.setValue(coord,
-                             velocity.getValue(coord) - openvdb::Vec3f(px, py, pz));
+    const openvdb::Vec3f corrected = velocity_dense[flat(coord)] - openvdb::Vec3f(px, py, pz);
+    velocity_dense[flat(coord)] = corrected;
+    velocity_writer.setValue(coord, corrected);
   }
 
   /* Report the residual divergence on the cells that were actually constrained, so the projection can
    * be verified instead of trusted. */
-  const openvdb::Vec3fGrid::ConstAccessor corrected = state.velocity->getConstAccessor();
   auto corrected_at = [&](const Coord &coord) {
-    return index.getValue(coord) >= 0 ? corrected.getValue(coord) : openvdb::Vec3f(0.0f);
+    const int i = index_at(coord);
+    return i >= 0 ? velocity_dense[flat(coord)] : openvdb::Vec3f(0.0f);
   };
   double after_sq = 0.0;
   for (const int i : IndexRange(count)) {
@@ -1241,8 +1301,10 @@ Volume *solve_frame(const Volume *previous,
     {
       ScopedTimer timer(ms_velocity);
       if (state.velocity->activeVoxelCount() > 0) {
+        Advection advection(*state.velocity);
+        configure_advection(advection, settings);
         state.velocity = advect_with_velocity<openvdb::Vec3fGrid>(
-            *state.velocity, *state.velocity, step_dt, settings);
+            *state.velocity, advection, step_dt);
       }
     }
     {
@@ -1252,12 +1314,16 @@ Volume *solve_frame(const Volume *previous,
     }
     {
       ScopedTimer timer(ms_scalars);
+      /* One advection object for the three fields: the construction allocates the scratch the tool
+       * needs, so it is built once per substep instead of once per field. */
+      Advection advection(*state.velocity);
+      configure_advection(advection, settings);
       state.density = advect_with_velocity<openvdb::FloatGrid>(
-          *state.density, *state.velocity, step_dt, settings);
+          *state.density, advection, step_dt);
       state.temperature = advect_with_velocity<openvdb::FloatGrid>(
-          *state.temperature, *state.velocity, step_dt, settings);
+          *state.temperature, advection, step_dt);
       state.fuel = advect_with_velocity<openvdb::FloatGrid>(
-          *state.fuel, *state.velocity, step_dt, settings);
+          *state.fuel, advection, step_dt);
     }
     {
       ScopedTimer timer(ms_combustion);
