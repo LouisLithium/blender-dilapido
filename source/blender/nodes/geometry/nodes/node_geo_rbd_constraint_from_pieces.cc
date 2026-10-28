@@ -32,6 +32,8 @@
 #include "BKE_attribute.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_instances.hh"
+#include "BLI_math_matrix.hh"
+
 #include "BKE_collection.hh"
 #include "BKE_mesh.hh"
 #include "BKE_object.hh"
