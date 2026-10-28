@@ -10,8 +10,7 @@
  *
  * The rasterization happens at the resolution of *this* node, not of the solver, so a dense emitter
  * does not force a dense simulation and a coarse one cannot blur the solver. The result is a
- * `Blender.IgnisSource` bundle that carries the volume, which the solver samples at its own voxel
- * centers.
+ * `Volume` geometry, which the solver samples at its own voxel centers.
  */
 
 #include "BLI_math_vector.hh"
@@ -132,10 +131,11 @@ static void node_declare(NodeDeclarationBuilder &b)
         .description("Velocity of the emitted smoke, for a jet or a muzzle flash");
   }
 
-  b.add_output<decl::Bundle>("Source"_ustr)
+  b.add_output<decl::Geometry>("Volume"_ustr)
+      .supported_type(GeometryComponent::Type::Volume)
       .description(
-          "Connect it to the `Sources` input of `Ignis Solver`, or nest several with `Combine "
-          "Bundle`");
+          "The rasterized emitter: one volume with the density, temperature, fuel and velocity "
+          "grids. Connect it to the `Sources` input of `Ignis Solver`");
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
@@ -238,12 +238,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   GeometrySet volume_geometry;
   volume_geometry.replace_volume(volume);
-
-  BundlePtr bundle_ptr = Bundle::create();
-  Bundle &bundle = bundle_ptr.ensure_mutable_inplace();
-  bundle.add(Bundle::type_item_name, std::string("Blender.IgnisSource"));
-  bundle.add(*BundleKey::from_str("geometry"), volume_geometry);
-  params.set_output("Source"_ustr, std::move(bundle_ptr));
+  params.set_output("Volume"_ustr, std::move(volume_geometry));
 }
 
 static void node_register()

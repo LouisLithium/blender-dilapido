@@ -5,23 +5,28 @@
 /** \file
  * \ingroup nodes
  *
- * `Ignis Solver`: the sparse smoke and fire solver. The state is a `Volume` (one grid per field), so
- * it can live in the cache of a simulation zone like any other geometry; everything else is passed
- * in and out every frame, which keeps the node stateless and makes it possible to scrub the
- * timeline.
+ * `Ignis Solver`: the sparse smoke and fire solver.
+ *
+ * Like the XPBD and rigid body solvers, the whole state of the simulation travels in a `World`
+ * bundle (the volume lives in its `geometry` item), and everything that acts on the simulation from
+ * the outside is a separate bundle (`Effectors`: the colliders of `Dilapido Collider`). The node is
+ * stateless apart from that bundle, so a simulation zone can keep it in its cache and the timeline
+ * can be scrubbed.
  */
+
+#include <algorithm>
+#include <optional>
 
 #include "BLI_array.hh"
 #include "BLI_math_vector.hh"
 
 #include "BKE_attribute.hh"
 #include "BKE_geometry_set.hh"
-#include "BKE_mesh.hh"
 #include "BKE_volume.hh"
 
+#include "NOD_bundle_type.hh"
 #include "NOD_geometry_nodes_bundle.hh"
-
-#include "BKE_volume.hh"
+#include "NOD_geometry_nodes_physics_bundles.hh"
 
 #include "node_geometry_util.hh"
 
@@ -30,6 +35,7 @@
 namespace blender::nodes::node_geo_ignis_solver_cc {
 
 using geometry::ignis::Stats;
+using namespace blender::nodes::physics_bundles;
 
 namespace {
 
@@ -92,48 +98,28 @@ static const EnumPropertyItem advection_limiter_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
-/** Name of the bundle type `Init Ignis Data` produces. */
-constexpr StringRef IGNIS_SOURCE_TYPE = "Blender.IgnisSource";
-
 /** Bundle types of `Dilapido Collider`, whose `geometry` is a mesh in world space. */
 constexpr StringRef COLLIDER_MESH_TYPE = "Blender.Collider.Mesh";
 constexpr StringRef COLLIDER_BOX_TYPE = "Blender.Collider.Box";
 
-/** Appends the volume of one source bundle. */
-void append_source_volume(const Bundle &bundle, Vector<const Volume *> &r_volumes)
-{
-  const GeometrySet *geometry = bundle.lookup_ptr<GeometrySet>(*BundleKey::from_str("geometry"));
-  if (geometry == nullptr) {
-    return;
-  }
-  if (const Volume *volume = geometry->get_volume()) {
-    r_volumes.append(volume);
-  }
-}
-
 /**
- * Collects the volumes of the sources in the input bundle.
+ * The bundle type of the `World` socket.
  *
- * The bundle may *be* one source (the output of a single `Init Ignis Data`) or contain several of
- * them as nested bundles (nested with `Combine Bundle`), so both are handled.
+ * The state itself is a plain volume in the `geometry` item; the types listed here are the nested
+ * bundles the solver understands, i.e. the effectors it can share with the other solvers.
  */
-void gather_sources(const Bundle &sources, Vector<const Volume *> &r_volumes)
+static NestedBundleTypePtr make_world_type()
 {
-  if (const std::optional<StringRef> type = sources.type()) {
-    if (*type == IGNIS_SOURCE_TYPE) {
-      append_source_volume(sources, r_volumes);
-      return;
-    }
-  }
-  const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(
-      sources, [](const StringRef type) { return type == IGNIS_SOURCE_TYPE; });
-  for (const StringRef path : paths) {
-    const BundlePtr *bundle_ptr = sources.lookup_path_ptr<BundlePtr>(path);
-    if (!bundle_ptr || !*bundle_ptr) {
-      continue;
-    }
-    append_source_volume(**bundle_ptr, r_volumes);
-  }
+  Vector<std::shared_ptr<const FlatBundleType>> types;
+  types.append(MeshColliderBundle::get_bundle_type());
+  types.append(BoxColliderBundle::get_bundle_type());
+  /* Registered here so that assets can create them in the same node tree. */
+  ForceBundle::get_bundle_type();
+
+  NestedBundleTypePtr world_type = std::make_shared<const NestedBundleType>(
+      "Blender.IgnisSolverWorld", std::move(types));
+  BundleTypeRegistry::register_type(world_type);
+  return world_type;
 }
 
 /** Appends the mesh of one collider bundle. `Dilapido Collider` bakes the transform in already. */
@@ -153,25 +139,25 @@ void append_collider(const Bundle &bundle, Vector<geometry::ignis::Collider> &r_
 }
 
 /**
- * Collects the colliders of the input bundle.
+ * Collects the colliders of the effector bundle.
  *
- * Like `Sources`, the bundle may be one collider or contain several nested with `Combine Bundle`,
- * so both are handled.
+ * The bundle may be one collider or contain several nested with `Combine Bundle`, so both are
+ * handled.
  */
-void gather_colliders(const Bundle &colliders, Vector<geometry::ignis::Collider> &r_colliders)
+void gather_colliders(const Bundle &effectors, Vector<geometry::ignis::Collider> &r_colliders)
 {
   auto is_collider = [](const StringRef type) {
     return type == COLLIDER_MESH_TYPE || type == COLLIDER_BOX_TYPE;
   };
-  if (const std::optional<StringRef> type = colliders.type()) {
+  if (const std::optional<StringRef> type = effectors.type()) {
     if (is_collider(*type)) {
-      append_collider(colliders, r_colliders);
+      append_collider(effectors, r_colliders);
       return;
     }
   }
-  const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(colliders, is_collider);
+  const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(effectors, is_collider);
   for (const StringRef path : paths) {
-    const BundlePtr *bundle_ptr = colliders.lookup_path_ptr<BundlePtr>(path);
+    const BundlePtr *bundle_ptr = effectors.lookup_path_ptr<BundlePtr>(path);
     if (!bundle_ptr || !*bundle_ptr) {
       continue;
     }
@@ -200,25 +186,33 @@ BundlePtr stats_to_bundle(const Stats &stats)
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Geometry>("State"_ustr)
+  static NestedBundleTypePtr world_type = make_world_type();
+
+  b.add_input<decl::Bundle>("World"_ustr)
+      .bundle_type(world_type)
+      .structure_type(StructureType::Single)
+      .description(
+          "The state of the simulation, carried in the `geometry` item as a volume with the "
+          "density, temperature, fuel, flame and velocity grids. Leave it empty to start a new "
+          "simulation");
+  b.add_output<decl::Bundle>("World"_ustr)
+      .description("The state of this frame: feed it back into `World` inside the simulation zone");
+
+  b.add_input<decl::Geometry>("Sources"_ustr)
       .supported_type(GeometryComponent::Type::Volume)
       .description(
-          "The state of the previous frame (one grid per field). Leave it unconnected to start a "
-          "new simulation; the output has to be fed back into the next frame inside a simulation "
-          "zone");
-  b.add_input<decl::Bundle>("Sources"_ustr)
+          "The emitter of this frame: the `Volume` of `Init Ignis Data`. It is sampled at the "
+          "voxel centers of the state, so the source may use its own resolution");
+  b.add_input<decl::Bundle>("Effectors"_ustr)
       .description(
-          "The rasterized emitters of this frame: the `Source` bundles of `Init Ignis Data`, nested "
-          "with `Combine Bundle`");
-  b.add_input<decl::Bundle>("Colliders"_ustr)
-      .description(
-          "The meshes the smoke cannot go through: the `Collider` bundles of `Dilapido Collider`, "
-          "nested with `Combine Bundle`. The surface becomes a wall of about one voxel, so a ground "
-          "plane and a closed obstacle both work; a collider that moves more than a voxel per frame "
-          "can be jumped over");
+          "The colliders of the frame: the `Collider` bundles of `Dilapido Collider`, nested with "
+          "`Combine Bundle`. Their surfaces become walls about one voxel thick, so a ground plane "
+          "and a closed obstacle both work; a collider that moves more than a voxel per frame can "
+          "be jumped over");
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 24.0f)
       .min(0.0f)
+      .subtype(PROP_TIME_ABSOLUTE)
       .description("Length of the frame in seconds; drive it with `Simulation Input > Delta Time`");
 
   {
@@ -350,34 +344,20 @@ static void node_declare(NodeDeclarationBuilder &b)
         .min(1e-8f)
         .description("Relative residual at which the pressure solve stops");
   }
-  {
-    auto &panel = b.add_panel("Output"_ustr).default_closed(false);
-    panel.add_input<decl::Bool>("Surface"_ustr)
-        .default_value(true)
-        .description("Extract the density isosurface every frame");
-    panel.add_input<decl::Float>("Iso Level"_ustr)
-        .default_value(0.5f)
-        .min(0.01f)
-        .usage_by_bool("Surface"_ustr, true);
-    panel.add_input<decl::Float>("Adaptivity"_ustr)
-        .default_value(0.0f)
-        .min(0.0f)
-        .max(1.0f)
-        .usage_by_bool("Surface"_ustr, true);
-  }
 
-  b.add_output<decl::Geometry>("State"_ustr)
-      .description("Feed it back into `State` inside the simulation zone");
-  b.add_output<decl::Geometry>("Surface"_ustr)
-      .description("The density isosurface, or an empty geometry when `Surface` is off");
   b.add_output<decl::Bundle>("Stats"_ustr)
       .description("Active voxels, substeps, pressure residual and timing, for debugging");
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
 {
-  const GeometrySet state_geometry = params.extract_input<GeometrySet>("State"_ustr);
-  const BundlePtr sources_bundle = params.extract_input<BundlePtr>("Sources"_ustr);
+  BundlePtr world_ptr = params.extract_input<BundlePtr>("World"_ustr);
+  if (!world_ptr) {
+    params.set_default_remaining_outputs();
+    return;
+  }
+  const GeometrySet sources = params.extract_input<GeometrySet>("Sources"_ustr);
+  const Volume *source = sources.get_volume();
   const float delta_time = params.extract_input<float>("Delta Time"_ustr);
 
   geometry::ignis::Settings settings;
@@ -409,51 +389,47 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.flame_threshold = params.extract_input<float>("Flame Threshold"_ustr);
   settings.pressure_iterations = params.extract_input<int>("Pressure Iterations"_ustr);
   settings.tolerance = params.extract_input<float>("Tolerance"_ustr);
-  settings.make_surface = params.extract_input<bool>("Surface"_ustr);
-  settings.iso_level = params.extract_input<float>("Iso Level"_ustr);
-  settings.adaptivity = params.extract_input<float>("Adaptivity"_ustr);
 
-  Vector<const Volume *> sources;
-  if (sources_bundle) {
-    gather_sources(*sources_bundle, sources);
+  Vector<geometry::ignis::Collider> colliders;
+  if (const BundlePtr effectors = params.extract_input<BundlePtr>("Effectors"_ustr)) {
+    gather_colliders(*effectors, colliders);
   }
 
-  const BundlePtr colliders_bundle = params.extract_input<BundlePtr>("Colliders"_ustr);
-  Vector<geometry::ignis::Collider> colliders;
-  if (colliders_bundle) {
-    gather_colliders(*colliders_bundle, colliders);
+  /* The state of the previous frame is the volume in the `geometry` item of the world. */
+  const Volume *previous = nullptr;
+  if (const GeometrySet *geometry = world_ptr->lookup_ptr<GeometrySet>(
+          *BundleKey::from_str("geometry")))
+  {
+    previous = geometry->get_volume();
   }
 
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
-    printf("IGNIS_DEBUG exec: sources %d, colliders %d, dt %.4f, state volume %s\n",
-           int(sources.size()),
+    printf("IGNIS_DEBUG exec: previous %s, source %s, colliders %d, dt %.4f\n",
+           previous != nullptr ? "yes" : "no",
+           source != nullptr ? "yes" : "no",
            int(colliders.size()),
-           delta_time,
-           state_geometry.get_volume() ? "yes" : "no");
+           delta_time);
   }
+
   Stats stats;
-  Mesh *surface = nullptr;
   Volume *volume = geometry::ignis::solve_frame(
-      state_geometry.get_volume(),
-      sources,
+      previous,
+      source,
       Span<const geometry::ignis::Collider>(colliders.data(), colliders.size()),
-                                               settings,
-                                               delta_time,
-                                               &surface,
-                                               stats);
+      settings,
+      delta_time,
+      stats);
 
-  GeometrySet state_output;
+  /* Only the state changes, everything else in the world is passed through. `add` does nothing when
+   * the item already exists, so the state has to overwrite it. */
+  BundlePtr world_output = world_ptr;
+  Bundle &world = world_output.ensure_mutable_inplace();
   if (volume != nullptr) {
-    state_output.replace_volume(volume);
+    GeometrySet geometry;
+    geometry.replace_volume(volume);
+    world.add_override(*BundleKey::from_str("geometry"), geometry);
   }
-  params.set_output("State"_ustr, std::move(state_output));
-
-  GeometrySet surface_output;
-  if (surface != nullptr) {
-    surface_output.replace_mesh(surface);
-  }
-  params.set_output("Surface"_ustr, std::move(surface_output));
-
+  params.set_output("World"_ustr, std::move(world_output));
   params.set_output("Stats"_ustr, stats_to_bundle(stats));
 
   if (stats.cfl_limited) {

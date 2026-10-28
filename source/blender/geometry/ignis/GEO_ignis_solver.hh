@@ -104,11 +104,6 @@ struct Settings {
   int pressure_iterations = 40;
   float tolerance = 1e-4f;
   int threads = 1;
-
-  /* Output. */
-  bool make_surface = true;
-  float iso_level = 0.5f;
-  float adaptivity = 0.0f;
 };
 
 struct Stats {
@@ -146,20 +141,18 @@ struct Collider {
  * Advance the solver by one frame.
  *
  * \param previous: the state of the previous frame, or null on the first frame.
- * \param sources: the rasterized emitters of this frame (the volumes of `Init Ignis Data`), sampled
- *                 at the voxel centers of the state, so the source and the solver may use different
- *                 resolutions.
+ * \param source: the rasterized emitter of this frame (the volume of `Init Ignis Data`), sampled at
+ *                the voxel centers of the state, so the source and the solver may use different
+ *                resolutions. Optional.
  * \param colliders: the meshes the smoke cannot go through, already posed in world space.
  * \param r_stats: timing and diagnostics, also used to report a clamped CFL.
  * \return the new state (a new #Volume, the caller owns it) or null when there is nothing to do.
- * The density isosurface is written to \a r_surface when `Settings::make_surface` is set.
  */
 Volume *solve_frame(const Volume *previous,
-                    Span<const Volume *> sources,
+                    const Volume *source,
                     Span<const Collider> colliders,
                     const Settings &settings,
                     float delta_time,
-                    Mesh **r_surface,
                     Stats &r_stats);
 
 }  // namespace geometry::ignis

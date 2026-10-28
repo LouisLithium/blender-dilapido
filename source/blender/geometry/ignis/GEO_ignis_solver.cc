@@ -35,7 +35,6 @@
 #ifdef WITH_OPENVDB
 #  include "BKE_volume_grid.hh"
 #  include "BKE_volume_openvdb.hh"
-#  include "BKE_volume_to_mesh.hh"
 
 #  include <openvdb/openvdb.h>
 #  include <openvdb/tools/Interpolation.h>
@@ -1113,29 +1112,13 @@ void clip_to_bounds(State &state, const Settings &settings)
   }
 }
 
-/** \{ */
-
-Mesh *build_surface(const State &state, const Settings &settings)
-{
-  if (!settings.make_surface || state.density->activeVoxelCount() == 0) {
-    return nullptr;
-  }
-  Mesh *mesh = bke::volume_grid_to_mesh(
-      *state.density, settings.iso_level, std::max(0.0f, settings.adaptivity));
-  if (mesh != nullptr) {
-    bke::mesh_smooth_set(*mesh, true);
-  }
-  return mesh;
-}
-
 }  // namespace
 
 Volume *solve_frame(const Volume *previous,
-                    const Span<const Volume *> sources,
+                    const Volume *source,
                     const Span<const Collider> colliders,
                     const Settings &settings,
                     const float delta_time,
-                    Mesh **r_surface,
                     Stats &r_stats)
 {
   const auto start = std::chrono::steady_clock::now();
@@ -1158,10 +1141,8 @@ Volume *solve_frame(const Volume *previous,
   const float dt = std::max(0.0f, delta_time);
   if (dt <= 0.0f) {
     /* First frame or a paused frame: only show the sources, do not integrate. */
-    for (const Volume *source : sources) {
-      if (source != nullptr) {
-        add_source_volume(state, *source);
-      }
+    if (source != nullptr) {
+      add_source_volume(state, *source);
     }
     ensure_velocity_topology(state);
     state.flame = create_float_grid(state.density->transformPtr());
@@ -1176,9 +1157,6 @@ Volume *solve_frame(const Volume *previous,
     r_stats.active_voxels = int(state.density->activeVoxelCount());
     Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
     write_state(*volume, state);
-    if (r_surface != nullptr) {
-      *r_surface = build_surface(state, settings);
-    }
     r_stats.substeps_used = 0;
     r_stats.milliseconds = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - start)
@@ -1211,10 +1189,8 @@ Volume *solve_frame(const Volume *previous,
   bool solids_built = colliders.is_empty();
 
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
-    for (const Volume *source : sources) {
-      if (source != nullptr) {
-        add_source_volume(state, *source);
-      }
+    if (source != nullptr) {
+      add_source_volume(state, *source);
     }
     ensure_velocity_topology(state);
     if (!solids_built) {
@@ -1249,9 +1225,6 @@ Volume *solve_frame(const Volume *previous,
   state.velocity->tree().prune(openvdb::Vec3f(1e-6f));
   r_stats.active_voxels = int(state.density->activeVoxelCount());
 
-  if (r_surface != nullptr) {
-    *r_surface = build_surface(state, settings);
-  }
   Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
   write_state(*volume, state);
 
@@ -1308,15 +1281,12 @@ Volume *solve_frame(const Volume *previous,
 #else /* WITH_OPENVDB */
 
 Volume *solve_frame(const Volume * /*previous*/,
-                    const Span<const Volume *> /*sources*/,
+                    const Volume * /*source*/,
+                    const Span<const Collider> /*colliders*/,
                     const Settings & /*settings*/,
                     const float /*delta_time*/,
-                    Mesh **r_surface,
                     Stats & /*r_stats*/)
 {
-  if (r_surface != nullptr) {
-    *r_surface = nullptr;
-  }
   return nullptr;
 }
 
