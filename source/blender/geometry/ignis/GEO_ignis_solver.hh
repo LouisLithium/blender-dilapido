@@ -92,7 +92,7 @@ struct Settings {
   int extrapolate = 4;
   /** Voxels of air around the smoke that take part in the pressure solve. A thin band cannot hold the
    * return flow of a rising plume and drags the smoke back down (see M66). */
-  int domain_padding = 10;
+  int domain_padding = 6;
   AdvectionScheme advection_scheme = AdvectionScheme::MacCormack;
   AdvectionLimiter advection_limiter = AdvectionLimiter::Clamp;
 
