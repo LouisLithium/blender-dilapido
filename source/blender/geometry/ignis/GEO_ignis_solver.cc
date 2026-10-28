@@ -50,6 +50,31 @@ namespace {
 
 using openvdb::Coord;
 
+/** Voxels per parallel chunk. Fixed so that a result never depends on the thread count. */
+constexpr int64_t PARALLEL_CHUNK = 4096;
+
+/**
+ * Runs `fn(begin, end)` over fixed chunks and adds the per chunk results **in chunk order**, so the
+ * sum is the same no matter how many threads run it. Used for every reduction in the solver.
+ */
+template<typename Func> double parallel_sum(const int64_t count, Func &&fn)
+{
+  const int64_t chunks = std::max<int64_t>(1, (count + PARALLEL_CHUNK - 1) / PARALLEL_CHUNK);
+  Array<double> partial(chunks, 0.0);
+  threading::parallel_for(IndexRange(chunks), 1, [&](const IndexRange range) {
+    for (const int64_t chunk : range) {
+      const int64_t begin = chunk * PARALLEL_CHUNK;
+      const int64_t end = std::min(begin + PARALLEL_CHUNK, count);
+      partial[chunk] = fn(begin, end);
+    }
+  });
+  double total = 0.0;
+  for (const double value : partial) {
+    total += value;
+  }
+  return total;
+}
+
 /** The whole state of the simulation. Nothing else is kept between frames. */
 struct State {
   openvdb::FloatGrid::Ptr density;
@@ -392,34 +417,43 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
   const float damping = std::max(0.0f, settings.velocity_damping);
   const float damping_factor = 1.0f / (1.0f + damping * dt);
 
-  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
-  openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
   /* The forces act on the smoke, not on the empty air: the weight of the ambient air is balanced by
    * the hydrostatic pressure that this solver does not model, so accelerating the whole velocity
    * band with gravity would drag the smoke down through the pressure solve. Iterating the smoke (a
-   * tenth of the band) instead of the band and testing the density is most of the win here. */
+   * tenth of the band) instead of the band and testing the density is most of the win here, and the
+   * coordinates are collected once so the work can be split over the threads. Every write goes to a
+   * voxel that already exists, so the chunks cannot race. */
+  Vector<Coord> coords;
+  coords.reserve(int(state.density->activeVoxelCount()));
   for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
-    if (iter.getValue() <= 1e-4f) {
-      continue;
+    if (iter.getValue() > 1e-4f) {
+      coords.append(iter.getCoord());
     }
-    const Coord coord = iter.getCoord();
-    float3 value = from_vdb(velocity.getValue(coord));
-    /* Boussinesq buoyancy: the ambient air is in hydrostatic equilibrium, so the only body force on
-     * the smoke is its density anomaly. With a temperature relative to the ambient that anomaly is
-     * just `T - ambient`, and `buoyancy = 1` means one unit above ambient accelerates the smoke at
-     * `g`: positive temperatures rise, negative ones sink, and no separate gravity is applied. */
-    const float anomaly = temperature.getValue(coord) - ambient;
-    if (anomaly != 0.0f) {
-      /* Opposite to gravity, so a positive anomaly rises and a negative one sinks. */
-      value -= settings.gravity * (buoyancy * anomaly * dt);
-    }
-    value += settings.wind * dt;
-    if (drag > 0.0f) {
-      value *= 1.0f / (1.0f + drag * dt);
-    }
-    value *= damping_factor;
-    velocity.setValue(coord, to_vdb(value));
   }
+  threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
+                          [&](const IndexRange range) {
+    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    const openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
+    for (const int64_t i : range) {
+      const Coord &coord = coords[i];
+      float3 value = from_vdb(velocity.getValue(coord));
+      /* Boussinesq buoyancy: the ambient air is in hydrostatic equilibrium, so the only body force
+       * on the smoke is its density anomaly. With a temperature relative to the ambient that anomaly
+       * is just `T - ambient`, and `buoyancy = 1` means one unit above ambient accelerates the smoke
+       * at `g`: positive temperatures rise, negative ones sink, no separate gravity is applied. */
+      const float anomaly = temperature.getValue(coord) - ambient;
+      if (anomaly != 0.0f) {
+        /* Opposite to gravity, so a positive anomaly rises and a negative one sinks. */
+        value -= settings.gravity * (buoyancy * anomaly * dt);
+      }
+      value += settings.wind * dt;
+      if (drag > 0.0f) {
+        value *= 1.0f / (1.0f + drag * dt);
+      }
+      value *= damping_factor;
+      velocity.setValue(coord, to_vdb(value));
+    }
+  });
 }
 
 /** Curl and vorticity confinement: `f = epsilon * h * (N x omega)` with `N = grad |omega|`. */
@@ -651,25 +685,32 @@ void carve_solids(State &state, const SolidMask &mask)
   if (mask.empty()) {
     return;
   }
-  openvdb::FloatGrid::Accessor density = state.density->getAccessor();
-  openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
-  openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
-  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
-  for (auto iter = state.density->beginValueOn(); iter; ++iter) {
-    const Coord coord = iter.getCoord();
-    if (!mask.is_solid(coord)) {
-      continue;
-    }
-    iter.setValue(0.0f);
-    temperature.setValue(coord, 0.0f);
-    fuel.setValue(coord, 0.0f);
-    velocity.setValue(coord, openvdb::Vec3f(0.0f));
-  }
-  for (auto iter = state.velocity->beginValueOn(); iter; ++iter) {
+  /* Every write goes to a voxel that already exists, so the chunks cannot race: each one gets its own
+   * accessor and the tree is never restructured. */
+  Vector<Coord> coords;
+  coords.reserve(int(state.density->activeVoxelCount()));
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
     if (mask.is_solid(iter.getCoord())) {
-      iter.setValue(openvdb::Vec3f(0.0f));
+      coords.append(iter.getCoord());
     }
   }
+  if (coords.is_empty()) {
+    return;
+  }
+  threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
+                          [&](const IndexRange range) {
+    openvdb::FloatGrid::Accessor density = state.density->getAccessor();
+    openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
+    openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
+    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    for (const int64_t i : range) {
+      const Coord &coord = coords[i];
+      density.setValue(coord, 0.0f);
+      temperature.setValue(coord, 0.0f);
+      fuel.setValue(coord, 0.0f);
+      velocity.setValue(coord, openvdb::Vec3f(0.0f));
+    }
+  });
 }
 
 /**
@@ -684,34 +725,42 @@ void clamp_velocity_at_solids(State &state, const SolidMask &mask)
   if (mask.empty()) {
     return;
   }
-  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
-  for (auto iter = state.velocity->beginValueOn(); iter; ++iter) {
-    const Coord coord = iter.getCoord();
-    openvdb::Vec3f value = iter.getValue();
-    if (mask.is_solid(coord)) {
-      iter.setValue(openvdb::Vec3f(0.0f));
-      continue;
-    }
-    if (mask.is_solid(coord.offsetBy(1, 0, 0))) {
-      value.x() = std::min(value.x(), 0.0f);
-    }
-    if (mask.is_solid(coord.offsetBy(-1, 0, 0))) {
-      value.x() = std::max(value.x(), 0.0f);
-    }
-    if (mask.is_solid(coord.offsetBy(0, 1, 0))) {
-      value.y() = std::min(value.y(), 0.0f);
-    }
-    if (mask.is_solid(coord.offsetBy(0, -1, 0))) {
-      value.y() = std::max(value.y(), 0.0f);
-    }
-    if (mask.is_solid(coord.offsetBy(0, 0, 1))) {
-      value.z() = std::min(value.z(), 0.0f);
-    }
-    if (mask.is_solid(coord.offsetBy(0, 0, -1))) {
-      value.z() = std::max(value.z(), 0.0f);
-    }
-    iter.setValue(value);
+  Vector<Coord> coords;
+  coords.reserve(int(state.velocity->activeVoxelCount()));
+  for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
+    coords.append(iter.getCoord());
   }
+  threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
+                          [&](const IndexRange range) {
+    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    for (const int64_t i : range) {
+      const Coord &coord = coords[i];
+      if (mask.is_solid(coord)) {
+        velocity.setValue(coord, openvdb::Vec3f(0.0f));
+        continue;
+      }
+      openvdb::Vec3f value = velocity.getValue(coord);
+      if (mask.is_solid(coord.offsetBy(1, 0, 0))) {
+        value.x() = std::min(value.x(), 0.0f);
+      }
+      if (mask.is_solid(coord.offsetBy(-1, 0, 0))) {
+        value.x() = std::max(value.x(), 0.0f);
+      }
+      if (mask.is_solid(coord.offsetBy(0, 1, 0))) {
+        value.y() = std::min(value.y(), 0.0f);
+      }
+      if (mask.is_solid(coord.offsetBy(0, -1, 0))) {
+        value.y() = std::max(value.y(), 0.0f);
+      }
+      if (mask.is_solid(coord.offsetBy(0, 0, 1))) {
+        value.z() = std::min(value.z(), 0.0f);
+      }
+      if (mask.is_solid(coord.offsetBy(0, 0, -1))) {
+        value.z() = std::max(value.z(), 0.0f);
+      }
+      velocity.setValue(coord, value);
+    }
+  });
 }
 
 /** \} */
@@ -843,35 +892,43 @@ void project_velocity(State &state,
 
   /* Right hand side `L p = divergence * h^2`, with `L` the index space Laplacian. */
   Array<double> rhs(count);
-  double divergence_sq = 0.0;
-  for (const int i : IndexRange(count)) {
-    const double divergence = divergence_at(velocity_at, unknowns[i]);
-    rhs[i] = divergence * voxel * voxel;
-    divergence_sq += divergence * divergence;
-  }
+  const double divergence_sq = parallel_sum(count, [&](const int64_t begin, const int64_t end) {
+    double sum = 0.0;
+    for (int64_t i = begin; i < end; i++) {
+      const double divergence = divergence_at(velocity_at, unknowns[int(i)]);
+      rhs[i] = divergence * voxel * voxel;
+      sum += divergence * divergence;
+    }
+    return sum;
+  });
   r_stats.divergence_before = float(std::sqrt(divergence_sq / double(count)));
 
   /* The 7 point Laplacian with the boundary voxels pinned to zero pressure: symmetric positive
    * definite, so the whole pressure field is determined. */
   auto apply_laplacian = [&](const Span<double> x, MutableSpan<double> r) {
-    for (const int i : IndexRange(count)) {
-      double sum = -6.0 * x[i];
-      const Coord &coord = unknowns[i];
-      for (const Coord &offset : offsets) {
-        const int j = unknown_at(coord + offset);
-        if (j >= 0) {
-          sum += x[j];
+    threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+      for (const int i : range) {
+        double sum = -6.0 * x[i];
+        const Coord &coord = unknowns[i];
+        for (const Coord &offset : offsets) {
+          const int j = unknown_at(coord + offset);
+          if (j >= 0) {
+            sum += x[j];
+          }
         }
+        r[i] = sum;
       }
-      r[i] = sum;
-    }
+    });
   };
   auto dot = [](const Span<double> a, const Span<double> b) {
-    double sum = 0.0;
-    for (const int i : a.index_range()) {
-      sum += a[i] * b[i];
-    }
-    return sum;
+    const int count = int(a.size());
+    return parallel_sum(count, [&](const int64_t begin, const int64_t end) {
+      double sum = 0.0;
+      for (int64_t i = begin; i < end; i++) {
+        sum += a[int(i)] * b[int(i)];
+      }
+      return sum;
+    });
   };
 
   /* Jacobi preconditioned conjugate gradient. The diagonal is the constant -6, so the preconditioner
@@ -886,10 +943,13 @@ void project_velocity(State &state,
    * changes slowly compared to the solve. It is only a guess, the solve still converges to the same
    * field. */
   if (state.pressure && state.pressure->activeVoxelCount() > 0) {
-    const openvdb::FloatGrid::ConstAccessor previous = state.pressure->getConstAccessor();
-    for (const int i : IndexRange(count)) {
-      pressure[i] = double(previous.getValue(unknowns[i]));
-    }
+    const openvdb::FloatGrid &previous_grid = *state.pressure;
+    threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+      const openvdb::FloatGrid::ConstAccessor previous = previous_grid.getConstAccessor();
+      for (const int i : range) {
+        pressure[i] = double(previous.getValue(unknowns[i]));
+      }
+    });
   }
   else {
     pressure.fill(0.0);
@@ -897,18 +957,22 @@ void project_velocity(State &state,
 
   apply_laplacian(pressure, product);
   const double rhs_norm = std::sqrt(dot(rhs, rhs));
-  for (const int i : IndexRange(count)) {
-    residual[i] = rhs[i] - product[i];
-  }
+  threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+    for (const int i : range) {
+      residual[i] = rhs[i] - product[i];
+    }
+  });
   int iterations = 0;
   double residual_norm = std::sqrt(dot(residual, residual));
   if (rhs_norm > 1e-12 && residual_norm > 0.0) {
     const int max_iterations = std::max(1, settings.pressure_iterations);
     const double tolerance = std::max(1e-8f, settings.tolerance);
-    for (const int i : IndexRange(count)) {
-      preconditioned[i] = residual[i] / 6.0;
-      direction[i] = preconditioned[i];
-    }
+    threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+      for (const int i : range) {
+        preconditioned[i] = residual[i] / 6.0;
+        direction[i] = preconditioned[i];
+      }
+    });
     double rz = dot(residual, preconditioned);
     for (; iterations < max_iterations; iterations++) {
       apply_laplacian(direction, product);
@@ -917,23 +981,29 @@ void project_velocity(State &state,
         break;
       }
       const double alpha = rz / pq;
-      for (const int i : IndexRange(count)) {
-        pressure[i] += alpha * direction[i];
-        residual[i] -= alpha * product[i];
-      }
+      threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+        for (const int i : range) {
+          pressure[i] += alpha * direction[i];
+          residual[i] -= alpha * product[i];
+        }
+      });
       residual_norm = std::sqrt(dot(residual, residual));
       if (residual_norm <= tolerance * rhs_norm) {
         iterations++;
         break;
       }
-      for (const int i : IndexRange(count)) {
-        preconditioned[i] = residual[i] / 6.0;
-      }
+      threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+        for (const int i : range) {
+          preconditioned[i] = residual[i] / 6.0;
+        }
+      });
       const double rz_next = dot(residual, preconditioned);
       const double beta = rz_next / rz;
-      for (const int i : IndexRange(count)) {
-        direction[i] = preconditioned[i] + beta * direction[i];
-      }
+      threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
+        for (const int i : range) {
+          direction[i] = preconditioned[i] + beta * direction[i];
+        }
+      });
       rz = rz_next;
     }
     r_stats.residual = float(residual_norm / rhs_norm);
@@ -945,19 +1015,25 @@ void project_velocity(State &state,
 
   /* `u -= grad p` with backward differences on every voxel of the band (the pressure of a voxel that
    * is not part of the system is zero, which keeps the field smooth towards the open boundary). */
-  openvdb::Vec3fGrid::Accessor velocity_writer = state.velocity->getAccessor();
   auto pressure_at = [&](const Coord &coord) {
     const int j = unknown_at(coord);
     return j >= 0 ? pressure[j] : 0.0;
   };
-  for (const Coord &coord : coords) {
-    const double pressure_here = pressure_at(coord);
-    const double px = (pressure_here - pressure_at(coord.offsetBy(-1, 0, 0))) / voxel;
-    const double py = (pressure_here - pressure_at(coord.offsetBy(0, -1, 0))) / voxel;
-    const double pz = (pressure_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
-    const openvdb::Vec3f corrected = velocity_dense[flat(coord)] - openvdb::Vec3f(px, py, pz);
-    velocity_dense[flat(coord)] = corrected;
-    velocity_writer.setValue(coord, corrected);
+  {
+    const int64_t count_coords = int64_t(coords.size());
+    threading::parallel_for(IndexRange(count_coords), PARALLEL_CHUNK, [&](const IndexRange range) {
+      openvdb::Vec3fGrid::Accessor writer = state.velocity->getAccessor();
+      for (const int64_t i : range) {
+        const Coord &coord = coords[i];
+        const double pressure_here = pressure_at(coord);
+        const double px = (pressure_here - pressure_at(coord.offsetBy(-1, 0, 0))) / voxel;
+        const double py = (pressure_here - pressure_at(coord.offsetBy(0, -1, 0))) / voxel;
+        const double pz = (pressure_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
+        const openvdb::Vec3f corrected = velocity_dense[flat(coord)] - openvdb::Vec3f(px, py, pz);
+        velocity_dense[flat(coord)] = corrected;
+        writer.setValue(coord, corrected);
+      }
+    });
   }
 
   /* Report the residual divergence on the cells that were actually constrained, so the projection can
@@ -966,11 +1042,14 @@ void project_velocity(State &state,
     const int i = index_at(coord);
     return i >= 0 ? velocity_dense[flat(coord)] : openvdb::Vec3f(0.0f);
   };
-  double after_sq = 0.0;
-  for (const int i : IndexRange(count)) {
-    const double divergence = divergence_at(corrected_at, unknowns[i]);
-    after_sq += divergence * divergence;
-  }
+  const double after_sq = parallel_sum(count, [&](const int64_t begin, const int64_t end) {
+    double sum = 0.0;
+    for (int64_t i = begin; i < end; i++) {
+      const double divergence = divergence_at(corrected_at, unknowns[int(i)]);
+      sum += divergence * divergence;
+    }
+    return sum;
+  });
   r_stats.divergence_after = float(std::sqrt(after_sq / double(count)));
 
   openvdb::FloatGrid::Ptr pressure_grid = openvdb::FloatGrid::create(0.0f);
@@ -1314,16 +1393,18 @@ Volume *solve_frame(const Volume *previous,
     }
     {
       ScopedTimer timer(ms_scalars);
-      /* One advection object for the three fields: the construction allocates the scratch the tool
-       * needs, so it is built once per substep instead of once per field. */
-      Advection advection(*state.velocity);
-      configure_advection(advection, settings);
-      state.density = advect_with_velocity<openvdb::FloatGrid>(
-          *state.density, advection, step_dt);
-      state.temperature = advect_with_velocity<openvdb::FloatGrid>(
-          *state.temperature, advection, step_dt);
-      state.fuel = advect_with_velocity<openvdb::FloatGrid>(
-          *state.fuel, advection, step_dt);
+      /* One advection per field, but the three fields are independent: give each one its own tool and
+       * run them at the same time. The result does not depend on the order, the fields never touch
+       * each other. */
+      const openvdb::Vec3fGrid &velocity = *state.velocity;
+      openvdb::FloatGrid::Ptr *targets[3] = {&state.density, &state.temperature, &state.fuel};
+      threading::parallel_for(IndexRange(3), 1, [&](const IndexRange range) {
+        for (const int i : range) {
+          Advection advection(velocity);
+          configure_advection(advection, settings);
+          *targets[i] = advect_with_velocity<openvdb::FloatGrid>(**targets[i], advection, step_dt);
+        }
+      });
     }
     {
       ScopedTimer timer(ms_combustion);
