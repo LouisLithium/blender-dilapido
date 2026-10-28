@@ -324,8 +324,12 @@ void add_source_volume(State &state, const Volume &source_volume)
         density.setValue(coord, std::max(density.getValue(coord), source_value));
         if (temperature_sampler.has_value()) {
           const float value = temperature_sampler->wsSample(world);
-          if (value > 0.0f) {
-            temperature.setValue(coord, std::max(temperature.getValue(coord), value));
+          if (value != 0.0f) {
+            /* The temperature is an anomaly relative to the ambient, so a source can heat *and* cool:
+             * a positive value pushes the temperature up, a negative one down. */
+            const float current = temperature.getValue(coord);
+            temperature.setValue(coord,
+                                 value > 0.0f ? std::max(current, value) : std::min(current, value));
           }
         }
         if (fuel_sampler.has_value()) {
@@ -377,7 +381,8 @@ typename GridType::Ptr advect_with_velocity(const GridType &grid,
 void apply_forces(State &state, const Settings &settings, const float delta_time)
 {
   const float dt = delta_time;
-  const float buoyancy = settings.buoyancy * settings.temperature_scale;
+  const float buoyancy = settings.buoyancy;
+  const float ambient = settings.ambient_temperature;
   const float drag = std::max(0.0f, settings.drag);
   const float damping = std::max(0.0f, settings.velocity_damping);
   const float damping_factor = 1.0f / (1.0f + damping * dt);
@@ -394,9 +399,16 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
       continue;
     }
     float3 value = from_vdb(iter.getValue());
-    value += settings.gravity * dt;
+    /* Boussinesq buoyancy: the ambient air is in hydrostatic equilibrium, so the only body force on
+     * the smoke is its density anomaly. With a temperature relative to the ambient that anomaly is
+     * just `T - ambient`, and `buoyancy = 1` means one unit above ambient accelerates the smoke at
+     * `g`: positive temperatures rise, negative ones sink, and no separate gravity is applied. */
+    const float anomaly = temperature.getValue(coord) - ambient;
+    if (anomaly != 0.0f) {
+      /* Opposite to gravity, so a positive anomaly rises and a negative one sinks. */
+      value -= settings.gravity * (buoyancy * anomaly * dt);
+    }
     value += settings.wind * dt;
-    value.z += temperature.getValue(coord) * buoyancy * dt;
     if (drag > 0.0f) {
       value *= 1.0f / (1.0f + drag * dt);
     }

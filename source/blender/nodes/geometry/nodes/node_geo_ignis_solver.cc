@@ -263,19 +263,28 @@ static void node_declare(NodeDeclarationBuilder &b)
     auto &panel = b.add_panel("Physics"_ustr).default_closed(false);
     panel.add_input<decl::Vector>("Gravity"_ustr)
         .default_value(float3(0.0f, 0.0f, -9.81f))
-        .subtype(PROP_ACCELERATION);
+        .subtype(PROP_ACCELERATION)
+        .description(
+            "Direction and strength of gravity. It is what the buoyancy is measured against: the "
+            "ambient air is in hydrostatic equilibrium, so gravity is not applied to the smoke "
+            "directly, it only scales the buoyancy");
     panel.add_input<decl::Vector>("Wind"_ustr)
         .default_value(float3(0.0f))
         .subtype(PROP_ACCELERATION)
         .description("Uniform acceleration that pushes the smoke sideways");
     panel.add_input<decl::Float>("Buoyancy"_ustr)
-        .default_value(2.0f)
-        .min(0.0f)
-        .description("Upward acceleration per unit of temperature");
-    panel.add_input<decl::Float>("Temperature Scale"_ustr)
         .default_value(1.0f)
-        .min(0.0f)
-        .description("Scales the temperature before it is used for the buoyancy");
+        .description(
+            "Acceleration per unit of temperature above the ambient, in units of gravity. 1 means "
+            "one unit of temperature accelerates the smoke by `g`, so anything above the ambient "
+            "temperature rises and anything below it sinks");
+    panel.add_input<decl::Float>("Ambient Temperature"_ustr)
+        .default_value(0.0f)
+        .description(
+            "Temperature of the surrounding air. The temperature field is measured against it, so "
+            "at 0 the source temperatures are anomalies: 1 rises, -1 sinks. Set it to 293.15 to "
+            "work in kelvin (and `Buoyancy` to 9.81 / 293.15 = 0.033 to get the physical "
+            "acceleration of that temperature difference)");
     panel.add_input<decl::Float>("Vorticity"_ustr)
         .default_value(0.0f)
         .min(0.0f)
@@ -291,7 +300,8 @@ static void node_declare(NodeDeclarationBuilder &b)
     panel.add_input<decl::Float>("Cooling"_ustr)
         .default_value(0.0f)
         .min(0.0f)
-        .description("Exponential decay of the temperature, in 1/s");
+        .description("Exponential decay of the temperature anomaly, in 1/s. It pulls the smoke back "
+                     "to the ambient temperature");
     panel.add_input<decl::Float>("Dissipation"_ustr)
         .default_value(0.0f)
         .min(0.0f)
@@ -320,7 +330,7 @@ static void node_declare(NodeDeclarationBuilder &b)
     panel.add_input<decl::Float>("Heat Release"_ustr)
         .default_value(0.0f)
         .min(0.0f)
-        .description("Temperature added per unit of burned fuel");
+        .description("Temperature anomaly added per unit of burned fuel");
     panel.add_input<decl::Float>("Smoke per Burn"_ustr)
         .default_value(1.0f)
         .min(0.0f)
@@ -371,7 +381,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.gravity = params.extract_input<float3>("Gravity"_ustr);
   settings.wind = params.extract_input<float3>("Wind"_ustr);
   settings.buoyancy = params.extract_input<float>("Buoyancy"_ustr);
-  settings.temperature_scale = params.extract_input<float>("Temperature Scale"_ustr);
+  settings.ambient_temperature = params.extract_input<float>("Ambient Temperature"_ustr);
   settings.vorticity = params.extract_input<float>("Vorticity"_ustr);
   settings.drag = params.extract_input<float>("Drag"_ustr);
   settings.velocity_damping = params.extract_input<float>("Velocity Damping"_ustr);

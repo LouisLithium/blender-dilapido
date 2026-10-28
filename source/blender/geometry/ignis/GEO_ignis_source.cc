@@ -109,6 +109,27 @@ void splat_value(openvdb::FloatGrid::Accessor &accessor,
   accessor.setValue(coord, std::max(accessor.getValue(coord), incoming));
 }
 
+/**
+ * Like #splat_value, but keeps the strongest value of either sign.
+ *
+ * The temperature is an anomaly relative to the ambient, so a source may be hotter *or* colder than
+ * the air around it; `splat_value` would drop everything below zero and a cooling emitter would do
+ * nothing.
+ */
+void splat_signed_value(openvdb::FloatGrid::Accessor &accessor,
+                        const Coord &coord,
+                        const float value,
+                        const float weight)
+{
+  const float incoming = value * weight;
+  if (incoming == 0.0f) {
+    return;
+  }
+  const float current = accessor.getValue(coord);
+  accessor.setValue(coord,
+                    incoming > 0.0f ? std::max(current, incoming) : std::min(current, incoming));
+}
+
 void splat_sample(Accessors &accessors,
                   const openvdb::math::Transform &transform,
                   const SourceSample &sample,
@@ -119,7 +140,7 @@ void splat_sample(Accessors &accessors,
   foreach_kernel_voxel(transform, sample.position, radius, [&](const Coord &coord,
                                                               const float weight) {
     splat_value(accessors.density, coord, sample.density * scale, weight);
-    splat_value(accessors.temperature, coord, sample.temperature * scale, weight);
+    splat_signed_value(accessors.temperature, coord, sample.temperature * scale, weight);
     splat_value(accessors.fuel, coord, sample.fuel * scale, weight);
     if (has_velocity) {
       const openvdb::Vec3f current = accessors.velocity.getValue(coord);
@@ -213,7 +234,7 @@ void fill_solid(const Span<const SourceSample> samples,
     const Coord coord = iter.getCoord();
     const float density = mean_values.density * settings.scale;
     splat_value(accessors.density, coord, density, 1.0f);
-    splat_value(accessors.temperature, coord, mean_values.temperature * settings.scale, 1.0f);
+    splat_signed_value(accessors.temperature, coord, mean_values.temperature * settings.scale, 1.0f);
     splat_value(accessors.fuel, coord, mean_values.fuel * settings.scale, 1.0f);
     accessors.velocity.setValue(coord, velocity);
   }

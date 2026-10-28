@@ -80,8 +80,10 @@ struct Settings {
   /* Forces and transport. */
   float3 gravity = float3(0.0f, 0.0f, -9.81f);
   float3 wind = float3(0.0f);
-  float buoyancy = 2.0f;
-  float temperature_scale = 1.0f;
+  /** Acceleration per unit of temperature anomaly, in units of gravity. */
+  float buoyancy = 1.0f;
+  /** The temperature field is measured against this; 0 means the field is the anomaly itself. */
+  float ambient_temperature = 0.0f;
   float vorticity = 0.0f;
   float drag = 0.0f;
   float cooling = 0.0f;

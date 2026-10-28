@@ -116,9 +116,11 @@ static void node_declare(NodeDeclarationBuilder &b)
         .structure_type(StructureType::Field)
         .description("Density the emitter holds its region at");
     panel.add_input<decl::Float>("Temperature"_ustr)
-        .default_value(0.0f)
+        .default_value(1.0f)
         .structure_type(StructureType::Field)
-        .description("Temperature of the emitted smoke, which is what the buoyancy pushes up");
+        .description(
+            "Temperature of the emitted smoke, measured against the ambient temperature of the "
+            "solver: positive rises, negative sinks, 0 is neutral");
     panel.add_input<decl::Float>("Fuel"_ustr)
         .default_value(0.0f)
         .min(0.0f)
