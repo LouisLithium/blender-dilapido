@@ -748,6 +748,13 @@ class XpbdSolverStep {
   const float sub_delta_time_;
   float substep_compliance_factor_;
 
+  /* Fine grained profile of the substep loop (only filled when XPBD_PROFILE is set). */
+  double prof_coupled_ = 0.0;
+  double prof_constraints_ = 0.0;
+  double prof_iterations_ = 0.0;
+  double prof_velocity_ = 0.0;
+  double prof_final_ = 0.0;
+
   const float interpolation_begin_;
   const float interpolation_end_;
 
@@ -799,6 +806,18 @@ class XpbdSolverStep {
 
   void do_step()
   {
+    /* Coarse phase profile, enabled with XPBD_PROFILE=1. */
+    const bool profile = std::getenv("XPBD_PROFILE") != nullptr;
+    double ms_gather = 0.0;
+    double ms_prepare = 0.0;
+    double ms_simulate = 0.0;
+    double ms_writeback = 0.0;
+    auto now = []() { return std::chrono::steady_clock::now(); };
+    auto ms_since = [](const std::chrono::steady_clock::time_point &start) {
+      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+          .count();
+    };
+    std::chrono::steady_clock::time_point phase_start = now();
     this->gather_nested_bundle_paths();
     this->gather_from_world__geometries();
     this->gather_from_world__fluids();
@@ -817,6 +836,11 @@ class XpbdSolverStep {
     this->gather_from_world__pin_rotations();
     this->gather_from_world__collision_contacts();
 
+    if (profile) {
+      ms_gather = ms_since(phase_start);
+      phase_start = now();
+    }
+
     this->parallel_for_each_chunk(32, [&](const int chunk_i) {
       TLS &tls = tls_.local();
       this->create_chunk_constraints__rod_stretch_shear(tls, chunk_i);
@@ -829,7 +853,17 @@ class XpbdSolverStep {
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
 
+    if (profile) {
+      ms_prepare = ms_since(phase_start);
+      phase_start = now();
+    }
+
     result_ = this->do_simulation();
+
+    if (profile) {
+      ms_simulate = ms_since(phase_start);
+      phase_start = now();
+    }
     this->report_fluid_density_warnings();
     this->write_back__pin_positions();
     this->write_back__rod_stretch_shear();
@@ -840,6 +874,29 @@ class XpbdSolverStep {
     this->write_back_geometries_to_world();
 
     this->write_back__contacts();
+
+    if (profile) {
+      ms_writeback = ms_since(phase_start);
+      printf("XPBD_PROFILE gather=%.1f prepare=%.1f simulate=%.1f write=%.1f total=%.1f ms "
+             "(chunks=%d substeps=%d iterations=%d)\n",
+             ms_gather,
+             ms_prepare,
+             ms_simulate,
+             ms_writeback,
+             ms_gather + ms_prepare + ms_simulate + ms_writeback,
+             int(this->geometries_.chunks.size()),
+             this->substeps_,
+             this->constraint_iterations_);
+      printf("XPBD_PROFILE   substeps: coupled=%.1f constraints=%.1f iterations=%.1f "
+             "velocity=%.1f final=%.1f ms\n",
+             prof_coupled_,
+             prof_constraints_,
+             prof_iterations_,
+             prof_velocity_,
+             prof_final_);
+      prof_coupled_ = prof_constraints_ = prof_iterations_ = prof_velocity_ = prof_final_ = 0.0;
+      fflush(stdout);
+    }
   }
 
   const Result &result() const
@@ -2892,13 +2949,27 @@ class XpbdSolverStep {
         float chunk_error_squared;
         int chunk_error_count;
         int solver_refs_i = 0;
+        const bool prof = std::getenv("XPBD_PROFILE") != nullptr;
+        auto since = [](const std::chrono::steady_clock::time_point &start) {
+          return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+              .count();
+        };
         for (const int substep_i : IndexRange(substeps_)) {
           const SubstepInterval substep(
               substeps_, substep_i, interpolation_begin_, interpolation_end_);
+          std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
           this->simulate__update_pins__chunk(chunk_i, substep);
           this->simulate__inertial_update__chunk(chunk_i, solver_refs_i);
+          if (prof) {
+            prof_coupled_ += since(mark);
+          }
+          mark = std::chrono::steady_clock::now();
           this->simulate__gather_dynamic_constraints__chunk(substep, chunk_i, solver_refs_i);
           this->simulate__reset_forces__chunk(chunk_i);
+          if (prof) {
+            prof_constraints_ += since(mark);
+            mark = std::chrono::steady_clock::now();
+          }
 
           const Span<xpbd::GeometryRef> solver_refs = geometries_.solver_refs[solver_refs_i];
           xpbd::ConstraintSetParams solve_params{solver_refs, sub_delta_time_};
@@ -2909,9 +2980,16 @@ class XpbdSolverStep {
             chunk_error_squared = updater.total_error_squared();
             chunk_error_count = updater.total_error_count();
           }
+          if (prof) {
+            prof_iterations_ += since(mark);
+            mark = std::chrono::steady_clock::now();
+          }
 
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
           this->simulate__velocity_solve__chunk(chunk_i, solver_refs_i);
+          if (prof) {
+            prof_velocity_ += since(mark);
+          }
           solver_refs_i = 1 - solver_refs_i;
         }
         this->simulate__ensure_final_data_in_outputs__chunk(chunk_i);
@@ -2937,28 +3015,56 @@ class XpbdSolverStep {
       for (const int substep_i : IndexRange(substeps_)) {
         const SubstepInterval substep(
             substeps_, substep_i, interpolation_begin_, interpolation_end_);
+        const bool prof = std::getenv("XPBD_PROFILE") != nullptr;
+        std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
+        auto since = [](const std::chrono::steady_clock::time_point &start) {
+          return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+              .count();
+        };
         this->parallel_for_each_chunk(16, [&](const int chunk_i) {
           this->simulate__update_pins__chunk(chunk_i, substep);
           this->simulate__inertial_update__chunk(chunk_i, solver_refs_i);
         });
         /* The collision surfaces of the coupled solids move with the simulation, so their BVH has
          * to be rebuilt before the contacts of this substep are gathered. */
+        if (prof) {
+          mark = std::chrono::steady_clock::now();
+        }
         this->simulate__update_coupled_surfaces(solver_refs_i);
+        if (prof) {
+          prof_coupled_ += since(mark);
+          mark = std::chrono::steady_clock::now();
+        }
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
+        if (prof) {
+          prof_constraints_ += since(mark);
+          mark = std::chrono::steady_clock::now();
+        }
         for ([[maybe_unused]] const int iter_i : IndexRange(constraint_iterations_)) {
           this->simulate__position_solve__single_iteration(solver_refs_i, average_error_squared);
           /* The fluid pushes the coupled cloth and soft bodies with the multipliers of this
            * iteration. Applied after the parallel solve so no chunk writes into another one. */
           this->simulate__fluid_boundary_reaction(solver_refs_i);
         }
+        if (prof) {
+          prof_iterations_ += since(mark);
+          mark = std::chrono::steady_clock::now();
+        }
         this->parallel_for_each_chunk(16, [&](const int chunk_i) {
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
         });
         this->simulate__velocity_solve(solver_refs_i);
+        if (prof) {
+          prof_velocity_ += since(mark);
+          mark = std::chrono::steady_clock::now();
+        }
         this->parallel_for_each_chunk(16, [&](const int chunk_i) {
           this->simulate__ensure_final_data_in_outputs__chunk(chunk_i);
         });
+        if (prof) {
+          prof_final_ += since(mark);
+        }
         solver_refs_i = 1 - solver_refs_i;
       }
     }
