@@ -66,6 +66,8 @@ set(SRC
   ignis/GEO_ignis_solver.cc
   ignis/GEO_ignis_source.cc
 
+  GEO_tetrahedralize.cc
+
   rigid_body/GEO_rigid_body_solver.cc
 
   xpbd/intern/xpbd_constraint_coloring.cc
@@ -117,6 +119,9 @@ set(SRC
 
   ignis/GEO_ignis_solver.hh
   ignis/GEO_ignis_source.hh
+
+  GEO_tetrahedralize.hh
+
   rigid_body/GEO_rigid_body_solver.hh
 
   xpbd/GEO_xpbd_constraint_align_rotations.hh
