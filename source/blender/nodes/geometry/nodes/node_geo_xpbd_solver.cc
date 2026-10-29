@@ -312,6 +312,15 @@ struct FluidChunkData {
   /** Support radius of the kernel, twice the particle radius. */
   float support_radius = 0.0f;
   xpbd::FluidParticleGrid grid;
+  /**
+   * Neighbour indices, rebuilt with the grid every substep. The constraint iterations and the
+   * velocity passes then walk a flat array instead of the hash, which is where most of the frame
+   * went when boundary particles are in play (they double the number of hash walks per particle).
+   */
+  xpbd::FluidNeighborList neighbors;
+  /** The same, resolved against the boundary and the coupled particles (query by fluid particle). */
+  xpbd::FluidNeighborList boundary_neighbors;
+  xpbd::FluidNeighborList coupled_neighbors;
   /** Accumulated lagrange multipliers, reset every substep. */
   Array<float> lambdas;
   /** Scratch buffers, sized like the chunk. */
@@ -3248,9 +3257,21 @@ class XpbdSolverStep {
     const Span<float3> positions = geometries_.solver_refs[solver_refs_i][chunk.data_key_i]
                                        .positions.slice(chunk.points_range);
     fluid.grid.build(positions, fluid.support_radius);
+    xpbd::fluid_build_neighbors(fluid.grid, positions, fluid.neighbors);
     fluid.lambdas.fill(0.0f);
 
     this->simulate__update_fluid_boundary__chunk(chunk_i, solver_refs_i);
+
+    /* The neighbour sets are frozen for the substep (the grid is only rebuilt here), so the
+     * boundary and coupled lists can be built once as well. */
+    if (fluid.boundary_active) {
+      xpbd::fluid_build_neighbors_at(
+          fluid.boundary_grid, positions, fluid.boundary_positions, fluid.boundary_neighbors);
+    }
+    if (fluid.has_coupled) {
+      xpbd::fluid_build_neighbors_at(
+          fluid.coupled_grid, positions, fluid.coupled_positions, fluid.coupled_neighbors);
+    }
 
     if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
       for (const int i : IndexRange(positions.size())) {
@@ -4011,18 +4032,20 @@ class XpbdSolverStep {
     xpbd::FluidBoundary boundary;
     if (fluid.boundary_active) {
       boundary.grid = &fluid.boundary_grid;
+      boundary.neighbors = &fluid.boundary_neighbors;
       boundary.positions = fluid.boundary_positions;
       boundary.masses = fluid.boundary_masses;
     }
     xpbd::FluidBoundary coupled;
     if (fluid.has_coupled) {
       coupled.grid = &fluid.coupled_grid;
+      coupled.neighbors = &fluid.coupled_neighbors;
       coupled.positions = fluid.coupled_positions;
       coupled.masses = fluid.coupled_masses;
       coupled.inv_masses = fluid.coupled_inv_masses;
     }
     const xpbd::FluidDensityStats stats = xpbd::fluid_solve_density_iteration(
-        fluid.grid,
+        fluid.neighbors,
         xpbd::FluidKernel(fluid.support_radius),
         solve_params.geometry_refs()[geo_i].positions.slice(points),
         geo_data.fluid_masses.as_span().slice(points),
@@ -4261,7 +4284,7 @@ class XpbdSolverStep {
 
     /* Added velocity from vorticity confinement and surface tension, on top of the velocities that
      * the position solve produced. */
-    xpbd::fluid_apply_vorticity_confinement(fluid.grid,
+    xpbd::fluid_apply_vorticity_confinement(fluid.neighbors,
                                             kernel,
                                             positions,
                                             masses,
@@ -4272,7 +4295,7 @@ class XpbdSolverStep {
                                             fluid.omegas,
                                             fluid.omega_magnitudes,
                                             fluid.corrections);
-    xpbd::fluid_apply_surface_tension(fluid.grid,
+    xpbd::fluid_apply_surface_tension(fluid.neighbors,
                                       positions,
                                       masses,
                                       fluid.support_radius,
@@ -4280,7 +4303,7 @@ class XpbdSolverStep {
                                       sub_delta_time_,
                                       velocities,
                                       fluid.corrections);
-    xpbd::fluid_apply_xsph_viscosity(fluid.grid,
+    xpbd::fluid_apply_xsph_viscosity(fluid.neighbors,
                                      kernel,
                                      positions,
                                      masses,
