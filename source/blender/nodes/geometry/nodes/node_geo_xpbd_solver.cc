@@ -2624,17 +2624,22 @@ class XpbdSolverStep {
           continue;
         }
 
+        /* The edges come from *all* elements, including the slivers whose volume constraint was
+         * left out: a vertex that only belongs to slivers would otherwise have no constraint at all
+         * and would stay on the floor while the rest of the body moves away (which is exactly what
+         * a "vertex glued to the ground" looks like). A sliver's edges have a normal length, so
+         * they are well conditioned even though its volume is not. */
         Vector<int2> &edges = constraint_usage.edge_points;
         Vector<float> &edge_rest_lengths = constraint_usage.edge_rest_lengths;
         Set<int64_t> edge_set;
-        edges.reserve(element_num * 3);
-        edge_rest_lengths.reserve(element_num * 3);
-        for (const int element_i : IndexRange(element_num)) {
-          const Span<int> element = constraint_usage.elements[element_i];
+        edges.reserve(faces.size() * 3);
+        edge_rest_lengths.reserve(faces.size() * 3);
+        for (const int face_i : IndexRange(faces.size())) {
+          const IndexRange face = faces[face_i];
           for (int i = 0; i < 4; i++) {
             for (int j = i + 1; j < 4; j++) {
-              const int v0 = element[i];
-              const int v1 = element[j];
+              const int v0 = corner_verts[face[i]];
+              const int v1 = corner_verts[face[j]];
               const int64_t key = (int64_t(std::min(v0, v1)) << 32) | int64_t(std::max(v0, v1));
               if (!edge_set.add(key)) {
                 continue;

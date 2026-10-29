@@ -341,6 +341,50 @@ void build_boundary(const Span<int4> tets,
   }
 }
 
+/**
+ * Drops the vertices that no element uses and remaps the indices of the elements and of the
+ * boundary triangles.
+ *
+ * Dropping the degenerate elements can leave vertices behind that nothing references any more. As
+ * loose vertices they would be invisible in a simulation mesh, but a solver integrates them as free
+ * points: they fall to the floor and stay there while the rest of the body moves away, which
+ * stretches the remaining faces into long spikes. There is no reason to keep them.
+ */
+static void compact_vertices(TetrahedralizedMesh &r_result)
+{
+  const int verts_num = int(r_result.vert_positions.size());
+  Array<int> remap(verts_num, -1);
+  for (const int4 &tet : r_result.tets) {
+    remap[tet.x] = 0;
+    remap[tet.y] = 0;
+    remap[tet.z] = 0;
+    remap[tet.w] = 0;
+  }
+  int used_num = 0;
+  for (int &index : remap) {
+    if (index >= 0) {
+      index = used_num++;
+    }
+  }
+  if (used_num == verts_num) {
+    return;
+  }
+
+  Vector<float3> positions(used_num);
+  for (const int i : IndexRange(verts_num)) {
+    if (remap[i] >= 0) {
+      positions[remap[i]] = r_result.vert_positions[i];
+    }
+  }
+  r_result.vert_positions = std::move(positions);
+  for (int4 &tet : r_result.tets) {
+    tet = int4(remap[tet.x], remap[tet.y], remap[tet.z], remap[tet.w]);
+  }
+  for (int3 &tri : r_result.boundary_tris) {
+    tri = int3(remap[tri.x], remap[tri.y], remap[tri.z]);
+  }
+}
+
 /** Volume of every element, in parallel. */
 void compute_tet_volumes(const Span<int4> tets,
                          const Span<float3> positions,
@@ -730,6 +774,8 @@ bool tetrahedralize_mesh(const Mesh &mesh,
       stamp("reboundary");
     }
   }
+
+  compact_vertices(r_result);
 
   r_result.volume = threading::parallel_reduce(
       IndexRange(r_result.tets.size()),
