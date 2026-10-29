@@ -12,12 +12,12 @@
  *
  * The output is split in two:
  *
- * - `Mesh` is the boundary of the tetrahedral mesh, a watertight triangle mesh that follows the
- *   input surface. Use it for rendering and for collision with other objects.
- * - `Tetrahedra` is one point per element, at its center, carrying the four vertex indices (`v0` to
- *   `v3`, into the `Mesh` output) and the rest volume (`rest_volume`). The positions of the vertices
- *   are deliberately not duplicated: the elements refer to the mesh vertices, so a deformation
- *   moves one set of positions.
+ * - `Mesh` is the tetrahedral mesh itself. Blender has no element primitive, so every tetrahedron is
+ *   a face with four corners (its four vertices, wound so that its volume is positive) and the
+ *   `rest_volume` face attribute holds the rest volume of that element. That is the whole interior
+ *   structure in the mesh data: no element list hidden in a separate geometry, and a solver reads
+ *   the elements straight out of the corners of the faces.
+ * - `Surface` is the boundary of that mesh, watertight, for rendering and collision.
  */
 
 #include <algorithm>
@@ -33,7 +33,6 @@
 #include "BKE_attribute.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_mesh.hh"
-#include "BKE_pointcloud.hh"
 
 #include "BLT_translation.hh"
 
@@ -64,11 +63,41 @@ static void node_declare(NodeDeclarationBuilder &b)
           "the input instead of the staircase of the lattice. Turning this off gives an exact "
           "lattice, which is slightly smaller than the input and visibly blocky");
   b.add_output<decl::Geometry>("Mesh"_ustr).description(
-      "Boundary of the tetrahedral mesh: a watertight triangle mesh with the vertices the "
-      "tetrahedra refer to");
-  b.add_output<decl::Geometry>("Tetrahedra"_ustr).description(
-      "One point per tetrahedron, at its center, with the four vertex indices `v0` to `v3` and the "
-      "rest volume `rest_volume`");
+      "The tetrahedral mesh itself: one four cornered face per tetrahedron, its corners being its "
+      "four vertices, and the rest volume of the element in the `rest_volume` face attribute");
+  b.add_output<decl::Geometry>("Surface"_ustr).description(
+      "Boundary of the tetrahedral mesh, a watertight triangle mesh for rendering and collision");
+}
+
+static Mesh *create_tet_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
+{
+  const int tets_num = int(tet_mesh.tets.size());
+  Mesh *mesh = BKE_mesh_new_nomain(tet_mesh.vert_positions.size(), 0, tets_num, tets_num * 4);
+  mesh->vert_positions_for_write().copy_from(tet_mesh.vert_positions);
+  if (tets_num == 0) {
+    return mesh;
+  }
+
+  MutableSpan<int> face_offsets = mesh->face_offsets_for_write();
+  offset_indices::fill_constant_group_size(4, 0, face_offsets);
+  MutableSpan<int> corner_verts = mesh->corner_verts_for_write();
+  threading::parallel_for(IndexRange(tets_num), 4096, [&](const IndexRange range) {
+    for (const int i : range) {
+      const int4 &tet = tet_mesh.tets[i];
+      corner_verts[i * 4 + 0] = tet.x;
+      corner_verts[i * 4 + 1] = tet.y;
+      corner_verts[i * 4 + 2] = tet.z;
+      corner_verts[i * 4 + 3] = tet.w;
+    }
+  });
+  bke::mesh_calc_edges(*mesh, false, false);
+
+  bke::MutableAttributeAccessor attributes = mesh->attributes_for_write();
+  bke::SpanAttributeWriter<float> rest_volume = attributes.lookup_or_add_for_write_span<float>(
+      "rest_volume", AttrDomain::Face);
+  rest_volume.span.copy_from(tet_mesh.tet_volumes.as_span());
+  rest_volume.finish();
+  return mesh;
 }
 
 static Mesh *create_surface_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
@@ -91,49 +120,6 @@ static Mesh *create_surface_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
     bke::mesh_calc_edges(*mesh, false, false);
   }
   return mesh;
-}
-
-static PointCloud *create_tet_pointcloud(const geometry::TetrahedralizedMesh &tet_mesh)
-{
-  PointCloud *pointcloud = bke::pointcloud_new_no_attributes(tet_mesh.tets.size());
-  bke::MutableAttributeAccessor attributes = pointcloud->attributes_for_write();
-  bke::SpanAttributeWriter<float3> positions = attributes.lookup_or_add_for_write_span<float3>(
-      "position", AttrDomain::Point);
-  bke::SpanAttributeWriter<int> v0 = attributes.lookup_or_add_for_write_span<int>("v0",
-                                                                                 AttrDomain::Point);
-  bke::SpanAttributeWriter<int> v1 = attributes.lookup_or_add_for_write_span<int>("v1",
-                                                                                 AttrDomain::Point);
-  bke::SpanAttributeWriter<int> v2 = attributes.lookup_or_add_for_write_span<int>("v2",
-                                                                                 AttrDomain::Point);
-  bke::SpanAttributeWriter<int> v3 = attributes.lookup_or_add_for_write_span<int>("v3",
-                                                                                 AttrDomain::Point);
-  bke::SpanAttributeWriter<float> rest_volume = attributes.lookup_or_add_for_write_span<float>(
-      "rest_volume", AttrDomain::Point);
-
-  const Span<float3> vert_positions = tet_mesh.vert_positions;
-  threading::parallel_for(tet_mesh.tets.index_range(), 4096, [&](const IndexRange range) {
-    for (const int i : range) {
-      const int4 &tet = tet_mesh.tets[i];
-      const float3 a = vert_positions[tet.x];
-      const float3 b = vert_positions[tet.y];
-      const float3 c = vert_positions[tet.z];
-      const float3 d = vert_positions[tet.w];
-      positions.span[i] = (a + b + c + d) * 0.25f;
-      v0.span[i] = tet.x;
-      v1.span[i] = tet.y;
-      v2.span[i] = tet.z;
-      v3.span[i] = tet.w;
-      rest_volume.span[i] = tet_mesh.tet_volumes[i];
-    }
-  });
-
-  positions.finish();
-  v0.finish();
-  v1.finish();
-  v2.finish();
-  v3.finish();
-  rest_volume.finish();
-  return pointcloud;
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
@@ -166,12 +152,12 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   GeometrySet mesh_set;
-  mesh_set.replace_mesh(create_surface_mesh(tet_mesh));
+  mesh_set.replace_mesh(create_tet_mesh(tet_mesh));
   params.set_output("Mesh"_ustr, std::move(mesh_set));
 
-  GeometrySet tets_set;
-  tets_set.replace_pointcloud(create_tet_pointcloud(tet_mesh));
-  params.set_output("Tetrahedra"_ustr, std::move(tets_set));
+  GeometrySet surface_set;
+  surface_set.replace_mesh(create_surface_mesh(tet_mesh));
+  params.set_output("Surface"_ustr, std::move(surface_set));
 }
 
 static void node_register()
@@ -181,8 +167,7 @@ static void node_register()
   geo_node_type_base(&ntype, "GeometryNodeTetrahedralize"_ustr);
   ntype.ui_name = "Tetrahedralize";
   ntype.ui_description =
-      "Fill a closed mesh with tetrahedra, with the four vertex indices and rest volume of every "
-      "element";
+      "Fill a closed mesh with tetrahedra, one four cornered face and a rest volume per element";
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.declare = node_declare;
