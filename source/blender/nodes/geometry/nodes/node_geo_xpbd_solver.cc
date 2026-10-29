@@ -33,6 +33,7 @@
 #include "GEO_xpbd_constraint_friction_face.hh"
 #include "GEO_xpbd_constraint_pin_position.hh"
 #include "GEO_xpbd_constraint_pin_rotation.hh"
+#include "GEO_xpbd_constraint_point_contact.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
 #include "GEO_xpbd_constraint_volume.hh"
@@ -141,6 +142,17 @@ static void node_declare(NodeDeclarationBuilder &b)
     auto &solver_panel = b.add_panel("Solver"_ustr).default_closed(true);
     solver_panel.add_input<decl::Int>("Substeps"_ustr).default_value(10).min(1);
     solver_panel.add_input<decl::Int>("Constraint Iterations"_ustr).default_value(1).min(1);
+    solver_panel.add_input<decl::Bool>("Self Collision"_ustr)
+        .default_value(false)
+        .description(
+            "Push the points of the simulated solids apart when they come closer than the sum of "
+            "their collision radii, so a cloth collides with itself and with soft bodies (the "
+            "points need a `radius` attribute, which the `Init Puncliga Data` node writes)");
+    solver_panel.add_input<decl::Float>("Contact Thickness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .description("Extra distance kept between two colliding points, on top of their radii");
     solver_panel.add_input<decl::String>("Solver Path"_ustr)
         .default_value("")
         .description("Optional output path in the world bundle for solver data");
@@ -597,6 +609,53 @@ struct CoupledSurface {
   Array<float3> prev_positions;
 };
 
+/**
+ * The point to point contacts of the simulated solids with themselves (see
+ * #xpbd::PointContactConstraintSet).
+ *
+ * Every point of every solid geometry is just a sphere with a radius here, which is what lets one
+ * pass keep a cloth from passing through itself, two cloths from passing through each other and a
+ * cloth from passing through a soft body: the two closest points are pushed apart before their
+ * spheres overlap. The pairs depend on the positions, so they are rebuilt every substep, while the
+ * topological neighbors (which must never push each other apart) are gathered once per frame.
+ */
+struct SelfContacts {
+  /** The participating geometries, with the range of the global points that belongs to each. */
+  Vector<int> geometry_data_key;
+  Vector<int> geometry_start;
+  Vector<int> geometry_size;
+  /** For the debug output of the constraint set. */
+  Vector<int> affected_geo_indices;
+
+  /** All points of all participating geometries, in one index space. */
+  Vector<int> point_geo;
+  Vector<int> point_local;
+  Vector<float> point_radius;
+  /** Concatenated positions and rest positions of all those points. */
+  Array<float3> positions;
+  Array<float3> rest_positions;
+
+  /**
+   * Sorted list of the points that are topologically connected to a point (the corners of the
+   * faces it belongs to and the edges it is part of). A cloth would push its own triangles apart
+   * and every element of a soft body would inflate without this.
+   */
+  Array<int> bond_offsets;
+  Array<int> bond_indices;
+
+  Array<int2> point_pairs;
+  Array<float> min_distances;
+  Array<float> compliances;
+  Array<float> lambdas;
+  xpbd::ConstraintColoring coloring;
+  std::optional<xpbd::PointContactConstraintSet> constraint_set;
+
+  bool is_empty() const
+  {
+    return point_geo.is_empty();
+  }
+};
+
 struct SubstepInterval {
   int current_i;
   float interpolate_begin;
@@ -795,6 +854,11 @@ class XpbdSolverStep {
   const float sub_delta_time_;
   float substep_compliance_factor_;
 
+  /** Whether the solid points of the world collide with each other (see #SelfContacts). */
+  const bool self_collision_;
+  /** Extra distance kept between two colliding points, on top of their two radii. */
+  const float contact_thickness_;
+
   /* Fine grained profile of the substep loop (only filled when XPBD_PROFILE is set). */
   double prof_coupled_ = 0.0;
   double prof_constraints_ = 0.0;
@@ -822,6 +886,15 @@ class XpbdSolverStep {
    */
   Vector<CoupledSurface> coupled_surfaces_;
 
+  /** Point to point contacts of the solids with themselves (empty when disabled). */
+  SelfContacts self_contacts_;
+  /**
+   * Memory of the contact colors of the current substep. The colors are rebuilt together with the
+   * pairs, so the memory of the previous substep is released instead of accumulating over the
+   * substeps of the frame.
+   */
+  std::unique_ptr<ResourceScope> self_contacts_memory_;
+
   Mutex field_evaluators_mutex_;
 
   Result result_;
@@ -835,6 +908,8 @@ class XpbdSolverStep {
                  const float total_delta_time,
                  const int substeps,
                  const int constraint_iterations,
+                 const bool self_collision,
+                 const float contact_thickness,
                  const float interpolation_begin,
                  const float interpolation_end,
                  const StringRef geometry_tag_filter,
@@ -842,6 +917,8 @@ class XpbdSolverStep {
       : world_(world),
         substeps_(substeps),
         sub_delta_time_(total_delta_time / substeps_),
+        self_collision_(self_collision),
+        contact_thickness_(std::max(contact_thickness, 0.0f)),
         interpolation_begin_(interpolation_begin),
         interpolation_end_(interpolation_end),
         world_to_simulation_(math::invert(simulation_to_world)),
@@ -900,6 +977,7 @@ class XpbdSolverStep {
 
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
+    this->prepare_self_contacts();
 
     if (profile) {
       ms_prepare = ms_since(phase_start);
@@ -3336,6 +3414,7 @@ class XpbdSolverStep {
           prof_coupled_ += since(mark);
           mark = std::chrono::steady_clock::now();
         }
+        this->simulate__update_self_contacts(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
         if (prof) {
@@ -3375,6 +3454,12 @@ class XpbdSolverStep {
 
   bool support_chunk_simulation() const
   {
+    /* The self contacts of the solids are a constraint set that spans all geometries, so they need
+     * the substep loop that owns the whole world (the multi chunk path solves every chunk
+     * independently). */
+    if (self_collision_) {
+      return false;
+    }
     for (const int data_key_i : geometries_.data_keys.index_range()) {
       const GeometryData &geo_data = *geometries_.data[data_key_i];
       if (!geo_data.static_constraints.is_empty()) {
@@ -4108,6 +4193,384 @@ class XpbdSolverStep {
   }
 
   /**
+   * The positions of the component that makes up \a data_key, in its own point space.
+   */
+  static Span<float3> geometry_component_positions(const GeometrySet &geometry,
+                                                   const GeometryComponent::Type type)
+  {
+    switch (type) {
+      case GeometryComponent::Type::Mesh:
+        if (const Mesh *mesh = geometry.get_mesh()) {
+          return mesh->vert_positions();
+        }
+        break;
+      case GeometryComponent::Type::PointCloud:
+        if (const PointCloud *pointcloud = geometry.get_pointcloud()) {
+          return pointcloud->positions();
+        }
+        break;
+      case GeometryComponent::Type::Curve:
+        if (const Curves *curves_id = geometry.get_curves()) {
+          return curves_id->geometry.wrap().positions();
+        }
+        break;
+      default:
+        break;
+    }
+    return {};
+  }
+
+  /**
+   * The rest pose of a geometry, which is what tells a pair of points that merely touches at rest
+   * (`Setup Structural Rest Data` and the soft body keep it) apart from a pair that folds onto
+   * itself during the simulation. Both names are checked because a cloth and a soft body write
+   * their own.
+   */
+  VArray<float3> lookup_rest_positions(const int data_key_i)
+  {
+    VArray<float3> rest_positions = this->lookup_attribute_optional<float3>(
+        data_key_i, "rest_position", AttrDomain::Point);
+    if (!rest_positions) {
+      rest_positions = this->lookup_attribute_optional<float3>(
+          data_key_i, "puncliga_rest_position", AttrDomain::Point);
+    }
+    return rest_positions;
+  }
+
+  /**
+   * Gathers all simulated points of the solid geometries (cloth, soft bodies and any other
+   * simulated geometry that is not a fluid) into one index space, and records which of them are
+   * topologically connected and therefore must never push each other apart.
+   *
+   * Runs once per frame: the topology does not change during the substeps, only which pairs are
+   * actually in contact does (they are rebuilt in #simulate__update_self_contacts).
+   */
+  void prepare_self_contacts()
+  {
+    SelfContacts &contacts = self_contacts_;
+    contacts = {};
+    if (!self_collision_) {
+      return;
+    }
+
+    /* The pairs that are connected by an edge or by the corners of a face, in global indices. */
+    Vector<int2> bonds;
+    /** Concatenated rest positions, and current positions as the fallback. */
+    Vector<float3> rest_positions_combined;
+
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.domain != AttrDomain::Point) {
+        continue;
+      }
+      if (geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size) {
+        continue;
+      }
+      /* A fluid collides with itself through the density constraint and its points overlap by
+       * design, so it is not part of this pass. */
+      if (geo_data.fluid_constraint_i >= 0) {
+        continue;
+      }
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+      GeometrySet &geometry = geo_set_data.geometry;
+      if (!geometry.has(data_key.type)) {
+        continue;
+      }
+
+      this->ensure_radius_loaded(data_key_i);
+      const VArraySpan<float> radii = geo_data.radii;
+      const Span<float3> positions = geometry_component_positions(geometry, data_key.type);
+      if (positions.size() != geo_data.size) {
+        continue;
+      }
+      const VArray<float3> rest_attr = this->lookup_rest_positions(data_key_i);
+      const VArraySpan<float3> rest_positions = rest_attr;
+      const bool has_rest_positions = rest_positions.size() == positions.size();
+
+      float max_radius = 0.0f;
+      for (const float radius : radii) {
+        max_radius = std::max(max_radius, radius);
+      }
+      if (max_radius <= 0.0f) {
+        this->report(NodeWarningType::Warning,
+                     fmt::format("Self collision: \"{}\" has no `radius` attribute, so its points "
+                                 "only collide within the contact thickness (the `Init Puncliga "
+                                 "Data` node writes a `Collision Radius`)",
+                                 geo_set_data.path));
+      }
+
+      const int start = contacts.point_geo.size();
+      const int size = geo_data.size;
+      contacts.geometry_data_key.append(data_key_i);
+      contacts.geometry_start.append(start);
+      contacts.geometry_size.append(size);
+      contacts.affected_geo_indices.append(data_key_i);
+      for (const int point_i : IndexRange(size)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(point_i);
+        contacts.point_radius.append(radii[point_i]);
+      }
+
+      /* Rest positions of the world geometry are already in the space of the solver (the world is
+       * not transformed), so nothing has to be converted here. */
+      rest_positions_combined.reserve(rest_positions_combined.size() + size);
+      for (const int point_i : IndexRange(size)) {
+        rest_positions_combined.append(has_rest_positions ? rest_positions[point_i] :
+                                                           positions[point_i]);
+      }
+
+      if (data_key.type == GeometryComponent::Type::Mesh) {
+        const Mesh &mesh = *geometry.get_mesh();
+        const Span<int2> edges = mesh.edges();
+        for (const int2 &edge : edges) {
+          bonds.append({start + edge[0], start + edge[1]});
+        }
+        /* The corners of a face are connected to each other as well: a cloth quad has two
+         * diagonals and a tetrahedron has six edges, of which the mesh only stores four. */
+        const OffsetIndices<int> faces = mesh.faces();
+        const Span<int> corner_verts = mesh.corner_verts();
+        for (const int face_i : IndexRange(faces.size())) {
+          const IndexRange face = faces[face_i];
+          if (face.size() < 3 || face.size() > 4) {
+            continue;
+          }
+          for (const int i : IndexRange(face.size())) {
+            for (const int j : IndexRange(i + 1, face.size() - i - 1)) {
+              bonds.append({start + corner_verts[face[i]], start + corner_verts[face[j]]});
+            }
+          }
+        }
+      }
+      else if (data_key.type == GeometryComponent::Type::Curve && geo_data.curves != nullptr) {
+        /* Consecutive points of a curve are connected, and so are the last and the first point of
+         * a cyclic one. */
+        const bke::CurvesGeometry &curves = *geo_data.curves;
+        const VArray<bool> cyclic = curves.cyclic();
+        const OffsetIndices<int> curves_points = curves.points_by_curve();
+        for (const int curve_i : curves_points.index_range()) {
+          const IndexRange points = curves_points[curve_i];
+          for (const int i : IndexRange(points.size())) {
+            const int point_i0 = int(points[i]);
+            if (i + 1 < points.size()) {
+              bonds.append({start + point_i0, start + int(points[i + 1])});
+            }
+            else if (cyclic[curve_i]) {
+              bonds.append({start + point_i0, start + int(points[0])});
+            }
+          }
+        }
+      }
+    }
+
+    const int points_num = contacts.point_geo.size();
+    if (points_num == 0) {
+      return;
+    }
+    contacts.positions.reinitialize(points_num);
+    contacts.rest_positions.reinitialize(points_num);
+    contacts.rest_positions.as_mutable_span().copy_from(rest_positions_combined.as_span());
+
+    /* Build the per point list of connected points (CSR, sorted for a binary search). */
+    Array<int> counts(points_num, 0);
+    for (const int2 &bond : bonds) {
+      counts[bond[0]]++;
+      counts[bond[1]]++;
+    }
+    contacts.bond_offsets.reinitialize(points_num + 1);
+    int offset = 0;
+    for (const int point_i : IndexRange(points_num)) {
+      contacts.bond_offsets[point_i] = offset;
+      offset += counts[point_i];
+    }
+    contacts.bond_offsets[points_num] = offset;
+    contacts.bond_indices.reinitialize(offset);
+    if (offset > 0) {
+      Array<int> cursors(points_num);
+      for (const int point_i : IndexRange(points_num)) {
+        cursors[point_i] = contacts.bond_offsets[point_i];
+      }
+      for (const int2 &bond : bonds) {
+        contacts.bond_indices[cursors[bond[0]]++] = bond[1];
+        contacts.bond_indices[cursors[bond[1]]++] = bond[0];
+      }
+      threading::parallel_for(IndexRange(points_num), 1024, [&](const IndexRange range) {
+        for (const int point_i : range) {
+          MutableSpan<int> list = contacts.bond_indices.as_mutable_span().slice(
+              contacts.bond_offsets[point_i],
+              contacts.bond_offsets[point_i + 1] - contacts.bond_offsets[point_i]);
+          std::sort(list.begin(), list.end());
+        }
+      });
+    }
+  }
+
+  /** Whether two points are connected by an edge or by a face and must not collide. */
+  static bool self_contact_is_bonded(const SelfContacts &contacts, const int point_i0,
+                                     const int point_i1)
+  {
+    if (contacts.bond_offsets.is_empty()) {
+      return false;
+    }
+    const Span<int> bonded = contacts.bond_indices.as_span().slice(
+        contacts.bond_offsets[point_i0],
+        contacts.bond_offsets[point_i0 + 1] - contacts.bond_offsets[point_i0]);
+    return std::binary_search(bonded.begin(), bonded.end(), point_i1);
+  }
+
+  /** Rebuilds the pairs that are close enough to collide at the current positions. */
+  void build_self_contact_pairs(SelfContacts &contacts)
+  {
+    contacts.point_pairs.reinitialize(0);
+    contacts.min_distances.reinitialize(0);
+    contacts.compliances.reinitialize(0);
+    contacts.lambdas.reinitialize(0);
+    contacts.coloring = {};
+    contacts.constraint_set.reset();
+
+    const int points_num = contacts.point_geo.size();
+    if (points_num < 2) {
+      return;
+    }
+
+    float max_radius = 0.0f;
+    for (const float radius : contacts.point_radius) {
+      max_radius = std::max(max_radius, radius);
+    }
+    /* Points within 25% of the contact distance are kept as candidates as well, so that a pair
+     * that another constraint pushes into contact during the iterations is already in the list. */
+    constexpr float probe_factor = 1.25f;
+    const float cell_size = (2.0f * max_radius + contact_thickness_) * probe_factor;
+    if (!(cell_size > 0.0f)) {
+      return;
+    }
+
+    const Span<float3> positions = contacts.positions;
+    const Span<float3> rest_positions = contacts.rest_positions;
+    const Span<float> radii = contacts.point_radius;
+    const float thickness = contact_thickness_;
+    const float cell_sq = cell_size * cell_size;
+
+    const auto is_candidate = [&](const int point_i0,
+                                  const int point_i1,
+                                  const float r_sq) -> bool {
+      if (point_i1 <= point_i0 || r_sq >= cell_sq) {
+        return false;
+      }
+      const float contact_distance = radii[point_i0] + radii[point_i1] + thickness;
+      const float probe = contact_distance * probe_factor;
+      if (r_sq >= probe * probe) {
+        return false;
+      }
+      if (self_contact_is_bonded(contacts, point_i0, point_i1)) {
+        return false;
+      }
+      /* Points that are already that close in the rest pose are neighbors in a way the topology
+       * does not express (the second ring of a finely tessellated sheet, the inside of a fold of
+       * the rest mesh); they would push each other apart forever. */
+      if (math::length_squared(rest_positions[point_i0] - rest_positions[point_i1]) <
+          probe * probe)
+      {
+        return false;
+      }
+      return true;
+    };
+
+    xpbd::FluidParticleGrid grid;
+    grid.build(positions, cell_size);
+
+    Array<int> counts(points_num, 0);
+    threading::parallel_for(IndexRange(points_num), 1024, [&](const IndexRange range) {
+      for (const int point_i0 : range) {
+        int count = 0;
+        grid.foreach_neighbor(
+            point_i0, positions, [&](const int point_i1, const float3 &, const float r_sq) {
+              count += is_candidate(point_i0, point_i1, r_sq) ? 1 : 0;
+            });
+        counts[point_i0] = count;
+      }
+    });
+
+    Array<int> offsets(points_num + 1);
+    int offset = 0;
+    for (const int point_i : IndexRange(points_num)) {
+      offsets[point_i] = offset;
+      offset += counts[point_i];
+    }
+    offsets[points_num] = offset;
+    const int pairs_num = offset;
+
+    contacts.point_pairs.reinitialize(pairs_num);
+    contacts.min_distances.reinitialize(pairs_num);
+    contacts.compliances.reinitialize(pairs_num);
+    contacts.compliances.fill(0.0f);
+
+    threading::parallel_for(IndexRange(points_num), 1024, [&](const IndexRange range) {
+      for (const int point_i0 : range) {
+        int cursor = offsets[point_i0];
+        grid.foreach_neighbor(
+            point_i0, positions, [&](const int point_i1, const float3 &, const float r_sq) {
+              if (!is_candidate(point_i0, point_i1, r_sq)) {
+                return;
+              }
+              contacts.point_pairs[cursor] = int2(point_i0, point_i1);
+              contacts.min_distances[cursor] = radii[point_i0] + radii[point_i1] + thickness;
+              cursor++;
+            });
+      }
+    });
+
+    if (std::getenv("XPBD_SELF_DEBUG") != nullptr) {
+      printf("XPBD_SELF points %d bonds %d pairs %d\n",
+             points_num,
+             int(contacts.bond_indices.size()),
+             pairs_num);
+    }
+    if (pairs_num == 0) {
+      return;
+    }
+
+    contacts.lambdas.reinitialize(pairs_num);
+    contacts.lambdas.fill(0.0f);
+
+    /* The colors are only valid for the pairs of this substep, so the memory of the previous
+     * substep is released instead of accumulating over the frame. */
+    self_contacts_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    contacts.coloring = xpbd::color_constraints__binary(contacts.point_pairs.as_span(),
+                                                        self_contacts_memory_->allocator());
+    contacts.constraint_set.emplace(contacts.affected_geo_indices,
+                                    contacts.point_pairs.as_span(),
+                                    contacts.min_distances.as_span(),
+                                    contacts.compliances.as_span(),
+                                    contacts.point_geo.as_span(),
+                                    contacts.point_local.as_span(),
+                                    error_scale_from_threshold(0.01f),
+                                    contacts.lambdas.as_mutable_span());
+  }
+
+  /**
+   * Copies the current solver positions into the contact point space and rebuilds the pairs. Runs
+   * once per substep, before the constraint iterations.
+   */
+  void simulate__update_self_contacts(const int solver_refs_i)
+  {
+    SelfContacts &contacts = self_contacts_;
+    if (contacts.is_empty()) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int i : contacts.geometry_data_key.index_range()) {
+      const IndexRange slice(contacts.geometry_start[i], contacts.geometry_size[i]);
+      const Span<float3> positions = refs[contacts.geometry_data_key[i]].positions;
+      if (positions.size() != slice.size()) {
+        continue;
+      }
+      contacts.positions.as_mutable_span().slice(slice).copy_from(positions);
+    }
+    this->build_self_contact_pairs(contacts);
+  }
+
+  /**
    * Writes the current solver positions into the collision surfaces and rebuilds their BVH trees.
    * Runs once per substep, before the contacts of the substep are gathered.
    */
@@ -4680,6 +5143,44 @@ class XpbdSolverStep {
             error_tls.local().total_error_count += updater.total_error_count();
           });
         }
+      }
+    }
+
+    if (std::getenv("XPBD_SELF_DEBUG") != nullptr && self_contacts_.constraint_set) {
+      const SelfContacts &contacts = self_contacts_;
+      float worst = 0.0f;
+      int active = 0;
+      for (const int pair_i : contacts.point_pairs.index_range()) {
+        const int g0 = contacts.point_pairs[pair_i][0];
+        const int g1 = contacts.point_pairs[pair_i][1];
+        const float3 &p0 = solver_refs[contacts.point_geo[g0]].positions[contacts.point_local[g0]];
+        const float3 &p1 = solver_refs[contacts.point_geo[g1]].positions[contacts.point_local[g1]];
+        const float distance = math::distance(p0, p1);
+        const float penetration = contacts.min_distances[pair_i] - distance;
+        if (penetration > 0.0f) {
+          active++;
+          worst = std::max(worst, penetration);
+        }
+      }
+      printf("XPBD_SELF penetration worst %g active %d/%d\n",
+             double(worst),
+             active,
+             int(contacts.point_pairs.size()));
+    }
+
+    if (self_contacts_.constraint_set.has_value()) {
+      /* The contacts span all geometries (a cloth against a soft body is one contact), which is
+       * why this is not part of the per chunk loop above. */
+      xpbd::PointContactConstraintSet &constraint = *self_contacts_.constraint_set;
+      for (const int color_i : self_contacts_.coloring.colors.index_range()) {
+        const IndexMask &mask = self_contacts_.coloring.colors[color_i];
+        threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
+          const IndexMask sliced_mask = mask.slice(range);
+          xpbd::GaussSeidelUpdater updater{solver_refs};
+          constraint.solve_sequential(solve_params, updater, sliced_mask);
+          error_tls.local().total_error_squared += updater.total_error_squared();
+          error_tls.local().total_error_count += updater.total_error_count();
+        });
       }
     }
 
@@ -5341,6 +5842,8 @@ static void node_geo_exec(GeoNodeExecParams params)
     return;
   }
   const int constraint_iterations = params.get_input<int>("Constraint Iterations"_ustr);
+  const bool self_collision = params.get_input<bool>("Self Collision"_ustr);
+  const float contact_thickness = params.get_input<float>("Contact Thickness"_ustr);
   const float delta_time = std::max(0.0f, params.get_input<float>("Delta Time"_ustr));
   Bundle &world = world_ptr.ensure_mutable_inplace();
   const std::string geometry_tag_filter = params.extract_input<std::string>("Filter"_ustr);
@@ -5353,6 +5856,8 @@ static void node_geo_exec(GeoNodeExecParams params)
                       delta_time,
                       substeps,
                       constraint_iterations,
+                      self_collision,
+                      contact_thickness,
                       interpolation_begin,
                       interpolation_end,
                       geometry_tag_filter,

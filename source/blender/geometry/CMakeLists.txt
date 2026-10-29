@@ -136,6 +136,7 @@ set(SRC
   xpbd/GEO_xpbd_constraint_math.hh
   xpbd/GEO_xpbd_constraint_pin_position.hh
   xpbd/GEO_xpbd_constraint_pin_rotation.hh
+  xpbd/GEO_xpbd_constraint_point_contact.hh
   xpbd/GEO_xpbd_constraint_rod_bend_twist.hh
   xpbd/GEO_xpbd_constraint_rod_stretch_shear.hh
   xpbd/GEO_xpbd_constraint_set.hh
