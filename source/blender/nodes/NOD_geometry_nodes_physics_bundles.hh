@@ -69,6 +69,17 @@ class EdgeLengthConstraintBundle {
 };
 
 /**
+ * Volume constraints of a tetrahedral mesh. The elements are the faces of the geometry (each face
+ * has four corners) and their `rest_volume` attribute holds the rest volume, which is what
+ * `Tetrahedralize` writes.
+ */
+class VolumeConstraintBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.Constraint.Volume";
+  static const FlatBundleTypePtr &get_bundle_type();
+};
+
+/**
  * Turns the points of a geometry into a position based fluid. The density constraint is solved
  * between all particles of the geometry that are within the support radius of each other.
  */

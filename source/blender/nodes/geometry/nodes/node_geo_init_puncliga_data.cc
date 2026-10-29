@@ -131,6 +131,7 @@ static void node_declare(NodeDeclarationBuilder &b)
    * `NodeSocket.is_icon_visible` reports it. */
   const int cloth = int(PuncligaType::Cloth);
   const int fluid = int(PuncligaType::Fluid);
+  const int soft = int(PuncligaType::SoftBody);
 
   {
     auto &panel = b.add_panel("Cloth"_ustr).default_closed(false);
@@ -228,8 +229,8 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0.0f)
         .min(0.0f)
         .description(
-            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, otherwise "
-            "0.1 kg)");
+            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, soft body: the "
+            "volume of the elements around the point, otherwise 0.1 kg)");
     panel.add_input<decl::Float>("Friction"_ustr)
         .default_value(0.5f)
         .min(0.0f)
@@ -239,6 +240,16 @@ static void node_declare(NodeDeclarationBuilder &b)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
         .description("Radius of the points for the point/mesh collider contacts");
+  }
+  {
+    auto &panel = b.add_panel("Soft Body"_ustr).default_closed(false);
+    panel.add_input<decl::Float>("Density"_ustr)
+        .default_value(1000.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, soft)
+        .description(
+            "Density of the material in kg/m^3, used to compute the mass of the vertices from the "
+            "volume of the tetrahedra around them");
   }
 
   b.add_output<decl::Geometry>("Geometry"_ustr).propagate_all();
@@ -306,6 +317,49 @@ static void write_pin(GeometrySet &geometry, const fn::Field<float> &pin_field, 
   }
   pinned.finish();
   pin_positions.finish();
+}
+
+/**
+ * Mass of the vertices of a tetrahedral mesh: the density times the volume of the elements that
+ * touch the vertex, i.e. a quarter of each of them. This is what makes a soft body deform like a
+ * material instead of like a mesh with uniform point masses (a coarse element would otherwise have
+ * the same inertia as a small one).
+ *
+ * \return False when the geometry is not a tetrahedral mesh (four cornered faces + `rest_volume`).
+ */
+static bool write_soft_body_mass(GeometrySet &geometry, const float density)
+{
+  Mesh *mesh = geometry.get_mesh_for_write();
+  if (mesh == nullptr) {
+    return false;
+  }
+  const VArray<float> rest_volumes = *mesh->attributes().lookup<float>("rest_volume",
+                                                                     bke::AttrDomain::Face);
+  if (!rest_volumes) {
+    return false;
+  }
+  const blender::OffsetIndices<int> faces = mesh->faces();
+  if (faces.is_empty() || mesh->verts_num == 0) {
+    return false;
+  }
+
+  Array<float> vertex_volumes(mesh->verts_num, 0.0f);
+  const Span<int> corner_verts = mesh->corner_verts();
+  for (const int face_i : IndexRange(faces.size())) {
+    const IndexRange face = faces[face_i];
+    const float share = rest_volumes[face_i] / float(face.size());
+    for (const int corner : face) {
+      vertex_volumes[corner_verts[corner]] += share;
+    }
+  }
+
+  bke::SpanAttributeWriter<float> mass = mesh->attributes_for_write().lookup_or_add_for_write_span<
+      float>("mass", bke::AttrDomain::Point);
+  for (const int i : IndexRange(mesh->verts_num)) {
+    mass.span[i] = std::max(density * vertex_volumes[i], 1e-6f);
+  }
+  mass.finish();
+  return true;
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
@@ -387,7 +441,28 @@ static void node_geo_exec(GeoNodeExecParams params)
       break;
     }
     case PuncligaType::SoftBody: {
-      /* Placeholder: only gravity and colliders, no internal constraints. */
+      /* The solver builds the distance constraints of the elements from their rest lengths, so the
+       * rest pose has to be stored before the geometry starts to move. */
+      if (Mesh *mesh = geometry.get_mesh_for_write()) {
+        if (!mesh->attributes().contains("rest_position")) {
+          bke::SpanAttributeWriter<float3> writer =
+              mesh->attributes_for_write().lookup_or_add_for_write_only_span<float3>(
+                  "rest_position", bke::AttrDomain::Point);
+          writer.span.copy_from(mesh->vert_positions());
+          writer.finish();
+        }
+      }
+      /* The mass comes from the volume of the tetrahedra, not from a uniform point mass. */
+      const float mass_input = params.get_input<float>("Mass"_ustr);
+      if (mass_input <= 0.0f) {
+        if (!write_soft_body_mass(geometry, params.get_input<float>("Density"_ustr))) {
+          params.error_message_add(
+              NodeWarningType::Warning,
+              TIP_("A soft body needs a tetrahedral mesh (four cornered faces with a "
+                   "`rest_volume` attribute, e.g. from the `Tetrahedralize` node); the mass of "
+                   "the points is left uniform"));
+        }
+      }
       break;
     }
   }

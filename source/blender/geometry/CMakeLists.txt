@@ -141,6 +141,7 @@ set(SRC
   xpbd/GEO_xpbd_constraint_set.hh
   xpbd/GEO_xpbd_constraint_set_params.hh
   xpbd/GEO_xpbd_constraint_set_templated.hh
+  xpbd/GEO_xpbd_constraint_volume.hh
   xpbd/GEO_xpbd_geometry_ref.hh
   xpbd/GEO_xpbd_updater_gauss_seidel.hh
   xpbd/GEO_xpbd_updater_velocity.hh

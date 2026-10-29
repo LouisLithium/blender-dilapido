@@ -16,6 +16,7 @@
 #include "BKE_pointcloud.hh"
 
 #include "BLI_math_geom.h"
+#include "BLI_set.hh"
 #include "BLI_stack.hh"
 #include "BLI_string_utf8.h"
 #include "BLI_virtual_array_range_spans.hh"
@@ -34,6 +35,7 @@
 #include "GEO_xpbd_constraint_pin_rotation.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
+#include "GEO_xpbd_constraint_volume.hh"
 #include "GEO_xpbd_fluid.hh"
 
 #include "NOD_geo_tag_filter.hh"
@@ -97,6 +99,7 @@ static NestedBundleTypePtr make_world_type()
   types.append(PinPositionBundle::get_bundle_type());
   types.append(PinRotationBundle::get_bundle_type());
   types.append(EdgeLengthConstraintBundle::get_bundle_type());
+  types.append(VolumeConstraintBundle::get_bundle_type());
   types.append(CrossEdgeLengthConstraintBundle::get_bundle_type());
   types.append(FluidBundle::get_bundle_type());
 
@@ -281,6 +284,39 @@ struct CrossEdgeLengthConstraintUsage {
   Vector<float> distances;
   Vector<float> compliances;
   MutableSpan<float> lambdas;
+
+  xpbd::ConstraintColoring coloring;
+};
+
+/** One volume constraint per four cornered face of a tetrahedral mesh. */
+struct VolumeConstraint {
+  std::string path;
+  float compliance = 0.0f;
+  /** Compliance of the distance constraints on the six edges of every element. */
+  float edge_compliance = 0.0f;
+  float error_threshold = 1e-3f;
+};
+struct VolumeConstraintUsage {
+  /** Index of the corresponding #VolumeConstraint. */
+  int constraint_i;
+  /** Four point indices per element (only the elements that are not slivers). */
+  GroupedSpan<int> elements;
+  Vector<int> element_points;
+  Array<int> element_offsets;
+  Vector<float> rest_volumes;
+  /** Materialized compliance per element, the constraint set holds a span into this. */
+  Vector<float> compliances;
+  MutableSpan<float> lambdas;
+
+  /**
+   * The six edges of every element (deduplicated), which get distance constraints as well: a
+   * volume constraint alone does not resist shear. The vectors have to outlive the constraint sets,
+   * which only hold spans.
+   */
+  Vector<int2> edge_points;
+  Vector<float> edge_rest_lengths;
+  Vector<float> edge_compliances;
+  MutableSpan<float> edge_lambdas;
 
   xpbd::ConstraintColoring coloring;
 };
@@ -477,6 +513,7 @@ struct GeometryData {
   Vector<PinPositionConstraintUsage> pin_position_constraints;
   Vector<PinRotationConstraintUsage> pin_rotation_constraints;
   Vector<EdgeLengthConstraintUsage> edge_length_constraints;
+  Vector<VolumeConstraintUsage> volume_constraints;
   Vector<CrossEdgeLengthConstraintUsage> cross_edge_length_constraints;
   Vector<MeshColliderUsage> mesh_colliders;
   Vector<RodStretchShearConstraintUsage> rod_stretch_shear_constraints;
@@ -726,6 +763,7 @@ struct ConstraintsInfo {
   Vector<PinPositionConstraint> pin_position_constraints;
   Vector<PinRotationConstraint> pin_rotation_constraints;
   Vector<EdgeLengthConstraint> edge_length_constraints;
+  Vector<VolumeConstraint> volume_constraints;
   Vector<CrossEdgeLengthConstraint> cross_edge_length_constraints;
   Vector<FluidConstraint> fluid_constraints;
 };
@@ -839,6 +877,7 @@ class XpbdSolverStep {
     this->gather_from_world__stretch_shear_constraints();
     this->gather_from_world__bend_twist_constraints();
     this->gather_from_world__edge_length_constraints();
+    this->gather_from_world__volume_constraints();
     this->gather_from_world__cross_edge_length_constraints();
     this->gather_from_world__damping();
     this->gather_from_world__pin_positions();
@@ -867,7 +906,39 @@ class XpbdSolverStep {
       phase_start = now();
     }
 
+    if (std::getenv("XPBD_DEBUG_NAN") != nullptr) {
+      int static_constraints = 0;
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        static_constraints += int(geometries_.data[data_key_i]->static_constraints.size());
+      }
+      printf("XPBD_DEBUG_NAN do_step: geometries %d chunks %d substeps %d iterations %d dt %g "
+             "chunk_path %d static_constraints %d\n",
+             int(geometries_.geometry_sets.size()),
+             int(geometries_.chunks.size()),
+             substeps_,
+             constraint_iterations_,
+             double(sub_delta_time_),
+             this->support_chunk_simulation() ? 1 : 0,
+             static_constraints);
+    }
     result_ = this->do_simulation();
+    if (std::getenv("XPBD_DEBUG_NAN") != nullptr) {
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        bke::AttributeAccessor attributes = geo_data.attributes;
+        const VArray<float3> positions = *attributes.lookup_or_default<float3>(
+            "position", AttrDomain::Point, float3(0.0f));
+        int bad = 0;
+        for (const int i : positions.index_range()) {
+          const float3 &p = positions[i];
+          bad += (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) ? 0 : 1;
+        }
+        printf("XPBD_DEBUG_NAN after do_step: geometry %d has %d non finite positions of %d\n",
+               data_key_i,
+               bad,
+               int(positions.size()));
+      }
+    }
 
     if (profile) {
       ms_simulate = ms_since(phase_start);
@@ -2426,6 +2497,193 @@ class XpbdSolverStep {
     }
   }
 
+  /**
+   * Volume constraints of tetrahedral meshes: every face of the mesh is one element, its four
+   * corners are the four points and the `rest_volume` face attribute is the rest volume (that is
+   * what the `Tetrahedralize` node writes).
+   */
+  void gather_from_world__volume_constraints()
+  {
+    TLS &tls = tls_.local();
+    const Span<std::string> paths = nested_bundle_paths_.lookup_as(VolumeConstraintBundle::name);
+    for (const StringRef path : paths) {
+      const Bundle &bundle = **world_.lookup_path_ptr<BundlePtr>(path);
+      VolumeConstraint constraint;
+      constraint.path = path;
+      constraint.compliance = bundle.lookup<float>(*BundleKey::from_str("compliance"))
+                                  .value_or(0.0f);
+      constraint.edge_compliance = bundle.lookup<float>(*BundleKey::from_str("edge_compliance"))
+                                       .value_or(0.0f);
+      constraint.error_threshold = bundle.lookup<float>(*BundleKey::from_str("error_threshold"))
+                                       .value_or(1e-3f);
+      const int constraint_i = constraints_.volume_constraints.append_and_get_index(
+          std::move(constraint));
+
+      for (const int data_key_i : geometries_.data.index_range()) {
+        const DataKey &data_key = geometries_.data_keys[data_key_i];
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        if (data_key.type != GeometryComponent::Type::Mesh) {
+          continue;
+        }
+        if (this->effector_applies_to_geometry(path, bundle, data_key_i)) {
+          VolumeConstraintUsage constraint_usage;
+          constraint_usage.constraint_i = constraint_i;
+          geo_data.volume_constraints.append(std::move(constraint_usage));
+        }
+      }
+    }
+
+    for (const int data_key_i : geometries_.data.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      for (VolumeConstraintUsage &constraint_usage : geo_data.volume_constraints) {
+        const VolumeConstraint &constraint =
+            constraints_.volume_constraints[constraint_usage.constraint_i];
+        const GeometrySetData &geo_set_data =
+            geometries_.geometry_sets[geometries_.data_keys[data_key_i].geo_bundle_i];
+        const Mesh &mesh = *geo_set_data.geometry.get_mesh();
+
+        const OffsetIndices<int> faces = mesh.faces();
+        const VArray<float> rest_volumes = *geo_data.attributes.lookup<float>("rest_volume",
+                                                                             AttrDomain::Face);
+        bool all_four_cornered = !faces.is_empty();
+        for (const int face_i : IndexRange(faces.size())) {
+          if (faces[face_i].size() != 4) {
+            all_four_cornered = false;
+            break;
+          }
+        }
+        if (!all_four_cornered || !rest_volumes) {
+          this->report(NodeWarningType::Warning,
+                       fmt::format("Volume constraint \"{}\" needs a tetrahedral mesh (four "
+                                   "cornered faces with a `rest_volume` attribute, e.g. from the "
+                                   "`Tetrahedralize` node), but \"{}\" is not one",
+                                   constraint.path,
+                                   geo_set_data.path));
+          continue;
+        }
+
+        /* A surface snap can leave slivers behind (a curved surface forces the lattice nodes of an
+         * element onto a plane). Their volume gradient is tiny, so their volume constraint is
+         * ill-conditioned and destabilizes the whole mesh; they are left out, their edges still
+         * keep them attached. */
+        const VArray<float3> rest_positions = this->lookup_attribute_optional<float3>(
+            data_key_i, "rest_position", AttrDomain::Point);
+        const VArraySpan<float3> rest_positions_span = rest_positions;
+        const Span<int> corner_verts = mesh.corner_verts();
+        Vector<int> &element_points = constraint_usage.element_points;
+        element_points.reserve(faces.size() * 4);
+        for (const int face_i : IndexRange(faces.size())) {
+          const IndexRange face = faces[face_i];
+          if (rest_positions && !this->is_valid_element(face, corner_verts, rest_positions_span,
+                                                       rest_volumes[face_i]))
+          {
+            continue;
+          }
+          for (const int corner : face) {
+            element_points.append(corner_verts[corner]);
+          }
+          constraint_usage.rest_volumes.append(rest_volumes[face_i]);
+        }
+        const int element_num = int(constraint_usage.rest_volumes.size());
+        if (element_num == 0) {
+          continue;
+        }
+        constraint_usage.element_offsets.reinitialize(element_num + 1);
+        offset_indices::fill_constant_group_size(
+            4, 0, constraint_usage.element_offsets.as_mutable_span());
+        constraint_usage.elements = GroupedSpan<int>(
+            OffsetIndices<int>(constraint_usage.element_offsets.as_span()),
+            element_points.as_span());
+        constraint_usage.compliances.reinitialize(element_num);
+        constraint_usage.compliances.fill(constraint.compliance);
+        constraint_usage.lambdas = tls.allocator.allocate_array<float>(element_num);
+        constraint_usage.lambdas.fill(0.0f);
+
+        auto &constraint_set = tls.scope.construct<xpbd::VolumeConstraintSet>(
+            data_key_i,
+            constraint_usage.elements,
+            constraint_usage.rest_volumes.as_span(),
+            constraint_usage.compliances.as_span(),
+            error_scale_from_threshold(constraint.error_threshold),
+            constraint_usage.lambdas);
+        xpbd::ConstraintColoring coloring = constraint_set.color_constraints(tls.allocator);
+        geo_data.static_constraints.append({&constraint_set, std::move(coloring)});
+
+        /* A volume constraint alone does not resist shear: a tetrahedron keeps its volume while it
+         * flattens into a pancake (a cube of jelly would collapse into a sheet on the floor). The
+         * six edges of every element are what makes the material hold its shape, which is the pair
+         * of constraints that a position based soft body uses (Macklin et al. 2016). They need the
+         * rest pose, which `Init Puncliga Data` stores for exactly this reason. */
+        if (!rest_positions) {
+          this->report(
+              NodeWarningType::Warning,
+              fmt::format("The soft body \"{}\" has no `rest_position` attribute, so its elements "
+                          "only get their volume constraint (a `Init Puncliga Data` node with the "
+                          "type set to Soft Body writes it)",
+                          geo_set_data.path));
+          continue;
+        }
+
+        Vector<int2> &edges = constraint_usage.edge_points;
+        Vector<float> &edge_rest_lengths = constraint_usage.edge_rest_lengths;
+        Set<int64_t> edge_set;
+        edges.reserve(element_num * 3);
+        edge_rest_lengths.reserve(element_num * 3);
+        for (const int element_i : IndexRange(element_num)) {
+          const Span<int> element = constraint_usage.elements[element_i];
+          for (int i = 0; i < 4; i++) {
+            for (int j = i + 1; j < 4; j++) {
+              const int v0 = element[i];
+              const int v1 = element[j];
+              const int64_t key = (int64_t(std::min(v0, v1)) << 32) | int64_t(std::max(v0, v1));
+              if (!edge_set.add(key)) {
+                continue;
+              }
+              edges.append({v0, v1});
+              edge_rest_lengths.append(math::distance(rest_positions[v0], rest_positions[v1]));
+            }
+          }
+        }
+        constraint_usage.edge_compliances.reinitialize(edges.size());
+        constraint_usage.edge_compliances.fill(constraint.edge_compliance);
+        constraint_usage.edge_lambdas = tls.allocator.allocate_array<float>(edges.size());
+        constraint_usage.edge_lambdas.fill(0.0f);
+
+        auto &edge_set_object = tls.scope.construct<xpbd::DistanceConstraintSet>(
+            data_key_i,
+            edges.as_span(),
+            edge_rest_lengths.as_span(),
+            constraint_usage.edge_compliances.as_span(),
+            error_scale_from_threshold(constraint.error_threshold),
+            constraint_usage.edge_lambdas);
+        xpbd::ConstraintColoring edge_coloring = edge_set_object.color_constraints(tls.allocator);
+        geo_data.static_constraints.append({&edge_set_object, std::move(edge_coloring)});
+      }
+    }
+  }
+
+  /** Whether a tetrahedron is not too flat to carry a volume constraint. */
+  static bool is_valid_element(const IndexRange face,
+                               const Span<int> corner_verts,
+                               const Span<float3> rest_positions,
+                               const float rest_volume) noexcept
+  {
+    if (face.size() != 4 || rest_volume <= 0.0f) {
+      return false;
+    }
+    const float3 &p0 = rest_positions[corner_verts[face[0]]];
+    const float3 &p1 = rest_positions[corner_verts[face[1]]];
+    const float3 &p2 = rest_positions[corner_verts[face[2]]];
+    const float3 &p3 = rest_positions[corner_verts[face[3]]];
+    const float longest = std::max(
+        std::max(std::max(math::distance(p0, p1), math::distance(p0, p2)),
+                 std::max(math::distance(p0, p3), math::distance(p1, p2))),
+        std::max(math::distance(p1, p3), math::distance(p2, p3)));
+    /* A well shaped element of this lattice decomposition has V = L^3 / 31; anything below a
+     * thousandth of L^3 is a sliver. */
+    return rest_volume > 1e-3f * longest * longest * longest;
+  }
+
   void gather_from_world__cross_edge_length_constraints()
   {
     TLS &tls = tls_.local();
@@ -2946,6 +3204,30 @@ class XpbdSolverStep {
     int total_error_count = 0;
   };
 
+  /** Debug helper: reports the first non finite position of any geometry (XPBD_DEBUG_NAN). */
+  static void debug_check_finite(const char *label, const Span<xpbd::GeometryRef> refs)
+  {
+    if (std::getenv("XPBD_DEBUG_NAN") == nullptr) {
+      return;
+    }
+    for (const int geo_i : refs.index_range()) {
+      const Span<float3> positions = refs[geo_i].positions;
+      for (const int point_i : positions.index_range()) {
+        const float3 &p = positions[point_i];
+        if (!(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))) {
+          printf("XPBD_DEBUG_NAN %s: geo %d point %d = (%g %g %g)\n",
+                 label,
+                 geo_i,
+                 point_i,
+                 double(p.x),
+                 double(p.y),
+                 double(p.z));
+          return;
+        }
+      }
+    }
+  }
+
   Result do_simulation()
   {
     this->prepare_solver_geometry_refs();
@@ -2975,6 +3257,9 @@ class XpbdSolverStep {
           mark = std::chrono::steady_clock::now();
           this->simulate__gather_dynamic_constraints__chunk(substep, chunk_i, solver_refs_i);
           this->simulate__reset_forces__chunk(chunk_i);
+          /* The multiplier of every constraint is reset once per substep, including the sets that
+           * are shared by all chunks (a volume or cross edge constraint is not tied to a chunk). */
+          this->simulate__reset_forces();
           if (prof) {
             prof_constraints_ += since(mark);
             mark = std::chrono::steady_clock::now();
@@ -2982,10 +3267,12 @@ class XpbdSolverStep {
 
           const Span<xpbd::GeometryRef> solver_refs = geometries_.solver_refs[solver_refs_i];
           xpbd::ConstraintSetParams solve_params{solver_refs, sub_delta_time_};
+          debug_check_finite("chunk after gather", solver_refs);
           for ([[maybe_unused]] const int iter_i : IndexRange(constraint_iterations_)) {
             xpbd::GaussSeidelUpdater updater{solver_refs};
             this->simulate__position_solve__single_iteration__chunk(
                 chunk_i, solve_params, updater);
+            debug_check_finite("chunk after iteration", solver_refs);
             chunk_error_squared = updater.total_error_squared();
             chunk_error_count = updater.total_error_count();
           }
@@ -4360,6 +4647,24 @@ class XpbdSolverStep {
     for (const int data_key_i : geometries_.data_keys.index_range()) {
       const GeometryData &geo_data = *geometries_.data[data_key_i];
       for (const ConstraintWithColoring &constraint : geo_data.static_constraints) {
+        if (std::getenv("XPBD_DEBUG_NAN") != nullptr) {
+          for (const int geo_i : constraint.constraint->get_affected_geo_indices()) {
+            const Span<float3> positions = solver_refs[geo_i].positions;
+            for (const int point_i : positions.index_range()) {
+              const float3 &p = positions[point_i];
+              if (!(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))) {
+                printf("XPBD_DEBUG_NAN before \"%s\": geo %d point %d = (%g %g %g)\n",
+                       constraint.constraint->debug_name().c_str(),
+                       geo_i,
+                       point_i,
+                       double(p.x),
+                       double(p.y),
+                       double(p.z));
+                break;
+              }
+            }
+          }
+        }
         for (const int color_i : constraint.coloring.colors.index_range()) {
           const IndexMask &mask = constraint.coloring.colors[color_i];
           threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {

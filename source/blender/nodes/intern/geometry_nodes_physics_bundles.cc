@@ -166,6 +166,34 @@ const FlatBundleTypePtr &EdgeLengthConstraintBundle::get_bundle_type()
   return bundle_type;
 }
 
+const FlatBundleTypePtr &VolumeConstraintBundle::get_bundle_type()
+{
+  static const FlatBundleTypePtr bundle_type = []() {
+    FlatBundleTypeBuilder b(VolumeConstraintBundle::name);
+    add_filter(b);
+    b.add<decl::Float>("compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description(
+            "Softness of the volume constraint. Zero keeps the volume of the elements exactly, "
+            "larger values let them compress");
+    b.add<decl::Float>("edge_compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description(
+            "Softness of the distance constraints on the six edges of every element, which is "
+            "what resists shear (a volume constraint alone lets an element flatten)");
+    b.add<decl::Float>("error_threshold"_ustr)
+        .default_value(1e-3f)
+        .min(1e-5f)
+        .description("Relative error below which the constraints count as solved");
+    const FlatBundleTypePtr bundle_type = b.build();
+    BundleTypeRegistry::register_type(bundle_type);
+    return bundle_type;
+  }();
+  return bundle_type;
+}
+
 const FlatBundleTypePtr &CrossEdgeLengthConstraintBundle::get_bundle_type()
 {
   static const FlatBundleTypePtr bundle_type = []() {
