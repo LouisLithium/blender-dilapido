@@ -184,6 +184,8 @@ static LatticePoints get_lattice_points(const GeometrySet &geometry)
 /** The local transform of one target point: move the rest centroid onto the deformed one. */
 struct LocalTransform {
   float3x3 linear;
+  /** The same transform for normals: the rotation part, or the inverse transpose of #linear. */
+  float3x3 normal;
   float3 rest_center;
   float3 deformed_center;
 
@@ -409,7 +411,8 @@ static LocalTransform fit_transform(const Span<float3> rest_offsets,
     rest_norm += w * math::length_squared(r);
   }
 
-  LocalTransform transform{float3x3::identity(), rest_center, deformed_center};
+  LocalTransform transform{
+      float3x3::identity(), float3x3::identity(), rest_center, deformed_center};
 
   /* A single point, or all of them on top of each other: only a translation can be fit. */
   if (!(rest_norm > 1e-12f)) {
@@ -438,7 +441,21 @@ static LocalTransform fit_transform(const Span<float3> rest_offsets,
       return transform;
     }
     transform.linear = to_matrix3x3(linear);
-
+    /* Normals follow the inverse transpose: a shear or a one sided scale would otherwise turn them
+     * the wrong way. */
+    Matrix3 inverse_linear;
+    if (invert_matrix3(linear, inverse_linear)) {
+      Matrix3 transposed{};
+      for (int row = 0; row < 3; row++) {
+        for (int column = 0; column < 3; column++) {
+          transposed[row][column] = inverse_linear[column][row];
+        }
+      }
+      transform.normal = to_matrix3x3(transposed);
+    }
+    else {
+      transform.normal = transform.linear;
+    }
     return transform;
   }
 
@@ -446,6 +463,7 @@ static LocalTransform fit_transform(const Span<float3> rest_offsets,
   best_fit_rotation(covariance, rotation);
   if (mode == DeformMode::Rigid) {
     transform.linear = to_matrix3x3(rotation);
+    transform.normal = transform.linear;
     return transform;
   }
 
@@ -462,6 +480,8 @@ static LocalTransform fit_transform(const Span<float3> rest_offsets,
     }
   }
   transform.linear = to_matrix3x3(scaled);
+  /* A uniform scale does not change the direction of a normal. */
+  transform.normal = to_matrix3x3(rotation);
   return transform;
 }
 /** The island (connected component) of every vertex of the rest lattice, over its edges. */
@@ -782,14 +802,18 @@ static void node_geo_exec(GeoNodeExecParams params)
                                falloff,
                                mode);
 
+  /**
+   * Deforms one array of points. \a r_normal_matrices is filled with the transform of every point
+   * when it is not empty (the mesh path needs it for the custom normals).
+   */
   const auto deform = [&](const MutableSpan<float3> positions,
                           const MutableSpan<float3> handle_left,
-                          const MutableSpan<float3> handle_right) {
+                          const MutableSpan<float3> handle_right,
+                          const MutableSpan<float3x3> r_normal_matrices) {
     if (positions.is_empty()) {
       return;
     }
-    const int candidates_num = math::min(lattice_num,
-                                         math::max(max_points, max_candidates));
+    const int candidates_num = math::min(lattice_num, math::max(max_points, max_candidates));
     threading::parallel_for(positions.index_range(), 1024, [&](const IndexRange range) {
       Array<KDTreeNearest<float3>> candidates(candidates_num);
       for (const int i : range) {
@@ -806,15 +830,53 @@ static void node_geo_exec(GeoNodeExecParams params)
           handle_left[i] = apply(handle_left[i]);
           handle_right[i] = apply(handle_right[i]);
         }
+        if (!r_normal_matrices.is_empty()) {
+          r_normal_matrices[i] = transform.normal;
+        }
       }
     });
   };
 
   if (Mesh *mesh = geometry.get_mesh_for_write()) {
-    deform(mesh->vert_positions_for_write(), {}, {});
-  }
-  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
-    deform(pointcloud->positions_for_write(), {}, {});
+    const bool has_custom_normals = mesh->attributes().contains("custom_normal");
+    Array<float3x3> normal_matrices(has_custom_normals ? mesh->verts_num : 0);
+    deform(mesh->vert_positions_for_write(), {}, {}, normal_matrices);
+    /* Writing the positions through the raw span does not tell the mesh that its derived data (the
+     * normals above all) is out of date, so without this the deformed mesh is shaded with the
+     * normals of its rest pose. */
+    mesh->tag_positions_changed();
+
+    if (has_custom_normals) {
+      /* The generated normals are recalculated now, but a custom split normal set keeps whatever the
+       * artist authored. It is stored as the offset of the normal relative to the face, so the
+       * deformation carries it along by itself when the face turns; only the absolute form (what an
+       * importer or an older file writes) has to be rotated with its vertex. */
+      const GroupedSpan<int> vert_to_corner = mesh->vert_to_corner_map();
+      bke::MutableAttributeAccessor attributes = mesh->attributes_for_write();
+      bke::SpanAttributeWriter<float3> custom_normals = attributes.lookup_or_add_for_write_span<float3>(
+          "custom_normal", AttrDomain::Corner);
+      if (!custom_normals.span.is_empty()) {
+        threading::parallel_for(IndexRange(mesh->verts_num), 1024, [&](const IndexRange range) {
+          for (const int i : range) {
+            const float3x3 &matrix = normal_matrices[i];
+            for (const int corner : vert_to_corner[i]) {
+              const float3 rest_normal = custom_normals.span[corner];
+              const float3 rotated = matrix * rest_normal;
+              const float3 mixed = blend >= 1.0f ? rotated :
+                                                     math::interpolate(rest_normal, rotated, blend);
+              const float length = math::length(mixed);
+              if (length > 0.0f) {
+                custom_normals.span[corner] = mixed / length;
+              }
+            }
+          }
+        });
+      }
+      custom_normals.finish();
+    }
+  }  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
+    deform(pointcloud->positions_for_write(), {}, {}, {});
+    pointcloud->tag_positions_changed();
   }
   if (Curves *curves_id = geometry.get_curves_for_write()) {
     bke::CurvesGeometry &curves = curves_id->geometry.wrap();
@@ -825,13 +887,14 @@ static void node_geo_exec(GeoNodeExecParams params)
           "handle_left", AttrDomain::Point);
       bke::SpanAttributeWriter<float3> handle_right =
           attributes.lookup_or_add_for_write_span<float3>("handle_right", AttrDomain::Point);
-      deform(curves.positions_for_write(), handle_left.span, handle_right.span);
+      deform(curves.positions_for_write(), handle_left.span, handle_right.span, {});
       handle_left.finish();
       handle_right.finish();
     }
     else {
-      deform(curves.positions_for_write(), {}, {});
+      deform(curves.positions_for_write(), {}, {}, {});
     }
+    curves.tag_positions_changed();
   }
 
   kdtree_free(tree);
