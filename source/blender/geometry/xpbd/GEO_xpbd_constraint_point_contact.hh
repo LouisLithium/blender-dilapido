@@ -89,6 +89,14 @@ class PointContactConstraintSet : public TemplatedConstraintSet<PointContactCons
   /** Global point index -> geometry index and index within that geometry. */
   Span<int> point_geo_;
   Span<int> point_local_;
+  /**
+   * Inverse mass of every point, zero for a hard pinned point: a pin is an infinitely stiff
+   * constraint, so a contact against it must move the *other* point only. Using the mass of the
+   * pinned point instead leaves half of the correction to be undone by the pin in the next
+   * iteration, which makes a pinned sheet soft under a load (measured: a soft body with water on top
+   * was pressed through a fully pinned cloth).
+   */
+  Span<float> inv_masses_;
   /* Scale factor for residual error. */
   float error_scale_;
   MutableSpan<float> lambdas_;
@@ -102,6 +110,7 @@ class PointContactConstraintSet : public TemplatedConstraintSet<PointContactCons
                             const Span<float> compliances,
                             const Span<int> point_geo,
                             const Span<int> point_local,
+                            const Span<float> inv_masses,
                             const float error_scale,
                             MutableSpan<float> lambdas)
       : TemplatedConstraintSet<PointContactConstraintSet>(point_pairs.size(), affected_geo_indices),
@@ -110,6 +119,7 @@ class PointContactConstraintSet : public TemplatedConstraintSet<PointContactCons
         compliances_(compliances),
         point_geo_(point_geo),
         point_local_(point_local),
+        inv_masses_(inv_masses),
         error_scale_(error_scale),
         lambdas_(lambdas)
   {
@@ -136,8 +146,8 @@ class PointContactConstraintSet : public TemplatedConstraintSet<PointContactCons
     const PointContactResult result = evaluate_point_contact(
         params.position(geo_i0, point_i0),
         params.position(geo_i1, point_i1),
-        params.inv_mass(geo_i0, point_i0),
-        params.inv_mass(geo_i1, point_i1),
+        inv_masses_[global_i0],
+        inv_masses_[global_i1],
         min_distances_[constraint_i],
         compliances_[constraint_i] * params.compliance_term_factor,
         lambdas_[constraint_i]);

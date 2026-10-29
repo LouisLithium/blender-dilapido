@@ -631,6 +631,8 @@ struct SelfContacts {
   Vector<int> point_geo;
   Vector<int> point_local;
   Vector<float> point_radius;
+  /** Inverse mass per point; zero for a hard pinned point (see the constraint set). */
+  Vector<float> point_inv_mass;
   /** Concatenated positions and rest positions of all those points. */
   Array<float3> positions;
   Array<float3> rest_positions;
@@ -647,6 +649,13 @@ struct SelfContacts {
   Array<float> min_distances;
   Array<float> compliances;
   Array<float> lambdas;
+  /**
+   * Connected island of every point (union-find over the bonds). The rest distance filter below is
+   * only valid inside one island: two points of the same sheet that lay next to each other in the
+   * rest pose must not push each other apart, but two separate sheets must collide even if they were
+   * modeled a millimeter apart (a stack of cloth layers).
+   */
+  Array<int> island_ids;
   xpbd::ConstraintColoring coloring;
   std::optional<xpbd::PointContactConstraintSet> constraint_set;
 
@@ -4306,10 +4315,34 @@ class XpbdSolverStep {
       contacts.geometry_start.append(start);
       contacts.geometry_size.append(size);
       contacts.affected_geo_indices.append(data_key_i);
+      const Span<float> inv_masses = geo_data.inv_masses;
+      /**
+       * A pinned point is a boundary condition for the contacts: if it keeps its mass, the pin
+       * undoes its half of every contact correction in the next iteration, and a heavy stack creeps
+       * through a pinned sheet (measured: a soft body with water on top went through a fully pinned
+       * cloth in five frames with the default four iterations, and held with ten). A pin that is
+       * already effectively rigid has to be treated like an infinite mass here, which costs nothing
+       * because the pin does not move anyway.
+       */
+      Array<bool> rigid_pin(size, false);
+      for (const PinPositionConstraintUsage &usage : geo_data.pin_position_constraints) {
+        for (const int pin_i : usage.points.index_range()) {
+          const int point_i = usage.points[pin_i];
+          if (!IndexRange(size).contains(point_i)) {
+            continue;
+          }
+          const float compliance_term = usage.compliances[pin_i] * substep_compliance_factor_;
+          if (compliance_term < 0.01f * inv_masses[point_i]) {
+            rigid_pin[point_i] = true;
+          }
+        }
+      }
       for (const int point_i : IndexRange(size)) {
         contacts.point_geo.append(data_key_i);
         contacts.point_local.append(point_i);
         contacts.point_radius.append(radii[point_i]);
+        const bool pinned = geo_data.is_hard_pinned[point_i] || rigid_pin[point_i];
+        contacts.point_inv_mass.append(pinned ? 0.0f : inv_masses[point_i]);
       }
 
       /* Rest positions of the world geometry are already in the space of the solver (the world is
@@ -4370,6 +4403,30 @@ class XpbdSolverStep {
     contacts.positions.reinitialize(points_num);
     contacts.rest_positions.reinitialize(points_num);
     contacts.rest_positions.as_mutable_span().copy_from(rest_positions_combined.as_span());
+
+    /* Connected islands, so the rest distance filter only applies to points that the material
+     * actually connects (see SelfContacts::island_ids). */
+    contacts.island_ids.reinitialize(points_num);
+    for (const int point_i : IndexRange(points_num)) {
+      contacts.island_ids[point_i] = point_i;
+    }
+    const auto find_island = [&](int point_i) {
+      while (contacts.island_ids[point_i] != point_i) {
+        contacts.island_ids[point_i] = contacts.island_ids[contacts.island_ids[point_i]];
+        point_i = contacts.island_ids[point_i];
+      }
+      return point_i;
+    };
+    for (const int2 &bond : bonds) {
+      const int root0 = find_island(bond[0]);
+      const int root1 = find_island(bond[1]);
+      if (root0 != root1) {
+        contacts.island_ids[root0] = root1;
+      }
+    }
+    for (const int point_i : IndexRange(points_num)) {
+      contacts.island_ids[point_i] = find_island(point_i);
+    }
 
     /* Build the per point list of connected points (CSR, sorted for a binary search). */
     Array<int> counts(points_num, 0);
@@ -4447,6 +4504,7 @@ class XpbdSolverStep {
 
     const Span<float3> positions = contacts.positions;
     const Span<float3> rest_positions = contacts.rest_positions;
+    const Span<int> island_ids = contacts.island_ids;
     const Span<float> radii = contacts.point_radius;
     const float thickness = contact_thickness_;
     const float cell_sq = cell_size * cell_size;
@@ -4465,11 +4523,13 @@ class XpbdSolverStep {
       if (self_contact_is_bonded(contacts, point_i0, point_i1)) {
         return false;
       }
-      /* Points that are already that close in the rest pose are neighbors in a way the topology
-       * does not express (the second ring of a finely tessellated sheet, the inside of a fold of
-       * the rest mesh); they would push each other apart forever. */
-      if (math::length_squared(rest_positions[point_i0] - rest_positions[point_i1]) <
-          probe * probe)
+      /* Inside one island, points that are already that close in the rest pose are neighbors in a
+       * way the topology does not express (the third ring of a finely tessellated sheet); they
+       * would push each other apart forever. Two *different* islands are never filtered: a stack of
+       * cloth layers has to collide even if the layers were modeled a millimeter apart. */
+      if (island_ids[point_i0] == island_ids[point_i1] &&
+          math::length_squared(rest_positions[point_i0] - rest_positions[point_i1]) <
+              probe * probe)
       {
         return false;
       }
@@ -4521,10 +4581,15 @@ class XpbdSolverStep {
     });
 
     if (std::getenv("XPBD_SELF_DEBUG") != nullptr) {
-      printf("XPBD_SELF points %d bonds %d pairs %d\n",
+      int pinned_num = 0;
+      for (const float inv_mass : contacts.point_inv_mass) {
+        pinned_num += inv_mass == 0.0f ? 1 : 0;
+      }
+      printf("XPBD_SELF points %d bonds %d pairs %d pinned %d\n",
              points_num,
              int(contacts.bond_indices.size()),
-             pairs_num);
+             pairs_num,
+             pinned_num);
     }
     if (pairs_num == 0) {
       return;
@@ -4544,6 +4609,7 @@ class XpbdSolverStep {
                                     contacts.compliances.as_span(),
                                     contacts.point_geo.as_span(),
                                     contacts.point_local.as_span(),
+                                    contacts.point_inv_mass.as_span(),
                                     error_scale_from_threshold(0.01f),
                                     contacts.lambdas.as_mutable_span());
   }
