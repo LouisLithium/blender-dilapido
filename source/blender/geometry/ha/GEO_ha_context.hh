@@ -35,8 +35,19 @@ bool ha_gpu_available();
 const char *ha_gpu_backend_name();
 
 /**
- * Makes sure a GPU context is active for the current scope. When there is no active context the
+ * Makes sure a GPU context is active for the current scope. When there is no context available the
  * work is skipped (dispatch would assert), so always check #is_valid().
+ *
+ * All device work of this module runs in one **dedicated context** (see #ha_context), never in the
+ * draw manager's context: shaders and storage buffers are per context, and an evaluation that ran
+ * in the main thread one frame and on a depsgraph worker the next used to mix both, which crashes
+ * (measured: `EXCEPTION_ACCESS_VIOLATION` inside the lazy-function executor and inside the GL
+ * readback in the GUI). The context is created lazily on the main thread and released right after,
+ * so any thread can activate it on demand; the whole dispatch sequence is serialized.
+ *
+ * Guards nest for free on the same thread: the outer one owns the context, the inner ones only
+ * count. `BLENDER_HA_DRAW_CONTEXT=1` restores the old "use the thread's active context" behaviour
+ * for A/B testing.
  */
 class HaContextGuard {
  public:
@@ -51,13 +62,54 @@ class HaContextGuard {
   }
 
  private:
+  /** Fails when the current context is not the one our GPU objects live in. */
+  bool accept_current_context();
+
   bool valid_ = false;
   bool enabled_by_us_ = false;
   bool owning_mutex_ = false;
+  bool nested_ = false;
+  /** The draw manager's context was borrowed for this scope (see #DRW_gpu_context_try_enable). */
+  bool borrowed_draw_context_ = false;
 };
 
-/** A storage buffer holding `float` elements (used for interleaved positions: 3 per element). */
-class HaBuffer {
+/* -------------------------------------------------------------------- */
+/** \name Backend scope
+ *
+ * An `HW Accelerate` zone declares that everything inside it should run on the compute backend.
+ * The zone body is still evaluated by the lazy-function executor on the CPU, so the request is
+ * handed to the nodes through a thread-local scope: while the zone body runs, any node that
+ * supports a GPU path (for example the XPBD solver) can ask #ha_scope_allows_gpu() and dispatch
+ * itself on the device. Nested zones push/pop, so the innermost zone wins.
+ * \{ */
+
+enum class HaScopeBackend {
+  None = 0,
+  Auto,
+  Strict,
+  ForceCpu,
+};
+
+class HaScope {
+ public:
+  explicit HaScope(HaScopeBackend backend);
+  ~HaScope();
+  HaScope(const HaScope &) = delete;
+  HaScope &operator=(const HaScope &) = delete;
+
+ private:
+  bool pushed_ = false;
+};
+
+/** Backend requested by the innermost zone on this thread, #HaScopeBackend::None outside of zones. */
+HaScopeBackend ha_scope_backend();
+
+/** True when the current evaluation may use the GPU (i.e. inside a zone that is not `Force CPU`). */
+bool ha_scope_allows_gpu();
+
+/** \} */
+
+/** A storage buffer holding `float` elements (used for interleaved positions: 3 per element). */class HaBuffer {
  public:
   HaBuffer() = default;
   ~HaBuffer();
@@ -67,12 +119,57 @@ class HaBuffer {
   /** Allocates (or reuses) a buffer for exactly \a elements floats. */
   bool ensure(int64_t elements);
   void upload(Span<float> data);
-  void download(MutableSpan<float> r_data);
+  void download(MutableSpan<float> r_data) const;
   void free();
 
   bool is_valid() const
   {
     return buf_ != nullptr;
+  }
+
+  /** Number of floats the buffer can hold. */
+  int64_t size() const
+  {
+    return elements_;
+  }
+
+  gpu::StorageBuf *buf() const
+  {
+    return buf_;
+  }
+
+ private:
+  gpu::StorageBuf *buf_ = nullptr;
+  int64_t elements_ = 0;
+};
+
+/**
+ * The same for `int` elements. Indices, counts and offsets are integers; keeping them in their own
+ * buffer type means the shader can declare `int` arrays without bit casting through floats.
+ */
+class HaBufferInt {
+ public:
+  HaBufferInt() = default;
+  ~HaBufferInt();
+  HaBufferInt(const HaBufferInt &) = delete;
+  HaBufferInt &operator=(const HaBufferInt &) = delete;
+
+  bool ensure(int64_t elements);
+  void upload(Span<int> data);
+  void download(MutableSpan<int> r_data) const;
+  /** Reads the whole buffer, used for small buffers only (`GPU_storagebuf_read` is a full read). */
+  bool read_one(int &r_value) const;
+  void clear_to_zero();
+  void free();
+
+  bool is_valid() const
+  {
+    return buf_ != nullptr;
+  }
+
+  int64_t size() const
+  {
+    return elements_;
   }
 
   gpu::StorageBuf *buf() const
@@ -92,6 +189,36 @@ class HaBuffer {
  */
 gpu::Shader *ha_shader_get(StringRef key, StringRef glsl_body);
 
+/** Access qualifier of one storage buffer binding, mirrors `gpu::shader::Qualifier`. */
+enum class HaShaderQualifier {
+  Read,
+  Write,
+  ReadWrite,
+};
+
+/** One storage buffer binding of a hand written compute kernel. */
+struct HaShaderResource {
+  int slot;
+  HaShaderQualifier qualifier;
+  /** GLSL element type, e.g. `"float"` or `"int"`. */
+  const char *type;
+  /** GLSL declaration, e.g. `"position_in[]"`. */
+  const char *name;
+};
+
+/**
+ * Compiles \a source (a complete `void main()`, without the storage buffer declarations) with the
+ * given bindings and caches it by \a cache_key. The cache key is mixed with a hash of the source,
+ * so editing a kernel can never hit a stale entry in the on-disk shader cache.
+ *
+ * The device layer prepends the `CREATE_INFO_RES_PASS_*` block so the generated shader gets the
+ * resource declarations of its create-info.
+ */
+gpu::Shader *ha_shader_get_source(StringRef cache_key,
+                                 StringRef source,
+                                 Span<const HaShaderResource> resources,
+                                 int local_group_size);
+
 /**
  * First reduction pass: one invocation per block of `BLOCK_SIZE` elements, writing one partial value
  * per block (at `partial[block * 3]`). `glsl_value_expr` is evaluated for every element with
@@ -109,6 +236,24 @@ gpu::Shader *ha_shader_get_reduce_stage2(
 
 /** Dispatches `ceil(element_count / 64)` work groups. */
 void ha_dispatch(gpu::Shader *shader, int element_count);
+
+/** Highest storage buffer slot the device layer uses. */
+constexpr int HA_MAX_BIND_SLOTS = 16;
+
+/**
+ * Binds \a buffers to the slots \a first_slot, \a first_slot + 1, ... and remembers what is bound,
+ * so a pass that reuses a binding does not make another driver call. Nothing unbinds: leaving a
+ * buffer bound is harmless, and the unbinds used to double the number of calls per pass (measured:
+ * 8 particles still cost 12.7 ms per frame with 116 passes, i.e. the calls are the floor).
+ *
+ * Invalidate with #ha_bindings_invalidate whenever something other than this module may have bound
+ * storage buffers in between (Blender's own draw/compositor code, or a direct bind in the geometry
+ * layer).
+ */
+void ha_bind_storage_buffers(Span<gpu::StorageBuf *> buffers, int first_slot = 0);
+
+/** Forgets what #ha_bind_storage_buffers bound. */
+void ha_bindings_invalidate();
 
 }  // namespace geometry::ha
 }  // namespace blender

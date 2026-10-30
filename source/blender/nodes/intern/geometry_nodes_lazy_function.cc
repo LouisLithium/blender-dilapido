@@ -54,6 +54,8 @@
 #include "BKE_scene.hh"
 #include "BKE_type_conversions.hh"
 
+#include "DNA_node_types.h"
+
 #include "ED_node.hh"
 
 #include "FN_lazy_function_execute.hh"
@@ -1850,7 +1852,30 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
   {
     const ScopedNodeTimer node_timer{context, output_bnode_};
 
+    const geometry::ha::HaScope scope{this->backend_scope()};
+
     if (this->try_execute_on_gpu(params)) {
+      return;
+    }
+
+    /* Every nested graph in Blender gets its own user data and local user data: the local one
+     * caches things like the node tree logger (which the node preview uses), so sharing the outer
+     * one made the body write into the outer graph's cache. Copying is what the group node and the
+     * other zone wrappers do (`GeoNodesUserData group_user_data = user_data;`). */
+    GeoNodesUserData body_user_data = *static_cast<GeoNodesUserData *>(context.user_data);
+    /* Tell the nodes inside the zone that they may use the compute backend. The request travels
+     * through the evaluation data, because the executor is free to run the body on worker
+     * threads. */
+    const int backend_request = int(this->backend_scope());
+    body_user_data.ha_backend_request = &backend_request;
+    GeoNodesLocalUserData body_local_user_data{body_user_data};
+    const lf::Context body_context{context.storage, &body_user_data, &body_local_user_data};
+
+    if (!this->maps_are_valid()) {
+      /* Would index the params of this node out of bounds. Never expected; refusing the body is
+       * better than crashing the whole application (measured: a node preview used to crash here
+       * when the zone is connected to the group output). */
+      this->mark_outputs_unused(params);
       return;
     }
 
@@ -1858,7 +1883,33 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
      * also the reference implementation for the GPU path. */
     lf::RemappedParams remapped_params{
         fn_, params, input_map_, output_map_, multi_threading_enabled_};
-    fn_.execute(remapped_params, context);
+    fn_.execute(remapped_params, body_context);
+  }
+
+  /**
+   * The socket maps translate an index of the body function into an index of this wrapper. Every
+   * entry has to point at a real socket, otherwise `RemappedParams` would read outside of the
+   * params array.
+   */
+  bool maps_are_valid() const
+  {
+    for (const int mapped : input_map_) {
+      if (mapped < 0 || mapped >= int(inputs_.size())) {
+        return false;
+      }
+    }
+    for (const int mapped : output_map_) {
+      if (mapped < 0 || mapped >= int(outputs_.size())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Used when the body cannot run. The outputs stay unset, which the executor accepts. */
+  void mark_outputs_unused(lf::Params & /*params*/) const
+  {
+    fprintf(stderr, "HA zone: inconsistent socket map, the body was skipped\n");
   }
 
   void *init_storage(LinearAllocator<> &allocator) const override
@@ -1882,6 +1933,25 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
   }
 
  private:
+  /** Backend requested by this zone, from the `Backend` property of the input node. */
+  geometry::ha::HaScopeBackend backend_scope() const
+  {
+    const bNode *input_node = zone_.input_node();
+    if (input_node == nullptr || input_node->storage == nullptr) {
+      return geometry::ha::HaScopeBackend::Auto;
+    }
+    const auto &data = *static_cast<const NodeGeometryHwAccelerateInput *>(input_node->storage);
+    switch (data.backend) {
+      case NODE_HW_ACCELERATE_BACKEND_STRICT:
+        return geometry::ha::HaScopeBackend::Strict;
+      case NODE_HW_ACCELERATE_BACKEND_FORCE_CPU:
+        return geometry::ha::HaScopeBackend::ForceCpu;
+      case NODE_HW_ACCELERATE_BACKEND_AUTO:
+      default:
+        return geometry::ha::HaScopeBackend::Auto;
+    }
+  }
+
   bool try_execute_on_gpu(lf::Params &params) const
   {
     if (program_ == nullptr) {

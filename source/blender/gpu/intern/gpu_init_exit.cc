@@ -8,6 +8,8 @@
 
 #include "BKE_material.hh"
 
+#include "BLI_vector.hh"
+
 #include "GPU_batch.hh"
 #include "GPU_init_exit.hh" /* interface */
 #include "GPU_pass.hh"
@@ -23,6 +25,36 @@ namespace blender {
  * (except for the extensions), I chose alphabetical and reverse alphabetical order
  */
 static bool initialized = false;
+
+namespace {
+
+struct ExitHook {
+  void (*callback)(void *user_data);
+  void *user_data;
+};
+
+Vector<ExitHook> &exit_hooks()
+{
+  static Vector<ExitHook> hooks;
+  return hooks;
+}
+
+}  // namespace
+
+void GPU_exit_hook_register(void (*callback)(void *user_data), void *user_data)
+{
+  exit_hooks().append({callback, user_data});
+}
+
+void GPU_exit_hook_unregister(void (*callback)(void *user_data), const void *user_data)
+{
+  for (const int i : exit_hooks().index_range()) {
+    if (exit_hooks()[i].callback == callback && exit_hooks()[i].user_data == user_data) {
+      exit_hooks().remove(i);
+      return;
+    }
+  }
+}
 
 void GPU_init()
 {
@@ -46,6 +78,15 @@ void GPU_init()
 
 void GPU_exit()
 {
+  /* Modules with their own context have to let go of it first. */
+  {
+    const Vector<ExitHook> hooks = exit_hooks();
+    exit_hooks().clear();
+    for (const ExitHook &hook : hooks) {
+      hook.callback(hook.user_data);
+    }
+  }
+
   gpu_batch_exit();
 
   GPU_pass_cache_free();

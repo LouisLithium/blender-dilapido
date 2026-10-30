@@ -282,6 +282,17 @@ struct GeoNodesUserData : public fn::UserData {
    * Child contexts might use logging again even if the current compute context does not.
    */
   bool verbose_log = true;
+  /**
+   * Backend request of the innermost `HW Accelerate` zone that is currently evaluating its body,
+   * `nullptr` outside of zones. Points to a stack value owned by the zone wrapper, so nested zones
+   * restore the previous request correctly.
+   *
+   * The values are `geometry::ha::HaScopeBackend` (0 = none, 1 = auto, 2 = strict, 3 = force CPU);
+   * they are passed as `int` so that this header does not have to depend on the geometry layer.
+   * This is how a node inside the zone learns that it may use the device: the lazy function
+   * executor is free to run nodes on worker threads, so a plain thread local would not reach them.
+   */
+  const int *ha_backend_request = nullptr;
 
   destruct_ptr<fn::LocalUserData> get_local(LinearAllocator<> &allocator) override;
 

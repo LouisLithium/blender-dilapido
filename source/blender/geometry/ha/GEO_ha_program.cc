@@ -405,6 +405,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input, bke::GeometrySet &r_
   if (element_count <= 0) {
     return false;
   }
+  /* This path binds its buffers itself, so the cache of #ha_bind_storage_buffers is stale from
+   * here on (the local #HaBuffer of the dispatch invalidates it again when it is freed). */
+  ha_bindings_invalidate();
 
   gpu::Shader *shader = ha_shader_get(glsl_offset_, glsl_offset_);
   if (shader == nullptr) {

@@ -13,10 +13,12 @@
  * - the zone only declares "evaluate this part of the tree on a compute backend, keep the data
  *   device-resident, sync at the border".
  *
- * M85: skeleton only. The body is evaluated transparently on the CPU (pass-through), so the zone
- * is a no-op that can be verified against "the same tree without a zone". The lazy-function
- * wrapper lives in `geometry_nodes_lazy_function.cc` (see
- * `build_hw_accelerate_zone_function`), which is where the GPU planner will be hooked in.
+ * The body is still evaluated by the lazy function executor on the CPU; nodes inside the zone that
+ * have a device implementation dispatch themselves there and read the request from the evaluation
+ * data (`GeoNodesUserData::ha_backend_request`). Implemented so far:
+ * - the position/field program of `geometry/ha/GEO_ha_program.cc` (M86),
+ * - the XPBD fluid substep of `geometry/ha/GEO_ha_xpbd.cc` (M87).
+ * Everything else in the zone stays on the CPU.
  */
 
 #include "BLI_string.h"
@@ -53,8 +55,13 @@ static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *cur
   if (node.type_legacy != GEO_NODE_HW_ACCELERATE_INPUT) {
     return;
   }
-  layout.label(TIP_("Backend not implemented yet: this zone currently runs on the CPU"),
-               ICON_INFO);
+  layout.prop(current_node_ptr, "backend", UI_ITEM_NONE, "", ICON_NONE);
+  /* Be explicit about the fact that the zone is a scope, not a compiler: only the nodes that have a
+   * device implementation leave the CPU. */
+  layout.label(
+      TIP_("Nodes with a device implementation (the XPBD fluid solver and position fields) run on "
+           "the compute backend. The rest of the zone is evaluated on the CPU"),
+      ICON_INFO);
 }
 
 /** \} */

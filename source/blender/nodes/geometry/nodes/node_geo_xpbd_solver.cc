@@ -2,6 +2,9 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 
 #include "BKE_bvhutils.hh"
@@ -38,6 +41,9 @@
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
 #include "GEO_xpbd_constraint_volume.hh"
 #include "GEO_xpbd_fluid.hh"
+
+#include "GEO_ha_context.hh"
+#include "GEO_ha_xpbd.hh"
 
 #include "NOD_geo_tag_filter.hh"
 #include "NOD_geometry_nodes_bundle.hh"
@@ -382,6 +388,16 @@ struct FluidChunkData {
   /** Only used when vorticity confinement is enabled. */
   Array<float3> omegas;
   Array<float> omega_magnitudes;
+
+  /**
+   * Device side of this fluid (M87). When `gpu_active` the whole substep runs on the compute
+   * backend and every CPU fluid pass for this chunk is skipped; the state is uploaded once per
+   * frame and downloaded at the end of the last substep.
+   */
+  geometry::ha::HaXpbdFluid gpu_fluid;
+  bool gpu_active = false;
+  /** Wall clock when the device work of the current frame started, for the debug log. */
+  double gpu_start_ms = 0.0;
 
   /**
    * Particles sampled on the colliders that the fluid can reach. They are rebuilt once per frame
@@ -884,6 +900,12 @@ class XpbdSolverStep {
 
   int constraint_iterations_;
 
+  /**
+   * Backend request of the `HW Accelerate` zone that is evaluating this solver, 0 outside of a
+   * zone. The values are `geometry::ha::HaScopeBackend` (1 = auto, 2 = strict, 3 = force CPU).
+   */
+  const int gpu_backend_request_;
+
   Geometries geometries_;
   ConstraintsInfo constraints_;
   Array<ChunkData> chunks_data_;
@@ -922,7 +944,8 @@ class XpbdSolverStep {
                  const float interpolation_begin,
                  const float interpolation_end,
                  const StringRef geometry_tag_filter,
-                 const float4x4 &simulation_to_world)
+                 const float4x4 &simulation_to_world,
+                 const int gpu_backend_request)
       : world_(world),
         substeps_(substeps),
         sub_delta_time_(total_delta_time / substeps_),
@@ -932,7 +955,8 @@ class XpbdSolverStep {
         interpolation_end_(interpolation_end),
         world_to_simulation_(math::invert(simulation_to_world)),
         geometry_tag_filter_(geometry_tag_filter),
-        constraint_iterations_(constraint_iterations)
+        constraint_iterations_(constraint_iterations),
+        gpu_backend_request_(gpu_backend_request)
   {
     substep_compliance_factor_ = math::safe_rcp(pow2f(sub_delta_time_));
   }
@@ -987,6 +1011,7 @@ class XpbdSolverStep {
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
     this->prepare_self_contacts();
+    this->prepare_fluid_gpu();
 
     if (profile) {
       ms_prepare = ms_since(phase_start);
@@ -3331,6 +3356,17 @@ class XpbdSolverStep {
     this->prepare_solver_geometry_refs();
     float average_error_squared = 0.0f;
 
+    /* One device context for the whole step when any fluid runs on the device: the fluid work is
+     * split over many small scopes (bind, every substep phase, every readback), and each of them
+     * would activate the context again otherwise. Nested guards are free. */
+    std::optional<geometry::ha::HaContextGuard> device_guard;
+    for (const ChunkData &chunk_data : chunks_data_) {
+      if (chunk_data.fluid.gpu_active) {
+        device_guard.emplace();
+        break;
+      }
+    }
+
     if (this->support_chunk_simulation()) {
       threading::EnumerableThreadSpecific<ResidualErrorTLS> error_tls;
 
@@ -3348,6 +3384,10 @@ class XpbdSolverStep {
               substeps_, substep_i, interpolation_begin_, interpolation_end_);
           std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
           this->simulate__update_pins__chunk(chunk_i, substep);
+          /* The device path advances the whole fluid substep at once (grid, predict, constraint
+           * iterations, velocity layer), so it replaces the inertial update below. */
+          this->simulate__gpu_fluid_substep(
+              chunk_i, solver_refs_i, substep, substep_i + 1 == substeps_);
           this->simulate__inertial_update__chunk(chunk_i, solver_refs_i);
           if (prof) {
             prof_coupled_ += since(mark);
@@ -3432,6 +3472,11 @@ class XpbdSolverStep {
         this->simulate__update_self_contacts(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
+        /* A fluid that runs on the device owns its whole substep (grid, predict, the density
+         * iterations and the velocity layer), so it is advanced here: after the host gathered the
+         * constraints of the other chunks (the gather skips device fluids) and reset their
+         * multipliers. Nothing else in this path reads a device fluid between the substeps. */
+        this->simulate__gpu_fluid_substep_unchunked(substep, solver_refs_i);
         if (prof) {
           prof_constraints_ += since(mark);
           mark = std::chrono::steady_clock::now();
@@ -3566,6 +3611,10 @@ class XpbdSolverStep {
 
   void simulate__inertial_update__chunk(const int chunk_i, const int solver_refs_i)
   {
+    if (chunks_data_[chunk_i].fluid.gpu_active) {
+      /* The device already did the predict step for this chunk. */
+      return;
+    }
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
     const IndexRange points_range = chunk.points_range;
     const int data_key_i = chunk.data_key_i;
@@ -3592,6 +3641,18 @@ class XpbdSolverStep {
   void simulate__gather_dynamic_constraints(const SubstepInterval &substep,
                                             const int solver_refs_i)
   {
+    /* Debug: `BLENDER_XPBD_NO_FACE_CONTACTS=1` gathers no collider contacts, which is how the
+     * device path (boundary particles, no contacts yet) can be compared with the CPU solve. */
+    if (std::getenv("BLENDER_XPBD_NO_FACE_CONTACTS") != nullptr) {
+      for (ChunkData &chunk_data : chunks_data_) {
+        chunk_data.external_face_contacts = {};
+        chunk_data.external_edge_contacts = {};
+      }
+      this->parallel_for_each_chunk(1, [&](const int chunk_i) {
+        this->simulate__update_fluid_neighborhood__chunk(chunk_i, solver_refs_i);
+      });
+      return;
+    }
     this->parallel_for_each_chunk(1, [&](const int chunk_i) {
       this->simulate__gather_dynamic_constraints__chunk(substep, chunk_i, solver_refs_i);
     });
@@ -3599,8 +3660,13 @@ class XpbdSolverStep {
 
   void simulate__gather_dynamic_constraints__chunk(const SubstepInterval &substep,
                                                    const int chunk_i,
-                                                   const int solver_refs_i)
+                                                   const int solver_refs_i,
+                                                   const bool force = false)
   {
+    if (chunks_data_[chunk_i].fluid.gpu_active && !force) {
+      /* The device substep gathers its contacts itself, from its own predicted positions. */
+      return;
+    }
     const float max_distance = this->get_max_search_distance(sub_delta_time_);
     ChunkData &chunk_data = chunks_data_[chunk_i];
     const ExternalFaceContacts &prev_face_contacts = chunk_data.external_face_contacts;
@@ -3635,6 +3701,185 @@ class XpbdSolverStep {
   }
 
   /**
+   * Debug only (`BLENDER_XPBD_GPU_NEIGHBORS=1`): builds the same grid and the same neighbour list
+   * on the GPU and compares them with the CPU result. The simulation itself keeps using the CPU
+   * list, so this never changes a result; it exists so the device implementation can be verified on
+   * real data from the existing fluid scenes instead of a synthetic scene.
+   */
+  void debug_compare_gpu_neighbors(const Span<float3> positions,
+                                   const float support_radius,
+                                   const xpbd::FluidNeighborList &cpu_list)
+  {
+    static const bool enabled = std::getenv("BLENDER_XPBD_GPU_NEIGHBORS") != nullptr;
+    if (!enabled) {
+      return;
+    }
+    /* Bounded so that playing a scene does not pay for it forever. */
+    static std::atomic<int> run_count{0};
+    if (run_count.fetch_add(1) >= 8) {
+      return;
+    }
+    const int particle_count = int(positions.size());
+    if (particle_count == 0) {
+      return;
+    }
+
+    geometry::ha::HaXpbdGrid gpu_grid;
+    if (!geometry::ha::ha_xpbd_grid_build(positions, support_radius, gpu_grid) ||
+        !geometry::ha::ha_xpbd_neighbors_build(gpu_grid))
+    {
+      this->debug_gpu_neighbors_report("XPBD_GPU_NEIGHBORS unavailable particles=%d\n",
+                                       particle_count);
+      return;
+    }
+
+    const double grid_ms = gpu_grid.stats.grid_ms;
+    const double neighbors_ms = gpu_grid.stats.neighbors_ms;
+    Array<int> gpu_offsets(particle_count + 1);
+    Array<int> gpu_indices(gpu_grid.neighbor_capacity > 0 ? gpu_grid.neighbor_capacity : 1);
+    geometry::ha::ha_xpbd_neighbors_download(gpu_grid, gpu_offsets, gpu_indices);
+    const int total = gpu_offsets[particle_count];
+
+    /* Same list twice: the device path has to be deterministic, which for the atomics + local sort
+     * combination is not free. */
+    auto same_ints = [](const Span<int> a, const Span<int> b) {
+      if (a.size() != b.size()) {
+        return false;
+      }
+      for (const int i : a.index_range()) {
+        if (a[i] != b[i]) {
+          return false;
+        }
+      }
+      return true;
+    };
+    bool deterministic = true;
+    {
+      geometry::ha::HaXpbdGrid second_grid;
+      if (geometry::ha::ha_xpbd_grid_build(positions, support_radius, second_grid) &&
+          geometry::ha::ha_xpbd_neighbors_build(second_grid))
+      {
+        Array<int> second_offsets(particle_count + 1);
+        Array<int> second_indices(second_grid.neighbor_capacity > 0 ? second_grid.neighbor_capacity
+                                                                  : 1);
+        geometry::ha::ha_xpbd_neighbors_download(second_grid, second_offsets, second_indices);
+        const int second_total = second_offsets[particle_count];
+        deterministic =
+            second_total == total &&
+            same_ints(second_offsets.as_span(), gpu_offsets.as_span()) &&
+            same_ints(second_indices.as_span().take_front(total),
+                      gpu_indices.as_span().take_front(total));
+      }
+    }
+
+    int mismatched_particles = 0;
+    int first_bad_particle = -1;
+    for (const int i : IndexRange(particle_count)) {
+      const int cpu_begin = cpu_list.offsets[i];
+      const int cpu_end = cpu_list.offsets[i + 1];
+      const int gpu_begin = gpu_offsets[i];
+      const int gpu_end = gpu_offsets[i + 1];
+      bool mismatched = cpu_end - cpu_begin != gpu_end - gpu_begin;
+      if (!mismatched) {
+        for (int k = 0; k < cpu_end - cpu_begin; k++) {
+          if (cpu_list.indices[cpu_begin + k] != gpu_indices[gpu_begin + k]) {
+            mismatched = true;
+            break;
+          }
+        }
+      }
+      if (mismatched) {
+        mismatched_particles++;
+        if (first_bad_particle < 0) {
+          first_bad_particle = i;
+        }
+      }
+    }
+    if (cpu_list.offsets.last() != total) {
+      mismatched_particles = std::max(mismatched_particles, 1);
+    }
+
+    printf("XPBD_GPU_NEIGHBORS particles=%d neighbors=%d cpu_neighbors=%d "
+           "mismatched_particles=%d first_bad=%d deterministic=%d grid_ms=%.3f neighbors_ms=%.3f "
+           "passes=%d/%d\n",
+           particle_count,
+           total,
+           cpu_list.offsets.last(),
+           mismatched_particles,
+           first_bad_particle,
+           deterministic ? 1 : 0,
+           grid_ms,
+           neighbors_ms,
+           gpu_grid.stats.grid_passes,
+           gpu_grid.stats.neighbor_passes);
+    fflush(stdout);
+    this->debug_gpu_neighbors_report(
+        "XPBD_GPU_NEIGHBORS particles=%d neighbors=%d cpu_neighbors=%d mismatched_particles=%d "
+        "first_bad=%d deterministic=%d grid_ms=%.3f neighbors_ms=%.3f passes=%d/%d\n",
+        particle_count,
+        total,
+        cpu_list.offsets.last(),
+        mismatched_particles,
+        first_bad_particle,
+        deterministic ? 1 : 0,
+        grid_ms,
+        neighbors_ms,
+        gpu_grid.stats.grid_passes,
+        gpu_grid.stats.neighbor_passes);
+  }
+
+  /**
+   * Mirrors the debug comparison into the file named by `BLENDER_XPBD_GPU_NEIGHBORS`, so the
+   * regression test can assert on the numbers (the C++ output of the evaluator is not reachable
+   * from Python).
+   */
+  void debug_gpu_neighbors_report(const char *format, ...)
+  {
+    va_list args;
+    va_start(args, format);
+    debug_gpu_write_report("BLENDER_XPBD_GPU_NEIGHBORS", format, args);
+    va_end(args);
+  }
+
+  /** Milliseconds on the steady clock, for the device debug log. */
+  static double time_now_ms()
+  {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  /** Appends one line to the file named by \a env_name, unless the variable names no file. */
+  static void debug_gpu_write_report(const char *env_name, const char *format, va_list args)  {
+    const char *path = std::getenv(env_name);
+    if (path == nullptr || path[0] == '\0' || (path[0] == '1' && path[1] == '\0')) {
+      return;
+    }
+    FILE *file = fopen(path, "a");
+    if (file == nullptr) {
+      return;
+    }
+    vfprintf(file, format, args);
+    fclose(file);
+  }
+
+  /** Logs one line to \a env_name and (when \a print_too) to stdout. */
+  static void debug_gpu_log(const char *env_name, const bool print_too, const char *format, ...)
+  {
+    va_list args;
+    va_start(args, format);
+    if (print_too) {
+      va_list console;
+      va_copy(console, args);
+      vprintf(format, console);
+      va_end(console);
+      fflush(stdout);
+    }
+    debug_gpu_write_report(env_name, format, args);
+    va_end(args);
+  }
+
+  /**
    * Rebuilds the neighbor grid of the fluid once per substep. The grid is not rebuilt for every
    * constraint iteration because particles only move a fraction of the support radius per
    * iteration.
@@ -3642,7 +3887,7 @@ class XpbdSolverStep {
   void simulate__update_fluid_neighborhood__chunk(const int chunk_i, const int solver_refs_i)
   {
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
-    if (!fluid.active) {
+    if (!fluid.active || fluid.gpu_active) {
       return;
     }
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
@@ -3650,6 +3895,7 @@ class XpbdSolverStep {
                                        .positions.slice(chunk.points_range);
     fluid.grid.build(positions, fluid.support_radius);
     xpbd::fluid_build_neighbors(fluid.grid, positions, fluid.neighbors);
+    this->debug_compare_gpu_neighbors(positions, fluid.support_radius, fluid.neighbors);
     fluid.lambdas.fill(0.0f);
 
     this->simulate__update_fluid_boundary__chunk(chunk_i, solver_refs_i);
@@ -4841,7 +5087,7 @@ class XpbdSolverStep {
                                              xpbd::GaussSeidelUpdater &updater)
   {
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
-    if (!fluid.active || fluid.grid.is_empty()) {
+    if (!fluid.active || fluid.gpu_active || fluid.grid.is_empty()) {
       return;
     }
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
@@ -5089,7 +5335,7 @@ class XpbdSolverStep {
   void simulate__fluid_velocity_solve__chunk(const int chunk_i, const int solver_refs_i)
   {
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
-    if (!fluid.active || fluid.grid.is_empty()) {
+    if (!fluid.active || fluid.gpu_active || fluid.grid.is_empty()) {
       return;
     }
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
@@ -5143,6 +5389,299 @@ class XpbdSolverStep {
           velocities, fluid.solid_fractions.as_span().slice(points), boundary_friction);
     }
     xpbd::fluid_apply_velocity_damping(damping, sub_delta_time_, velocities);
+  }
+
+  /**
+   * Decides whether the fluid of a chunk can be advanced on the compute backend and uploads its
+   * state. Requires:
+   * - an `HW Accelerate` zone that allows the GPU (or `BLENDER_XPBD_GPU=1`),
+   * - no two way coupling with another simulated geometry (the reaction of the pressure on the
+   *   vertices of the solids is not implemented on the device yet),
+   * - no constraints on the fluid geometry itself (the density constraint is the only one the
+   *   device knows), and one chunk holding the whole fluid.
+   */
+  /**
+   * Why a chunk cannot use the device, `nullptr` when it can. `r_soft` tells whether the limitation
+   * is only "not implemented on the device yet" (coupling), which an explicit
+   * `BLENDER_XPBD_GPU=1` may override for A/B testing, or a hard structural one.
+   */
+  /** Particle count below which the fluid stays on the CPU (see #fluid_gpu_rejection). */
+  int device_min_particles() const
+  {
+    static const int threshold = [] {
+      const char *value = std::getenv("BLENDER_XPBD_GPU_MIN_PARTICLES");
+      if (value != nullptr) {
+        return int(std::atoi(value));
+      }
+      return 16384;
+    }();
+    return threshold;
+  }
+
+  const char *fluid_gpu_rejection(const int chunk_i, bool &r_soft) const
+  {
+    r_soft = false;
+    const FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.active) {
+      return "not a fluid";
+    }
+    if (fluid.has_coupled) {
+      r_soft = true;
+      return "coupled with another geometry";
+    }
+    /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
+     * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
+     * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
+     * nothing faster and the fixed cost was visible. */
+    if (int(geometries_.chunks[chunk_i].points_range.size()) < this->device_min_particles()) {
+      r_soft = true;
+      return "below the device particle threshold";
+    }
+    /* The multi chunk path (`!support_chunk_simulation()`, i.e. self contacts or constraint sets
+     * that span the whole world) runs the device fluid too, see
+     * #simulate__gpu_fluid_substep_unchunked. */
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    if (geo_data.uses_rotation || geo_data.curves != nullptr) {
+      return "curves or rotations";
+    }
+    if (!geo_data.static_constraints.is_empty()) {
+      return "static constraints";
+    }
+    const ChunkData &chunk_data = chunks_data_[chunk_i];
+    if (!chunk_data.static_constraints.is_empty() ||
+        !chunk_data.static_velocity_constraints.is_empty() ||
+        !chunk_data.pin_position_constraints.is_empty() ||
+        !chunk_data.pin_rotation_constraints.is_empty())
+    {
+      return "per chunk constraints";
+    }
+    if (chunk.points_range != IndexRange(geo_data.size)) {
+      return "split into several chunks";
+    }
+    return nullptr;
+  }
+
+  bool fluid_can_use_gpu(const int chunk_i) const
+  {
+    bool soft = false;
+    return this->fluid_gpu_rejection(chunk_i, soft) == nullptr;
+  }
+
+  void prepare_fluid_gpu()
+  {
+    const char *force = std::getenv("BLENDER_XPBD_GPU");
+    const bool force_gpu = force != nullptr && StringRef(force) == "1";
+    const bool force_cpu = force != nullptr && StringRef(force) == "0";
+    /* An `HW Accelerate` zone is what asks for the device; the environment variable is only an
+     * override for the tests. */
+    const bool requested = force_cpu ? false :
+                           force_gpu ? true :
+                                       /* Inside an `HW Accelerate` zone: the request comes with the
+                                        * evaluation data (see GeoNodesUserData). The thread local is a
+                                        * fallback for calls that happen on the zone's own thread. */
+                                       (gpu_backend_request_ == 1 || gpu_backend_request_ == 2 ||
+                                        geometry::ha::ha_scope_allows_gpu());
+    const bool print = std::getenv("XPBD_GPU_DEBUG") != nullptr;
+    bool soft_rejection = false;
+    for (const int chunk_i : chunks_data_.index_range()) {
+      FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+      fluid.gpu_active = false;
+      if (!fluid.active) {
+        continue;
+      }
+      if (!requested) {
+        debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                      print,
+                      "XPBD_GPU backend=cpu particles=%d reason=zone not requested\n",
+                      int(geometries_.chunks[chunk_i].points_range.size()));
+        continue;
+      }
+      if (const char *rejection = this->fluid_gpu_rejection(chunk_i, soft_rejection)) {
+        const bool ignore_soft = force_gpu || gpu_backend_request_ == 2; /* Backend = Strict */
+        if (!(ignore_soft && soft_rejection)) {
+          debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                        print,
+                        "XPBD_GPU backend=cpu particles=%d reason=%s\n",
+                        int(geometries_.chunks[chunk_i].points_range.size()),
+                        rejection);
+          if (gpu_backend_request_ == 2) {
+            /* Strict: the zone promised the device, so say why that did not happen. */
+            this->report(NodeWarningType::Warning,
+                         fmt::format("HW Accelerate zone (Strict): the fluid is solved on the CPU "
+                                     "({})",
+                                     rejection));
+          }
+          continue;
+        }
+        /* Explicit `BLENDER_XPBD_GPU=1`: run it anyway, for A/B comparisons of the parts that are
+         * implemented on the device already. */
+      }
+      const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+      const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+      const FluidConstraint &constraint = constraints_.fluid_constraints[fluid.constraint_i];
+      const IndexRange points = chunk.points_range;
+
+      geometry::ha::HaXpbdFluidInputs inputs;
+      inputs.positions = geo_data.position_attr.span.slice(points);
+      inputs.velocities = geo_data.velocity_attr.span.slice(points);
+      inputs.external_force = geo_data.external_force_attr.slice(points);
+      inputs.masses = geo_data.fluid_masses.as_span().slice(points);
+      inputs.inv_masses = geo_data.inv_masses.as_span().slice(points);
+      inputs.rest_density = geo_data.fluid_rest_density.as_span().slice(points);
+      inputs.negative_pressure_limit = geo_data.fluid_negative_pressure_limit.as_span().slice(
+          points);
+      inputs.viscosity = geo_data.fluid_viscosity.as_span().slice(points);
+      inputs.damping = geo_data.fluid_damping.as_span().slice(points);
+      inputs.vorticity = geo_data.fluid_vorticity.as_span().slice(points);
+      inputs.surface_tension = geo_data.fluid_surface_tension.as_span().slice(points);
+      inputs.boundary_friction = geo_data.fluid_boundary_friction.as_span().slice(points);
+      inputs.use_boundary = geo_data.fluid_use_boundary.as_span().slice(points);
+      inputs.boundary_positions = fluid.boundary_positions.as_span();
+      inputs.boundary_masses = fluid.boundary_masses.as_span();
+
+      fluid.gpu_start_ms = time_now_ms();
+      fluid.gpu_active = fluid.gpu_fluid.bind(inputs,
+                                             fluid.support_radius,
+                                             sub_delta_time_,
+                                             constraint.compliance * substep_compliance_factor_,
+                                             constraint.artificial_pressure,
+                                             0.1f * fluid.support_radius);
+      debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                    print,
+                    "XPBD_GPU backend=%s particles=%d substeps=%d iterations=%d support_radius=%g%s%s\n",
+                    fluid.gpu_active ? "device" : "cpu",
+                    int(points.size()),
+                    substeps_,
+                    constraint_iterations_,
+                    double(fluid.support_radius),
+                    fluid.gpu_active ? "" : " reason=",
+                    fluid.gpu_active ? "" : fluid.gpu_fluid.last_error());
+    }
+  }
+
+  /**
+   * Runs the whole fluid substep on the device and hands the result back to the solver buffers.
+   * Only the last substep of the frame is downloaded: nothing between the substeps reads the CPU
+   * copy of a device fluid.
+   */
+  void simulate__gpu_fluid_substep(const int chunk_i,
+                                   const int solver_refs_i,
+                                   const SubstepInterval &substep,
+                                   const bool download_result)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    if (!fluid.gpu_active) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    const IndexRange points = chunk.points_range;
+    const MutableSpan<float3> positions =
+        geometries_.solver_refs[solver_refs_i][chunk.data_key_i].positions.slice(points);
+
+    /* Contacts are gathered on the host once per substep (that needs the predicted positions),
+     * then solved on the device like on the CPU. */
+    const bool gathers_contacts = !geo_data.mesh_colliders.is_empty();
+    geometry::ha::HaXpbdFluid::ContactHook hook;
+    if (gathers_contacts) {
+      hook = [&]() -> bool {
+        fluid.gpu_fluid.download_positions(positions);
+        this->simulate__gather_dynamic_constraints__chunk(substep, chunk_i, solver_refs_i, true);
+        const bool uploaded = this->upload_contacts_to_gpu(chunk_i);
+        if (std::getenv("XPBD_GPU_DEBUG") != nullptr) {
+          printf("XPBD_GPU contacts substep=%d count=%d uploaded=%d\n",
+                 substep.current_i,
+                 int(chunks_data_[chunk_i].external_face_contacts.points.size()),
+                 uploaded ? 1 : 0);
+          fflush(stdout);
+        }
+        return uploaded;
+      };
+    }
+
+    const bool ok = fluid.gpu_fluid.substep(constraint_iterations_, hook);
+    if (gathers_contacts) {
+      /* Seed the next gather with the multipliers the device ended up with. */
+      ExternalFaceContacts &contacts = chunks_data_[chunk_i].external_face_contacts;
+      fluid.gpu_fluid.download_contact_lambdas(contacts.lambdas_normal.as_mutable_span(),
+                                               contacts.lambdas_friction.as_mutable_span());
+    }
+    if (!ok || download_result) {
+      const MutableSpan<float3> velocities = geo_data.velocity_attr.span.slice(points);
+      fluid.gpu_fluid.download(positions, velocities);
+      if (download_result) {
+        const geometry::ha::HaXpbdFluidFrameStats &stats = fluid.gpu_fluid.frame_stats();
+        int neighbor_total = 0;
+        geometry::ha::ha_xpbd_neighbors_total(fluid.gpu_fluid.grid(), neighbor_total);
+        debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                      std::getenv("XPBD_GPU_DEBUG") != nullptr,
+                      "XPBD_GPU frame backend=%s particles=%d substeps=%d frame_ms=%.2f "
+                      "grid_ms=%.2f neighbors_ms=%.2f solve_ms=%.2f velocity_ms=%.2f passes=%d "
+                      "neighbors=%d%s%s\n",
+                      ok ? "device" : "cpu",
+                      fluid.gpu_fluid.particle_count(),
+                      stats.substeps,
+                      time_now_ms() - fluid.gpu_start_ms,
+                      stats.grid_ms,
+                      stats.neighbors_ms,
+                      stats.solve_ms,
+                      stats.velocity_ms,
+                      stats.passes,
+                      neighbor_total,
+                      ok ? "" : " reason=",
+                      ok ? "" : fluid.gpu_fluid.last_error());
+      }
+    }
+    if (!ok) {
+      /* Fall back to the CPU for the rest of the frame: the device state is unchanged, so the
+       * download above is a valid starting point. */
+      fluid.gpu_active = false;
+      fluid.gpu_fluid.free();
+    }
+  }
+
+  /**
+   * The same for the path that solves the whole world in one substep loop (`Self Collision` or
+   * constraint sets that span several geometries). The device fluid does not take part in those
+   * constraints, so it can advance its whole substep at once; only the collider contacts of the
+   * fluid are gathered here, inside the device substep.
+   */
+  void simulate__gpu_fluid_substep_unchunked(const SubstepInterval &substep,
+                                             const int solver_refs_i)
+  {
+    const bool download_result = substep.current_i + 1 == substeps_;
+    for (const int chunk_i : chunks_data_.index_range()) {
+      if (!chunks_data_[chunk_i].fluid.gpu_active) {
+        continue;
+      }
+      this->simulate__gpu_fluid_substep(chunk_i, solver_refs_i, substep, download_result);
+    }
+  }
+
+  /** Hands the contacts of the current substep to the device. */
+  bool upload_contacts_to_gpu(const int chunk_i)
+  {
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    const ExternalFaceContacts &contacts = chunks_data_[chunk_i].external_face_contacts;
+    if (contacts.points.is_empty()) {
+      return false;
+    }
+    geometry::ha::HaXpbdContacts device_contacts;
+    device_contacts.points = contacts.points.as_span();
+    device_contacts.radii = contacts.point_radii.as_span();
+    device_contacts.positions_on_face = contacts.positions_on_face.as_span();
+    device_contacts.collider_motion = contacts.collider_motion.as_span();
+    device_contacts.collider_velocities = contacts.collider_velocities.as_span();
+    device_contacts.face_normals = contacts.face_normals.as_span();
+    device_contacts.margins = contacts.face_margins.as_span();
+    device_contacts.static_frictions = contacts.static_frictions.as_span();
+    device_contacts.dynamic_frictions = contacts.dynamic_frictions.as_span();
+    device_contacts.compliance_terms = contacts.compliance_terms.as_span();
+    device_contacts.error_scales = contacts.error_scales.as_span();
+    device_contacts.lambdas_normal = contacts.lambdas_normal.as_span();
+    device_contacts.lambdas_friction = contacts.lambdas_friction.as_span();
+    return fluid.gpu_fluid.set_contacts(device_contacts);
   }
 
   void simulate__reset_forces()
@@ -5280,7 +5819,7 @@ class XpbdSolverStep {
 
     this->simulate__fluid_position_solve__chunk(chunk_i, solve_params, updater);
 
-    if (!chunk_data.external_face_contacts.points.is_empty()) {
+    if (!chunk_data.fluid.gpu_active && !chunk_data.external_face_contacts.points.is_empty()) {
       ExternalFaceContacts &contacts = chunk_data.external_face_contacts;
       xpbd::CollisionFaceConstraintSet constraint(chunk.data_key_i,
                                                   contacts.points,
@@ -5337,6 +5876,10 @@ class XpbdSolverStep {
 
   void simulate__update_velocities__chunk(const int chunk_i, const int solver_refs_i)
   {
+    if (chunks_data_[chunk_i].fluid.gpu_active) {
+      /* The velocities already come from the device, see #simulate__gpu_fluid_substep. */
+      return;
+    }
     if (sub_delta_time_ <= 0.0f) {
       /* This may happen for example on the first frame when no time has passed yet. */
       return;
@@ -5381,6 +5924,10 @@ class XpbdSolverStep {
 
     this->simulate__fluid_velocity_solve__chunk(chunk_i, solver_refs_i);
 
+    if (chunk_data.fluid.gpu_active) {
+      /* The device also solved the collider friction of this substep. */
+      return;
+    }
     if (!chunk_data.external_face_contacts.points.is_empty()) {
       ExternalFaceContacts &contacts = chunk_data.external_face_contacts;
       xpbd::FrictionFaceConstraintSet constraint(chunk.data_key_i,
@@ -5924,6 +6471,11 @@ static void node_geo_exec(GeoNodeExecParams params)
   const float interpolation_end = params.extract_input<float>("End"_ustr);
   const std::string solver_path = params.extract_input<std::string>("Solver Path"_ustr);
 
+  /* `HW Accelerate` zone the solver is evaluated in, if any (0 = outside of a zone). The zone
+   * wrapper puts the request into the evaluation data, see `GeoNodesUserData::ha_backend_request`. */
+  const GeoNodesUserData &user_data = *static_cast<const GeoNodesUserData *>(params.user_data());
+  const int backend_request = user_data.ha_backend_request ? *user_data.ha_backend_request : 0;
+
   XpbdSolverStep step(world,
                       delta_time,
                       substeps,
@@ -5933,7 +6485,8 @@ static void node_geo_exec(GeoNodeExecParams params)
                       interpolation_begin,
                       interpolation_end,
                       geometry_tag_filter,
-                      simulation_to_world);
+                      simulation_to_world,
+                      backend_request);
   step.do_step();
 
   if (!solver_path.empty()) {

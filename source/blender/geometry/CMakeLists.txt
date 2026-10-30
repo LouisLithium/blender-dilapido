@@ -73,6 +73,7 @@ set(SRC
   ha/GEO_ha_context.cc
   ha/GEO_ha_expr.cc
   ha/GEO_ha_program.cc
+  ha/GEO_ha_xpbd.cc
 
   GEO_tetrahedralize.cc
 
@@ -129,6 +130,11 @@ set(SRC
   ignis/GEO_ignis_source.hh
 
   GEO_tetrahedralize.hh
+
+  ha/GEO_ha_context.hh
+  ha/GEO_ha_expr.hh
+  ha/GEO_ha_program.hh
+  ha/GEO_ha_xpbd.hh
 
   rigid_body/GEO_rigid_body_solver.hh
 

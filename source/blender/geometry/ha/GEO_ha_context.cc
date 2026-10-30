@@ -9,8 +9,9 @@
 #include <mutex>
 #include <string>
 
-#include "BLI_array.hh"
-#include "BLI_map.hh"
+#include "BKE_global.hh"
+
+#include "BLI_array.hh"#include "BLI_map.hh"
 #include "BLI_math_base.hh"
 #include "BLI_threads.h"
 
@@ -24,6 +25,8 @@
 #include "GPU_storage_buffer.hh"
 
 #include "DRW_engine.hh"
+
+#include "GHOST_IContext.hh"
 
 #include "WM_api.hh"
 
@@ -71,42 +74,73 @@ std::mutex &ha_context_mutex()
   return mutex;
 }
 
-GHOST_IContext *&ha_system_context()
+/**
+ * The secondary context of this module. Created on the main thread by
+ * #gpu::GPU_create_secondary_context, which also restores whatever context was active before (that
+ * is what `WM_system_gpu_context_create` did *not* do: on Vulkan it left the main thread pointing at
+ * our context and the next window redraw crashed in `VKContext::sync_backbuffer`).
+ */
+gpu::GPUSecondaryContextData &ha_secondary_context()
 {
-  static GHOST_IContext *context = nullptr;
-  return context;
+  static gpu::GPUSecondaryContextData data;
+  return data;
 }
 
-GPUContext *&ha_context()
+GPUContext *ha_context()
+{
+  return ha_secondary_context().gpu_context;
+}
+
+/**
+ * The context our shaders and buffers were created in. Every guard has to run in it: the `gpu::`
+ * module stores a context's objects in a per-backend map keyed by the context, so using them from
+ * another context is undefined behaviour.
+ */
+GPUContext *&ha_objects_context()
 {
   static GPUContext *context = nullptr;
   return context;
 }
 
+/**
+ * Drops the secondary context. Runs from a #GPU_exit hook, i.e. while the backend is still alive:
+ * a context that outlives #GPU_exit leaves its allocations behind (Vulkan reports them as unfreed
+ * and crashes afterwards).
+ */
+void ha_context_dispose(void * /*user_data*/)
+{
+  gpu::GPUSecondaryContextData &data = ha_secondary_context();
+  if (data.gpu_context == nullptr) {
+    return;
+  }
+  ha_context_mutex().lock();
+  gpu::GPU_destroy_secondary_context(data);
+  ha_bindings_invalidate();
+  if (ha_objects_context() == data.gpu_context) {
+    ha_objects_context() = nullptr;
+  }
+  ha_context_mutex().unlock();
+  ha_debug("HA context destroyed");
+}
+
 bool ha_create_context()
 {
-  /* Creating a GHOST offscreen context is documented as a main thread operation (see
-   * `RenderDisplay::ensure_system_gpu_context`). Allow an opt-in for experiments: if the backend
-   * tolerates it, background mode can use the GPU as well. */
+  /* Creating a GHOST offscreen context is a main thread operation. */
   if (!BLI_thread_is_main() && getenv("BLENDER_HA_THREAD_CONTEXT") == nullptr) {
     ha_debug("cannot create the HA context off the main thread");
     return false;
   }
-  GHOST_IContext *system_context = WM_system_gpu_context_create();
-  if (system_context == nullptr) {
-    ha_debug("WM_system_gpu_context_create failed");
+  if (GPU_backend_ghost_system_get() == nullptr) {
+    ha_debug("no GHOST system, cannot create the HA context");
     return false;
   }
-  /* Creation leaves the context current; release it so the guard can bind it per dispatch. */
-  WM_system_gpu_context_release(system_context);
-  GPUContext *context = GPU_context_create(nullptr, system_context);
-  if (context == nullptr) {
-    WM_system_gpu_context_dispose(system_context);
-    ha_debug("GPU_context_create failed");
+  gpu::GPUSecondaryContextData data = gpu::GPU_create_secondary_context();
+  if (data.ghost_context == nullptr || data.gpu_context == nullptr) {
+    ha_debug("GPU_create_secondary_context failed");
     return false;
   }
-  ha_system_context() = system_context;
-  ha_context() = context;
+  ha_secondary_context() = data;
+  GPU_exit_hook_register(ha_context_dispose, nullptr);
   ha_debug("HA context created");
   return true;
 }
@@ -142,6 +176,31 @@ const char *ha_gpu_backend_name()
 /** \name Context
  * \{ */
 
+namespace {
+
+/**
+ * State of the innermost #HaContextGuard of this thread. Guards nest (a solver step that owns the
+ * context for its whole run does not pay for every dispatch), and the state is per thread because
+ * a GL context is current on one thread at a time.
+ */
+struct HaGuardState {
+  int depth = 0;
+  bool valid = false;
+  bool owns_mutex = false;
+  bool enabled_by_us = false;
+  /* What was current before this guard activated the dedicated context. It has to be put back:
+   * the draw manager assumes its own context is active when it swaps the window's backbuffer, and
+   * `VKContext::sync_backbuffer` (called from the swap-chain callback) reads the *active* context.
+   * Leaving `nullptr` there crashed in `wm_draw_update` (measured). */
+  GHOST_IContext *previous_ghost_context = nullptr;
+  GPUContext *previous_gpu_context = nullptr;
+};
+
+thread_local HaGuardState g_guard_state;
+
+
+}  // namespace
+
 /**
  * The backend never initializes the GPU itself (that would pull in the window manager / GHOST).
  * In background mode the host has to call `gpu.init()` first.
@@ -155,14 +214,48 @@ HaContextGuard::HaContextGuard()
   if (!ha_gpu_available()) {
     return;
   }
-  /* Fast path: the main thread usually has the draw manager's context bound already. */
-  if (BLI_thread_is_main() && GPU_context_active_get() != nullptr) {
-    valid_ = true;
+  if (g_guard_state.depth > 0) {
+    /* Nested: the outer guard already made the context current on this thread. */
+    nested_ = true;
+    g_guard_state.depth++;
+    valid_ = g_guard_state.valid;
     return;
   }
 
-  /* Slow path: borrow the dedicated HA context. A GL context can only be current on one thread at
-   * a time, so the whole dispatch sequence is serialized. */
+  /* `BLENDER_HA_DRAW_CONTEXT=1` is kept as an A/B switch for the old behaviour. */
+  const bool force_draw_context = getenv("BLENDER_HA_DRAW_CONTEXT") != nullptr;
+
+  /* 1. Some context is already current on this thread: use it (this is the common case on the main
+   *    thread, where the draw manager's context is active while the modifier is evaluated). */
+  if (GPU_context_active_get() != nullptr) {
+    g_guard_state = {1, true, false, false};
+    valid_ = true;
+    if (!this->accept_current_context()) {
+      valid_ = false;
+      g_guard_state = {};
+    }
+    return;
+  }
+  (void)force_draw_context;
+
+  /* 2. Borrow the draw manager's context. `DRW_gpu_context_try_enable` also takes the draw ticket,
+   *    so the main thread cannot draw (and swap the window's backbuffer) while we dispatch. The GPU
+   *    module keeps one *globally* active context, so two contexts in use at the same time is what
+   *    crashed in the GUI (`VKContext::sync_backbuffer` on a windowless context). */
+  if (!G.background && DRW_gpu_context_try_enable()) {
+    borrowed_draw_context_ = true;
+    g_guard_state = {1, true, false, false};
+    valid_ = GPU_context_active_get() != nullptr && this->accept_current_context();
+    if (!valid_) {
+      DRW_gpu_context_disable();
+      borrowed_draw_context_ = false;
+      g_guard_state = {};
+    }
+    return;
+  }
+
+  /* 3. Background mode (no window, nothing to draw): our own context, serialized behind the mutex.
+   *    Only created here, so the GUI can never end up with objects in two different contexts. */
   ha_context_mutex().lock();
   owning_mutex_ = true;
 
@@ -172,23 +265,128 @@ HaContextGuard::HaContextGuard()
     return;
   }
 
-  WM_system_gpu_context_activate(ha_system_context());
-  GPU_context_active_set(ha_context());
+  ha_debug("context activated (dedicated)");
+  g_guard_state.previous_ghost_context = GHOST_IContext::getActiveDrawingContext();
+  g_guard_state.previous_gpu_context = GPU_context_active_get();
+  gpu::GPU_activate_secondary_context(ha_secondary_context());
   GPU_context_begin_frame(ha_context());
   enabled_by_us_ = true;
-  valid_ = true;
+  valid_ = this->accept_current_context();
+  if (!valid_) {
+    GPU_context_end_frame(ha_context());
+    gpu::GPU_deactivate_secondary_context(ha_secondary_context());
+    if (g_guard_state.previous_ghost_context != nullptr) {
+      g_guard_state.previous_ghost_context->activateDrawingContext();
+    }
+    if (g_guard_state.previous_gpu_context != nullptr) {
+      GPU_context_active_set(g_guard_state.previous_gpu_context);
+    }
+    ha_context_mutex().unlock();
+    owning_mutex_ = false;
+    enabled_by_us_ = false;
+    g_guard_state = {};
+    return;
+  }
+  /* Bindings belong to the context, and another thread may have used the slots meanwhile. */
+  ha_bindings_invalidate();
+  g_guard_state = {1, true, owning_mutex_, enabled_by_us_, {}, {}};
+}
+
+bool HaContextGuard::accept_current_context()
+{
+  GPUContext *context = GPU_context_active_get();
+  if (context == nullptr) {
+    return false;
+  }
+  GPUContext *expected = ha_objects_context();
+  if (expected == nullptr) {
+    ha_objects_context() = context;
+    return true;
+  }
+  if (expected != context) {
+    /* Shaders and storage buffers belong to the context they were created in. Never mix them. */
+    ha_debug("context mismatch, falling back to the CPU");
+    return false;
+  }
+  return true;
 }
 
 HaContextGuard::~HaContextGuard()
 {
-  if (enabled_by_us_) {
-    GPU_context_end_frame(ha_context());
-    GPU_context_active_set(nullptr);
-    WM_system_gpu_context_release(ha_system_context());
+  if (nested_) {
+    g_guard_state.depth--;
+    return;
   }
-  if (owning_mutex_) {
+  if (g_guard_state.depth == 0) {
+    return;
+  }
+  if (g_guard_state.enabled_by_us) {
+    GPU_context_end_frame(ha_context());
+    gpu::GPU_deactivate_secondary_context(ha_secondary_context());
+    /* Give the thread back the contexts it had (the draw manager's one on the main thread). */
+    if (g_guard_state.previous_ghost_context != nullptr) {
+      g_guard_state.previous_ghost_context->activateDrawingContext();
+    }
+    if (g_guard_state.previous_gpu_context != nullptr) {
+      GPU_context_active_set(g_guard_state.previous_gpu_context);
+    }
+  }
+  if (borrowed_draw_context_) {
+    DRW_gpu_context_disable();
+    borrowed_draw_context_ = false;
+  }
+  if (g_guard_state.owns_mutex) {
     ha_context_mutex().unlock();
   }
+  g_guard_state = {};
+  enabled_by_us_ = false;
+  owning_mutex_ = false;
+  valid_ = false;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Backend scope
+ * \{ */
+
+namespace {
+
+/* One slot per nested zone. Thread local, because the executor may evaluate different zones on
+ * different threads. */
+thread_local int ha_scope_depth = 0;
+thread_local std::array<HaScopeBackend, 32> ha_scope_stack = {};
+
+}  // namespace
+
+HaScope::HaScope(const HaScopeBackend backend)
+{
+  if (ha_scope_depth < int(ha_scope_stack.size())) {
+    ha_scope_stack[ha_scope_depth] = backend;
+    ha_scope_depth++;
+    pushed_ = true;
+  }
+}
+
+HaScope::~HaScope()
+{
+  if (pushed_) {
+    ha_scope_depth--;
+  }
+}
+
+HaScopeBackend ha_scope_backend()
+{
+  if (ha_scope_depth == 0) {
+    return HaScopeBackend::None;
+  }
+  return ha_scope_stack[ha_scope_depth - 1];
+}
+
+bool ha_scope_allows_gpu()
+{
+  const HaScopeBackend backend = ha_scope_backend();
+  return backend == HaScopeBackend::Auto || backend == HaScopeBackend::Strict;
 }
 
 /** \} */
@@ -200,9 +398,7 @@ HaContextGuard::~HaContextGuard()
 HaBuffer::~HaBuffer()
 {
   this->free();
-}
-
-bool HaBuffer::ensure(const int64_t elements)
+}bool HaBuffer::ensure(const int64_t elements)
 {
   if (buf_ != nullptr && elements_ == elements) {
     return true;
@@ -239,7 +435,7 @@ void HaBuffer::upload(const Span<float> data)
   GPU_storagebuf_update(buf_, padded.data());
 }
 
-void HaBuffer::download(const MutableSpan<float> r_data)
+void HaBuffer::download(const MutableSpan<float> r_data) const
 {
   if (buf_ == nullptr) {
     return;
@@ -257,6 +453,90 @@ void HaBuffer::free()
   if (buf_ != nullptr) {
     GPU_storagebuf_free(buf_);
     buf_ = nullptr;
+    /* A new buffer may reuse the address of the freed one, which would make the binding cache skip
+     * a bind that is actually needed. */
+    ha_bindings_invalidate();
+  }
+  elements_ = 0;
+}
+
+HaBufferInt::~HaBufferInt()
+{
+  this->free();
+}
+
+bool HaBufferInt::ensure(const int64_t elements)
+{
+  if (buf_ != nullptr && elements_ == elements) {
+    return true;
+  }
+  this->free();
+  if (elements <= 0) {
+    return false;
+  }
+  buf_ = GPU_storagebuf_create_ex(size_t(elements) * sizeof(int),
+                                  nullptr,
+                                  GPU_USAGE_DYNAMIC,
+                                  __func__);
+  if (buf_ == nullptr) {
+    return false;
+  }
+  elements_ = elements;
+  return true;
+}
+
+void HaBufferInt::upload(const Span<int> data)
+{
+  if (buf_ == nullptr) {
+    return;
+  }
+  if (data.size() == elements_) {
+    GPU_storagebuf_update(buf_, data.data());
+    return;
+  }
+  const int padded_size = int(elements_);
+  Array<int> padded(padded_size, 0);
+  const int64_t copy_size = std::min<int64_t>(data.size(), elements_);
+  padded.as_mutable_span().take_front(int(copy_size)).copy_from(data.take_front(int(copy_size)));
+  GPU_storagebuf_update(buf_, padded.data());
+}
+
+void HaBufferInt::download(const MutableSpan<int> r_data) const
+{
+  if (buf_ == nullptr) {
+    return;
+  }
+  const int64_t total = elements_;
+  Array<int> tmp(total);
+  GPU_storagebuf_read(buf_, tmp.data());
+  const int64_t copy_size = std::min<int64_t>(r_data.size(), elements_);
+  r_data.take_front(int(copy_size)).copy_from(tmp.as_span().take_front(int(copy_size)));
+}
+
+bool HaBufferInt::read_one(int &r_value) const
+{
+  if (buf_ == nullptr || elements_ < 1) {
+    return false;
+  }
+  /* `GPU_storagebuf_read` always reads the whole buffer, so this is only used for tiny buffers. */
+  GPU_storagebuf_read(buf_, &r_value);
+  return true;
+}
+
+void HaBufferInt::clear_to_zero()
+{
+  if (buf_ != nullptr) {
+    GPU_storagebuf_clear_to_zero(buf_);
+  }
+}
+
+void HaBufferInt::free()
+{
+  if (buf_ != nullptr) {
+    GPU_storagebuf_free(buf_);
+    buf_ = nullptr;
+    /* Same as #HaBuffer::free: the address may be reused by a new buffer. */
+    ha_bindings_invalidate();
   }
   elements_ = 0;
 }
@@ -269,23 +549,35 @@ void HaBuffer::free()
 
 namespace {
 
-struct HaResource {
-  int slot;
-  gpu::shader::Qualifier qualifier;
-  const char *type;
-  const char *name;
-};
+gpu::shader::Qualifier to_gpu_qualifier(const HaShaderQualifier qualifier)
+{
+  switch (qualifier) {
+    case HaShaderQualifier::Read:
+      return gpu::shader::Qualifier::read;
+    case HaShaderQualifier::Write:
+      return gpu::shader::Qualifier::write;
+    case HaShaderQualifier::ReadWrite:
+      return gpu::shader::Qualifier::read_write;
+  }
+  return gpu::shader::Qualifier::read;
+}
+
+}  // namespace
 
 /**
  * Compiles \a source (a complete `main` plus the resource declaration block) with the given storage
  * buffers and caches it by \a cache_key.
  */
-gpu::Shader *ha_shader_from_source(const StringRef cache_key,
-                                   const StringRef source,
-                                   const Span<const HaResource> resources,
-                                   const int local_group_size)
+gpu::Shader *ha_shader_get_source(const StringRef cache_key,
+                                 const StringRef source,
+                                 const Span<const HaShaderResource> resources,
+                                 const int local_group_size)
 {
+  /* Mixing the source into the key means an edited kernel can never hit a stale entry in the
+   * in-memory cache or in the on-disk shader cache (the info name below is derived from it). */
   std::string key(cache_key);
+  key += '#';
+  key += std::to_string(std::hash<std::string>{}(std::string(source)));
   if (gpu::Shader **found = shader_cache().lookup_ptr(key)) {
     return *found;
   }
@@ -311,8 +603,9 @@ gpu::Shader *ha_shader_from_source(const StringRef cache_key,
   ShaderCreateInfo info(info_name.c_str());
   info.local_group_size(local_group_size);
   info.builtins(BuiltinBits::GLOBAL_INVOCATION_ID);
-  for (const HaResource &resource : resources) {
-    info.storage_buf(resource.slot, resource.qualifier, resource.type, resource.name);
+  for (const HaShaderResource &resource : resources) {
+    info.storage_buf(
+        resource.slot, to_gpu_qualifier(resource.qualifier), resource.type, resource.name);
   }
   /* Has to point at the registered placeholder; the generated source below replaces it. */
   info.compute_source("gpu_shader_ha_zone.glsl");
@@ -348,27 +641,29 @@ gpu::Shader *ha_shader_from_source(const StringRef cache_key,
   return shader;
 }
 
-const std::array<HaResource, 3> POSITION_RESOURCES = {{
-    {0, gpu::shader::Qualifier::read, "float", "position_in[]"},
-    {1, gpu::shader::Qualifier::write, "float", "position_out[]"},
-    {2, gpu::shader::Qualifier::read, "float", "aggregate[]"},
+namespace {
+
+const std::array<HaShaderResource, 3> POSITION_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "position_in[]"},
+    {1, HaShaderQualifier::Write, "float", "position_out[]"},
+    {2, HaShaderQualifier::Read, "float", "aggregate[]"},
 }};
 
-const std::array<HaResource, 3> REDUCE_STAGE1_RESOURCES = {{
-    {0, gpu::shader::Qualifier::read, "float", "position_in[]"},
-    {1, gpu::shader::Qualifier::read, "float", "params[]"},
-    {2, gpu::shader::Qualifier::write, "float", "partial[]"},
+const std::array<HaShaderResource, 3> REDUCE_STAGE1_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "position_in[]"},
+    {1, HaShaderQualifier::Read, "float", "params[]"},
+    {2, HaShaderQualifier::Write, "float", "partial[]"},
 }};
 
-const std::array<HaResource, 3> REDUCE_STAGE2_RESOURCES = {{
-    {0, gpu::shader::Qualifier::read, "float", "partial[]"},
-    {1, gpu::shader::Qualifier::read, "float", "params[]"},
-    {2, gpu::shader::Qualifier::write, "float", "aggregate[]"},
+const std::array<HaShaderResource, 3> REDUCE_STAGE2_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "partial[]"},
+    {1, HaShaderQualifier::Read, "float", "params[]"},
+    {2, HaShaderQualifier::Write, "float", "aggregate[]"},
 }};
 
-Span<const HaResource> as_span(const std::array<HaResource, 3> &resources)
+Span<const HaShaderResource> as_span(const std::array<HaShaderResource, 3> &resources)
 {
-  return Span<const HaResource>(resources.data(), int64_t(resources.size()));
+  return Span<const HaShaderResource>(resources.data(), int64_t(resources.size()));
 }
 
 }  // namespace
@@ -390,7 +685,7 @@ gpu::Shader *ha_shader_get(const StringRef key, const StringRef glsl_body)
       "  position_out[base + 2] = position.z + offset.z;\n"
       "}\n";
 
-  return ha_shader_from_source(
+  return ha_shader_get_source(
       key, source, as_span(POSITION_RESOURCES), LOCAL_GROUP_SIZE);
 }
 
@@ -433,7 +728,7 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                              "  partial[block * 3] = acc;\n"
                              "}\n";
 
-  return ha_shader_from_source(
+  return ha_shader_get_source(
       key, source, as_span(REDUCE_STAGE1_RESOURCES), LOCAL_GROUP_SIZE);
 }
 
@@ -464,7 +759,7 @@ gpu::Shader *ha_shader_get_reduce_stage2(const StringRef key,
   }
   source += "  aggregate[slot * 3] = acc;\n}\n";
 
-  return ha_shader_from_source(
+  return ha_shader_get_source(
       key, source, as_span(REDUCE_STAGE2_RESOURCES), LOCAL_GROUP_SIZE);
 }
 
@@ -479,6 +774,33 @@ void ha_dispatch(gpu::Shader *shader, const int element_count)
     return;
   }
   GPU_compute_dispatch(shader, groups, 1, 1);
+}
+
+namespace {
+
+/** What #ha_bind_storage_buffers left bound, per slot. */
+std::array<gpu::StorageBuf *, HA_MAX_BIND_SLOTS> g_bound_slots{};
+
+}  // namespace
+
+void ha_bind_storage_buffers(const Span<gpu::StorageBuf *> buffers, const int first_slot)
+{
+  for (const int i : buffers.index_range()) {
+    const int slot = first_slot + i;
+    if (slot >= HA_MAX_BIND_SLOTS) {
+      break;
+    }
+    if (g_bound_slots[slot] == buffers[i]) {
+      continue;
+    }
+    GPU_storagebuf_bind(buffers[i], slot);
+    g_bound_slots[slot] = buffers[i];
+  }
+}
+
+void ha_bindings_invalidate()
+{
+  g_bound_slots.fill(nullptr);
 }
 
 /** \} */

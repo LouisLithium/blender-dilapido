@@ -7584,7 +7584,7 @@ static const EnumPropertyItem rna_enum_hw_accelerate_backend_items[] = {
      "STRICT",
      0,
      "Strict",
-     "Report an error when a node inside the zone is not supported by the backend"},
+     "Report a warning when a node inside the zone cannot use the compute backend"},
     {NODE_HW_ACCELERATE_BACKEND_FORCE_CPU,
      "FORCE_CPU",
      0,
