@@ -2632,14 +2632,14 @@ class XpbdSolverStep {
         const OffsetIndices<int> faces = mesh.faces();
         const VArray<float> rest_volumes = *geo_data.attributes.lookup<float>("rest_volume",
                                                                              AttrDomain::Face);
-        bool all_four_cornered = !faces.is_empty();
+        /* The elements are the four cornered faces. A tetrahedral mesh also carries its boundary as
+         * three cornered faces (`Tetrahedralize` writes them so the same mesh is a closed surface),
+         * and those are not elements: they have no rest volume and no gradient of their own. */
+        int elements_num = 0;
         for (const int face_i : IndexRange(faces.size())) {
-          if (faces[face_i].size() != 4) {
-            all_four_cornered = false;
-            break;
-          }
+          elements_num += faces[face_i].size() == 4 ? 1 : 0;
         }
-        if (!all_four_cornered || !rest_volumes) {
+        if (elements_num == 0 || !rest_volumes) {
           this->report(NodeWarningType::Warning,
                        fmt::format("Volume constraint \"{}\" needs a tetrahedral mesh (four "
                                    "cornered faces with a `rest_volume` attribute, e.g. from the "
@@ -2661,6 +2661,9 @@ class XpbdSolverStep {
         element_points.reserve(faces.size() * 4);
         for (const int face_i : IndexRange(faces.size())) {
           const IndexRange face = faces[face_i];
+          if (face.size() != 4) {
+            continue;
+          }
           if (rest_positions && !this->is_valid_element(face, corner_verts, rest_positions_span,
                                                        rest_volumes[face_i]))
           {
@@ -2723,6 +2726,9 @@ class XpbdSolverStep {
         edge_rest_lengths.reserve(faces.size() * 3);
         for (const int face_i : IndexRange(faces.size())) {
           const IndexRange face = faces[face_i];
+          if (face.size() != 4) {
+            continue;
+          }
           for (int i = 0; i < 4; i++) {
             for (int j = i + 1; j < 4; j++) {
               const int v0 = corner_verts[face[i]];

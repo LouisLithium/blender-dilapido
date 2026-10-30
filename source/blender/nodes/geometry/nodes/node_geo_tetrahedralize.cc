@@ -10,25 +10,26 @@
  * you cloth), but it is useful anywhere the volume has to be broken into cells: it is also what
  * turns a mesh into a shell that can be deformed, frozen or re-meshed.
  *
- * The output is split in two:
- *
- * - `Mesh` is the tetrahedral mesh itself. Blender has no element primitive, so every tetrahedron is
- *   a face with four corners (its four vertices, wound so that its volume is positive) and the
- *   `rest_volume` face attribute holds the rest volume of that element. That is the whole interior
- *   structure in the mesh data: no element list hidden in a separate geometry, and a solver reads
- *   the elements straight out of the corners of the faces.
- * - `Surface` is the boundary of that mesh, watertight, for rendering and collision.
+ * `Mesh` is the tetrahedral mesh and its surface in one geometry. Blender has no element primitive,
+ * so every tetrahedron is a face with four corners (its four vertices, wound so that its volume is
+ * positive) and the `rest_volume` face attribute holds the rest volume of that element; the
+ * boundary of the element set follows as three cornered faces, so the same mesh renders and collides
+ * as a closed surface. That is the whole structure in the mesh data - no element list hidden in a
+ * separate geometry - and the corner count is what tells an element from a boundary triangle.
  */
 
 #include <algorithm>
 #include <string>
 
 #include "BLI_array.hh"
+
 #include "BLI_math_vector.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_offset_indices.hh"
+
 #include "BLI_span.hh"
 #include "BLI_task.hh"
+
 
 #include "BKE_attribute.hh"
 #include "BKE_geometry_set.hh"
@@ -63,31 +64,57 @@ static void node_declare(NodeDeclarationBuilder &b)
           "the input instead of the staircase of the lattice. Turning this off gives an exact "
           "lattice, which is slightly smaller than the input and visibly blocky");
   b.add_output<decl::Geometry>("Mesh"_ustr).description(
-      "The tetrahedral mesh itself: one four cornered face per tetrahedron, its corners being its "
-      "four vertices, and the rest volume of the element in the `rest_volume` face attribute");
-  b.add_output<decl::Geometry>("Surface"_ustr).description(
-      "Boundary of the tetrahedral mesh, a watertight triangle mesh for rendering and collision");
+      "The tetrahedral mesh: one four cornered face per tetrahedron (its corners are the four "
+      "vertices of the element, its rest volume is in the `rest_volume` face attribute) plus the "
+      "boundary triangles, so the same mesh is also the closed surface that can be rendered and "
+      "collided with");
 }
 
 static Mesh *create_tet_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
 {
-  const int tets_num = int(tet_mesh.tets.size());
-  Mesh *mesh = BKE_mesh_new_nomain(tet_mesh.vert_positions.size(), 0, tets_num, tets_num * 4);
-  mesh->vert_positions_for_write().copy_from(tet_mesh.vert_positions);
-  if (tets_num == 0) {
+  const int elements_num = int(tet_mesh.tets.size());
+  const int triangles_num = int(tet_mesh.boundary_tris.size());
+  const Span<float3> positions = tet_mesh.vert_positions;
+
+  /* The boundary triangles are all there, so the surface of the mesh is complete. An element face
+   * covers two of the four faces of its tetrahedron, but with the winding that gives the element a
+   * positive volume those two face *into* the mesh: they are the interior structure, not a second
+   * layer of the surface. */
+
+  const int faces_num = elements_num + triangles_num;
+  Mesh *mesh = BKE_mesh_new_nomain(tet_mesh.vert_positions.size(),
+                                   0,
+                                   faces_num,
+                                   elements_num * 4 + triangles_num * 3);
+  mesh->vert_positions_for_write().copy_from(positions);
+  if (faces_num == 0) {
     return mesh;
   }
 
   MutableSpan<int> face_offsets = mesh->face_offsets_for_write();
-  offset_indices::fill_constant_group_size(4, 0, face_offsets);
+  offset_indices::fill_constant_group_size(4, 0, face_offsets.take_front(elements_num + 1));
+  if (triangles_num > 0) {
+    offset_indices::fill_constant_group_size(
+        3, elements_num * 4, face_offsets.drop_front(elements_num));
+  }
+
   MutableSpan<int> corner_verts = mesh->corner_verts_for_write();
-  threading::parallel_for(IndexRange(tets_num), 4096, [&](const IndexRange range) {
+  threading::parallel_for(IndexRange(elements_num), 4096, [&](const IndexRange range) {
     for (const int i : range) {
-      const int4 &tet = tet_mesh.tets[i];
-      corner_verts[i * 4 + 0] = tet.x;
-      corner_verts[i * 4 + 1] = tet.y;
-      corner_verts[i * 4 + 2] = tet.z;
-      corner_verts[i * 4 + 3] = tet.w;
+      const int4 &element = tet_mesh.tets[i];
+      corner_verts[i * 4 + 0] = element.x;
+      corner_verts[i * 4 + 1] = element.y;
+      corner_verts[i * 4 + 2] = element.z;
+      corner_verts[i * 4 + 3] = element.w;
+    }
+  });
+  threading::parallel_for(IndexRange(triangles_num), 4096, [&](const IndexRange range) {
+    for (const int i : range) {
+      const int3 &tri = tet_mesh.boundary_tris[i];
+      const int corner = elements_num * 4 + i * 3;
+      corner_verts[corner + 0] = tri.x;
+      corner_verts[corner + 1] = tri.y;
+      corner_verts[corner + 2] = tri.z;
     }
   });
   bke::mesh_calc_edges(*mesh, false, false);
@@ -95,30 +122,18 @@ static Mesh *create_tet_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
   bke::MutableAttributeAccessor attributes = mesh->attributes_for_write();
   bke::SpanAttributeWriter<float> rest_volume = attributes.lookup_or_add_for_write_span<float>(
       "rest_volume", AttrDomain::Face);
-  rest_volume.span.copy_from(tet_mesh.tet_volumes.as_span());
+  rest_volume.span.take_front(elements_num).copy_from(tet_mesh.tet_volumes.as_span());
+  rest_volume.span.drop_front(elements_num).fill(0.0f);
   rest_volume.finish();
-  return mesh;
-}
 
-static Mesh *create_surface_mesh(const geometry::TetrahedralizedMesh &tet_mesh)
-{
-  Mesh *mesh = BKE_mesh_new_nomain(
-      tet_mesh.vert_positions.size(), 0, tet_mesh.boundary_tris.size(), tet_mesh.boundary_tris.size() * 3);
-  mesh->vert_positions_for_write().copy_from(tet_mesh.vert_positions);
-  if (!tet_mesh.boundary_tris.is_empty()) {
-    MutableSpan<int> face_offsets = mesh->face_offsets_for_write();
-    offset_indices::fill_constant_group_size(3, 0, face_offsets);
-    MutableSpan<int> corner_verts = mesh->corner_verts_for_write();
-    threading::parallel_for(tet_mesh.boundary_tris.index_range(), 4096, [&](const IndexRange range) {
-      for (const int i : range) {
-        const int3 &tri = tet_mesh.boundary_tris[i];
-        corner_verts[i * 3 + 0] = tri.x;
-        corner_verts[i * 3 + 1] = tri.y;
-        corner_verts[i * 3 + 2] = tri.z;
-      }
-    });
-    bke::mesh_calc_edges(*mesh, false, false);
-  }
+  /* Flat shading: the normals of a volume mesh have no meaning to interpolate (an element face is
+   * surrounded by the faces of the neighbouring elements, which are inside the mesh), and averaging
+   * them gives dark patches wherever an element face is part of the surface. `Set Shade Smooth` is
+   * one node away for anyone who wants it. */
+  bke::SpanAttributeWriter<bool> sharp_face = attributes.lookup_or_add_for_write_span<bool>(
+      "sharp_face", AttrDomain::Face);
+  sharp_face.span.fill(true);
+  sharp_face.finish();
   return mesh;
 }
 
@@ -149,15 +164,22 @@ static void node_geo_exec(GeoNodeExecParams params)
         NodeWarningType::Warning,
         TIP_("No tetrahedra were created. The mesh has to be closed (it needs a volume) and "
              "thicker than the voxel size"));
+    params.set_default_remaining_outputs();
+    return;
   }
 
   GeometrySet mesh_set;
   mesh_set.replace_mesh(create_tet_mesh(tet_mesh));
   params.set_output("Mesh"_ustr, std::move(mesh_set));
+}
 
-  GeometrySet surface_set;
-  surface_set.replace_mesh(create_surface_mesh(tet_mesh));
-  params.set_output("Surface"_ustr, std::move(surface_set));
+static void node_label(const bNodeTree * /*ntree*/,
+                       const bNode * /*node*/,
+                       char *label,
+                       const int label_maxncpy)
+{
+  BLI_strncpy_utf8(
+      label, CTX_IFACE_(BLT_I18NCONTEXT_ID_NODETREE, "Tetrahedralize"), label_maxncpy);
 }
 
 static void node_register()
