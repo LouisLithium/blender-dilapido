@@ -1139,6 +1139,11 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "RBD")
         self.draw_menu(layout, "Puncliga")
         self.draw_menu(layout, "Ignis")
+        layout.separator()
+        # Zones must be created as a *pair* (`node.add_zone`), otherwise the two nodes are not
+        # paired and the tree contains no zone at all (Blender shows the nodes with an error
+        # outline). Never list the input/output node types individually here.
+        self.hw_accelerate_zone(layout, label="HW Accelerate")
 
 
 add_menus = {

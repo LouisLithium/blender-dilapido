@@ -7574,6 +7574,43 @@ static void def_geo_repeat_input(BlenderRNA *brna, StructRNA *srna)
   def_common_zone_input(brna, srna);
 }
 
+static const EnumPropertyItem rna_enum_hw_accelerate_backend_items[] = {
+    {NODE_HW_ACCELERATE_BACKEND_AUTO,
+     "AUTO",
+     0,
+     "Auto",
+     "Run on the compute backend and fall back to the CPU for unsupported nodes"},
+    {NODE_HW_ACCELERATE_BACKEND_STRICT,
+     "STRICT",
+     0,
+     "Strict",
+     "Report an error when a node inside the zone is not supported by the backend"},
+    {NODE_HW_ACCELERATE_BACKEND_FORCE_CPU,
+     "FORCE_CPU",
+     0,
+     "Force CPU",
+     "Evaluate the whole zone on the CPU (for comparison or when no device is available)"},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
+static void def_geo_hw_accelerate_input(BlenderRNA *brna, StructRNA *srna)
+{
+  RNA_def_struct_sdna_from(srna, "NodeGeometryHwAccelerateInput", "storage");
+
+  def_common_zone_input(brna, srna);
+
+  PropertyRNA *prop = RNA_def_property(srna, "backend", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_items(prop, rna_enum_hw_accelerate_backend_items);
+  RNA_def_property_enum_sdna(prop, nullptr, "backend");
+  RNA_def_property_ui_text(prop, "Backend", "How the zone is executed");
+  RNA_def_property_update(prop, NC_NODE | NA_EDITED, "rna_Node_update");
+}
+
+static void def_geo_hw_accelerate_output(BlenderRNA * /*brna*/, StructRNA *srna)
+{
+  RNA_def_struct_sdna_from(srna, "NodeGeometryHwAccelerateOutput", "storage");
+}
+
 static void def_geo_foreach_geometry_element_input(BlenderRNA *brna, StructRNA *srna)
 {
   RNA_def_struct_sdna_from(srna, "NodeGeometryForeachGeometryElementInput", "storage");
@@ -10719,6 +10756,8 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeDilapidoForce");
   define("GeometryNode", "GeometryNodeIgnisSolver");
   define("GeometryNode", "GeometryNodeInitIgnisData");
+  define("GeometryNode", "GeometryNodeHWAccelerateInput", def_geo_hw_accelerate_input);
+  define("GeometryNode", "GeometryNodeHWAccelerateOutput", def_geo_hw_accelerate_output);
   define("GeometryNode", "GeometryNodeImageInfo");
   define("GeometryNode", "GeometryNodeImageTexture", def_geo_image_texture);
   define("GeometryNode", "GeometryNodeImportCSV");

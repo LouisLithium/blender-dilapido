@@ -691,6 +691,10 @@ const bTheme U_theme_default = {
     .node_zone_repeat = RGBA(0x76512f33),
     .node_zone_foreach_geometry_element = RGBA(0x33527f33),
     .node_zone_closure = RGBA(0x7d7d3a33),
+    /* Vulkan brand red (#A41E22), darkened for the node editor. With a 22% alpha (same as the
+     * other zone colors) it needs to be a bit brighter than the plain logo color to stay legible
+     * over the dark background. */
+    .node_zone_hw_accelerate = RGBA(0x80191E38),
     .movie = RGBA(0x0f0f0fcc),
     .gp_vertex_size = 3,
     .gp_vertex = RGBA(0x97979700),

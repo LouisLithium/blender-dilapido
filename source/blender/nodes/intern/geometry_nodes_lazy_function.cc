@@ -56,17 +56,22 @@
 
 #include "ED_node.hh"
 
+#include "FN_lazy_function_execute.hh"
 #include "FN_lazy_function_graph_executor.hh"
 
 #include "DEG_depsgraph_query.hh"
 
 #include "GEO_foreach_geometry.hh"
+#include "GEO_ha_context.hh"
+#include "GEO_ha_program.hh"
 
 #include "list_function_eval.hh"
 #include "volume_grid_function_eval.hh"
 
 #include <fmt/format.h>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <sstream>
 
 namespace blender::nodes {
@@ -1793,6 +1798,157 @@ std::string zone_wrapper_output_name(const ZoneBuildInfo &zone_info,
 }
 
 /**
+ * Wraps the body of a #HW Accelerate zone.
+ *
+ * M85: this is a transparent pass-through, i.e. the body is executed with the same parameters as
+ * the zone wrapper, just with the sockets remapped (the wrapper and the body function order their
+ * sockets differently, see #initialize_zone_wrapper and #build_zone_body_function).
+ *
+ * M86+: this is the place where the body is handed to the GPU planner in `geometry/ha/`. The zone
+ * itself stays stateless, so there is no cache or iteration logic here.
+ */
+class LazyFunctionForHwAccelerateZone : public LazyFunction {
+ private:
+  const bNodeTree &btree_;
+  const bke::bNodeTreeZone &zone_;
+  const bNode &output_bnode_;
+  const ZoneBuildInfo &zone_info_;
+  const LazyFunction &fn_;
+  Array<int> input_map_;
+  Array<int> output_map_;
+  /* Null when the zone body is not supported by the GPU backend. */
+  std::unique_ptr<geometry::ha::HaZoneProgram> program_;
+  /* Owned by #lf::RemappedParams, which requires a stable reference. */
+  mutable bool multi_threading_enabled_ = false;
+
+ public:
+  LazyFunctionForHwAccelerateZone(const bNodeTree &btree,
+                                  const bke::bNodeTreeZone &zone,
+                                  const bNode &output_bnode,
+                                  const ZoneBuildInfo &zone_info,
+                                  const LazyFunction &fn,
+                                  Vector<lf::Input> inputs,
+                                  Vector<lf::Output> outputs,
+                                  Array<int> input_map,
+                                  Array<int> output_map,
+                                  std::unique_ptr<geometry::ha::HaZoneProgram> program)
+      : btree_(btree),
+        zone_(zone),
+        output_bnode_(output_bnode),
+        zone_info_(zone_info),
+        fn_(fn),
+        input_map_(std::move(input_map)),
+        output_map_(std::move(output_map)),
+        program_(std::move(program))
+  {
+    debug_name_ = "HW Accelerate Zone";
+    inputs_ = std::move(inputs);
+    outputs_ = std::move(outputs);
+  }
+
+  void execute_impl(lf::Params &params, const lf::Context &context) const override
+  {
+    const ScopedNodeTimer node_timer{context, output_bnode_};
+
+    if (this->try_execute_on_gpu(params)) {
+      return;
+    }
+
+    /* Fallback: the body is evaluated transparently on the CPU, which is always correct and is
+     * also the reference implementation for the GPU path. */
+    lf::RemappedParams remapped_params{
+        fn_, params, input_map_, output_map_, multi_threading_enabled_};
+    fn_.execute(remapped_params, context);
+  }
+
+  void *init_storage(LinearAllocator<> &allocator) const override
+  {
+    return fn_.init_storage(allocator);
+  }
+
+  void destruct_storage(void *storage) const override
+  {
+    fn_.destruct_storage(storage);
+  }
+
+  std::string input_name(const int i) const override
+  {
+    return zone_wrapper_input_name(zone_info_, zone_, inputs_, i);
+  }
+
+  std::string output_name(const int i) const override
+  {
+    return zone_wrapper_output_name(zone_info_, zone_, outputs_, i);
+  }
+
+ private:
+  bool try_execute_on_gpu(lf::Params &params) const
+  {
+    if (program_ == nullptr) {
+      return false;
+    }
+    if (zone_info_.indices.inputs.main.is_empty() || zone_info_.indices.outputs.main.is_empty()) {
+      return false;
+    }
+    const int geometry_input_i = zone_info_.indices.inputs.main[0];
+    const int geometry_output_i = zone_info_.indices.outputs.main[0];
+    if (params.get_output_usage(geometry_output_i) == lf::ValueUsage::Unused) {
+      return false;
+    }
+
+    geometry::ha::HaContextGuard guard;
+    if (!guard.is_valid()) {
+      if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+        printf("HA zone: no GPU context, CPU fallback\n");
+        fflush(stdout);
+      }
+      return false;
+    }
+
+    /* `get_input` dereferences the pointer without checking, which crashes when the executor
+     * decided that the input is unused. Use the checked variant and fall back to the CPU. */
+    void *input_ptr = params.try_get_input_data_ptr_or_request(geometry_input_i);
+    if (input_ptr == nullptr) {
+      if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+        fprintf(stderr, "HA zone: input not available, CPU fallback\n");
+        fflush(stderr);
+      }
+      return false;
+    }
+    const SocketValueVariant &input_variant = *static_cast<const SocketValueVariant *>(input_ptr);
+    if (!input_variant.is_single()) {
+      return false;
+    }
+    const GeometrySet input_geometry = input_variant.get<GeometrySet>();
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      fprintf(stderr, "HA zone: got geometry mesh=%p\n", (void *)input_geometry.get_mesh());
+      fflush(stderr);
+    }
+
+    GeometrySet output_geometry;
+    if (!program_->evaluate(input_geometry, output_geometry)) {
+      return false;
+    }
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      fprintf(stderr, "HA zone: evaluated\n");
+      fflush(stderr);
+    }
+
+    if (!zone_info_.indices.outputs.input_usages.is_empty()) {
+      params.set_output(zone_info_.indices.outputs.input_usages[0], true);
+    }
+    params.set_output(geometry_output_i,
+                      SocketValueVariant::From(std::move(output_geometry)));
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      printf("HA zone: GPU dispatch, offset = %s\n",
+             std::string(program_->glsl_offset()).c_str());
+      fflush(stdout);
+    }
+    return true;
+  }
+};
+
+/**
  * Logs intermediate values from the lazy-function graph evaluation into #NodesEvalLog based on
  * the mapping between the lazy-function graph and the corresponding #bNodeTree.
  */
@@ -2080,6 +2236,10 @@ struct GeometryNodesLazyFunctionBuilder {
         case NODE_CLOSURE_OUTPUT:
           this->build_closure_zone_function(zone);
           break;
+        case GEO_NODE_HW_ACCELERATE_OUTPUT: {
+          this->build_hw_accelerate_zone_function(zone);
+          break;
+        }
         default: {
           BLI_assert_unreachable();
           break;
@@ -2255,6 +2415,109 @@ struct GeometryNodesLazyFunctionBuilder {
     /* Wrap the loop body in another function that implements the foreach behavior. */
     auto &zone_fn = build_foreach_geometry_element_zone_lazy_function(
         scope_, btree_, zone, zone_info, body_fn);
+    zone_info.lazy_function = &zone_fn;
+  }
+
+  /**
+   * Builds a #LazyFunction for an #HW Accelerate zone.
+   *
+   * The zone is a *residency + backend* scope: it owns no state and does not iterate. The body is
+   * built by the generic zone body builder and currently executed as-is (pass-through). The
+   * socket remapping below is necessary because the wrapper order (see #initialize_zone_wrapper)
+   * differs from the body function order (see #build_zone_body_function).
+   */
+  void build_hw_accelerate_zone_function(const bNodeTreeZone &zone)
+  {
+    ZoneBuildInfo &zone_info = zone_build_infos_[zone.index];
+    ZoneBodyFunction &body_fn = this->build_zone_body_function(
+        zone,
+        "HW Accelerate Body",
+        &scope_.construct<GeometryNodesLazyFunctionSideEffectProvider>());
+
+    Vector<lf::Input> inputs;
+    Vector<lf::Output> outputs;
+    initialize_zone_wrapper(zone, zone_info, body_fn, true, inputs, outputs);
+
+    /* #lf::RemappedParams maps *inner* (body) indices to the wrapper (outer) indices, see
+     * `RemappedParams::try_get_input_data_ptr_impl`. The two socket lists are built from the same
+     * data in the same order, so the identity mapping is the base case; the explicit assignments
+     * below keep it correct if that ever changes (e.g. for sockets that only exist on one side). */
+    const int body_inputs_num = body_fn.function->inputs().size();
+    const int body_outputs_num = body_fn.function->outputs().size();
+    Array<int> input_map(body_inputs_num);
+    array_utils::fill_index_range<int>(input_map);
+    Array<int> output_map(body_outputs_num);
+    array_utils::fill_index_range<int>(output_map);
+
+    for (const int i : zone_info.indices.inputs.main.index_range()) {
+      input_map[body_fn.indices.inputs.main[i]] = zone_info.indices.inputs.main[i];
+    }
+    for (const int i : zone_info.indices.inputs.border_links.index_range()) {
+      input_map[body_fn.indices.inputs.border_links[i]] =
+          zone_info.indices.inputs.border_links[i];
+    }
+    for (const int i : zone_info.indices.inputs.output_usages.index_range()) {
+      input_map[body_fn.indices.inputs.output_usages[i]] =
+          zone_info.indices.inputs.output_usages[i];
+    }
+    for (const auto item : zone_info.indices.inputs.reference_sets.items()) {
+      input_map[body_fn.indices.inputs.reference_sets.lookup(item.key)] = item.value;
+    }
+
+    for (const int i : zone_info.indices.outputs.main.index_range()) {
+      output_map[body_fn.indices.outputs.main[i]] = zone_info.indices.outputs.main[i];
+    }
+    for (const int i : zone_info.indices.outputs.input_usages.index_range()) {
+      output_map[body_fn.indices.outputs.input_usages[i]] =
+          zone_info.indices.outputs.input_usages[i];
+    }
+    for (const int i : zone_info.indices.outputs.border_link_usages.index_range()) {
+      output_map[body_fn.indices.outputs.border_link_usages[i]] =
+          zone_info.indices.outputs.border_link_usages[i];
+    }
+
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      printf("HA zone %s: wrapper in=%d out=%d | body in=%d out=%d\n",
+             zone.output_node()->name,
+             int(inputs.size()),
+             int(outputs.size()),
+             body_inputs_num,
+             body_outputs_num);
+      for (const int i : input_map.index_range()) {
+        printf("  in  %d -> %d\n", i, input_map[i]);
+      }
+      for (const int i : output_map.index_range()) {
+        printf("  out %d -> %d\n", i, output_map[i]);
+      }
+      fflush(stdout);
+    }
+
+    /* Try to compile the zone body for the GPU. `nullptr` means "not supported", in which case the
+     * body is evaluated on the CPU as before. */
+    std::unique_ptr<geometry::ha::HaZoneProgram> program =
+        geometry::ha::HaZoneProgram::try_build(btree_, zone);
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      if (program) {
+        printf("HA zone %s: GPU program, offset = %s\n",
+               zone.output_node()->name,
+               std::string(program->glsl_offset()).c_str());
+      }
+      else {
+        printf("HA zone %s: CPU fallback (body not supported)\n", zone.output_node()->name);
+      }
+      fflush(stdout);
+    }
+
+    auto &zone_fn = scope_.construct<LazyFunctionForHwAccelerateZone>(btree_,
+                                                                     zone,
+                                                                     *zone.output_node(),
+                                                                     zone_info,
+                                                                     *body_fn.function,
+                                                                     std::move(inputs),
+                                                                     std::move(outputs),
+                                                                     std::move(input_map),
+                                                                     std::move(output_map),
+                                                                     std::move(program));
     zone_info.lazy_function = &zone_fn;
   }
 

@@ -4,13 +4,17 @@
 
 set(INC
   PUBLIC .
+  PUBLIC ha
   PUBLIC ignis
   PUBLIC rigid_body
   PUBLIC xpbd
   ../makesrna
   ../../../intern/eigen
+  ../draw
   ../draw/intern
   ../gpu
+  ../gpu/intern
+  ../windowmanager
 )
 
 set(INC_SYS
@@ -65,6 +69,10 @@ set(SRC
 
   ignis/GEO_ignis_solver.cc
   ignis/GEO_ignis_source.cc
+
+  ha/GEO_ha_context.cc
+  ha/GEO_ha_expr.cc
+  ha/GEO_ha_program.cc
 
   GEO_tetrahedralize.cc
 

@@ -429,6 +429,18 @@ class NodeMenu(Menu):
         return props
 
     @classmethod
+    def hw_accelerate_zone(cls, layout, label):
+        props = layout.operator(cls.zone_operator_id, text=iface_(label), translate=False)
+        props.input_node_type = "GeometryNodeHWAccelerateInput"
+        props.output_node_type = "GeometryNodeHWAccelerateOutput"
+        props.add_default_geometry_link = True
+
+        if hasattr(props, "use_transform"):
+            props.use_transform = cls.use_transform
+
+        return props
+
+    @classmethod
     def draw_root_assets(cls, layout):
         if cls.draw_assets:
             layout.menu_contents(cls.root_asset_menu)

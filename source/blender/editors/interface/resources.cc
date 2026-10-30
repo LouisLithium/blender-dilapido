@@ -728,6 +728,9 @@ const uchar *get_color_ptr(bTheme *btheme, int spacetype, int colorid)
         case TH_NODE_ZONE_CLOSURE:
           cp = ts->node_zone_closure;
           break;
+        case TH_NODE_ZONE_HW_ACCELERATE:
+          cp = ts->node_zone_hw_accelerate;
+          break;
         case TH_SIMULATED_FRAMES:
           cp = ts->simulated_frames;
           break;

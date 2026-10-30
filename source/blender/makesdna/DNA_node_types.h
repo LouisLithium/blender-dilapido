@@ -3543,6 +3543,36 @@ struct NodeGeometryRepeatOutput {
 #endif
 };
 
+/** Which execution backend a #HW Accelerate zone uses. */
+enum NodeHwAccelerateBackend {
+  /** Unsupported nodes are an error, never fall back silently. */
+  NODE_HW_ACCELERATE_BACKEND_STRICT = 0,
+  /** Unsupported nodes fall back to the CPU and are marked in the UI. */
+  NODE_HW_ACCELERATE_BACKEND_AUTO = 1,
+  /** Evaluate the whole zone on the CPU (A/B comparison, no GPU, render farms). */
+  NODE_HW_ACCELERATE_BACKEND_FORCE_CPU = 2,
+};
+
+/**
+ * The zone is a *residency + backend* scope: it has no state and no iteration of its own. The
+ * pairing information lives on the input node (mirroring the other zone types in Blender).
+ */
+struct NodeGeometryHwAccelerateInput {
+  DNA_DEFINE_CXX_METHODS(NodeGeometryHwAccelerateInput)
+
+  /** bNode.identifier of the corresponding output node. */
+  int32_t output_node_id = 0;
+  /** #NodeHwAccelerateBackend. */
+  int backend = NODE_HW_ACCELERATE_BACKEND_AUTO;
+};
+
+struct NodeGeometryHwAccelerateOutput {
+  DNA_DEFINE_CXX_METHODS(NodeGeometryHwAccelerateOutput)
+
+  /** Reserved for zone-wide settings (device selection, memory budget, ...). */
+  int _pad = 0;
+};
+
 struct NodeGeometryForeachGeometryElementInput {
   DNA_DEFINE_CXX_METHODS(NodeGeometryForeachGeometryElementInput)
 

@@ -381,6 +381,9 @@ typedef struct ThemeSpace {
   unsigned char node_zone_repeat[4];
   unsigned char node_zone_foreach_geometry_element[4];
   unsigned char node_zone_closure[4];
+  unsigned char node_zone_hw_accelerate[4];
+  /** Keeps the sub-structs that follow 8-byte aligned (required by DNA). */
+  unsigned char _pad_zone[4];
   unsigned char simulated_frames[4];
 
   /** For sequence editor. */
