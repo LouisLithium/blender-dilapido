@@ -92,6 +92,7 @@ static const EnumPropertyItem puncliga_emission_items[] = {
 
 namespace attribute_names {
 constexpr StringRefNull type = "puncliga_type";
+constexpr StringRefNull piece_id = "puncliga_piece_id";
 constexpr StringRefNull emission = "puncliga_emission";
 constexpr StringRefNull rest_density = "puncliga_rest_density";
 constexpr StringRefNull viscosity = "puncliga_viscosity";
@@ -240,6 +241,14 @@ static void node_declare(NodeDeclarationBuilder &b)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
         .description("Radius of the points for the point/mesh collider contacts");
+    panel.add_input<decl::Int>("Piece ID"_ustr)
+        .default_value(0)
+        .min(0)
+        .description(
+            "Number of this piece, written as the `puncliga_piece_id` attribute. Several pieces of "
+            "the same type can be told apart after the simulation with it (the `Split Puncliga "
+            "Data` group filters by it); every piece defaults to 0, so it can be ignored when there "
+            "is only one");
   }
   {
     auto &panel = b.add_panel("Soft Body"_ustr).default_closed(false);
@@ -310,13 +319,21 @@ static void write_pin(GeometrySet &geometry, const fn::Field<float> &pin_field, 
   bke::SpanAttributeWriter<float3> pin_positions =
       attributes.lookup_or_add_for_write_only_span<float3>(attribute_names::rest_position,
                                                            AttrDomain::Point);
+  /* The plain `rest_position` name as well, so every piece of the simulation has its rest pose under
+   * the same name (a soft body writes it too). Post processing needs it: `Point Deform` takes the
+   * rest lattice as an input, and that lattice is the simulated geometry with `position` replaced by
+   * `rest_position`. */
+  bke::SpanAttributeWriter<float3> plain_rest =
+      attributes.lookup_or_add_for_write_only_span<float3>("rest_position", AttrDomain::Point);
   for (const int i : IndexRange(points_num)) {
     const bool above = pin_values[i] > 0.5f;
     pinned.span[i] = invert ? !above : above;
     pin_positions.span[i] = positions[i];
+    plain_rest.span[i] = positions[i];
   }
   pinned.finish();
   pin_positions.finish();
+  plain_rest.finish();
 }
 
 /**
@@ -379,6 +396,10 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   write_uniform<int>(geometry, attribute_names::type, bke::AttrDomain::Point, type);
   write_uniform<int>(geometry, attribute_names::emission, bke::AttrDomain::Point, emission);
+  write_uniform<int>(geometry,
+                     attribute_names::piece_id,
+                     bke::AttrDomain::Point,
+                     params.get_input<int>("Piece ID"_ustr));
   write_uniform<float>(geometry, "radius", bke::AttrDomain::Point, radius);
   write_uniform<float>(geometry, "mass", bke::AttrDomain::Point, mass);
   write_uniform<float>(geometry, "static_friction", bke::AttrDomain::Point, friction);
