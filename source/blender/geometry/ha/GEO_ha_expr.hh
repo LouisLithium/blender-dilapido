@@ -107,4 +107,7 @@ float3 ha_evaluate(const HaExpr &expr, int index, Span<float> positions);
 /** GLSL expression. In scope: `vec3 position` and `int index`. */
 std::string ha_emit_glsl(const HaExpr &expr);
 
+/** The same for a scalar expression, without the implicit `vec3(...)` promotion. */
+std::string ha_emit_glsl_scalar(const HaExpr &expr);
+
 }  // namespace blender::geometry::ha

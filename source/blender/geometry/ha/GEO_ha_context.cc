@@ -11,7 +11,8 @@
 
 #include "BKE_global.hh"
 
-#include "BLI_array.hh"#include "BLI_map.hh"
+#include "BLI_array.hh"
+#include "BLI_map.hh"
 #include "BLI_math_base.hh"
 #include "BLI_threads.h"
 
@@ -440,8 +441,14 @@ void HaBuffer::download(const MutableSpan<float> r_data) const
   if (buf_ == nullptr) {
     return;
   }
-  const int64_t total = elements_;
-  Array<float> tmp(total);
+  /* `GPU_storagebuf_read` always reads the whole buffer, so read straight into the destination when
+   * it is large enough instead of going through a temporary (that copy used to be 12 MB of pure
+   * overhead per evaluation at a million elements). */
+  if (r_data.size() >= elements_) {
+    GPU_storagebuf_read(buf_, r_data.data());
+    return;
+  }
+  Array<float> tmp(elements_);
   GPU_storagebuf_read(buf_, tmp.data());
   const int64_t copy_size = std::min<int64_t>(r_data.size(), elements_);
   r_data.take_front(int(copy_size))
@@ -586,7 +593,7 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
 
   /* Version of the generated shader pipeline; bump whenever the resource layout or the kernel
    * templates change, so that the on-disk shader cache cannot return a stale binary. */
-  constexpr int HA_SHADER_VERSION = 2;
+  constexpr int HA_SHADER_VERSION = 3;
 
   /* Unique per program: the resource declaration macros are derived from this name, and the shader
    * cache uses it as part of its key. */
@@ -668,7 +675,9 @@ Span<const HaShaderResource> as_span(const std::array<HaShaderResource, 3> &reso
 
 }  // namespace
 
-gpu::Shader *ha_shader_get(const StringRef key, const StringRef glsl_body)
+gpu::Shader *ha_shader_get(const StringRef key,
+                           const StringRef glsl_position,
+                           const StringRef glsl_selection)
 {
   const std::string source =
       std::string("void main()\n"
@@ -677,12 +686,24 @@ gpu::Shader *ha_shader_get(const StringRef key, const StringRef glsl_body)
                   "  int base = index * 3;\n"
                   "  vec3 position = vec3(position_in[base], position_in[base + 1], "
                   "position_in[base + 2]);\n"
-                  "  vec3 offset = ") +
-      std::string(glsl_body) +
+                  "  vec3 target = ") +
+      std::string(glsl_position) +
       ";\n"
-      "  position_out[base] = position.x + offset.x;\n"
-      "  position_out[base + 1] = position.y + offset.y;\n"
-      "  position_out[base + 2] = position.z + offset.z;\n"
+      /* The implicit float -> bool conversion of the field system is `value > 0` (see
+       * `float_to_bool` in `BKE_type_conversions`), so the selection test has to match it exactly:
+       * `!= 0` would select the negative elements as well. */
+      "  if (" +
+      std::string(glsl_selection) +
+      " > 0.0) {\n"
+      "    position_out[base] = target.x;\n"
+      "    position_out[base + 1] = target.y;\n"
+      "    position_out[base + 2] = target.z;\n"
+      "  }\n"
+      "  else {\n"
+      "    position_out[base] = position.x;\n"
+      "    position_out[base + 1] = position.y;\n"
+      "    position_out[base + 2] = position.z;\n"
+      "  }\n"
       "}\n";
 
   return ha_shader_get_source(

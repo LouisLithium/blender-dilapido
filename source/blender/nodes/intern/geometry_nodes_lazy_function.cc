@@ -66,6 +66,7 @@
 #include "GEO_foreach_geometry.hh"
 #include "GEO_ha_context.hh"
 #include "GEO_ha_program.hh"
+#include "GEO_ha_status.hh"
 
 #include "list_function_eval.hh"
 #include "volume_grid_function_eval.hh"
@@ -1651,6 +1652,49 @@ void report_from_multi_function(const mf::Context &context,
                               {node_context->node_id(), {type, std::move(message)}});
 }
 
+/**
+ * The same for a lazy-function, which reports on behalf of a specific node (the caller knows which
+ * one, unlike the multi-function case where the compute context carries it).
+ */
+void report_from_lazy_function(const lf::Context &context,
+                               const bNode &node,
+                               const NodeWarningType type,
+                               std::string message)
+{
+  if (context.user_data == nullptr) {
+    return;
+  }
+  const auto &user_data = *static_cast<const GeoNodesUserData *>(context.user_data);
+  if (user_data.call_data == nullptr) {
+    return;
+  }
+  eval_log::NodesEvalLog *log = user_data.call_data->eval_log;
+  if (log == nullptr) {
+    return;
+  }
+  const bke::NodeComputeContext *node_context = nullptr;
+  for (const ComputeContext *compute_context = user_data.compute_context; compute_context;
+       compute_context = compute_context->parent())
+  {
+    node_context = dynamic_cast<const bke::NodeComputeContext *>(compute_context);
+    if (node_context) {
+      break;
+    }
+  }
+  if (node_context == nullptr) {
+    return;
+  }
+  const auto *tree_context = node_context->parent();
+  if (tree_context == nullptr) {
+    return;
+  }
+  eval_log::NodeTreeLogger &logger = log->get_local_tree_logger(*tree_context);
+  if (logger.allocator == nullptr) {
+    return;
+  }
+  logger.node_warnings.append(*logger.allocator, {node.identifier, {type, std::move(message)}});
+}
+
 using JoinReferenceSetsCache = Map<Vector<lf::OutputSocket *>, lf::OutputSocket *>;
 
 struct BuildGraphParams {
@@ -1820,6 +1864,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
   Array<int> output_map_;
   /* Null when the zone body is not supported by the GPU backend. */
   std::unique_ptr<geometry::ha::HaZoneProgram> program_;
+  /* Why #program_ is null, in a form the node UI can show. */
+  std::string program_reason_;
   /* Owned by #lf::RemappedParams, which requires a stable reference. */
   mutable bool multi_threading_enabled_ = false;
 
@@ -1833,7 +1879,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
                                   Vector<lf::Output> outputs,
                                   Array<int> input_map,
                                   Array<int> output_map,
-                                  std::unique_ptr<geometry::ha::HaZoneProgram> program)
+                                  std::unique_ptr<geometry::ha::HaZoneProgram> program,
+                                  std::string program_reason)
       : btree_(btree),
         zone_(zone),
         output_bnode_(output_bnode),
@@ -1841,7 +1888,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
         fn_(fn),
         input_map_(std::move(input_map)),
         output_map_(std::move(output_map)),
-        program_(std::move(program))
+        program_(std::move(program)),
+        program_reason_(std::move(program_reason))
   {
     debug_name_ = "HW Accelerate Zone";
     inputs_ = std::move(inputs);
@@ -1854,9 +1902,13 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
 
     const geometry::ha::HaScope scope{this->backend_scope()};
 
-    if (this->try_execute_on_gpu(params)) {
+    std::string fallback_reason;
+    int elements = 0;
+    if (this->try_execute_on_gpu(params, fallback_reason, elements)) {
+      this->publish_status(geometry::ha::HaNodeState::Device, {}, elements);
       return;
     }
+    this->report_fallback(context, fallback_reason);
 
     /* Every nested graph in Blender gets its own user data and local user data: the local one
      * caches things like the node tree logger (which the node preview uses), so sharing the outer
@@ -1952,17 +2004,82 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     }
   }
 
-  bool try_execute_on_gpu(lf::Params &params) const
+  /**
+   * Publishes what this zone did for the node UI (badge + read only info block, see
+   * `geometry/ha/GEO_ha_status.hh`). Reported on the zone *input* node, because that is the node
+   * that owns the `Backend` property and therefore the natural place to look.
+   */
+  void publish_status(const geometry::ha::HaNodeState state,
+                      std::string reason,
+                      const int elements) const
   {
+    const bNode *input_node = zone_.input_node();
+    if (input_node == nullptr) {
+      return;
+    }
+    geometry::ha::HaNodeStatus status;
+    status.state = state;
+    if (state == geometry::ha::HaNodeState::Device) {
+      status.backend = geometry::ha::ha_gpu_backend_name();
+      status.elements = elements;
+    }
+    else {
+      status.reason = std::move(reason);
+    }
+    geometry::ha::ha_status_set(btree_, *input_node, status);
+  }
+
+  /**
+   * Tells the user why the zone ran on the CPU. `Strict` promised the device, so that is a warning;
+   * with `Auto` it is information. `Force CPU` is what the user asked for, so nothing is reported.
+   * A silent fallback is exactly what made this feature hard to trust (see M88b).
+   */
+  void report_fallback(const lf::Context &context, const std::string &reason) const
+  {
+    const bNode *input_node = zone_.input_node();
+    const geometry::ha::HaScopeBackend backend = this->backend_scope();
+    if (backend == geometry::ha::HaScopeBackend::ForceCpu) {
+      /* Not a fallback: the user asked for the CPU. Clear the hint so switching the backend does
+       * not leave a stale "device" badge behind. */
+      if (input_node != nullptr) {
+        geometry::ha::ha_status_clear(btree_, *input_node);
+      }
+      return;
+    }
+    this->publish_status(geometry::ha::HaNodeState::Fallback, reason, 0);
+    if (input_node == nullptr) {
+      return;
+    }
+    const NodeWarningType type = backend == geometry::ha::HaScopeBackend::Strict ?
+                                     NodeWarningType::Warning :
+                                     NodeWarningType::Info;
+    report_from_lazy_function(
+        context,
+        *input_node,
+        type,
+        fmt::format("HW Accelerate zone: the body is evaluated on the CPU ({})", reason));
+  }
+
+  bool try_execute_on_gpu(lf::Params &params, std::string &r_reason, int &r_elements) const
+  {
+    if (this->backend_scope() == geometry::ha::HaScopeBackend::ForceCpu) {
+      /* `Force CPU` is an explicit user choice: the device must not be used, not even when the
+       * program is available. */
+      r_reason = "the zone is set to Force CPU";
+      return false;
+    }
     if (program_ == nullptr) {
+      r_reason = program_reason_.empty() ? std::string("the body is not supported") : program_reason_;
       return false;
     }
     if (zone_info_.indices.inputs.main.is_empty() || zone_info_.indices.outputs.main.is_empty()) {
+      r_reason = "the zone has no geometry socket";
       return false;
     }
     const int geometry_input_i = zone_info_.indices.inputs.main[0];
     const int geometry_output_i = zone_info_.indices.outputs.main[0];
     if (params.get_output_usage(geometry_output_i) == lf::ValueUsage::Unused) {
+      r_reason = "the zone output is unused";
       return false;
     }
 
@@ -1972,6 +2089,7 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
         printf("HA zone: no GPU context, CPU fallback\n");
         fflush(stdout);
       }
+      r_reason = "no GPU context";
       return false;
     }
 
@@ -1983,10 +2101,12 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
         fprintf(stderr, "HA zone: input not available, CPU fallback\n");
         fflush(stderr);
       }
+      r_reason = "the input is not available yet";
       return false;
     }
     const SocketValueVariant &input_variant = *static_cast<const SocketValueVariant *>(input_ptr);
     if (!input_variant.is_single()) {
+      r_reason = "the input is a field, not a single geometry";
       return false;
     }
     const GeometrySet input_geometry = input_variant.get<GeometrySet>();
@@ -1996,7 +2116,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     }
 
     GeometrySet output_geometry;
-    if (!program_->evaluate(input_geometry, output_geometry)) {
+    if (!program_->evaluate(input_geometry, output_geometry, &r_elements)) {
+      r_reason = "the input geometry is not supported (a mesh is required)";
       return false;
     }
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
@@ -2010,8 +2131,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     params.set_output(geometry_output_i,
                       SocketValueVariant::From(std::move(output_geometry)));
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
-      printf("HA zone: GPU dispatch, offset = %s\n",
-             std::string(program_->glsl_offset()).c_str());
+      printf("HA zone: GPU dispatch, position = %s\n",
+             std::string(program_->glsl_position()).c_str());
       fflush(stdout);
     }
     return true;
@@ -2563,17 +2684,22 @@ struct GeometryNodesLazyFunctionBuilder {
     }
 
     /* Try to compile the zone body for the GPU. `nullptr` means "not supported", in which case the
-     * body is evaluated on the CPU as before. */
+     * body is evaluated on the CPU as before; the reason travels with the function so the node UI
+     * can explain the fallback instead of staying silent. */
+    std::string program_reason;
     std::unique_ptr<geometry::ha::HaZoneProgram> program =
-        geometry::ha::HaZoneProgram::try_build(btree_, zone);
+        geometry::ha::HaZoneProgram::try_build(btree_, zone, &program_reason);
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
       if (program) {
-        printf("HA zone %s: GPU program, offset = %s\n",
+        printf("HA zone %s: GPU program, position = %s, selection = %s\n",
                zone.output_node()->name,
-               std::string(program->glsl_offset()).c_str());
+               std::string(program->glsl_position()).c_str(),
+               std::string(program->glsl_selection()).c_str());
       }
       else {
-        printf("HA zone %s: CPU fallback (body not supported)\n", zone.output_node()->name);
+        printf("HA zone %s: CPU fallback (%s)\n",
+               zone.output_node()->name,
+               program_reason.c_str());
       }
       fflush(stdout);
     }
@@ -2587,7 +2713,8 @@ struct GeometryNodesLazyFunctionBuilder {
                                                                      std::move(outputs),
                                                                      std::move(input_map),
                                                                      std::move(output_map),
-                                                                     std::move(program));
+                                                                     std::move(program),
+                                                                     std::move(program_reason));
     zone_info.lazy_function = &zone_fn;
   }
 

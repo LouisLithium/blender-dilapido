@@ -28,11 +28,20 @@ VKStagingBuffer::VKStagingBuffer(const VKBuffer &device_buffer,
       usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   }
 
+  /* The host access hint has to match the direction. `HOST_ACCESS_SEQUENTIAL_WRITE` lets the
+   * allocator hand out write combined (uncached) host memory, which is fast to fill from the CPU
+   * but slow to read: a readback of a 12 MB storage buffer measured ~150 ms that way, versus
+   * ~10 ms with `HOST_ACCESS_RANDOM` (which lets VMA pick cached memory). Uploads keep the write
+   * hint, readbacks get the random access one. */
+  const VmaAllocationCreateFlags host_access_flags =
+      direction == Direction::HostToDevice ?
+          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT :
+          VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+
   host_buffer_.create(region_size_,
                       usage,
                       VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                      VMA_ALLOCATION_CREATE_MAPPED_BIT |
-                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+                      VMA_ALLOCATION_CREATE_MAPPED_BIT | host_access_flags,
                       0.4f,
                       false,
                       "StagingBuffer");

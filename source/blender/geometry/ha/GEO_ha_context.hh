@@ -183,11 +183,12 @@ class HaBufferInt {
 };
 
 /**
- * Returns a compute shader whose body is \a glsl_body (the statement list of `main`), cached by
- * \a key. The shader reads `position_in[]` and `aggregate[]`, writes `position_out[]` and provides
- * `vec3 position` and `int index` to the body.
+ * Returns a compute shader that writes `position_out[]` from \a glsl_position (a `vec3`
+ * expression) for the elements where \a glsl_selection (a scalar expression) is not zero, and
+ * copies the input position through otherwise. Cached by \a key. In scope of both expressions:
+ * `vec3 position` (the current position) and `int index`.
  */
-gpu::Shader *ha_shader_get(StringRef key, StringRef glsl_body);
+gpu::Shader *ha_shader_get(StringRef key, StringRef glsl_position, StringRef glsl_selection);
 
 /** Access qualifier of one storage buffer binding, mirrors `gpu::shader::Qualifier`. */
 enum class HaShaderQualifier {

@@ -351,6 +351,15 @@ std::string ha_emit_glsl(const HaExpr &expr)
   return emit_as_vector(expr);
 }
 
+std::string ha_emit_glsl_scalar(const HaExpr &expr)
+{
+  if (expr.type == HaType::Float3) {
+    /* Callers check the type; a vector would need an explicit component. */
+    return emit(expr) + ".x";
+  }
+  return emit(expr);
+}
+
 /** \} */
 
 }  // namespace blender::geometry::ha

@@ -27,6 +27,10 @@
 #include "GEO_ha_context.hh"
 #include "GEO_ha_expr.hh"
 
+#include <chrono>
+
+#include <fmt/format.h>
+
 namespace blender::geometry::ha {
 
 namespace {
@@ -46,6 +50,24 @@ void ha_program_debug(const char *message)
   }
 }
 
+/** Wall clock of one stage, printed by #ha_program_debug_timings when `BLENDER_HA_DEBUG` is set. */
+class StageTimer {
+ public:
+  StageTimer() : last_(std::chrono::steady_clock::now()) {}
+
+  /** Milliseconds since the previous call (and restarts the clock). */
+  double lap()
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - last_).count();
+    last_ = now;
+    return ms;
+  }
+
+ private:
+  std::chrono::steady_clock::time_point last_;
+};
+
 }  // namespace
 
 namespace {
@@ -59,16 +81,64 @@ struct CompileContext {
   const bNode *zone_input_node = nullptr;
   bool ok = true;
   int depth = 0;
+  /** Why the compilation stopped, in a form the node UI can show. */
+  std::string reason;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
 const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket);
 const HaExpr *compile_output(CompileContext &ctx, const bNode &node, int socket_index);
 
+/**
+ * Marks the compilation as failed. Only the first reason is kept: it is the one closest to the zone
+ * output, which is the one the user has to fix first.
+ */
+bool fail(CompileContext &ctx, std::string reason)
+{
+  if (ctx.ok) {
+    ctx.reason = std::move(reason);
+  }
+  ctx.ok = false;
+  return false;
+}
+
+/**
+ * Fails when one of \a socket_indices is linked, for inputs that the node's own implementation
+ * reads but this program does not. Ignoring such a connection would silently compute a different
+ * result than the CPU, which is the one thing this backend must never do.
+ *
+ * Inputs that the node itself ignores (an unused third input of `Math`, for example) do not have to
+ * be listed: both sides ignore them, so the results still match.
+ */
+bool reject_linked_inputs(CompileContext &ctx,
+                          const bNode &node,
+                          const std::initializer_list<int> socket_indices)
+{
+  for (const int index : socket_indices) {
+    if (index < 0 || index >= node.input_sockets().size()) {
+      continue;
+    }
+    const bNodeSocket &socket = node.input_socket(index);
+    if (socket.link != nullptr) {
+      return fail(ctx,
+                  fmt::format("node '{}': input '{}' is not supported",
+                              node.name,
+                              socket.name));
+    }
+  }
+  return true;
+}
+
 float read_float_default(const bNodeSocket &socket)
 {
   const auto *value = static_cast<const bNodeSocketValueFloat *>(socket.default_value);
   return value != nullptr ? value->value : 0.0f;
+}
+
+bool read_bool_default(const bNodeSocket &socket)
+{
+  const auto *value = static_cast<const bNodeSocketValueBoolean *>(socket.default_value);
+  return value != nullptr ? value->value : false;
 }
 
 float3 read_vector_default(const bNodeSocket &socket)
@@ -96,40 +166,64 @@ const HaExpr *compile_math(CompileContext &ctx, const bNode &node)
 {
   const HaExpr *a = compile_input(ctx, node, 0);
   const HaExpr *b = compile_input(ctx, node, 1);
+  const HaExpr *result = nullptr;
   switch (node.custom1) {
     case NODE_MATH_ADD:
-      return &ctx.pool.add(HaType::Float, HaOp::Add, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Add, {a, b});
+      break;
     case NODE_MATH_SUBTRACT:
-      return &ctx.pool.add(HaType::Float, HaOp::Sub, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Sub, {a, b});
+      break;
     case NODE_MATH_MULTIPLY:
-      return &ctx.pool.add(HaType::Float, HaOp::Mul, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Mul, {a, b});
+      break;
     case NODE_MATH_DIVIDE:
-      return &ctx.pool.add(HaType::Float, HaOp::Div, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Div, {a, b});
+      break;
     case NODE_MATH_MAXIMUM:
-      return &ctx.pool.add(HaType::Float, HaOp::Max, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Max, {a, b});
+      break;
     case NODE_MATH_MINIMUM:
-      return &ctx.pool.add(HaType::Float, HaOp::Min, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Min, {a, b});
+      break;
     case NODE_MATH_SINE:
-      return &ctx.pool.add(HaType::Float, HaOp::Sin, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Sin, {a});
+      break;
     case NODE_MATH_COSINE:
-      return &ctx.pool.add(HaType::Float, HaOp::Cos, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Cos, {a});
+      break;
     case NODE_MATH_ABSOLUTE:
-      return &ctx.pool.add(HaType::Float, HaOp::Abs, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Abs, {a});
+      break;
     case NODE_MATH_FLOOR:
-      return &ctx.pool.add(HaType::Float, HaOp::Floor, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Floor, {a});
+      break;
     case NODE_MATH_CEIL:
-      return &ctx.pool.add(HaType::Float, HaOp::Ceil, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Ceil, {a});
+      break;
     case NODE_MATH_FRACTION:
-      return &ctx.pool.add(HaType::Float, HaOp::Fract, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Fract, {a});
+      break;
     case NODE_MATH_SQRT:
-      return &ctx.pool.add(HaType::Float, HaOp::Sqrt, {a});
+      result = &ctx.pool.add(HaType::Float, HaOp::Sqrt, {a});
+      break;
     case NODE_MATH_POWER:
-      return &ctx.pool.add(HaType::Float, HaOp::Pow, {a, b});
+      result = &ctx.pool.add(HaType::Float, HaOp::Pow, {a, b});
+      break;
     default:
       break;
   }
-  ctx.ok = false;
-  return &ctx.pool.constant(0.0f);
+  if (result == nullptr) {
+    fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
+    return &ctx.pool.constant(0.0f);
+  }
+  /* The `Clamp` checkbox of the Math node clamps the result to 0..1, and the node's own
+   * implementation does the same, so it has to be part of the expression. */
+  if ((node.custom2 & SHD_MATH_CLAMP) != 0) {
+    result = &ctx.pool.add(
+        HaType::Float, HaOp::Clamp, {result, &ctx.pool.constant(0.0f), &ctx.pool.constant(1.0f)});
+  }
+  return result;
 }
 
 const HaExpr *compile_vector_math(CompileContext &ctx, const bNode &node)
@@ -167,7 +261,7 @@ const HaExpr *compile_vector_math(CompileContext &ctx, const bNode &node)
     default:
       break;
   }
-  ctx.ok = false;
+  fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
   return &ctx.pool.constant(0.0f);
 }
 
@@ -190,31 +284,39 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
       op = HaAggregateOp::Max;
       break;
     default:
-      ctx.ok = false;
+      fail(ctx, "Attribute Statistic: this output is not supported");
       return &ctx.pool.constant(0.0f);
   }
 
   /* Only scalar statistics for now (vector statistics would need a 3-component reduction). */
   if (node.custom1 != CD_PROP_FLOAT) {
-    ctx.ok = false;
+    fail(ctx, "Attribute Statistic: only float statistics are supported");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  /* `Selection` is applied by the node on the CPU; ignoring it here would reduce over a different
+   * set of elements. */
+  if (!reject_linked_inputs(ctx, node, {1})) {
     return &ctx.pool.constant(0.0f);
   }
 
   /* The reduction has to run over the zone geometry (the GPU program only has that one). */
   if (node.input_sockets().is_empty()) {
-    ctx.ok = false;
+    fail(ctx, "Attribute Statistic: missing geometry input");
     return &ctx.pool.constant(0.0f);
   }
   const bNodeSocket &geometry_input = node.input_socket(0);
   if (geometry_input.link == nullptr || geometry_input.link->fromnode != ctx.zone_input_node) {
-    ctx.ok = false;
+    fail(ctx, "Attribute Statistic: the geometry has to come from the zone input");
     return &ctx.pool.constant(0.0f);
   }
 
   /* `Attribute` is input socket 2. */
   const HaExpr *value = compile_input(ctx, node, 2);
   if (!ctx.ok || value == nullptr || value->type != HaType::Float) {
-    ctx.ok = false;
+    if (ctx.ok) {
+      fail(ctx, "Attribute Statistic: only scalar attributes are supported");
+    }
     return &ctx.pool.constant(0.0f);
   }
 
@@ -267,24 +369,23 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
     result = &ctx.pool.add(HaType::Float, op, {compile_input(ctx, node, 0)});
   }
   else if (node.is_type("ShaderNodeClamp"_ustr)) {
-    /* `custom1` is the clamp type: NODE_CLAMP_MINMAX uses the Min/Max sockets, NODE_CLAMP_RANGE
-     * clamps to 0..1. */
+    /* `custom1` is the clamp type. Both modes read the `Min`/`Max` sockets: `Range` only swaps them
+     * when they are in the wrong order (see `node_shader_clamp.cc`), it does *not* clamp to 0..1. */
+    const HaExpr *value = compile_input(ctx, node, 0);
+    const HaExpr *min_value = compile_input(ctx, node, 1);
+    const HaExpr *max_value = compile_input(ctx, node, 2);
     if (node.custom1 == NODE_CLAMP_RANGE) {
       result = &ctx.pool.add(HaType::Float,
-                            HaOp::Clamp,
-                            {compile_input(ctx, node, 0),
-                             &ctx.pool.constant(0.0f),
-                             &ctx.pool.constant(1.0f)});
+                             HaOp::Clamp,
+                             {value,
+                              &ctx.pool.add(HaType::Float, HaOp::Min, {min_value, max_value}),
+                              &ctx.pool.add(HaType::Float, HaOp::Max, {min_value, max_value})});
     }
     else if (node.custom1 == NODE_CLAMP_MINMAX) {
-      result = &ctx.pool.add(HaType::Float,
-                            HaOp::Clamp,
-                            {compile_input(ctx, node, 0),
-                             compile_input(ctx, node, 1),
-                             compile_input(ctx, node, 2)});
+      result = &ctx.pool.add(HaType::Float, HaOp::Clamp, {value, min_value, max_value});
     }
     else {
-      ctx.ok = false;
+      fail(ctx, fmt::format("node '{}': clamp mode is not supported", node.name));
       result = &ctx.pool.constant(0.0f);
     }
   }
@@ -292,7 +393,8 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
     result = compile_statistic(ctx, node, socket_index);
   }
   else {
-    ctx.ok = false;
+    fail(ctx,
+         fmt::format("node '{}' ({}) is not supported", node.name, node.idname));
     result = &ctx.pool.constant(0.0f);
   }
 
@@ -312,10 +414,13 @@ const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket)
         return &ctx.pool.constant(read_vector_default(socket));
       case SOCK_INT:
         return &ctx.pool.constant(float(read_int_default(socket)));
+      case SOCK_BOOLEAN:
+        return &ctx.pool.constant(read_bool_default(socket) ? 1.0f : 0.0f);
       default:
         break;
     }
-    ctx.ok = false;
+    fail(ctx,
+         fmt::format("unlinked input '{}' of an unsupported socket type", socket.name));
     return &ctx.pool.constant(0.0f);
   }
   return compile_output(ctx, *socket.link->fromnode, socket.link->fromsock->index());
@@ -345,56 +450,83 @@ void aggregate_op_strings(const HaAggregateOp op, std::string &r_combine, std::s
 HaZoneProgram::~HaZoneProgram() = default;
 
 std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree*/,
-                                                        const bke::bNodeTreeZone &zone)
+                                                        const bke::bNodeTreeZone &zone,
+                                                        std::string *r_reason)
 {
+  auto fail = [&](std::string reason) -> std::unique_ptr<HaZoneProgram> {
+    if (r_reason != nullptr) {
+      *r_reason = std::move(reason);
+    }
+    return nullptr;
+  };
+
   const bNode *input_node = zone.input_node();
   const bNode *output_node = zone.output_node();
   if (input_node == nullptr || output_node == nullptr) {
-    return nullptr;
+    return fail("the zone is not paired");
   }
 
-  /* Only a single "Set Position" node is supported for now. */
-  const Vector<const bNode *> child_nodes = zone.child_nodes();
-  if (child_nodes.size() != 1) {
-    return nullptr;
-  }
-  const bNode &set_position = *child_nodes[0];
-  if (!set_position.is_type("GeometryNodeSetPosition"_ustr)) {
-    return nullptr;
-  }
-  if (set_position.input_sockets().size() < 4 || set_position.output_sockets().is_empty()) {
-    return nullptr;
-  }
-
-  /* The geometry has to enter directly from the zone input node... */
-  const bNodeSocket &geometry_input = set_position.input_socket(0);
-  if (geometry_input.link == nullptr || geometry_input.link->fromnode != input_node) {
-    return nullptr;
-  }
-  /* ...and leave directly into the zone output node. */
+  /* The zone output has to be fed directly by a `Set Position` node. Field nodes (`Position`,
+   * `Math`, ...) do not appear in `zone.child_nodes()` because they do not depend on the zone
+   * geometry, so this is the only structural requirement that is needed: everything that reaches
+   * the output goes through that node, and its inputs are what gets compiled below. */
   if (output_node->input_sockets().is_empty()) {
-    return nullptr;
+    return fail("the zone output has no input socket");
   }
   const bNodeSocket &zone_output_input = output_node->input_socket(0);
-  if (zone_output_input.link == nullptr || zone_output_input.link->fromnode != &set_position) {
-    return nullptr;
+  if (zone_output_input.link == nullptr) {
+    return fail("the zone output is not connected");
+  }
+  const bNode &set_position = *zone_output_input.link->fromnode;
+  if (!set_position.is_type("GeometryNodeSetPosition"_ustr)) {
+    return fail(fmt::format("node '{}' ({}) is not supported",
+                            set_position.name,
+                            set_position.idname));
+  }
+  if (set_position.input_sockets().size() < 4 || set_position.output_sockets().is_empty()) {
+    return fail("'Set Position' has unexpected sockets");
+  }
+
+  /* The geometry has to enter directly from the zone input node. */
+  const bNodeSocket &geometry_input = set_position.input_socket(0);
+  if (geometry_input.link == nullptr || geometry_input.link->fromnode != input_node) {
+    return fail("the geometry of 'Set Position' has to come directly from the zone input");
   }
 
   HaExprPool pool;
   auto program = std::make_unique<HaZoneProgram>();
   CompileContext ctx{pool, program->aggregates_};
   ctx.zone_input_node = input_node;
-  /* `Set Position`: Geometry, Selection, Position, Offset. A constant offset is supported too. */
+
+  /* `Set Position`: Geometry, Selection, Position, Offset.
+   *
+   * - `Position` unlinked means "keep the current position" (the socket's default input type is the
+   *   position field), so the base of the expression is the element position.
+   * - `Selection` defaults to true; the node writes `Position + Offset` for selected elements only,
+   *   so the kernel mixes between the old and the new position instead of skipping the write. */
+  const HaExpr *base = set_position.input_socket(2).link != nullptr ?
+                           compile_input(ctx, set_position, 2) :
+                           &pool.add(HaType::Float3, HaOp::Position);
   const HaExpr *offset = compile_input(ctx, set_position, 3);
+  const HaExpr *selection = compile_input(ctx, set_position, 1);
   if (!ctx.ok) {
-    return nullptr;
+    return fail(ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+  }
+  if (selection->type != HaType::Float) {
+    /* A non scalar selection would need the same implicit conversion the CPU field evaluation
+     * does; refusing keeps the GPU and CPU results identical. */
+    return fail("the 'Selection' of 'Set Position' has to be a scalar");
   }
 
-  program->glsl_offset_ = ha_emit_glsl(*offset);
+  const HaExpr &final_position = pool.add(HaType::Float3, HaOp::Add, {base, offset});
+  program->glsl_position_ = ha_emit_glsl(final_position);
+  program->glsl_selection_ = ha_emit_glsl_scalar(*selection);
   return program;
 }
 
-bool HaZoneProgram::evaluate(const bke::GeometrySet &input, bke::GeometrySet &r_output) const
+bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
+                             bke::GeometrySet &r_output,
+                             int *r_elements) const
 {
   const Mesh *src_mesh = input.get_mesh();
   if (src_mesh == nullptr) {
@@ -409,16 +541,22 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input, bke::GeometrySet &r_
    * here on (the local #HaBuffer of the dispatch invalidates it again when it is freed). */
   ha_bindings_invalidate();
 
-  gpu::Shader *shader = ha_shader_get(glsl_offset_, glsl_offset_);
+  gpu::Shader *shader = ha_shader_get(glsl_position_ + '#' + glsl_selection_,
+                                      glsl_position_,
+                                      glsl_selection_);
   if (shader == nullptr) {
     return false;
   }
   ha_program_debug("shader ready");
+  if (r_elements != nullptr) {
+    *r_elements = element_count;
+  }
 
   /* Invocations are padded to the local group size; the extra ones only touch the padding. */
   constexpr int local_size = 64;
   const int padded_count = (element_count + local_size - 1) / local_size * local_size;
 
+  StageTimer timer;
   HaBuffer buffer_in;
   HaBuffer buffer_out;
   if (!buffer_in.ensure(int64_t(padded_count) * 3) ||
@@ -427,13 +565,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input, bke::GeometrySet &r_
     return false;
   }
 
+  /* `positions` already is three interleaved floats per element, so both directions are a plain
+   * byte copy instead of a `float3` component loop (which cost ~6 ms per million elements each
+   * way, more than the dispatch itself). */
   Array<float> host_input(padded_count * 3, 0.0f);
-  for (const int i : positions.index_range()) {
-    host_input[i * 3 + 0] = positions[i].x;
-    host_input[i * 3 + 1] = positions[i].y;
-    host_input[i * 3 + 2] = positions[i].z;
-  }
+  host_input.as_mutable_span().take_front(element_count * 3).copy_from(
+      Span<float>(reinterpret_cast<const float *>(positions.data()), positions.size() * 3));
   buffer_in.upload(host_input);
+  const double upload_ms = timer.lap();
   ha_program_debug("uploaded");
 
   /* Aggregates first: the position kernel reads them. Two passes per aggregate: one invocation per
@@ -504,23 +643,37 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input, bke::GeometrySet &r_
   GPU_shader_unbind();
   ha_program_debug("dispatched");
   GPU_finish();
+  const double dispatch_ms = timer.lap();
 
   Array<float> host_output(padded_count * 3);
   buffer_out.download(host_output);
+  const double download_ms = timer.lap();
   ha_program_debug("downloaded");
 
   Mesh *mesh = BKE_mesh_copy_for_eval(*src_mesh);
   MutableSpan<float3> dst_positions = mesh->vert_positions_for_write();
-  for (const int i : positions.index_range()) {
-    dst_positions[i] = float3(
-        host_output[i * 3 + 0], host_output[i * 3 + 1], host_output[i * 3 + 2]);
-  }
+  dst_positions.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_output.data()),
+                                       element_count));
   /* Positions changed, so the derived normals have to be recomputed. */
   mesh->tag_positions_changed();
 
   bke::GeometrySet output = input;
   output.replace_mesh(mesh);
   r_output = std::move(output);
+  if (ha_program_debug_enabled()) {
+    /* The transfer is what decides whether this backend is worth it for element wise work: at 1M
+     * points the CPU reference is a few milliseconds, so a slow upload or a stalling readback is
+     * the whole budget. */
+    fprintf(stderr,
+            "HA program: %d elements: upload %.2f ms, dispatch %.2f ms, download %.2f ms, "
+            "write %.2f ms\n",
+            element_count,
+            upload_ms,
+            dispatch_ms,
+            download_ms,
+            timer.lap());
+    fflush(stderr);
+  }
   return true;
 }
 
