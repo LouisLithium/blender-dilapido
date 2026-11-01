@@ -2163,7 +2163,8 @@ bool HaXpbdFluid::iterate()
   if (sdf_active_) {
     gpu::Shader *sdf_contact = ha_shader_get_source(
         "xpbd|sdf_contact",
-        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_CONTACT,
+        std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + GLSL_SDF_HELPERS +
+            KERNEL_SDF_CONTACT,
         as_span(SDF_CONTACT_RESOURCES),
         LOCAL_GROUP_SIZE);
     if (sdf_contact == nullptr) {
@@ -2307,7 +2308,8 @@ bool HaXpbdFluid::finish_substep()
   if (sdf_active_) {
     gpu::Shader *sdf_friction = ha_shader_get_source(
         "xpbd|sdf_friction",
-        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_FRICTION,
+        std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + GLSL_SDF_HELPERS +
+            KERNEL_SDF_FRICTION,
         as_span(SDF_FRICTION_RESOURCES),
         LOCAL_GROUP_SIZE);
     if (sdf_friction == nullptr) {
