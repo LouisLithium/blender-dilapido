@@ -62,6 +62,11 @@ const char *GLSL_PRELUDE =
     "uint ha_hash_cell(int cx, int cy, int cz)\n"
     "{\n"
     "  return (uint(cx) * 73856093u) ^ (uint(cy) * 19349663u) ^ (uint(cz) * 83492791u);\n"
+    "}\n"
+    "bool ha_is_finite(vec3 v)\n"
+    "{\n"
+    "  return v.x == v.x && v.y == v.y && v.z == v.z && abs(v.x) < 1e30 && abs(v.y) < 1e30 &&\n"
+    "         abs(v.z) < 1e30;\n"
     "}\n";
 
 /**
@@ -819,11 +824,6 @@ const char *GLSL_FLUID_HELPERS =
     "  if (r <= 0.0 || r >= params[4]) { return 0.0; }\n"
     "  float diff = params[4] - r;\n"
     "  return params[15] * diff * diff * diff * r * r * r;\n"
-    "}\n"
-    "bool ha_is_finite(vec3 v)\n"
-    "{\n"
-    "  return v.x == v.x && v.y == v.y && v.z == v.z && abs(v.x) < 1e30 && abs(v.y) < 1e30 &&\n"
-    "         abs(v.z) < 1e30;\n"
     "}\n";
 
 /** The prologue shared by every per particle kernel: the index guard and the particle position. */
@@ -1582,12 +1582,13 @@ std::array<HaShaderResource, 6> SDF_CONTACT_RESOURCES = {{
     {5, HaShaderQualifier::Read, "float", "params[]"},
 }};
 
-std::array<HaShaderResource, 5> SDF_FRICTION_RESOURCES = {{
+std::array<HaShaderResource, 6> SDF_FRICTION_RESOURCES = {{
     {0, HaShaderQualifier::ReadWrite, "float", "velocity_io[]"},
     {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
     {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
     {3, HaShaderQualifier::Read, "float", "position_in[]"},
     {4, HaShaderQualifier::Read, "float", "params[]"},
+    {5, HaShaderQualifier::Read, "float", "props[]"},
 }};
 
 /** \} */
@@ -2163,8 +2164,7 @@ bool HaXpbdFluid::iterate()
   if (sdf_active_) {
     gpu::Shader *sdf_contact = ha_shader_get_source(
         "xpbd|sdf_contact",
-        std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + GLSL_SDF_HELPERS +
-            KERNEL_SDF_CONTACT,
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_CONTACT,
         as_span(SDF_CONTACT_RESOURCES),
         LOCAL_GROUP_SIZE);
     if (sdf_contact == nullptr) {
@@ -2308,19 +2308,19 @@ bool HaXpbdFluid::finish_substep()
   if (sdf_active_) {
     gpu::Shader *sdf_friction = ha_shader_get_source(
         "xpbd|sdf_friction",
-        std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + GLSL_SDF_HELPERS +
-            KERNEL_SDF_FRICTION,
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_FRICTION,
         as_span(SDF_FRICTION_RESOURCES),
         LOCAL_GROUP_SIZE);
     if (sdf_friction == nullptr) {
       last_error_ = "shader creation failed";
       return false;
     }
-    std::array<gpu::StorageBuf *, 5> buffers{velocity_current().buf(),
+    std::array<gpu::StorageBuf *, 6> buffers{velocity_current().buf(),
                                             sdf_data_.buf(),
                                             sdf_params_.buf(),
                                             grid_.positions.buf(),
-                                            params_.buf()};
+                                            params_.buf(),
+                                            props_.buf()};
     dispatch_pass(sdf_friction, buffer_span(buffers), count);
     stats_.passes++;
   }
