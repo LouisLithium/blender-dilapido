@@ -21,6 +21,7 @@
 #include <functional>
 
 #include "GEO_ha_context.hh"
+#include "GEO_ha_sdf.hh"
 
 namespace blender::geometry::ha {
 
@@ -293,6 +294,28 @@ class HaXpbdFluid {
   /** Uploads the contacts gathered on the host for the current substep. */
   bool set_contacts(const HaXpbdContacts &contacts);
 
+  /**
+   * Uploads a dense signed distance field of the colliders. When one is bound, contacts are solved
+   * on the device by sampling it (one trilinear sample per particle per iteration) and the host
+   * does not gather anything: no position readback, no contact table upload.
+   *
+   * \param radius: Distance the particle center is kept away from the surface.
+   * \param friction: 0 is frictionless, 1 removes the full tangential velocity on contact.
+   * \param max_correction: Maximum push per iteration, 0 means unlimited.
+   */
+  bool bind_sdf(const HaSdfGrid &grid,
+                float radius,
+                float friction,
+                float max_correction);
+
+  /** Drops the distance field, so the collider contacts are gathered on the host again. */
+  void clear_sdf();
+
+  bool has_sdf() const
+  {
+    return sdf_active_;
+  }
+
   /** Downloads the normal/friction multipliers so the host can seed the next substep with them. */
   bool download_contact_lambdas(const MutableSpan<float> r_lambdas_normal,
                                 const MutableSpan<float> r_lambdas_friction) const;
@@ -347,6 +370,12 @@ class HaXpbdFluid {
   const char *last_error_ = "";
 
   HaXpbdGrid grid_;
+
+  /** Flags of the collider distance field, see #bind_sdf. */
+  bool sdf_active_ = false;
+  /** 12 floats: origin, spacing, dims, radius, friction, max correction, enabled, unused. */
+  HaBuffer sdf_params_;
+  HaBuffer sdf_data_;
 
   /** Packed per particle properties, see #HA_PROP_STRIDE. */
   HaBuffer props_;

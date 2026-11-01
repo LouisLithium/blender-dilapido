@@ -1479,6 +1479,167 @@ gpu::Shader *run_kernel(const StringRef key,
 /** \name HaXpbdFluid
  * \{ */
 
+/* -------------------------------------------------------------------- */
+/** \name Collider distance field
+ * \{ */
+
+/**
+ * Trilinear sampling of the dense collider distance field (`GEO_ha_sdf`). The lattice
+ * matches the host side: voxel `i` is centered at `origin + (i + 0.5) * spacing`.
+ */
+const char *GLSL_SDF_HELPERS =
+    "float ha_sdf_texel(ivec3 cell, ivec3 dims)\n"
+    "{\n"
+    "  ivec3 c = clamp(cell, ivec3(0), dims - ivec3(1));\n"
+    "  return sdf_data[(c.z * dims.y + c.y) * dims.x + c.x];\n"
+    "}\n"
+    "float ha_sdf_value(vec3 p)\n"
+    "{\n"
+    "  vec3 origin = vec3(sdf_params[0], sdf_params[1], sdf_params[2]);\n"
+    "  float spacing = sdf_params[3];\n"
+    "  ivec3 dims = ivec3(int(sdf_params[4]), int(sdf_params[5]), int(sdf_params[6]));\n"
+    "  vec3 local = (p - origin) / spacing - vec3(0.5);\n"
+    "  ivec3 base = ivec3(floor(local));\n"
+    "  vec3 f = local - vec3(base);\n"
+    "  float c000 = ha_sdf_texel(base, dims);\n"
+    "  float c100 = ha_sdf_texel(base + ivec3(1, 0, 0), dims);\n"
+    "  float c010 = ha_sdf_texel(base + ivec3(0, 1, 0), dims);\n"
+    "  float c110 = ha_sdf_texel(base + ivec3(1, 1, 0), dims);\n"
+    "  float c001 = ha_sdf_texel(base + ivec3(0, 0, 1), dims);\n"
+    "  float c101 = ha_sdf_texel(base + ivec3(1, 0, 1), dims);\n"
+    "  float c011 = ha_sdf_texel(base + ivec3(0, 1, 1), dims);\n"
+    "  float c111 = ha_sdf_texel(base + ivec3(1, 1, 1), dims);\n"
+    "  return mix(mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),\n"
+    "             mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y), f.z);\n"
+    "}\n"
+    "vec3 ha_sdf_normal(vec3 p)\n"
+    "{\n"
+    "  float e = sdf_params[3];\n"
+    "  vec3 gradient = vec3(\n"
+    "      ha_sdf_value(p + vec3(e, 0.0, 0.0)) - ha_sdf_value(p - vec3(e, 0.0, 0.0)),\n"
+    "      ha_sdf_value(p + vec3(0.0, e, 0.0)) - ha_sdf_value(p - vec3(0.0, e, 0.0)),\n"
+    "      ha_sdf_value(p + vec3(0.0, 0.0, e)) - ha_sdf_value(p - vec3(0.0, 0.0, e)));\n"
+    "  float length_sq = dot(gradient, gradient);\n"
+    "  if (length_sq < 1e-12) { return vec3(0.0, 0.0, 1.0); }\n"
+    "  return gradient * inversesqrt(length_sq);\n"
+    "}\n";
+
+/** Pushes the particles out of the collider, one trilinear sample per particle. */
+const char *KERNEL_SDF_CONTACT =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= int(params[0])) { return; }\n"
+    "  if (sdf_params[10] <= 0.0) { return; }\n"
+    "  if (props[i * HA_PROP + 1] <= 0.0) { return; }\n"
+    "  int base = i * 3;\n"
+    "  vec3 p = vec3(position_io[base + 0], position_io[base + 1], position_io[base + 2]);\n"
+    "  float distance_to_surface = ha_sdf_value(p);\n"
+    "  float contact_radius = sdf_params[7];\n"
+    "  particle_state[i * HA_STATE + 7] = 0.0;\n"
+    "  if (distance_to_surface >= contact_radius) { return; }\n"
+    "  vec3 normal = ha_sdf_normal(p);\n"
+    "  float push = contact_radius - distance_to_surface;\n"
+    "  float max_correction = sdf_params[9];\n"
+    "  if (max_correction > 0.0) { push = min(push, max_correction); }\n"
+    "  vec3 correction = normal * push;\n"
+    "  if (!ha_is_finite(correction)) { return; }\n"
+    "  position_io[base + 0] += correction.x;\n"
+    "  position_io[base + 1] += correction.y;\n"
+    "  position_io[base + 2] += correction.z;\n"
+    "  particle_state[i * HA_STATE + 7] = 1.0;\n"
+    "}\n";
+
+/** No-slip friction against the collider, after the fluid velocity layer. */
+const char *KERNEL_SDF_FRICTION =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= int(params[0])) { return; }\n"
+    "  if (sdf_params[10] <= 0.0) { return; }\n"
+    "  if (props[i * HA_PROP + 1] <= 0.0) { return; }\n"
+    "  int base = i * 3;\n"
+    "  vec3 p = vec3(position_in[base + 0], position_in[base + 1], position_in[base + 2]);\n"
+    "  float contact_radius = sdf_params[7];\n"
+    "  if (ha_sdf_value(p) >= contact_radius) { return; }\n"
+    "  vec3 normal = ha_sdf_normal(p);\n"
+    "  vec3 v = vec3(velocity_io[base + 0], velocity_io[base + 1], velocity_io[base + 2]);\n"
+    "  float normal_velocity = dot(v, normal);\n"
+    "  if (normal_velocity < 0.0) { v -= normal * normal_velocity; }\n"
+    "  vec3 tangent = v - normal * dot(v, normal);\n"
+    "  v -= tangent * clamp(sdf_params[8], 0.0, 1.0);\n"
+    "  velocity_io[base + 0] = v.x;\n"
+    "  velocity_io[base + 1] = v.y;\n"
+    "  velocity_io[base + 2] = v.z;\n"
+    "}\n";
+
+std::array<HaShaderResource, 6> SDF_CONTACT_RESOURCES = {{
+    {0, HaShaderQualifier::ReadWrite, "float", "position_io[]"},
+    {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
+    {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
+    {3, HaShaderQualifier::ReadWrite, "float", "particle_state[]"},
+    {4, HaShaderQualifier::Read, "float", "props[]"},
+    {5, HaShaderQualifier::Read, "float", "params[]"},
+}};
+
+std::array<HaShaderResource, 5> SDF_FRICTION_RESOURCES = {{
+    {0, HaShaderQualifier::ReadWrite, "float", "velocity_io[]"},
+    {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
+    {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
+    {3, HaShaderQualifier::Read, "float", "position_in[]"},
+    {4, HaShaderQualifier::Read, "float", "params[]"},
+}};
+
+/** \} */
+
+bool HaXpbdFluid::bind_sdf(const HaSdfGrid &grid,
+                            const float radius,
+                            const float friction,
+                            const float max_correction)
+{
+  if (!ready_) {
+    last_error_ = "not bound";
+    return false;
+  }
+  if (!grid.is_valid()) {
+    this->clear_sdf();
+    return false;
+  }
+  HaContextGuard guard;
+  if (!guard.is_valid()) {
+    last_error_ = "no GPU context";
+    return false;
+  }
+  if (!sdf_data_.ensure(grid.data.size()) || !sdf_params_.ensure(12)) {
+    last_error_ = "sdf allocation failed";
+    this->clear_sdf();
+    return false;
+  }
+  sdf_data_.upload(grid.data.as_span());
+  const std::array<float, 12> params{grid.origin.x,
+                                     grid.origin.y,
+                                     grid.origin.z,
+                                     grid.spacing,
+                                     float(grid.dims.x),
+                                     float(grid.dims.y),
+                                     float(grid.dims.z),
+                                     radius,
+                                     friction,
+                                     max_correction,
+                                     1.0f,
+                                     0.0f};
+  sdf_params_.upload(params);
+  sdf_active_ = true;
+  return true;
+}
+
+void HaXpbdFluid::clear_sdf()
+{
+  sdf_active_ = false;
+  sdf_data_.free();
+  sdf_params_.free();
+}
+
 HaXpbdFluid::~HaXpbdFluid()
 {
   this->free();
@@ -1631,6 +1792,7 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
   /* The host may have bound other buffers to the slots since the last frame (draw, compositor,
    * another node), so the binding cache starts empty for every frame. */
   ha_bindings_invalidate();
+  this->clear_sdf();
   HaContextGuard guard;
   if (!guard.is_valid()) {
     last_error_ = "no GPU context";
@@ -1998,6 +2160,25 @@ bool HaXpbdFluid::iterate()
         grid_.positions.buf(), particle_state_.buf(), props_.buf(), params_.buf()};
     dispatch_pass(apply, buffer_span(buffers), count);
   }
+  if (sdf_active_) {
+    gpu::Shader *sdf_contact = ha_shader_get_source(
+        "xpbd|sdf_contact",
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_CONTACT,
+        as_span(SDF_CONTACT_RESOURCES),
+        LOCAL_GROUP_SIZE);
+    if (sdf_contact == nullptr) {
+      last_error_ = "shader creation failed";
+      return false;
+    }
+    std::array<gpu::StorageBuf *, 6> buffers{grid_.positions.buf(),
+                                            sdf_data_.buf(),
+                                            sdf_params_.buf(),
+                                            particle_state_.buf(),
+                                            props_.buf(),
+                                            params_.buf()};
+    dispatch_pass(sdf_contact, buffer_span(buffers), count);
+    stats_.passes++;
+  }
   if (contact_count_ > 0) {
     std::array<gpu::StorageBuf *, 8> buffers{grid_.positions.buf(),
                                              prev_positions_.buf(),
@@ -2121,6 +2302,24 @@ bool HaXpbdFluid::finish_substep()
                                              contact_lambda_.buf(),
                                              params_.buf()};
     dispatch_pass(contact_friction, buffer_span(buffers), contact_count_);
+    stats_.passes++;
+  }
+  if (sdf_active_) {
+    gpu::Shader *sdf_friction = ha_shader_get_source(
+        "xpbd|sdf_friction",
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_SDF_FRICTION,
+        as_span(SDF_FRICTION_RESOURCES),
+        LOCAL_GROUP_SIZE);
+    if (sdf_friction == nullptr) {
+      last_error_ = "shader creation failed";
+      return false;
+    }
+    std::array<gpu::StorageBuf *, 5> buffers{velocity_current().buf(),
+                                            sdf_data_.buf(),
+                                            sdf_params_.buf(),
+                                            grid_.positions.buf(),
+                                            params_.buf()};
+    dispatch_pass(sdf_friction, buffer_span(buffers), count);
     stats_.passes++;
   }
   stats_.velocity_ms = time_now_ms() - velocity_start;

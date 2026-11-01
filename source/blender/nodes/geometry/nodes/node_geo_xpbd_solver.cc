@@ -396,6 +396,14 @@ struct FluidChunkData {
    */
   geometry::ha::HaXpbdFluid gpu_fluid;
   bool gpu_active = false;
+  /**
+   * Dense distance field of the collider of this fluid, when it has exactly one static mesh
+   * collider. Contacts are then solved on the device by sampling it (no host gather, no readback).
+   */
+  geometry::ha::HaSdfGrid sdf;
+  bool sdf_ready = false;
+  /** Bumped when the field is rebuilt, so the cache can be skipped while nothing moves. */
+  uint64_t sdf_hash = 0;
   /** Wall clock when the device work of the current frame started, for the debug log. */
   double gpu_start_ms = 0.0;
 
@@ -5468,6 +5476,88 @@ class XpbdSolverStep {
     return this->fluid_gpu_rejection(chunk_i, soft) == nullptr;
   }
 
+  /**
+   * Bakes the collider distance field of a fluid (see #FluidChunkData::sdf). Only one static mesh
+   * collider is supported for now, which covers the common cases (a floor, a basin, a plate);
+   * deformable or animated colliders keep using the host side BVH contacts.
+   */
+  void prepare_fluid_sdf(FluidChunkData &fluid, const GeometryData &geo_data)
+  {
+    fluid.sdf_ready = false;
+    if (geo_data.mesh_colliders.size() != 1) {
+      return;
+    }
+    const MeshCollider &collider = constraints_.mesh_colliders[geo_data.mesh_colliders[0]
+                                                                  .constraint_i];
+    if (collider.is_boundary) {
+      /* Boundary particles already keep the fluid out of the collider, no contact needed. */
+      return;
+    }
+    const StaticMeshInfo *static_info = std::get_if<StaticMeshInfo>(&collider.mesh);
+    if (static_info == nullptr || static_info->mesh == nullptr) {
+      return;
+    }
+    const Mesh &mesh = *static_info->mesh;
+    if (mesh.corner_tris().is_empty()) {
+      return;
+    }
+
+    /* Content hash, not the mesh pointer: the geometry nodes evaluation hands out a new mesh every
+     * frame, so a pointer based key rebuilt the field on every single frame (measured: 5.2 s per
+     * frame instead of 200 ms). A handful of vertex positions is enough to notice a moving or
+     * deformed collider. */
+    uint64_t hash = uint64_t(mesh.verts_num) * 2654435761u;
+    hash ^= uint64_t(mesh.corner_tris().size()) * 40503u;
+    for (const int column : IndexRange(4)) {
+      for (const int row : IndexRange(4)) {
+        hash = hash * 33u + uint64_t(BLI_hash_int(int(collider.end_transform[column][row] * 4096.0f)));
+      }
+    }
+    {
+      const Span<float3> positions = mesh.vert_positions();
+      const int step = std::max(1, int(positions.size()) / 16);
+      for (int i = 0; i < int(positions.size()); i += step) {
+        hash = hash * 33u + uint64_t(BLI_hash_int(int(positions[i].x * 4096.0f)));
+        hash = hash * 33u + uint64_t(BLI_hash_int(int(positions[i].y * 4096.0f)));
+        hash = hash * 33u + uint64_t(BLI_hash_int(int(positions[i].z * 4096.0f)));
+      }
+    }
+
+    if (hash != fluid.sdf_hash) {
+      const Span<float3> local_positions = mesh.vert_positions();
+      Array<float3> world_positions(local_positions.size());
+      threading::parallel_for(local_positions.index_range(), 4096, [&](const IndexRange range) {
+        for (const int i : range) {
+          world_positions[i] = math::transform_point(collider.end_transform, local_positions[i]);
+        }
+      });
+      /* Half a particle radius per voxel: fine enough for the contact normal, cheap to bake. */
+      const float voxel_size = std::max(1e-4f, 0.5f * fluid.support_radius);
+      /* The band has to be wider than one substep of movement plus the radius, otherwise a fast
+       * particle can cross the whole band of a thin collider. */
+      const float band_width = std::max(4.0f * voxel_size, 2.0f * fluid.support_radius);
+      if (!geometry::ha::ha_sdf_build(world_positions,
+                                      mesh.corner_verts(),
+                                      mesh.corner_tris(),
+                                      voxel_size,
+                                      band_width,
+                                      fluid.sdf))
+      {
+        fluid.sdf_hash = 0;
+        return;
+      }
+      fluid.sdf_hash = hash;
+      debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                    std::getenv("XPBD_GPU_DEBUG") != nullptr,
+                    "XPBD_GPU sdf baked collider=%s voxels=%lld spacing=%.4f band=%.4f\n",
+                    collider.path.c_str(),
+                    (long long)fluid.sdf.voxels_num(),
+                    double(fluid.sdf.spacing),
+                    double(band_width));
+    }
+    fluid.sdf_ready = fluid.sdf.is_valid();
+  }
+
   void prepare_fluid_gpu()
   {
     const char *force = std::getenv("BLENDER_XPBD_GPU");
@@ -5540,6 +5630,8 @@ class XpbdSolverStep {
       inputs.boundary_positions = fluid.boundary_positions.as_span();
       inputs.boundary_masses = fluid.boundary_masses.as_span();
 
+      this->prepare_fluid_sdf(fluid, geo_data);
+
       fluid.gpu_start_ms = time_now_ms();
       fluid.gpu_active = fluid.gpu_fluid.bind(inputs,
                                              fluid.support_radius,
@@ -5547,6 +5639,23 @@ class XpbdSolverStep {
                                              constraint.compliance * substep_compliance_factor_,
                                              constraint.artificial_pressure,
                                              0.1f * fluid.support_radius);
+      if (fluid.gpu_active && fluid.sdf_ready) {
+        /* Contact radius is the particle radius, the density support radius is twice that. */
+        const bool bound = fluid.gpu_fluid.bind_sdf(
+            fluid.sdf,
+            0.5f * fluid.support_radius,
+            std::clamp(constraints_.mesh_colliders[geo_data.mesh_colliders[0].constraint_i]
+                           .friction,
+                       0.0f,
+                       1.0f),
+            0.1f * fluid.support_radius);
+        debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                      print,
+                      "XPBD_GPU collision backend=%s voxels=%lld spacing=%g\n",
+                      bound ? "sdf" : "cpu-gather",
+                      (long long)fluid.sdf.voxels_num(),
+                      double(fluid.sdf.spacing));
+      }
       debug_gpu_log("BLENDER_XPBD_GPU_LOG",
                     print,
                     "XPBD_GPU backend=%s particles=%d substeps=%d iterations=%d support_radius=%g%s%s\n",
@@ -5582,7 +5691,10 @@ class XpbdSolverStep {
 
     /* Contacts are gathered on the host once per substep (that needs the predicted positions),
      * then solved on the device like on the CPU. */
-    const bool gathers_contacts = !geo_data.mesh_colliders.is_empty();
+    /* With a distance field the device solves the collider contacts itself, so the host does not
+     * gather anything and there is no readback per substep. */
+    const bool gathers_contacts = !geo_data.mesh_colliders.is_empty() &&
+                                  !fluid.gpu_fluid.has_sdf();
     geometry::ha::HaXpbdFluid::ContactHook hook;
     if (gathers_contacts) {
       hook = [&]() -> bool {
