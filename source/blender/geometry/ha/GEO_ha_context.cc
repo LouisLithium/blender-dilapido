@@ -593,7 +593,7 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
 
   /* Version of the generated shader pipeline; bump whenever the resource layout or the kernel
    * templates change, so that the on-disk shader cache cannot return a stale binary. */
-  constexpr int HA_SHADER_VERSION = 3;
+  constexpr int HA_SHADER_VERSION = 4;
 
   /* Unique per program: the resource declaration macros are derived from this name, and the shader
    * cache uses it as part of its key. */
@@ -673,6 +673,46 @@ Span<const HaShaderResource> as_span(const std::array<HaShaderResource, 3> &reso
   return Span<const HaShaderResource>(resources.data(), int64_t(resources.size()));
 }
 
+/**
+ * Helpers the generated expressions call. They mirror the BLI functions that the CPU node
+ * implementations use (`safe_divide`, `safe_modf`, `safe_floored_modf`, `safe_powf`, `wrapf`), and
+ * they exist because the guards differ per component for vectors: writing them out inline in every
+ * expression would make the generated source explode and is easy to get wrong.
+ *
+ * Prepended to every kernel that evaluates generated expressions (the position kernel and the first
+ * reduction pass). Keep it in sync with `GEO_ha_expr.cc`.
+ */
+const char *HA_GLSL_HELPERS =
+    "float ha_safe_divide(float a, float b) { return b != 0.0 ? a / b : 0.0; }\n"
+    "vec3 ha_safe_divide(vec3 a, vec3 b) {\n"
+    "  return vec3(ha_safe_divide(a.x, b.x), ha_safe_divide(a.y, b.y), ha_safe_divide(a.z, b.z));\n"
+    "}\n"
+    "float ha_safe_mod(float a, float b) { return b != 0.0 ? a - b * trunc(a / b) : 0.0; }\n"
+    "vec3 ha_safe_mod(vec3 a, vec3 b) {\n"
+    "  return vec3(ha_safe_mod(a.x, b.x), ha_safe_mod(a.y, b.y), ha_safe_mod(a.z, b.z));\n"
+    "}\n"
+    "float ha_safe_floored_mod(float a, float b) { return b != 0.0 ? a - floor(a / b) * b : 0.0; }\n"
+    "vec3 ha_safe_floored_mod(vec3 a, vec3 b) {\n"
+    "  return vec3(ha_safe_floored_mod(a.x, b.x),\n"
+    "              ha_safe_floored_mod(a.y, b.y),\n"
+    "              ha_safe_floored_mod(a.z, b.z));\n"
+    "}\n"
+    "float ha_safe_pow(float b, float e) {\n"
+    "  if (b >= 0.0) { return pow(b, e); }\n"
+    "  if (e != trunc(e)) { return 0.0; }\n"
+    "  return mod(e, 2.0) == 0.0 ? pow(-b, e) : -pow(-b, e);\n"
+    "}\n"
+    "vec3 ha_safe_pow(vec3 b, vec3 e) {\n"
+    "  return vec3(ha_safe_pow(b.x, e.x), ha_safe_pow(b.y, e.y), ha_safe_pow(b.z, e.z));\n"
+    "}\n"
+    "float ha_wrap(float v, float mx, float mn) {\n"
+    "  float range = mx - mn;\n"
+    "  return range != 0.0 ? v - range * floor((v - mn) / range) : mn;\n"
+    "}\n"
+    "vec3 ha_wrap(vec3 v, vec3 mx, vec3 mn) {\n"
+    "  return vec3(ha_wrap(v.x, mx.x, mn.x), ha_wrap(v.y, mx.y, mn.y), ha_wrap(v.z, mx.z, mn.z));\n"
+    "}\n";
+
 }  // namespace
 
 gpu::Shader *ha_shader_get(const StringRef key,
@@ -680,13 +720,14 @@ gpu::Shader *ha_shader_get(const StringRef key,
                            const StringRef glsl_selection)
 {
   const std::string source =
-      std::string("void main()\n"
+      std::string(HA_GLSL_HELPERS) +
+      "void main()\n"
                   "{\n"
                   "  int index = int(gl_GlobalInvocationID.x);\n"
                   "  int base = index * 3;\n"
                   "  vec3 position = vec3(position_in[base], position_in[base + 1], "
                   "position_in[base + 2]);\n"
-                  "  vec3 target = ") +
+                  "  vec3 target = " +
       std::string(glsl_position) +
       ";\n"
       /* The implicit float -> bool conversion of the field system is `value > 0` (see
@@ -717,7 +758,7 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
 {
   /* One invocation per block; the loop is serial inside the block so that the summation order is
    * fixed (deterministic and close to the CPU result). */
-  const std::string source = std::string("void main()\n"
+  const std::string source = std::string(HA_GLSL_HELPERS) + "void main()\n"
                                          "{\n"
                                          "  int block = int(gl_GlobalInvocationID.x);\n"
                                          "  int element_count = int(params[0]);\n"
@@ -725,7 +766,7 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                                          "  if (block >= block_count) {\n"
                                          "    return;\n"
                                          "  }\n"
-                                         "  int start = block * ") +
+                                         "  int start = block * " +
                              std::to_string(HA_REDUCE_BLOCK_SIZE) +
                              ";\n"
                              "  int end = min(start + " +

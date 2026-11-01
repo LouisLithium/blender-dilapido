@@ -164,107 +164,437 @@ const HaExpr *compile_input(CompileContext &ctx, const bNode &node, const int so
   return compile_socket(ctx, node.input_socket(socket_index));
 }
 
+/** One entry of the Math / Vector Math dispatch tables. */
+struct HaOpInfo {
+  HaOp op = HaOp::Const;
+  /** Number of inputs the operation reads (from socket 0 upwards). */
+  int arg_count = 2;
+  /** Result type; `Float3` only for the vector math table. */
+  HaType type = HaType::Float;
+  /** Extra input index when it is not simply `arg_count - 1` (Vector Math `Scale`). */
+  int extra_input = -1;
+};
+
 const HaExpr *compile_math(CompileContext &ctx, const bNode &node)
 {
-  const HaExpr *a = compile_input(ctx, node, 0);
-  const HaExpr *b = compile_input(ctx, node, 1);
-  const HaExpr *result = nullptr;
+  HaOpInfo info;
   switch (node.custom1) {
     case NODE_MATH_ADD:
-      result = &ctx.pool.add(HaType::Float, HaOp::Add, {a, b});
+      info = {HaOp::Add, 2};
       break;
     case NODE_MATH_SUBTRACT:
-      result = &ctx.pool.add(HaType::Float, HaOp::Sub, {a, b});
+      info = {HaOp::Sub, 2};
       break;
     case NODE_MATH_MULTIPLY:
-      result = &ctx.pool.add(HaType::Float, HaOp::Mul, {a, b});
+      info = {HaOp::Mul, 2};
       break;
     case NODE_MATH_DIVIDE:
-      result = &ctx.pool.add(HaType::Float, HaOp::Div, {a, b});
+      info = {HaOp::Div, 2};
       break;
     case NODE_MATH_MAXIMUM:
-      result = &ctx.pool.add(HaType::Float, HaOp::Max, {a, b});
+      info = {HaOp::Max, 2};
       break;
     case NODE_MATH_MINIMUM:
-      result = &ctx.pool.add(HaType::Float, HaOp::Min, {a, b});
-      break;
-    case NODE_MATH_SINE:
-      result = &ctx.pool.add(HaType::Float, HaOp::Sin, {a});
-      break;
-    case NODE_MATH_COSINE:
-      result = &ctx.pool.add(HaType::Float, HaOp::Cos, {a});
-      break;
-    case NODE_MATH_ABSOLUTE:
-      result = &ctx.pool.add(HaType::Float, HaOp::Abs, {a});
-      break;
-    case NODE_MATH_FLOOR:
-      result = &ctx.pool.add(HaType::Float, HaOp::Floor, {a});
-      break;
-    case NODE_MATH_CEIL:
-      result = &ctx.pool.add(HaType::Float, HaOp::Ceil, {a});
-      break;
-    case NODE_MATH_FRACTION:
-      result = &ctx.pool.add(HaType::Float, HaOp::Fract, {a});
-      break;
-    case NODE_MATH_SQRT:
-      result = &ctx.pool.add(HaType::Float, HaOp::Sqrt, {a});
+      info = {HaOp::Min, 2};
       break;
     case NODE_MATH_POWER:
-      result = &ctx.pool.add(HaType::Float, HaOp::Pow, {a, b});
+      info = {HaOp::Pow, 2};
+      break;
+    case NODE_MATH_LOGARITHM:
+      info = {HaOp::Log, 2};
+      break;
+    case NODE_MATH_ARCTAN2:
+      info = {HaOp::Atan2, 2};
+      break;
+    case NODE_MATH_MODULO:
+      info = {HaOp::Modulo, 2};
+      break;
+    case NODE_MATH_FLOORED_MODULO:
+      info = {HaOp::FlooredModulo, 2};
+      break;
+    case NODE_MATH_SNAP:
+      info = {HaOp::Snap, 2};
+      break;
+    case NODE_MATH_PINGPONG:
+      info = {HaOp::PingPong, 2};
+      break;
+    case NODE_MATH_LESS_THAN:
+      info = {HaOp::LessThan, 2};
+      break;
+    case NODE_MATH_GREATER_THAN:
+      info = {HaOp::GreaterThan, 2};
+      break;
+    case NODE_MATH_MULTIPLY_ADD:
+      info = {HaOp::MulAdd, 3};
+      break;
+    case NODE_MATH_WRAP:
+      info = {HaOp::Wrap, 3};
+      break;
+    case NODE_MATH_SMOOTH_MIN:
+      info = {HaOp::SmoothMin, 3};
+      break;
+    case NODE_MATH_SMOOTH_MAX:
+      info = {HaOp::SmoothMax, 3};
+      break;
+    case NODE_MATH_COMPARE:
+      info = {HaOp::CompareEps, 3};
+      break;
+    case NODE_MATH_SINE:
+      info = {HaOp::Sin, 1};
+      break;
+    case NODE_MATH_COSINE:
+      info = {HaOp::Cos, 1};
+      break;
+    case NODE_MATH_TANGENT:
+      info = {HaOp::Tan, 1};
+      break;
+    case NODE_MATH_ARCSINE:
+      info = {HaOp::Asin, 1};
+      break;
+    case NODE_MATH_ARCCOSINE:
+      info = {HaOp::Acos, 1};
+      break;
+    case NODE_MATH_ARCTANGENT:
+      info = {HaOp::Atan, 1};
+      break;
+    case NODE_MATH_ABSOLUTE:
+      info = {HaOp::Abs, 1};
+      break;
+    case NODE_MATH_FLOOR:
+      info = {HaOp::Floor, 1};
+      break;
+    case NODE_MATH_CEIL:
+      info = {HaOp::Ceil, 1};
+      break;
+    case NODE_MATH_FRACTION:
+      info = {HaOp::Fract, 1};
+      break;
+    case NODE_MATH_SQRT:
+      info = {HaOp::Sqrt, 1};
+      break;
+    case NODE_MATH_INV_SQRT:
+      info = {HaOp::InvSqrt, 1};
+      break;
+    case NODE_MATH_SIGN:
+      info = {HaOp::Sign, 1};
+      break;
+    case NODE_MATH_EXPONENT:
+      info = {HaOp::Exp, 1};
+      break;
+    case NODE_MATH_ROUND:
+      info = {HaOp::Round, 1};
+      break;
+    case NODE_MATH_TRUNC:
+      info = {HaOp::Trunc, 1};
+      break;
+    case NODE_MATH_SINH:
+      info = {HaOp::Sinh, 1};
+      break;
+    case NODE_MATH_COSH:
+      info = {HaOp::Cosh, 1};
+      break;
+    case NODE_MATH_TANH:
+      info = {HaOp::Tanh, 1};
       break;
     default:
-      break;
+      fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
+      return &ctx.pool.constant(0.0f);
   }
-  if (result == nullptr) {
-    fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
-    return &ctx.pool.constant(0.0f);
+
+  Vector<const HaExpr *> args;
+  for (const int i : IndexRange(info.arg_count)) {
+    args.append(compile_input(ctx, node, i));
   }
+  HaExpr &result = ctx.pool.add(info.type, info.op, args.as_span());
   /* The `Clamp` checkbox of the Math node clamps the result to 0..1, and the node's own
    * implementation does the same, so it has to be part of the expression. */
   if ((node.custom2 & SHD_MATH_CLAMP) != 0) {
-    result = &ctx.pool.add(
-        HaType::Float, HaOp::Clamp, {result, &ctx.pool.constant(0.0f), &ctx.pool.constant(1.0f)});
+    return &ctx.pool.add(
+        HaType::Float, HaOp::Clamp, {&result, &ctx.pool.constant(0.0f), &ctx.pool.constant(1.0f)});
   }
-  return result;
+  return &result;
 }
 
 const HaExpr *compile_vector_math(CompileContext &ctx, const bNode &node)
 {
-  const HaExpr *a = compile_input(ctx, node, 0);
-  const HaExpr *b = compile_input(ctx, node, 1);
+  HaOpInfo info{HaOp::Const, 2, HaType::Float3};
   switch (node.custom1) {
     case NODE_VECTOR_MATH_ADD:
-      return &ctx.pool.add(HaType::Float3, HaOp::Add, {a, b});
+      info.op = HaOp::Add;
+      break;
     case NODE_VECTOR_MATH_SUBTRACT:
-      return &ctx.pool.add(HaType::Float3, HaOp::Sub, {a, b});
+      info.op = HaOp::Sub;
+      break;
     case NODE_VECTOR_MATH_MULTIPLY:
-      return &ctx.pool.add(HaType::Float3, HaOp::Mul, {a, b});
+      info.op = HaOp::Mul;
+      break;
     case NODE_VECTOR_MATH_DIVIDE:
-      return &ctx.pool.add(HaType::Float3, HaOp::Div, {a, b});
+      info.op = HaOp::Div;
+      break;
+    case NODE_VECTOR_MATH_MINIMUM:
+      info.op = HaOp::Min;
+      break;
+    case NODE_VECTOR_MATH_MAXIMUM:
+      info.op = HaOp::Max;
+      break;
+    case NODE_VECTOR_MATH_MODULO:
+      info.op = HaOp::Modulo;
+      break;
+    case NODE_VECTOR_MATH_SNAP:
+      info.op = HaOp::Snap;
+      break;
+    case NODE_VECTOR_MATH_CROSS_PRODUCT:
+      info.op = HaOp::Cross;
+      break;
+    case NODE_VECTOR_MATH_PROJECT:
+      info.op = HaOp::Project;
+      break;
+    case NODE_VECTOR_MATH_REFLECT:
+      info.op = HaOp::Reflect;
+      break;
+    case NODE_VECTOR_MATH_WRAP:
+      info = {HaOp::Wrap, 3, HaType::Float3};
+      break;
+    case NODE_VECTOR_MATH_MULTIPLY_ADD:
+      info = {HaOp::MulAdd, 3, HaType::Float3};
+      break;
     case NODE_VECTOR_MATH_SCALE:
       /* Inputs: Vector, Vector_001, Vector_002, Scale. */
-      return &ctx.pool.add(HaType::Float3, HaOp::Mul, {a, compile_input(ctx, node, 3)});
-    case NODE_VECTOR_MATH_LENGTH:
-      return &ctx.pool.add(HaType::Float, HaOp::Length, {a});
-    case NODE_VECTOR_MATH_ABSOLUTE:
-      return &ctx.pool.add(HaType::Float3, HaOp::Abs, {a});
-    case NODE_VECTOR_MATH_FLOOR:
-      return &ctx.pool.add(HaType::Float3, HaOp::Floor, {a});
-    case NODE_VECTOR_MATH_CEIL:
-      return &ctx.pool.add(HaType::Float3, HaOp::Ceil, {a});
-    case NODE_VECTOR_MATH_FRACTION:
-      return &ctx.pool.add(HaType::Float3, HaOp::Fract, {a});
-    case NODE_VECTOR_MATH_NORMALIZE:
-      return &ctx.pool.add(HaType::Float3, HaOp::Normalize, {a});
-    case NODE_VECTOR_MATH_DOT_PRODUCT:
-      return &ctx.pool.add(HaType::Float, HaOp::Dot, {a, b});
-    case NODE_VECTOR_MATH_DISTANCE:
-      return &ctx.pool.add(HaType::Float, HaOp::Distance, {a, b});
-    default:
+      info = {HaOp::Mul, 1, HaType::Float3, 3};
       break;
+    case NODE_VECTOR_MATH_LENGTH:
+      info = {HaOp::Length, 1, HaType::Float};
+      break;
+    case NODE_VECTOR_MATH_DOT_PRODUCT:
+      info = {HaOp::Dot, 2, HaType::Float};
+      break;
+    case NODE_VECTOR_MATH_DISTANCE:
+      info = {HaOp::Distance, 2, HaType::Float};
+      break;
+    case NODE_VECTOR_MATH_NORMALIZE:
+      info = {HaOp::Normalize, 1, HaType::Float3};
+      break;
+    case NODE_VECTOR_MATH_ABSOLUTE:
+      info = {HaOp::Abs, 1, HaType::Float3};
+      break;
+    case NODE_VECTOR_MATH_FLOOR:
+      info = {HaOp::Floor, 1, HaType::Float3};
+      break;
+    case NODE_VECTOR_MATH_CEIL:
+      info = {HaOp::Ceil, 1, HaType::Float3};
+      break;
+    case NODE_VECTOR_MATH_FRACTION:
+      info = {HaOp::Fract, 1, HaType::Float3};
+      break;
+    default:
+      fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
+      return &ctx.pool.constant(0.0f);
   }
-  fail(ctx, fmt::format("node '{}': operation is not supported", node.name));
-  return &ctx.pool.constant(0.0f);
+
+  Vector<const HaExpr *> args;
+  for (const int i : IndexRange(info.arg_count)) {
+    args.append(compile_input(ctx, node, i));
+  }
+  if (info.extra_input >= 0) {
+    args.append(compile_input(ctx, node, info.extra_input));
+  }
+  return &ctx.pool.add(info.type, info.op, args.as_span());
+}
+
+/**
+ * `FunctionNodeCompare`, float only. `EQ`/`NE` use the `Epsilon` input (a plain `<=` on the absolute
+ * difference, exactly like the node's own multi-function).
+ */
+const HaExpr *compile_compare(CompileContext &ctx, const bNode &node)
+{
+  const auto &storage = *static_cast<const NodeFunctionCompare *>(node.storage);
+  if (storage.data_type != SOCK_FLOAT) {
+    fail(ctx, "Compare: only the float mode is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (storage.mode != NODE_COMPARE_MODE_ELEMENT) {
+    fail(ctx, "Compare: only the element-wise mode is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaParam param;
+  switch (storage.operation) {
+    case NODE_COMPARE_LESS_THAN:
+      param = HaParam::CompareLess;
+      break;
+    case NODE_COMPARE_LESS_EQUAL:
+      param = HaParam::CompareLessEqual;
+      break;
+    case NODE_COMPARE_GREATER_THAN:
+      param = HaParam::CompareGreater;
+      break;
+    case NODE_COMPARE_GREATER_EQUAL:
+      param = HaParam::CompareGreaterEqual;
+      break;
+    case NODE_COMPARE_EQUAL:
+      param = HaParam::CompareEqual;
+      break;
+    case NODE_COMPARE_NOT_EQUAL:
+      param = HaParam::CompareNotEqual;
+      break;
+    default:
+      fail(ctx, "Compare: this operation is not supported");
+      return &ctx.pool.constant(0.0f);
+  }
+
+  const bool with_epsilon = ELEM(param, HaParam::CompareEqual, HaParam::CompareNotEqual);
+  Vector<const HaExpr *> args;
+  args.append(compile_input(ctx, node, 0));
+  args.append(compile_input(ctx, node, 1));
+  if (with_epsilon) {
+    if (node.input_sockets().size() < 3) {
+      fail(ctx, "Compare: the Epsilon input is missing");
+      return &ctx.pool.constant(0.0f);
+    }
+    args.append(compile_input(ctx, node, 2));
+  }
+  HaExpr &result = ctx.pool.add(HaType::Float, HaOp::Compare, args.as_span());
+  result.param = int(param);
+  return &result;
+}
+
+const HaExpr *compile_bool_math(CompileContext &ctx, const bNode &node)
+{
+  HaParam param;
+  switch (node.custom1) {
+    case NODE_BOOLEAN_MATH_AND:
+      param = HaParam::BoolAnd;
+      break;
+    case NODE_BOOLEAN_MATH_OR:
+      param = HaParam::BoolOr;
+      break;
+    case NODE_BOOLEAN_MATH_NOT:
+      param = HaParam::BoolNot;
+      break;
+    case NODE_BOOLEAN_MATH_NAND:
+      param = HaParam::BoolNand;
+      break;
+    case NODE_BOOLEAN_MATH_NOR:
+      param = HaParam::BoolNor;
+      break;
+    case NODE_BOOLEAN_MATH_XOR:
+      param = HaParam::BoolXor;
+      break;
+    case NODE_BOOLEAN_MATH_XNOR:
+      param = HaParam::BoolXnor;
+      break;
+    default:
+      fail(ctx, "Boolean Math: this operation is not supported");
+      return &ctx.pool.constant(0.0f);
+  }
+  /* `NOT` only reads one input, the others read two. */
+  const int arg_count = param == HaParam::BoolNot ? 1 : 2;
+  Vector<const HaExpr *> args;
+  for (const int i : IndexRange(arg_count)) {
+    args.append(compile_input(ctx, node, i));
+  }
+  HaExpr &result = ctx.pool.add(HaType::Float, HaOp::BoolMath, args.as_span());
+  result.param = int(param);
+  return &result;
+}
+
+/** `ShaderNodeMix` for the float and vector types (colours and rotations are not supported). */
+const HaExpr *compile_mix(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  const auto &storage = *static_cast<const NodeShaderMix *>(node.storage);
+  /* Inputs: Factor_Float(0), Factor_Vector(1), A_Float(2), B_Float(3), A_Vector(4), B_Vector(5). */
+  int factor_index;
+  int a_index;
+  int b_index;
+  HaType type;
+  switch (storage.data_type) {
+    case SOCK_FLOAT:
+      factor_index = 0;
+      a_index = 2;
+      b_index = 3;
+      type = HaType::Float;
+      if (socket_index != 0) {
+        fail(ctx, "Mix: unexpected output socket");
+        return &ctx.pool.constant(0.0f);
+      }
+      break;
+    case SOCK_VECTOR:
+      factor_index = storage.factor_mode == NODE_MIX_MODE_UNIFORM ? 0 : 1;
+      a_index = 4;
+      b_index = 5;
+      type = HaType::Float3;
+      if (socket_index != 1) {
+        fail(ctx, "Mix: unexpected output socket");
+        return &ctx.pool.constant(0.0f);
+      }
+      break;
+    default:
+      fail(ctx, "Mix: only the float and vector modes are supported");
+      return &ctx.pool.constant(0.0f);
+  }
+  if (storage.blend_type != MA_RAMP_BLEND) {
+    /* Only used for colours, which are not supported anyway. */
+    fail(ctx, "Mix: only the mix blend mode is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaExpr &result = ctx.pool.add(HaType(type),
+                                HaOp::Mix,
+                                {compile_input(ctx, node, factor_index),
+                                 compile_input(ctx, node, a_index),
+                                 compile_input(ctx, node, b_index)});
+  if (storage.clamp_factor != 0) {
+    result.param |= HA_PARAM_CLAMP;
+  }
+  return &result;
+}
+
+/** `ShaderNodeMapRange` for the float and vector types. */
+const HaExpr *compile_map_range(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  const auto &storage = *static_cast<const NodeMapRange *>(node.storage);
+  /* Inputs: Value(0) From Min(1) From Max(2) To Min(3) To Max(4) Steps(5), then the vector copies
+   * at 6..11. */
+  const bool vector = storage.data_type == CD_PROP_FLOAT3;
+  const int base = vector ? 6 : 0;
+  const HaType type = vector ? HaType::Float3 : HaType::Float;
+  if (socket_index != (vector ? 1 : 0)) {
+    fail(ctx, "Map Range: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaParam interpolation;
+  switch (storage.interpolation_type) {
+    case NODE_MAP_RANGE_LINEAR:
+      interpolation = HaParam::MapRangeLinear;
+      break;
+    case NODE_MAP_RANGE_STEPPED:
+      interpolation = HaParam::MapRangeStepped;
+      break;
+    case NODE_MAP_RANGE_SMOOTHSTEP:
+      interpolation = HaParam::MapRangeSmoothStep;
+      break;
+    case NODE_MAP_RANGE_SMOOTHERSTEP:
+      interpolation = HaParam::MapRangeSmootherStep;
+      break;
+    default:
+      fail(ctx, "Map Range: this interpolation is not supported");
+      return &ctx.pool.constant(0.0f);
+  }
+
+  Vector<const HaExpr *> args;
+  for (const int i : IndexRange(5)) {
+    args.append(compile_input(ctx, node, base + i));
+  }
+  if (interpolation == HaParam::MapRangeStepped) {
+    args.append(compile_input(ctx, node, base + 5));
+  }
+  HaExpr &result = ctx.pool.add(type, HaOp::MapRange, args.as_span());
+  result.param = int(interpolation);
+  if (storage.clamp != 0) {
+    result.param |= HA_PARAM_CLAMP;
+  }
+  return &result;
 }
 
 const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const int socket_index)
@@ -393,6 +723,18 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("GeometryNodeAttributeStatistic"_ustr)) {
     result = compile_statistic(ctx, node, socket_index);
+  }
+  else if (node.is_type("FunctionNodeCompare"_ustr)) {
+    result = compile_compare(ctx, node);
+  }
+  else if (node.is_type("FunctionNodeBooleanMath"_ustr)) {
+    result = compile_bool_math(ctx, node);
+  }
+  else if (node.is_type("ShaderNodeMix"_ustr)) {
+    result = compile_mix(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeMapRange"_ustr)) {
+    result = compile_map_range(ctx, node, socket_index);
   }
   else {
     fail(ctx,
