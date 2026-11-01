@@ -11,7 +11,8 @@
  * bundle; the node itself only has `Delta Time` and the output. The world holds
  *
  *  - `geometry`: the state of the previous frame (a volume with one grid per field),
- *  - `source`: the rasterized emitter of this frame (the volume of `Init Ignis Data`),
+ *  - `source`: the rasterized emitters of this frame (the volumes of `Init Ignis Data`; several of
+ *    them are mixed when they are instanced, see #gather_source_volumes),
  *  - `effectors`: the colliders (`Dilapido Collider`) and the force fields (`Dilapido Force`),
  *  - `settings`: the simulation parameters (`Blender.IgnisSettings`), so the asset can expose the
  *    whole panel without every knob being a socket of this node.
@@ -26,6 +27,7 @@
 #include "BLI_math_vector.hh"
 
 #include "BKE_geometry_set.hh"
+#include "BKE_instances.hh"
 #include "BKE_volume.hh"
 
 #include "NOD_bundle_type.hh"
@@ -154,6 +156,45 @@ const GeometrySet *lookup_geometry(const Bundle &bundle, const StringRef key)
   return bundle.lookup_ptr<GeometrySet>(*BundleKey::from_str(key));
 }
 
+/**
+ * Collects the volumes of a geometry set, including the ones that are nested in instances.
+ *
+ * A `GeometrySet` holds at most one `Volume` component, and joining two of them is not implemented
+ * in this branch (`join_volumes()` drops them: resampling grids with the same name and picking the
+ * cell size of the result is an open question), so `Join Geometry` of two `Init Ignis Data` outputs
+ * produces nothing at all. A geometry set does hold any number of instances though, and every
+ * instance may contain a geometry set with a volume in it, so several emitters are mixed with
+ * `Geometry to Instance` (or any other node that creates instances) and found by this walk.
+ *
+ * \note The transform of an instance is ignored: `Init Ignis Data` rasterizes its input in the space
+ * it is given and a volume carries its own grid transform, so moving an emitter has to happen before
+ * it is rasterized (`Transform Geometry` on the mesh upstream, or `Object Info > Transform`).
+ */
+static void gather_source_volumes(const GeometrySet &geometry,
+                                  Vector<const Volume *> &r_volumes,
+                                  const int depth)
+{
+  if (const Volume *volume = geometry.get_volume()) {
+    r_volumes.append(volume);
+  }
+  /* Instances may contain instances; a malformed or deeply nested graph is simply cut off. */
+  if (depth >= 8) {
+    return;
+  }
+  const bke::Instances *instances = geometry.get_instances();
+  if (instances == nullptr) {
+    return;
+  }
+  /* `references()` is the deduplicated table, so a volume that is instanced several times (or with
+   * different transforms) contributes once, which is what the solver wants. */
+  for (const bke::InstanceReference &reference : instances->references()) {
+    if (reference.type() != bke::InstanceReference::Type::GeometrySet) {
+      continue;
+    }
+    gather_source_volumes(reference.geometry_set(), r_volumes, depth + 1);
+  }
+}
+
 geometry::ignis::Settings read_settings(const Bundle &world)
 {
   geometry::ignis::Settings settings;
@@ -260,6 +301,7 @@ BundlePtr stats_to_bundle(const Stats &stats)
   BundlePtr bundle_ptr = Bundle::create();
   Bundle &bundle = bundle_ptr.ensure_mutable_inplace();
   bundle.add(*BundleKey::from_str("active_voxels"), stats.active_voxels);
+  bundle.add(*BundleKey::from_str("sources"), stats.sources);
   bundle.add(*BundleKey::from_str("substeps"), stats.substeps_used);
   bundle.add(*BundleKey::from_str("pressure_iterations"), stats.pressure_iterations);
   bundle.add(*BundleKey::from_str("residual"), stats.residual);
@@ -311,9 +353,18 @@ static void node_geo_exec(GeoNodeExecParams params)
   if (const GeometrySet *geometry = lookup_geometry(*world_ptr, "geometry")) {
     previous = geometry->get_volume();
   }
-  const Volume *source = nullptr;
+  Vector<const Volume *> sources;
   if (const GeometrySet *geometry = lookup_geometry(*world_ptr, "source")) {
-    source = geometry->get_volume();
+    gather_source_volumes(*geometry, sources, 0);
+    if (sources.is_empty()) {
+      /* A world with a `source` item but no volume in it. That is normal on the frames an emitter is
+       * switched off (an empty emitter), but it is also what `Join Geometry` of two emitters looks
+       * like (that node drops volumes instead of joining them), so the message names the fix. */
+      params.error_message_add(
+          NodeWarningType::Info,
+          TIP_("The source holds no volume. Several emitters are mixed with `Geometry to Instance` "
+               "(`Join Geometry` drops volumes: a geometry set holds one)"));
+    }
   }
 
   Vector<geometry::ignis::Collider> colliders;
@@ -328,10 +379,10 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.wind += acceleration;
 
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
-    printf("IGNIS_DEBUG exec: previous %s, source %s, colliders %d, acceleration %.2f %.2f %.2f, "
+    printf("IGNIS_DEBUG exec: previous %s, sources %d, colliders %d, acceleration %.2f %.2f %.2f, "
            "dt %.4f\n",
            previous != nullptr ? "yes" : "no",
-           source != nullptr ? "yes" : "no",
+           int(sources.size()),
            int(colliders.size()),
            double(acceleration.x),
            double(acceleration.y),
@@ -342,7 +393,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   Stats stats;
   Volume *volume = geometry::ignis::solve_frame(
       previous,
-      source,
+      Span<const Volume *>(sources.data(), sources.size()),
       Span<const geometry::ignis::Collider>(colliders.data(), colliders.size()),
       settings,
       delta_time,

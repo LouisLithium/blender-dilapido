@@ -118,6 +118,8 @@ struct Stats {
   float divergence_after = 0.0f;
   /** Voxels of the frame that ended up inside a collider and were removed. */
   int solid_voxels = 0;
+  /** Emitters that contributed to the frame (every volume of the source geometry). */
+  int sources = 0;
   bool cfl_limited = false;
   bool resized = false;
   double milliseconds = 0.0;
@@ -143,15 +145,17 @@ struct Collider {
  * Advance the solver by one frame.
  *
  * \param previous: the state of the previous frame, or null on the first frame.
- * \param source: the rasterized emitter of this frame (the volume of `Init Ignis Data`), sampled at
- *                the voxel centers of the state, so the source and the solver may use different
- *                resolutions. Optional.
+ * \param sources: the rasterized emitters of this frame (the volumes of `Init Ignis Data`), sampled
+ *                 at the voxel centers of the state, so a source and the solver may use different
+ *                 resolutions. They are added one after the other: the scalar fields keep the
+ *                 larger magnitude per voxel, so several emitters of different strength and
+ *                 temperature mix instead of overwriting each other. Optional.
  * \param colliders: the meshes the smoke cannot go through, already posed in world space.
  * \param r_stats: timing and diagnostics, also used to report a clamped CFL.
  * \return the new state (a new #Volume, the caller owns it) or null when there is nothing to do.
  */
 Volume *solve_frame(const Volume *previous,
-                    const Volume *source,
+                    Span<const Volume *> sources,
                     Span<const Collider> colliders,
                     const Settings &settings,
                     float delta_time,

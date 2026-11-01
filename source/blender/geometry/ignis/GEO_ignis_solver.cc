@@ -272,9 +272,11 @@ int solver_radius(const Settings &settings)
  * Adds a rasterized emitter (the volume of `Init Ignis Data`) to the state.
  *
  * The source may use a different resolution than the solver, so it is sampled at the voxel centers of
- * the state instead of being copied. Density, temperature and fuel keep the larger of the two values
- * (a steady emitter holds its region at its own level instead of piling up until the simulation
- * explodes), and the velocity is blended in by the strength of the source.
+ * the state instead of being copied. Density, temperature and fuel keep the larger magnitude of the
+ * two (a steady emitter holds its region at its own level instead of piling up until the simulation
+ * explodes), and the velocity is blended in by the strength of the source. Merging by magnitude is
+ * what makes several emitters add up: a hot source and a cold one next to it keep both their
+ * temperatures instead of the last one overwriting the first.
  */
 void add_source_volume(State &state, const Volume &source_volume)
 {
@@ -1358,12 +1360,13 @@ void clip_to_bounds(State &state, const Settings &settings)
 }  // namespace
 
 Volume *solve_frame(const Volume *previous,
-                    const Volume *source,
+                    const Span<const Volume *> sources,
                     const Span<const Collider> colliders,
                     const Settings &settings,
                     const float delta_time,
                     Stats &r_stats)
 {
+  r_stats.sources = int(sources.size());
   const auto start = std::chrono::steady_clock::now();
   const float voxel_size = std::max(1e-5f, settings.voxel_size);
 
@@ -1384,7 +1387,7 @@ Volume *solve_frame(const Volume *previous,
   const float dt = std::max(0.0f, delta_time);
   if (dt <= 0.0f) {
     /* First frame or a paused frame: only show the sources, do not integrate. */
-    if (source != nullptr) {
+    for (const Volume *source : sources) {
       add_source_volume(state, *source);
     }
     ensure_velocity_topology(state);
@@ -1441,9 +1444,11 @@ Volume *solve_frame(const Volume *previous,
   double ms_solids = 0.0;
 
   for ([[maybe_unused]] const int substep : IndexRange(substeps)) {
-    if (source != nullptr) {
+    if (!sources.is_empty()) {
       ScopedTimer timer(ms_sources);
-      add_source_volume(state, *source);
+      for (const Volume *source : sources) {
+        add_source_volume(state, *source);
+      }
     }
     ensure_velocity_topology(state);
     if (!solids_built) {
