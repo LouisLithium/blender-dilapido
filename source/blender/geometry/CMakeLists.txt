@@ -74,6 +74,7 @@ set(SRC
   ha/GEO_ha_expr.cc
   ha/GEO_ha_program.cc
   ha/GEO_ha_sdf.cc
+  ha/GEO_ha_status.cc
   ha/GEO_ha_xpbd.cc
 
   GEO_tetrahedralize.cc
@@ -136,6 +137,7 @@ set(SRC
   ha/GEO_ha_expr.hh
   ha/GEO_ha_program.hh
   ha/GEO_ha_sdf.hh
+  ha/GEO_ha_status.hh
   ha/GEO_ha_xpbd.hh
 
   rigid_body/GEO_rigid_body_solver.hh

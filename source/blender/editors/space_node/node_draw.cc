@@ -102,6 +102,8 @@
 
 #include "GEO_fillet_curves.hh"
 
+#include "GEO_ha_status.hh"
+
 #include "node_intern.hh" /* own include */
 
 #include <fmt/format.h>
@@ -3003,6 +3005,45 @@ static void node_draw_basis(const bContext &C,
                  0,
                  "");
     block_emboss_set(&block, ui::EmbossType::Emboss);
+  }
+  /* Hardware acceleration badge.
+   *
+   * Only nodes that published a state during the last evaluation get one (see
+   * `geometry/ha/GEO_ha_status.hh`), so it appears exactly where it means something: a node with a
+   * device implementation that is currently inside an `HW Accelerate` zone. Two channels, like the
+   * other node badges: the icon tells the state at a glance, the tooltip carries the details. */
+  {
+    geometry::ha::HaNodeStatus ha_status;
+    if (geometry::ha::ha_status_get(ntree, node, ha_status)) {
+      const bool on_device = ha_status.state == geometry::ha::HaNodeState::Device;
+      std::string tip;
+      if (on_device) {
+        tip = "Hardware accelerated on " + ha_status.backend;
+        if (ha_status.elements > 0) {
+          tip += " (" + std::to_string(ha_status.elements) + " elements)";
+        }
+      }
+      else {
+        tip = "Hardware acceleration available, but the CPU was used";
+        if (!ha_status.reason.empty()) {
+          tip += ": " + ha_status.reason;
+        }
+      }
+      iconofs -= iconbutw;
+      block_emboss_set(&block, ui::EmbossType::None);
+      uiDefIconBut(&block,
+                   ui::ButtonType::But,
+                   on_device ? ICON_MEMORY : ICON_INFO,
+                   iconofs,
+                   rct.ymax - NODE_DY,
+                   iconbutw,
+                   UI_UNIT_Y,
+                   nullptr,
+                   0,
+                   0,
+                   StringRef(tip));
+      block_emboss_set(&block, ui::EmbossType::Emboss);
+    }
   }
   if (node.type_legacy == GEO_NODE_VIEWER) {
     const bool is_active = &node == tree_draw_ctx.active_geometry_nodes_viewer;

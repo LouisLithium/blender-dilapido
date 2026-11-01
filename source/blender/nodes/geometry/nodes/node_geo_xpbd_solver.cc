@@ -43,12 +43,18 @@
 #include "GEO_xpbd_fluid.hh"
 
 #include "GEO_ha_context.hh"
+#include "GEO_ha_status.hh"
 #include "GEO_ha_xpbd.hh"
 
 #include "NOD_geo_tag_filter.hh"
 #include "NOD_geometry_nodes_bundle.hh"
 #include "NOD_geometry_nodes_list.hh"
 #include "NOD_geometry_nodes_physics_bundles.hh"
+
+#include "RNA_access.hh"
+
+#include "UI_interface_layout.hh"
+#include "UI_resources.hh"
 
 #include "node_geometry_util.hh"
 
@@ -3359,6 +3365,41 @@ class XpbdSolverStep {
     }
   }
 
+  /**
+   * Publishes what the last step did on the compute backend, so that the node can show it (header
+   * badge and the info block). Called only when the solver runs inside an `HW Accelerate` zone.
+   */
+ public:
+  void publish_ha_status(const bNodeTree &tree, const bNode &node) const
+  {
+    geometry::ha::HaNodeStatus status;
+    status.backend = geometry::ha::ha_gpu_backend_name();
+    bool has_fluid = false;
+    for (const ChunkData &chunk_data : chunks_data_) {
+      const FluidChunkData &fluid = chunk_data.fluid;
+      if (!fluid.active) {
+        continue;
+      }
+      has_fluid = true;
+      if (fluid.gpu_active) {
+        status.state = geometry::ha::HaNodeState::Device;
+        status.elements = fluid.gpu_fluid.particle_count();
+        break;
+      }
+    }
+    if (status.state != geometry::ha::HaNodeState::Device) {
+      if (!has_fluid) {
+        /* Nothing to accelerate: no badge at all. */
+        geometry::ha::ha_status_clear(tree, node);
+        return;
+      }
+      status.state = geometry::ha::HaNodeState::Fallback;
+      status.reason = gpu_rejection_reason_;
+    }
+    geometry::ha::ha_status_set(tree, node, status);
+  }
+
+ private:
   Result do_simulation()
   {
     this->prepare_solver_geometry_refs();
@@ -5413,6 +5454,9 @@ class XpbdSolverStep {
    * is only "not implemented on the device yet" (coupling), which an explicit
    * `BLENDER_XPBD_GPU=1` may override for A/B testing, or a hard structural one.
    */
+  /** Why the fluid could not use the device in the last evaluation, for the node UI. */
+  std::string gpu_rejection_reason_;
+
   /** Particle count below which the fluid stays on the CPU (see #fluid_gpu_rejection). */
   int device_min_particles() const
   {
@@ -5560,6 +5604,7 @@ class XpbdSolverStep {
 
   void prepare_fluid_gpu()
   {
+    gpu_rejection_reason_.clear();
     const char *force = std::getenv("BLENDER_XPBD_GPU");
     const bool force_gpu = force != nullptr && StringRef(force) == "1";
     const bool force_cpu = force != nullptr && StringRef(force) == "0";
@@ -5588,6 +5633,9 @@ class XpbdSolverStep {
         continue;
       }
       if (const char *rejection = this->fluid_gpu_rejection(chunk_i, soft_rejection)) {
+        if (gpu_rejection_reason_.empty()) {
+          gpu_rejection_reason_ = rejection;
+        }
         const bool ignore_soft = force_gpu || gpu_backend_request_ == 2; /* Backend = Strict */
         if (!(ignore_soft && soft_rejection)) {
           debug_gpu_log("BLENDER_XPBD_GPU_LOG",
@@ -5600,6 +5648,13 @@ class XpbdSolverStep {
             this->report(NodeWarningType::Warning,
                          fmt::format("HW Accelerate zone (Strict): the fluid is solved on the CPU "
                                      "({})",
+                                     rejection));
+          }
+          else if (gpu_backend_request_ == 1) {
+            /* Auto: a silent fallback is what made the whole feature hard to trust, so say it
+             * once per evaluation on the node (info, not a warning: nothing went wrong). */
+            this->report(NodeWarningType::Info,
+                         fmt::format("HW Accelerate zone: the fluid is solved on the CPU ({})",
                                      rejection));
           }
           continue;
@@ -6560,6 +6615,29 @@ class XpbdSolverStep {
   }
 };
 
+/**
+ * Read only info block: what the last evaluation did on the compute backend. Blender's rule for
+ * node UI is to keep status out of the node body unless it says something, so this only draws when
+ * the node reported a state (i.e. it runs inside an `HW Accelerate` zone).
+ */
+static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *current_node_ptr)
+{
+  bNode &node = *static_cast<bNode *>(current_node_ptr->data);
+  const bNodeTree &tree = node.owner_tree();
+  geometry::ha::HaNodeStatus status;
+  if (!geometry::ha::ha_status_get(tree, node, status)) {
+    return;
+  }
+  layout.separator();
+  if (status.state == geometry::ha::HaNodeState::Device) {
+    layout.label(fmt::format("Device: {} · {} elements", status.backend, status.elements),
+                 ICON_MEMORY);
+  }
+  else {
+    layout.label(fmt::format("CPU: {}", status.reason), ICON_INFO);
+  }
+}
+
 static void node_geo_exec(GeoNodeExecParams params)
 {
   BundlePtr world_ptr = params.get_input<BundlePtr>("World"_ustr);
@@ -6600,6 +6678,14 @@ static void node_geo_exec(GeoNodeExecParams params)
                       simulation_to_world,
                       backend_request);
   step.do_step();
+  if (backend_request != 0) {
+    step.publish_ha_status(params.node().owner_tree(), params.node());
+  }
+  else {
+    /* Outside of a zone: drop the state, so that the badge does not linger after the node was
+     * taken out of the zone. */
+    geometry::ha::ha_status_clear(params.node().owner_tree(), params.node());
+  }
 
   if (!solver_path.empty()) {
     BundlePtr solver_data_ptr = Bundle::create();
@@ -6636,6 +6722,7 @@ static void node_register()
   ntype.declare = node_declare;
   ntype.default_width = bke::NodeWidth::_200;
   ntype.labelfunc = node_label;
+  ntype.draw_buttons_ex = node_layout_ex;
   blender::bke::node_register_type(ntype);
 }
 NOD_REGISTER_NODE(node_register)
