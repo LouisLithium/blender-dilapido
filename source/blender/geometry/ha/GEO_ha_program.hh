@@ -7,22 +7,28 @@
  *
  * Compiles the body of a `HW Accelerate` zone into a compute program.
  *
- * The supported shape is one `Set Position` node whose geometry comes straight from the zone input
- * and goes straight into the zone output:
+ * A program is a **chain** of `Set Position` nodes that starts at the zone input and ends at the
+ * zone output:
  *
- *   zone input -> Set Position -> zone output
+ *   zone input -> Set Position -> Set Position -> ... -> zone output
  *
- * All three field inputs of that node are supported, built from the nodes the expression IR
- * understands (position, index, vector math, math, combine/separate, clamp, reductions).
+ * The whole chain is evaluated on the device with **one upload and one download**: the steps
+ * ping-pong between two device buffers, so adding a node to the zone costs a dispatch and nothing
+ * else (measured: the transfer is ~14 ms per million elements, a dispatch ~4 ms).
  *
  * Everything else returns `nullptr` **with a reason** and the zone falls back to the regular CPU
- * evaluation, so this file can only ever make things faster, not wrong. Two rules keep it that way:
+ * evaluation, so this file can only ever make things faster, not wrong. Three rules keep it that
+ * way:
  *
  * - A socket the node's own implementation reads but this program does not (for example
  *   `Attribute Statistic > Selection`) has to make the compilation fail, never be ignored.
  * - A socket that only changes the result through a node property (for example the `Clamp`
  *   checkbox of the `Math` node) has to be honoured or rejected. `MATH_CLAMP` and the two `Clamp`
  *   modes are handled; that class of bug is exactly what the parity tests look for.
+ * - The device buffers live for exactly one evaluation (the steps of the chain stay resident for
+ *   the duration of that evaluation). Keeping them across frames buys nothing measurable: the
+ *   depsgraph does not re-evaluate a zone whose inputs did not change, so the interesting frames
+ *   always have new data to upload.
  */
 
 #pragma once
@@ -55,6 +61,14 @@ struct HaAggregate {
   HaAggregateOp op = HaAggregateOp::Sum;
 };
 
+/** One geometry modifying node of the chain: where every element ends up, and which ones move. */
+struct HaProgramStep {
+  /** `vec3` expression, with `vec3 position` / `int index` in scope. */
+  std::string glsl_position;
+  /** Scalar expression, compared against zero (the field system's `float -> bool` conversion). */
+  std::string glsl_selection;
+};
+
 class HaZoneProgram {
  public:
   ~HaZoneProgram();
@@ -77,22 +91,16 @@ class HaZoneProgram {
                 bke::GeometrySet &r_output,
                 int *r_elements = nullptr) const;
 
-  /** The GLSL expression of the final position, for debug output. */
-  StringRefNull glsl_position() const
+  int step_count() const
   {
-    return glsl_position_;
+    return int(steps_.size());
   }
 
-  /** The GLSL expression of the selection, for debug output. */
-  StringRefNull glsl_selection() const
-  {
-    return glsl_selection_;
-  }
+  /** Human readable form of the compiled chain, for the debug log. */
+  std::string debug_description() const;
 
  private:
-  std::string glsl_position_;
-  /** `1.0` when every element is affected, otherwise a scalar expression compared against zero. */
-  std::string glsl_selection_;
+  Vector<HaProgramStep> steps_;
   Vector<HaAggregate> aggregates_;
 };
 

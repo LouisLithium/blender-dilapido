@@ -73,6 +73,8 @@ class StageTimer {
 namespace {
 
 constexpr int MAX_EXPRESSION_DEPTH = 64;
+/** Upper bound for the number of geometry nodes in one zone body. Each one is a dispatch. */
+constexpr int MAX_CHAIN_STEPS = 16;
 
 struct CompileContext {
   HaExprPool &pool;
@@ -477,20 +479,34 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
   if (zone_output_input.link == nullptr) {
     return fail("the zone output is not connected");
   }
-  const bNode &set_position = *zone_output_input.link->fromnode;
-  if (!set_position.is_type("GeometryNodeSetPosition"_ustr)) {
-    return fail(fmt::format("node '{}' ({}) is not supported",
-                            set_position.name,
-                            set_position.idname));
-  }
-  if (set_position.input_sockets().size() < 4 || set_position.output_sockets().is_empty()) {
-    return fail("'Set Position' has unexpected sockets");
-  }
 
-  /* The geometry has to enter directly from the zone input node. */
-  const bNodeSocket &geometry_input = set_position.input_socket(0);
-  if (geometry_input.link == nullptr || geometry_input.link->fromnode != input_node) {
-    return fail("the geometry of 'Set Position' has to come directly from the zone input");
+  /* Walk back through the chain of `Set Position` nodes until the zone input is reached. The whole
+   * chain is compiled into one program, so it costs one upload and one download no matter how many
+   * nodes it contains. */
+  Vector<const bNode *> chain;
+  const bNode *current = zone_output_input.link->fromnode;
+  while (true) {
+    if (chain.size() >= MAX_CHAIN_STEPS) {
+      return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
+                              MAX_CHAIN_STEPS));
+    }
+    if (!current->is_type("GeometryNodeSetPosition"_ustr)) {
+      return fail(fmt::format("node '{}' ({}) is not supported", current->name, current->idname));
+    }
+    if (current->input_sockets().size() < 4 || current->output_sockets().is_empty()) {
+      return fail("'Set Position' has unexpected sockets");
+    }
+    chain.append(current);
+
+    const bNodeSocket &geometry_input = current->input_socket(0);
+    if (geometry_input.link == nullptr) {
+      return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
+    }
+    const bNode *previous = geometry_input.link->fromnode;
+    if (previous == input_node) {
+      break;
+    }
+    current = previous;
   }
 
   HaExprPool pool;
@@ -498,30 +514,52 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
   CompileContext ctx{pool, program->aggregates_};
   ctx.zone_input_node = input_node;
 
-  /* `Set Position`: Geometry, Selection, Position, Offset.
-   *
-   * - `Position` unlinked means "keep the current position" (the socket's default input type is the
-   *   position field), so the base of the expression is the element position.
-   * - `Selection` defaults to true; the node writes `Position + Offset` for selected elements only,
-   *   so the kernel mixes between the old and the new position instead of skipping the write. */
-  const HaExpr *base = set_position.input_socket(2).link != nullptr ?
-                           compile_input(ctx, set_position, 2) :
-                           &pool.add(HaType::Float3, HaOp::Position);
-  const HaExpr *offset = compile_input(ctx, set_position, 3);
-  const HaExpr *selection = compile_input(ctx, set_position, 1);
-  if (!ctx.ok) {
-    return fail(ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
-  }
-  if (selection->type != HaType::Float) {
-    /* A non scalar selection would need the same implicit conversion the CPU field evaluation
-     * does; refusing keeps the GPU and CPU results identical. */
-    return fail("the 'Selection' of 'Set Position' has to be a scalar");
-  }
+  /* Compile first step -> last step (`chain` is stored last -> first). */
+  for (const int i : chain.index_range()) {
+    const bNode &node = *chain[chain.size() - 1 - i];
 
-  const HaExpr &final_position = pool.add(HaType::Float3, HaOp::Add, {base, offset});
-  program->glsl_position_ = ha_emit_glsl(final_position);
-  program->glsl_selection_ = ha_emit_glsl_scalar(*selection);
+    /* `Set Position`: Geometry, Selection, Position, Offset.
+     *
+     * - `Position` unlinked means "keep the current position" (the socket's default input type is
+     *   the position field), so the base of the expression is the element position. In a chain the
+     *   "current position" is the previous step's result, which is exactly what the kernel reads.
+     * - `Selection` defaults to true; the node writes `Position + Offset` for selected elements
+     *   only, so the kernel picks between the old and the new position instead of skipping the
+     *   write. */
+    const HaExpr *base = node.input_socket(2).link != nullptr ?
+                             compile_input(ctx, node, 2) :
+                             &pool.add(HaType::Float3, HaOp::Position);
+    const HaExpr *offset = compile_input(ctx, node, 3);
+    const HaExpr *selection = compile_input(ctx, node, 1);
+    if (!ctx.ok) {
+      return fail(ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    }
+    if (selection->type != HaType::Float) {
+      /* A non scalar selection would need the same implicit conversion the CPU field evaluation
+       * does; refusing keeps the GPU and CPU results identical. */
+      return fail("the 'Selection' of 'Set Position' has to be a scalar");
+    }
+
+    const HaExpr &final_position = pool.add(HaType::Float3, HaOp::Add, {base, offset});
+    program->steps_.append(
+        {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
+  }
   return program;
+}
+
+std::string HaZoneProgram::debug_description() const
+{
+  std::string result;
+  for (const int i : steps_.index_range()) {
+    if (!result.empty()) {
+      result += " -> ";
+    }
+    result += fmt::format("[{}] position = {}, selection = {}",
+                          i,
+                          steps_[i].glsl_position,
+                          steps_[i].glsl_selection);
+  }
+  return result;
 }
 
 bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
@@ -534,33 +572,23 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   }
   const Span<float3> positions = src_mesh->vert_positions();
   const int element_count = int(positions.size());
-  if (element_count <= 0) {
+  if (element_count <= 0 || steps_.is_empty()) {
     return false;
   }
   /* This path binds its buffers itself, so the cache of #ha_bind_storage_buffers is stale from
    * here on (the local #HaBuffer of the dispatch invalidates it again when it is freed). */
   ha_bindings_invalidate();
 
-  gpu::Shader *shader = ha_shader_get(glsl_position_ + '#' + glsl_selection_,
-                                      glsl_position_,
-                                      glsl_selection_);
-  if (shader == nullptr) {
-    return false;
-  }
-  ha_program_debug("shader ready");
-  if (r_elements != nullptr) {
-    *r_elements = element_count;
-  }
-
   /* Invocations are padded to the local group size; the extra ones only touch the padding. */
   constexpr int local_size = 64;
   const int padded_count = (element_count + local_size - 1) / local_size * local_size;
 
   StageTimer timer;
-  HaBuffer buffer_in;
-  HaBuffer buffer_out;
-  if (!buffer_in.ensure(int64_t(padded_count) * 3) ||
-      !buffer_out.ensure(int64_t(padded_count) * 3))
+  /* Two buffers, ping-ponged between the steps: this is what makes a chain cost one upload and one
+   * download instead of two transfers per node. */
+  HaBuffer buffers[2];
+  if (!buffers[0].ensure(int64_t(padded_count) * 3) ||
+      !buffers[1].ensure(int64_t(padded_count) * 3))
   {
     return false;
   }
@@ -571,12 +599,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   Array<float> host_input(padded_count * 3, 0.0f);
   host_input.as_mutable_span().take_front(element_count * 3).copy_from(
       Span<float>(reinterpret_cast<const float *>(positions.data()), positions.size() * 3));
-  buffer_in.upload(host_input);
+  buffers[0].upload(host_input);
   const double upload_ms = timer.lap();
   ha_program_debug("uploaded");
 
-  /* Aggregates first: the position kernel reads them. Two passes per aggregate: one invocation per
-   * block writes a partial value, then a single invocation folds them. */
+  /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
+   * geometry (that is what `Attribute Statistic` is wired to). Two passes per aggregate: one
+   * invocation per block writes a partial value, then a single invocation folds them. */
   const int aggregate_count = int(aggregates_.size());
   HaBuffer buffer_aggregate;
   if (!buffer_aggregate.ensure(std::max<int64_t>(1, int64_t(aggregate_count) * 3))) {
@@ -609,13 +638,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       buffer_params.upload(params);
 
       GPU_shader_bind(stage1);
-      GPU_storagebuf_bind(buffer_in.buf(), 0);
+      GPU_storagebuf_bind(buffers[0].buf(), 0);
       GPU_storagebuf_bind(buffer_params.buf(), 1);
       GPU_storagebuf_bind(buffer_partial.buf(), 2);
       ha_dispatch(stage1, block_count);
       GPU_storagebuf_unbind(buffer_partial.buf());
       GPU_storagebuf_unbind(buffer_params.buf());
-      GPU_storagebuf_unbind(buffer_in.buf());
+      GPU_storagebuf_unbind(buffers[0].buf());
       GPU_shader_unbind();
 
       GPU_shader_bind(stage2);
@@ -632,21 +661,42 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     ha_program_debug("aggregates ready");
   }
 
-  GPU_shader_bind(shader);
-  GPU_storagebuf_bind(buffer_in.buf(), 0);
-  GPU_storagebuf_bind(buffer_out.buf(), 1);
-  GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
-  ha_dispatch(shader, padded_count);
-  GPU_storagebuf_unbind(buffer_aggregate.buf());
-  GPU_storagebuf_unbind(buffer_in.buf());
-  GPU_storagebuf_unbind(buffer_out.buf());
-  GPU_shader_unbind();
+  /* The steps: each one reads the previous result and writes the other buffer. Only the last one
+   * has to be finished before the readback, the intermediate dispatches stay queued. */
+  double dispatch_ms = 0.0;
+  for (const int i : steps_.index_range()) {
+    const HaProgramStep &step = steps_[i];
+    gpu::Shader *shader = ha_shader_get(step.glsl_position + '#' + step.glsl_selection,
+                                        step.glsl_position,
+                                        step.glsl_selection);
+    if (shader == nullptr) {
+      return false;
+    }
+    HaBuffer &src = buffers[i % 2];
+    HaBuffer &dst = buffers[(i + 1) % 2];
+    GPU_shader_bind(shader);
+    GPU_storagebuf_bind(src.buf(), 0);
+    GPU_storagebuf_bind(dst.buf(), 1);
+    GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
+    ha_dispatch(shader, padded_count);
+    GPU_storagebuf_unbind(buffer_aggregate.buf());
+    GPU_storagebuf_unbind(dst.buf());
+    GPU_storagebuf_unbind(src.buf());
+    GPU_shader_unbind();
+    if (i + 1 == steps_.size()) {
+      GPU_finish();
+      dispatch_ms = timer.lap();
+    }
+  }
   ha_program_debug("dispatched");
-  GPU_finish();
-  const double dispatch_ms = timer.lap();
+  if (r_elements != nullptr) {
+    *r_elements = element_count;
+  }
 
+  /* After `n` steps the result is in buffer `n % 2`. */
+  const HaBuffer &result = buffers[steps_.size() % 2];
   Array<float> host_output(padded_count * 3);
-  buffer_out.download(host_output);
+  result.download(host_output);
   const double download_ms = timer.lap();
   ha_program_debug("downloaded");
 
@@ -663,13 +713,15 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   if (ha_program_debug_enabled()) {
     /* The transfer is what decides whether this backend is worth it for element wise work: at 1M
      * points the CPU reference is a few milliseconds, so a slow upload or a stalling readback is
-     * the whole budget. */
+     * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
-            "HA program: %d elements: upload %.2f ms, dispatch %.2f ms, download %.2f ms, "
-            "write %.2f ms\n",
+            "HA program: %d elements, %d step(s): upload %.2f ms, dispatch %.2f ms (%d), "
+            "download %.2f ms, write %.2f ms\n",
             element_count,
+            int(steps_.size()),
             upload_ms,
             dispatch_ms,
+            int(steps_.size()),
             download_ms,
             timer.lap());
     fflush(stderr);

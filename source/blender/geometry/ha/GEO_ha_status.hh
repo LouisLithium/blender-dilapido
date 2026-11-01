@@ -11,6 +11,12 @@
  * state get one, so it only appears where it means something) and a read only info block in the
  * node itself. A node publishes its state at the end of its execution, so the information is the
  * *actual* result of the last frame instead of "this node supports the device".
+ *
+ * ⚠️ **The key is the tree and node *name*, not the pointer.** Geometry nodes are evaluated on a
+ * copy of the node tree (the depsgraph evaluates `bNodeTree` as an ID), so the `bNode *` a node
+ * publishes with is a different object than the one the node editor draws. Measured: publishing
+ * reported `tree=0x...F9308` while the UI holds `0x...F708` for the same tree, so a pointer keyed
+ * table never produced a single badge. Names are preserved by the copy, which is why they work.
  */
 
 #pragma once
@@ -37,6 +43,12 @@ struct HaNodeStatus {
   std::string reason;
   /** Elements the node handled, e.g. particles for the fluid solver. Zero when unknown. */
   int elements = 0;
+  /**
+   * Geometry nodes the device evaluated as one program (the `HW Accelerate` chain). Nodes that are
+   * in the same zone share one transfer, so this is what tells the user that adding a node *inside*
+   * the zone is cheap while a second zone is not. Zero when the node does not report it.
+   */
+  int steps = 0;
 };
 
 /** Publishes the state of the last evaluation of \a node. */

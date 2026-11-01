@@ -3020,7 +3020,14 @@ static void node_draw_basis(const bContext &C,
       if (on_device) {
         tip = "Hardware accelerated on " + ha_status.backend;
         if (ha_status.elements > 0) {
-          tip += " (" + std::to_string(ha_status.elements) + " elements)";
+          tip += " (" + std::to_string(ha_status.elements) + " elements";
+          if (ha_status.steps > 1) {
+            /* Nodes inside one zone share a single upload/download, so the count is the useful
+             * number to show: it explains why moving a node into the zone is free and adding a
+             * second zone is not. */
+            tip += ", " + std::to_string(ha_status.steps) + " nodes in one transfer";
+          }
+          tip += ")";
         }
       }
       else {

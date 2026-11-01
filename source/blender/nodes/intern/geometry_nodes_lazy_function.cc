@@ -2022,9 +2022,21 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     if (state == geometry::ha::HaNodeState::Device) {
       status.backend = geometry::ha::ha_gpu_backend_name();
       status.elements = elements;
+      status.steps = program_ ? program_->step_count() : 0;
     }
     else {
       status.reason = std::move(reason);
+    }
+    if (getenv("BLENDER_HA_DEBUG") != nullptr) {
+      /* The node UI looks the status up with the *displayed* tree and node, so the identity used
+       * here is what decides whether the badge appears at all. */
+      fprintf(stderr,
+              "HA status: tree=%p node=%p id=%d state=%d\n",
+              (void *)&btree_,
+              (void *)input_node,
+              input_node->identifier,
+              int(state));
+      fflush(stderr);
     }
     geometry::ha::ha_status_set(btree_, *input_node, status);
   }
@@ -2131,8 +2143,7 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     params.set_output(geometry_output_i,
                       SocketValueVariant::From(std::move(output_geometry)));
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
-      printf("HA zone: GPU dispatch, position = %s\n",
-             std::string(program_->glsl_position()).c_str());
+      printf("HA zone: GPU dispatch, %s\n", program_->debug_description().c_str());
       fflush(stdout);
     }
     return true;
@@ -2691,10 +2702,9 @@ struct GeometryNodesLazyFunctionBuilder {
         geometry::ha::HaZoneProgram::try_build(btree_, zone, &program_reason);
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
       if (program) {
-        printf("HA zone %s: GPU program, position = %s, selection = %s\n",
+        printf("HA zone %s: GPU program, %s\n",
                zone.output_node()->name,
-               std::string(program->glsl_position()).c_str(),
-               std::string(program->glsl_selection()).c_str());
+               program->debug_description().c_str());
       }
       else {
         printf("HA zone %s: CPU fallback (%s)\n",
