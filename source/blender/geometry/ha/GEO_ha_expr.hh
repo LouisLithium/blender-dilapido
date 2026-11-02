@@ -182,6 +182,16 @@ enum class HaOp {
    * phase. A port of `node_shader_tex_wave.cc` on top of the Perlin fbm.
    */
   WaveTexture,
+  /**
+   * `Voronoi Texture > Distance`, 3D. Args: vector, scale, detail, roughness, lacunarity,
+   * smoothness, exponent, randomness. #HaExpr::param packs the feature (bits 0-3), the distance
+   * metric (bits 4-7) and `normalize` (bit 8). A port of the 3D path in `BLI_noise.cc`.
+   */
+  VoronoiTexture,
+  /** `Voronoi Texture > Position` (3D): same args and packing as #VoronoiTexture. */
+  VoronoiPosition,
+  /** `Voronoi Texture > Radius` (N-Sphere feature): args vector, scale, randomness. */
+  VoronoiRadius,
 };
 
 /** Bit of #HaExpr::param that enables clamping (`Mix` factor, `Map Range` result). */

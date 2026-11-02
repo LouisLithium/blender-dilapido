@@ -362,6 +362,10 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::WaveTexture:
       /* Same: the wave is a helper; the CPU reference is the node evaluation. */
       return 0.0f;
+    case HaOp::VoronoiTexture:
+    case HaOp::VoronoiRadius:
+      /* Same: the voronoi kernel is a helper; the CPU reference is the node evaluation. */
+      return 0.0f;
     case HaOp::Sin:
       return math::sin(eval_float(*expr.args[0], index, positions));
     case HaOp::Cos:
@@ -492,6 +496,9 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
       }
       return float3(positions[i], positions[i + 1], positions[i + 2]);
     }
+    case HaOp::VoronoiPosition:
+      /* The voronoi kernel lives in the GLSL helpers; the CPU reference is the node evaluation. */
+      return float3(0.0f);
     case HaOp::Combine:
       return float3(eval_float(*expr.args[0], index, positions),
                     eval_float(*expr.args[1], index, positions),
@@ -1031,6 +1038,25 @@ std::string emit(const HaExpr &expr)
              emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " + std::to_string(wave_type) +
              ", " + std::to_string(bands_dir) + ", " + std::to_string(rings_dir) + ", " +
              std::to_string(profile) + ")";
+    }
+    case HaOp::VoronoiTexture:
+    case HaOp::VoronoiPosition: {
+      const int feature = expr.param & 0xF;
+      const int metric = (expr.param >> 4) & 0xF;
+      const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
+      const std::string args = emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) + ", " +
+                               emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " +
+                               emit(*expr.args[4]) + ", " + emit(*expr.args[5]) + ", " +
+                               emit(*expr.args[6]) + ", " + emit(*expr.args[7]) + ", " +
+                               std::to_string(feature) + ", " + std::to_string(metric) + ", " +
+                               (normalize ? "true" : "false");
+      return (expr.op == HaOp::VoronoiTexture ? "ha_voronoi_texture_3d(" :
+                                                "ha_voronoi_position_3d(") +
+             args + ")";
+    }
+    case HaOp::VoronoiRadius: {
+      return "ha_voronoi_radius_3d(" + emit_as_vector(*expr.args[0]) + ", " +
+             emit(*expr.args[1]) + ", " + emit(*expr.args[2]) + ")";
     }
   }
   return "0.0";

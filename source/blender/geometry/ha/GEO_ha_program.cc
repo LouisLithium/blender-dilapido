@@ -814,6 +814,102 @@ const HaExpr *compile_wave_texture(CompileContext &ctx, const bNode &node, const
   return &wave;
 }
 
+/**
+ * `ShaderNodeTexVoronoi`, 3D. `Distance`, `Position` and the `N-Sphere Radius` output are
+ * supported; `Color` is refused (the IR has no colour type) and so are the other dimensions.
+ */
+const HaExpr *compile_voronoi_texture(CompileContext &ctx,
+                                      const bNode &node,
+                                      const int socket_index)
+{
+  const auto &storage = *static_cast<const NodeTexVoronoi *>(node.storage);
+  if (storage.dimensions != 3) {
+    fail(ctx, "Voronoi Texture: only the 3D dimensions are supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (node.input_sockets().size() < 9) {
+    fail(ctx, "Voronoi Texture: unexpected sockets");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  /* Outputs: Distance(0), Color(1), Position(2), W(3), Radius(4). */
+  if (socket_index == 1 || socket_index == 3) {
+    fail(ctx,
+         "Voronoi Texture: only the 'Distance', 'Position' and 'Radius' outputs are supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const int feature = storage.feature;
+  if ((socket_index == 4) != (feature == 4)) {
+    fail(ctx, "Voronoi Texture: the 'Radius' output only exists for the 'N-Sphere Radius' feature");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (socket_index == 2 && feature >= 3) {
+    fail(ctx, "Voronoi Texture: this feature has no 'Position' output");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  const HaExpr *vector = node.input_socket(0).link != nullptr ?
+                             compile_input(ctx, node, 0) :
+                             &ctx.pool.add(HaType::Float3, HaOp::Position);
+  if (vector->type != HaType::Float3) {
+    fail(ctx, "Voronoi Texture: the vector input has to be a vector");
+    return &ctx.pool.constant(0.0f);
+  }
+  const HaExpr *scale = compile_input(ctx, node, 2);
+  /* `randomness` is clamped to [0, 1] by the node. */
+  const HaExpr *randomness = &ctx.pool.add(HaType::Float,
+                                           HaOp::Clamp,
+                                           {compile_input(ctx, node, 8),
+                                            &ctx.pool.constant(0.0f),
+                                            &ctx.pool.constant(1.0f)});
+  if (!ctx.ok) {
+    fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return &ctx.pool.constant(0.0f);
+  }
+
+  if (socket_index == 4) {
+    HaExpr &radius = ctx.pool.add(HaType::Float,
+                                  HaOp::VoronoiRadius,
+                                  {vector, scale, randomness});
+    return &radius;
+  }
+
+  const int metric = storage.distance;
+  const HaExpr *detail = compile_input(ctx, node, 3);
+  const HaExpr *roughness = compile_input(ctx, node, 4);
+  const HaExpr *lacunarity = compile_input(ctx, node, 5);
+  /* `smoothness` is only used by `Smooth F1`, where the node halves it and clamps it to [0, 0.5]. */
+  const HaExpr *smoothness = &ctx.pool.constant(0.0f);
+  if (feature == 2) {
+    const HaExpr *halved = &ctx.pool.add(
+        HaType::Float, HaOp::Div, {compile_input(ctx, node, 6), &ctx.pool.constant(2.0f)});
+    smoothness = &ctx.pool.add(HaType::Float,
+                               HaOp::Clamp,
+                               {halved, &ctx.pool.constant(0.0f), &ctx.pool.constant(0.5f)});
+  }
+  const HaExpr *exponent = metric == 3 ? compile_input(ctx, node, 7) :
+                                        &ctx.pool.constant(0.0f);
+  if (!ctx.ok) {
+    fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return &ctx.pool.constant(0.0f);
+  }
+
+  const bool is_position = socket_index == 2;
+  HaExpr &voronoi = ctx.pool.add(is_position ? HaType::Float3 : HaType::Float,
+                                 is_position ? HaOp::VoronoiPosition : HaOp::VoronoiTexture,
+                                 {vector,
+                                  scale,
+                                  detail,
+                                  roughness,
+                                  lacunarity,
+                                  smoothness,
+                                  exponent,
+                                  randomness});
+  voronoi.param = (feature & 0xF) | ((metric & 0xF) << 4) |
+                  (storage.normalize != 0 ? HA_PARAM_CLAMP : 0);
+  return &voronoi;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -971,7 +1067,9 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
 
   HaExpr &read = ctx.pool.add(HaType::Float, HaOp::AggregateRead);
   read.aggregate_slot = int(ctx.aggregates.size());
-  ctx.aggregates.append({ha_emit_glsl(*value), op});
+  /* The reduction kernel stores the value in a `float`, so the expression must not be promoted to a
+   * vector here (`ha_emit_glsl` would wrap a scalar in `vec3(...)`, which does not compile). */
+  ctx.aggregates.append({ha_emit_glsl_scalar(*value), op});
   return &read;
 }
 
@@ -1005,11 +1103,18 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
     result = compile_vector_math(ctx, node);
   }
   else if (node.is_type("ShaderNodeCombineXYZ"_ustr)) {
-    result = &ctx.pool.add(HaType::Float3,
-                          HaOp::Combine,
-                          {compile_input(ctx, node, 0),
-                           compile_input(ctx, node, 1),
-                           compile_input(ctx, node, 2)});
+    const HaExpr *x = compile_input(ctx, node, 0);
+    const HaExpr *y = compile_input(ctx, node, 1);
+    const HaExpr *z = compile_input(ctx, node, 2);
+    if (x->type != HaType::Float || y->type != HaType::Float || z->type != HaType::Float) {
+      /* Blender converts a linked vector into a scalar here (averaging the components); the IR has
+       * no such conversion, and emitting it would produce `vec3(vec3, 0, 0)` in GLSL. */
+      fail(ctx, "Combine XYZ: the components have to be scalars");
+      result = &ctx.pool.constant(float3(0.0f));
+    }
+    else {
+      result = &ctx.pool.add(HaType::Float3, HaOp::Combine, {x, y, z});
+    }
   }
   else if (node.is_type("ShaderNodeSeparateXYZ"_ustr)) {
     const HaOp op = socket_index == 0 ? HaOp::SplitX :
@@ -1064,6 +1169,9 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("ShaderNodeTexWave"_ustr)) {
     result = compile_wave_texture(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeTexVoronoi"_ustr)) {
+    result = compile_voronoi_texture(ctx, node, socket_index);
   }
   else {
     fail(ctx,
