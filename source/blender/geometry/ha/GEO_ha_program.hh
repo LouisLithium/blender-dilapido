@@ -105,6 +105,13 @@ struct HaElementStep {
   std::string glsl_value;
   /** Scalar expression; greater than zero means "write this element". */
   std::string glsl_selection;
+  /**
+   * Value the attribute has when it does not exist yet. `Set Shade Smooth` creates `sharp_*` with
+   * `true` (measured against the CPU), so unselected elements of a missing attribute read as sharp.
+   */
+  float default_value = 0.0f;
+  /** Attributes read by this step's fields, bound at slot 3 + index (same layout as POINT). */
+  Vector<HaAttribute> attributes;
 };
 
 class HaZoneProgram {

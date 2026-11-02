@@ -94,6 +94,9 @@ struct CompileContext {
   int depth = 0;
   /** Why the compilation stopped, in a form the node UI can show. */
   std::string reason;
+  /** Set while compiling a field for a FACE/EDGE element pass: `Position` and reductions are not
+   * available there, and `Named Attribute` reads that domain instead of POINT. */
+  bool element_domain = false;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
@@ -940,50 +943,51 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
 
 /**
  * `GeometryNodeSetShadeSmooth`: writes `sharp_face` (FACE) or `sharp_edge` (EDGE) for the selected
- * elements. Both fields have to be **constant**: a field would have to be evaluated per face/edge,
- * and the element kernel has no bindings on that domain yet, so a linked field is refused instead
- * of being silently evaluated with the wrong domain.
+ * elements. Its two fields are compiled for the element domain: they may read that domain's
+ * attributes and the element index, but not `Position` (a face has no position of its own).
  */
-bool compile_set_shade_smooth(CompileContext &ctx, const bNode &node, HaElementStep &r_step)
+bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaElementStep &r_step)
 {
   const bke::AttrDomain domain = bke::AttrDomain(node.custom1);
   if (!ELEM(domain, bke::AttrDomain::Face, bke::AttrDomain::Edge)) {
-    fail(ctx, "Set Shade Smooth: only the Face and Edge domains are supported");
+    fail(point_ctx, "Set Shade Smooth: only the Face and Edge domains are supported");
     return false;
   }
   const Span<const bNodeSocket *> inputs = node.input_sockets();
   if (inputs.size() < 3) {
-    fail(ctx, "Set Shade Smooth: unexpected sockets");
+    fail(point_ctx, "Set Shade Smooth: unexpected sockets");
     return false;
   }
-  /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
-  const bNodeSocket &selection_socket = node.input_socket(1);
-  if (selection_socket.link != nullptr) {
-    fail(ctx, "Set Shade Smooth: a linked 'Selection' is not supported");
-    return false;
-  }
-  const bool selection =
-      static_cast<const bNodeSocketValueBoolean *>(selection_socket.default_value)->value;
-  if (!selection) {
-    /* Nothing is written, so the node can be dropped from the program. */
-    r_step.attribute.clear();
-    return true;
-  }
-  const bNodeSocket &smooth_socket = node.input_socket(2);
-  if (smooth_socket.link != nullptr) {
-    fail(ctx, "Set Shade Smooth: a linked 'Shade Smooth' is not supported");
-    return false;
-  }
-  const bool smooth =
-      static_cast<const bNodeSocketValueBoolean *>(smooth_socket.default_value)->value;
-  r_step.attribute = domain == bke::AttrDomain::Face ? "sharp_face" : "sharp_edge";
   r_step.domain = domain == bke::AttrDomain::Face ? HaElementDomain::Face : HaElementDomain::Edge;
+  r_step.attribute = domain == bke::AttrDomain::Face ? "sharp_face" : "sharp_edge";
   r_step.components = 1;
-  /* `sharp` is the inverse of the node's `Shade Smooth`, and the node writes it for every selected
-   * element. The CPU removes the attribute when the whole mesh is smooth; an all-false attribute
-   * means exactly the same thing downstream. */
-  r_step.glsl_value = smooth ? "0.0" : "1.0";
-  r_step.glsl_selection = "1.0";
+  /* Creating `sharp_face` / `sharp_edge` starts from `true` (measured: with a partial selection and
+   * no existing attribute, the unselected elements are sharp on the CPU). */
+  r_step.default_value = 1.0f;
+
+  /* Compile the fields for the element domain: `Named Attribute` reads that domain, and the kernel
+   * binds those buffers instead of the POINT ones. */
+  HaExprPool element_pool;
+  Vector<HaAggregate> element_aggregates;
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.element_domain = true;
+
+  /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
+  const HaExpr *selection = compile_input(ctx, node, 1);
+  const HaExpr *smooth = compile_input(ctx, node, 2);
+  if (!ctx.ok) {
+    fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return false;
+  }
+  if (selection->type != HaType::Float || smooth->type != HaType::Float) {
+    fail(point_ctx, "Set Shade Smooth: 'Selection' and 'Shade Smooth' have to be scalars");
+    return false;
+  }
+  r_step.glsl_selection = ha_emit_glsl_scalar(*selection);
+  /* `sharp` is the inverse of the node's `Shade Smooth`; the field's `float -> bool` conversion is
+   * `> 0`, exactly like the field system. */
+  r_step.glsl_value = "(1.0 - ((" + ha_emit_glsl_scalar(*smooth) + ") > 0.0 ? 1.0 : 0.0))";
   return true;
 }
 
@@ -1089,6 +1093,11 @@ const HaExpr *compile_map_range(CompileContext &ctx, const bNode &node, const in
 
 const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const int socket_index)
 {
+  if (ctx.element_domain) {
+    /* The reduction reads the POINT position buffer, which an element pass does not bind. */
+    fail(ctx, "Attribute Statistic: not available on FACE/EDGE element domains");
+    return &ctx.pool.constant(0.0f);
+  }
   /* Outputs: 0 = Mean, 1 = Median, 2 = Sum, 3 = Min, 4 = Max, 5 = Range, 6 = Std Dev, 7 = Variance.
    * Only reductions that the backend can do in one pass are supported. */
   HaAggregateOp op;
@@ -1168,6 +1177,12 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
 
   const HaExpr *result = nullptr;
   if (node.is_type("GeometryNodeInputPosition"_ustr)) {
+    if (ctx.element_domain) {
+      /* A face does not have a position of its own; Blender would use the face center, which needs
+       * the corner topology. Refusing keeps the device result from silently differing. */
+      fail(ctx, "the 'Position' field is not available on FACE/EDGE element domains");
+      return &ctx.pool.constant(0.0f);
+    }
     result = &ctx.pool.add(HaType::Float3, HaOp::Position);
   }
   else if (node.is_type("GeometryNodeInputIndex"_ustr)) {
@@ -1822,10 +1837,12 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         return false;
       }
       Array<float> host_in(int64_t(padded) * step.components, 0.0f);
+      bool attribute_exists = false;
       if (const std::optional<bke::AttributeMetaData> meta =
               src_attributes.lookup_meta_data(step.attribute))
       {
         if (meta->domain == domain && meta->data_type == bke::AttrType::Bool) {
+          attribute_exists = true;
           const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(step.attribute,
                                                                                domain);
           if (reader) {
@@ -1836,7 +1853,101 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
           }
         }
       }
+      if (!attribute_exists) {
+        /* The CPU creates the attribute and leaves unselected elements at its default (which is
+         * `true` for `sharp_face` / `sharp_edge`), so the pass has to start from there. */
+        std::fill_n(host_in.begin(), count, step.default_value);
+      }
       element_in.upload(host_in);
+
+      /* The attributes this step's fields read, taken from the same domain of the source mesh. */
+      Array<HaBuffer> step_attribute_buffers(step.attributes.size());
+      Vector<std::string> step_attribute_names;
+      Vector<HaShaderResource> step_resources;
+      step_attribute_names.reserve(step.attributes.size());
+      step_resources.reserve(step.attributes.size());
+      for (const int attribute_i : step.attributes.index_range()) {
+        const HaAttribute &attribute = step.attributes[attribute_i];
+        const int64_t total = int64_t(padded) * attribute.components;
+        Array<float> host_attribute(total, 0.0f);
+        const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
+            attribute.name);
+        if (meta.has_value()) {
+          if (meta->domain != domain) {
+            /* Interpolating from another domain is not implemented; the CPU path handles it. */
+            BKE_id_free(nullptr, mesh);
+            return false;
+          }
+          if (attribute.components == 1) {
+            switch (meta->data_type) {
+              case bke::AttrType::Float: {
+                const bke::AttributeReader<float> reader = src_attributes.lookup<float>(
+                    attribute.name, domain);
+                if (reader) {
+                  const VArray<float> &values = reader.varray;
+                  for (const int element : IndexRange(count)) {
+                    host_attribute[element] = values[element];
+                  }
+                }
+                break;
+              }
+              case bke::AttrType::Int32: {
+                const bke::AttributeReader<int> reader = src_attributes.lookup<int>(
+                    attribute.name, domain);
+                if (reader) {
+                  const VArray<int> &values = reader.varray;
+                  for (const int element : IndexRange(count)) {
+                    host_attribute[element] = float(values[element]);
+                  }
+                }
+                break;
+              }
+              case bke::AttrType::Bool: {
+                const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(
+                    attribute.name, domain);
+                if (reader) {
+                  const VArray<bool> &values = reader.varray;
+                  for (const int element : IndexRange(count)) {
+                    host_attribute[element] = values[element] ? 1.0f : 0.0f;
+                  }
+                }
+                break;
+              }
+              default:
+                BKE_id_free(nullptr, mesh);
+                return false;
+            }
+          }
+          else {
+            if (meta->data_type != bke::AttrType::Float3) {
+              BKE_id_free(nullptr, mesh);
+              return false;
+            }
+            const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(
+                attribute.name, domain);
+            if (reader) {
+              const VArray<float3> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                const float3 value = values[element];
+                host_attribute[element * 3 + 0] = value.x;
+                host_attribute[element * 3 + 1] = value.y;
+                host_attribute[element * 3 + 2] = value.z;
+              }
+            }
+          }
+        }
+        if (!step_attribute_buffers[attribute_i].ensure(total)) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        step_attribute_buffers[attribute_i].upload(host_attribute);
+        step_attribute_names.append("attribute_" + std::to_string(attribute_i) + "[]");
+        step_resources.append({3 + attribute_i,
+                               HaShaderQualifier::Read,
+                               attribute.components == 3 ? "vec3" : "float",
+                               step_attribute_names.last().c_str()});
+      }
+
       const std::array<float, 4> element_params_host{float(count), 0.0f, 0.0f, 0.0f};
       element_params.upload(element_params_host);
 
@@ -1845,7 +1956,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
               std::to_string(step.components),
           step.glsl_value,
           step.glsl_selection,
-          step.components);
+          step.components,
+          Span<const HaShaderResource>(step_resources.data(), int64_t(step_resources.size())));
       if (element_shader == nullptr) {
         BKE_id_free(nullptr, mesh);
         return false;
@@ -1854,7 +1966,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       GPU_storagebuf_bind(element_in.buf(), 0);
       GPU_storagebuf_bind(element_out.buf(), 1);
       GPU_storagebuf_bind(element_params.buf(), 2);
+      for (const int attribute_i : step.attributes.index_range()) {
+        GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+      }
       ha_dispatch(element_shader, padded);
+      for (const int attribute_i : step.attributes.index_range()) {
+        GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+      }
       GPU_storagebuf_unbind(element_params.buf());
       GPU_storagebuf_unbind(element_out.buf());
       GPU_storagebuf_unbind(element_in.buf());
@@ -1881,18 +1999,23 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   output.replace_mesh(mesh);
   r_output = std::move(output);
   if (ha_program_debug_enabled()) {
+    int element_attribute_count = 0;
+    for (const HaElementStep &step : element_steps_) {
+      element_attribute_count += int(step.attributes.size());
+    }
     /* The transfer is what decides whether this backend is worth it for element wise work: at 1M
      * points the CPU reference is a few milliseconds, so a slow upload or a stalling readback is
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
             "HA program: %d elements, %d step(s), %d attribute(s), %d store(s), %d element "
-            "pass(es): upload %.2f ms, "
+            "pass(es), %d element attribute(s): upload %.2f ms, "
             "dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
             int(attributes_.size()),
             int(stores_.size()),
             int(element_steps_.size()),
+            element_attribute_count,
             upload_ms,
             dispatch_ms,
             int(steps_.size()),

@@ -234,7 +234,8 @@ gpu::Shader *ha_shader_get_store(StringRef key,
 gpu::Shader *ha_shader_get_element(StringRef key,
                                    StringRef glsl_value,
                                    StringRef glsl_selection,
-                                   int components);
+                                   int components,
+                                   Span<const HaShaderResource> extra_resources = {});
 
 /**
  * Compiles \a source (a complete `void main()`, without the storage buffer declarations) with the

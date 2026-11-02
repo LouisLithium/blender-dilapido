@@ -2553,7 +2553,8 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
 gpu::Shader *ha_shader_get_element(const StringRef key,
                                    const StringRef glsl_value,
                                    const StringRef glsl_selection,
-                                   const int components)
+                                   const int components,
+                                   const Span<const HaShaderResource> extra_resources)
 {
   const bool vector = components > 1;
   const char *type = vector ? "vec3" : "float";
@@ -2582,7 +2583,18 @@ gpu::Shader *ha_shader_get_element(const StringRef key,
       {1, HaShaderQualifier::Write, type, "element_out[]"},
       {2, HaShaderQualifier::Read, "float", "params[]"},
   }};
-  return ha_shader_get_source(key, body, as_span(resources), LOCAL_GROUP_SIZE);
+  Vector<HaShaderResource> all_resources;
+  all_resources.append(resources[0]);
+  all_resources.append(resources[1]);
+  all_resources.append(resources[2]);
+  for (const HaShaderResource &resource : extra_resources) {
+    all_resources.append(resource);
+  }
+  return ha_shader_get_source(
+      key,
+      body,
+      Span<const HaShaderResource>(all_resources.data(), int64_t(all_resources.size())),
+      LOCAL_GROUP_SIZE);
 }
 
 gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
