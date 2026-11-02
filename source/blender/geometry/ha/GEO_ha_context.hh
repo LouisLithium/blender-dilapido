@@ -226,6 +226,17 @@ gpu::Shader *ha_shader_get_store(StringRef key,
                                  Span<const HaShaderResource> extra_resources = {});
 
 /**
+ * Compiles a kernel for an element domain that is not POINT (FACE / EDGE): for every element, if
+ * \a glsl_selection (a scalar expression, evaluated with `int index` in scope) is not zero, writes
+ * \a glsl_value into `element_out[]`, otherwise copies `element_in[]` through. `params[0]` is the
+ * element count (the dispatch is padded to the work group size). `components` is 1 or 3.
+ */
+gpu::Shader *ha_shader_get_element(StringRef key,
+                                   StringRef glsl_value,
+                                   StringRef glsl_selection,
+                                   int components);
+
+/**
  * Compiles \a source (a complete `void main()`, without the storage buffer declarations) with the
  * given bindings and caches it by \a cache_key. The cache key is mixed with a hash of the source,
  * so editing a kernel can never hit a stale entry in the on-disk shader cache.

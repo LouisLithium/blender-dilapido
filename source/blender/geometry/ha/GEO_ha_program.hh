@@ -85,6 +85,28 @@ struct HaStore {
   std::string glsl_value;
 };
 
+/** Element domain of a #HaElementStep. Only the domains with supported nodes get an entry. */
+enum class HaElementDomain {
+  Face,
+  Edge,
+};
+
+/**
+ * One node that writes an attribute on a domain that has no positions of its own (FACE / EDGE).
+ * Currently produced by `Set Shade Smooth`, which needs both of its fields to be constant: a field
+ * would have to be evaluated on that domain, which needs its own attribute bindings.
+ */
+struct HaElementStep {
+  std::string attribute;
+  HaElementDomain domain = HaElementDomain::Face;
+  /** 1 for a scalar attribute, 3 for a vector one. */
+  int components = 1;
+  /** Scalar expression, evaluated with `int index` (the element index) in scope. */
+  std::string glsl_value;
+  /** Scalar expression; greater than zero means "write this element". */
+  std::string glsl_selection;
+};
+
 class HaZoneProgram {
  public:
   ~HaZoneProgram();
@@ -124,6 +146,12 @@ class HaZoneProgram {
     return int(stores_.size());
   }
 
+  /** Number of FACE/EDGE attribute passes. */
+  int element_step_count() const
+  {
+    return int(element_steps_.size());
+  }
+
   /** Human readable form of the compiled chain, for the debug log. */
   std::string debug_description() const;
 
@@ -134,6 +162,8 @@ class HaZoneProgram {
   Vector<HaAttribute> attributes_;
   /** `Store Named Attribute` nodes, in evaluation order (all after the position chain). */
   Vector<HaStore> stores_;
+  /** FACE / EDGE attribute passes (all after the stores; they do not touch positions). */
+  Vector<HaElementStep> element_steps_;
 };
 
 }  // namespace geometry::ha

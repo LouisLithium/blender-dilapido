@@ -81,6 +81,8 @@ constexpr int MAX_EXPRESSION_DEPTH = 64;
 constexpr int MAX_CHAIN_STEPS = 16;
 /** Upper bound for the `Store Named Attribute` nodes after the chain. Each one is a dispatch. */
 constexpr int MAX_STORE_STEPS = 8;
+/** Upper bound for the FACE/EDGE attribute passes. Each one is a dispatch. */
+constexpr int MAX_ELEMENT_STEPS = 8;
 
 struct CompileContext {
   HaExprPool &pool;
@@ -936,6 +938,55 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
   return &voronoi;
 }
 
+/**
+ * `GeometryNodeSetShadeSmooth`: writes `sharp_face` (FACE) or `sharp_edge` (EDGE) for the selected
+ * elements. Both fields have to be **constant**: a field would have to be evaluated per face/edge,
+ * and the element kernel has no bindings on that domain yet, so a linked field is refused instead
+ * of being silently evaluated with the wrong domain.
+ */
+bool compile_set_shade_smooth(CompileContext &ctx, const bNode &node, HaElementStep &r_step)
+{
+  const bke::AttrDomain domain = bke::AttrDomain(node.custom1);
+  if (!ELEM(domain, bke::AttrDomain::Face, bke::AttrDomain::Edge)) {
+    fail(ctx, "Set Shade Smooth: only the Face and Edge domains are supported");
+    return false;
+  }
+  const Span<const bNodeSocket *> inputs = node.input_sockets();
+  if (inputs.size() < 3) {
+    fail(ctx, "Set Shade Smooth: unexpected sockets");
+    return false;
+  }
+  /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
+  const bNodeSocket &selection_socket = node.input_socket(1);
+  if (selection_socket.link != nullptr) {
+    fail(ctx, "Set Shade Smooth: a linked 'Selection' is not supported");
+    return false;
+  }
+  const bool selection =
+      static_cast<const bNodeSocketValueBoolean *>(selection_socket.default_value)->value;
+  if (!selection) {
+    /* Nothing is written, so the node can be dropped from the program. */
+    r_step.attribute.clear();
+    return true;
+  }
+  const bNodeSocket &smooth_socket = node.input_socket(2);
+  if (smooth_socket.link != nullptr) {
+    fail(ctx, "Set Shade Smooth: a linked 'Shade Smooth' is not supported");
+    return false;
+  }
+  const bool smooth =
+      static_cast<const bNodeSocketValueBoolean *>(smooth_socket.default_value)->value;
+  r_step.attribute = domain == bke::AttrDomain::Face ? "sharp_face" : "sharp_edge";
+  r_step.domain = domain == bke::AttrDomain::Face ? HaElementDomain::Face : HaElementDomain::Edge;
+  r_step.components = 1;
+  /* `sharp` is the inverse of the node's `Shade Smooth`, and the node writes it for every selected
+   * element. The CPU removes the attribute when the whole mesh is smooth; an all-false attribute
+   * means exactly the same thing downstream. */
+  r_step.glsl_value = smooth ? "0.0" : "1.0";
+  r_step.glsl_selection = "1.0";
+  return true;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -1310,10 +1361,29 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
    * chain is compiled into one program, so it costs one upload and one download no matter how many
    * nodes it contains. */
   Vector<const bNode *> chain;
+  Vector<const bNode *> element_nodes;
   while (true) {
     if (chain.size() >= MAX_CHAIN_STEPS) {
       return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
                               MAX_CHAIN_STEPS));
+    }
+    /* Nodes that write an attribute on a domain without positions are a pass-through for the
+     * geometry; they become their own device pass. */
+    if (current->is_type("GeometryNodeSetShadeSmooth"_ustr)) {
+      if (element_nodes.size() >= MAX_ELEMENT_STEPS) {
+        return fail(fmt::format("the zone contains more than {} element passes",
+                                MAX_ELEMENT_STEPS));
+      }
+      element_nodes.append(current);
+      const bNodeSocket &geometry_input = current->input_socket(0);
+      if (geometry_input.link == nullptr) {
+        return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
+      }
+      current = geometry_input.link->fromnode;
+      if (current == input_node) {
+        break;
+      }
+      continue;
     }
     if (!current->is_type("GeometryNodeSetPosition"_ustr) &&
         !current->is_type("GeometryNodeTransform"_ustr))
@@ -1382,6 +1452,25 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
         {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
   }
 
+  /* Then the FACE/EDGE passes, first -> last (`element_nodes` is stored last -> first). */
+  for (const int i : element_nodes.index_range()) {
+    HaElementStep step;
+    if (!compile_set_shade_smooth(ctx, *element_nodes[element_nodes.size() - 1 - i], step)) {
+      return fail(ctx.reason.empty() ? std::string("the element node is not supported") :
+                                      ctx.reason);
+    }
+    if (!step.attribute.empty()) {
+      program->element_steps_.append(std::move(step));
+    }
+  }
+
+  /* A zone that only contains element passes still needs one position step: the chain is what
+   * carries the geometry through the device buffers (and the stores read its result), so insert an
+   * identity step instead of falling back. */
+  if (program->steps_.is_empty()) {
+    program->steps_.append({"(position + vec3(0.0))", "1.0"});
+  }
+
   /* Then the stores, first -> last (`store_nodes` is stored last -> first). */
   for (const int i : store_nodes.index_range()) {
     HaStore store;
@@ -1404,6 +1493,15 @@ std::string HaZoneProgram::debug_description() const
                           i,
                           steps_[i].glsl_position,
                           steps_[i].glsl_selection);
+  }
+  for (const HaElementStep &step : element_steps_) {
+    if (!result.empty()) {
+      result += " -> ";
+    }
+    result += fmt::format("[{}] = {} where {} > 0",
+                          step.attribute,
+                          step.glsl_value,
+                          step.glsl_selection);
   }
   return result;
 }
@@ -1701,6 +1799,84 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
+  /* The FACE / EDGE passes: they do not touch positions, so they run after the chain and the
+   * stores, writing straight into the result mesh. */
+  if (!element_steps_.is_empty()) {
+    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
+    for (const HaElementStep &step : element_steps_) {
+      const bke::AttrDomain domain = step.domain == HaElementDomain::Face ? bke::AttrDomain::Face :
+                                                                           bke::AttrDomain::Edge;
+      const int count = int(mesh_attributes.domain_size(domain));
+      if (count <= 0) {
+        continue;
+      }
+      const int padded = (count + local_size - 1) / local_size * local_size;
+      HaBuffer element_in;
+      HaBuffer element_out;
+      HaBuffer element_params;
+      if (!element_in.ensure(int64_t(padded) * step.components) ||
+          !element_out.ensure(int64_t(padded) * step.components) || !element_params.ensure(4))
+      {
+        BKE_id_free(nullptr, mesh);
+        return false;
+      }
+      Array<float> host_in(int64_t(padded) * step.components, 0.0f);
+      if (const std::optional<bke::AttributeMetaData> meta =
+              src_attributes.lookup_meta_data(step.attribute))
+      {
+        if (meta->domain == domain && meta->data_type == bke::AttrType::Bool) {
+          const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(step.attribute,
+                                                                               domain);
+          if (reader) {
+            const VArray<bool> &values = reader.varray;
+            for (const int element : IndexRange(count)) {
+              host_in[element] = values[element] ? 1.0f : 0.0f;
+            }
+          }
+        }
+      }
+      element_in.upload(host_in);
+      const std::array<float, 4> element_params_host{float(count), 0.0f, 0.0f, 0.0f};
+      element_params.upload(element_params_host);
+
+      gpu::Shader *element_shader = ha_shader_get_element(
+          "element|" + step.glsl_value + "|" + step.glsl_selection + "|" +
+              std::to_string(step.components),
+          step.glsl_value,
+          step.glsl_selection,
+          step.components);
+      if (element_shader == nullptr) {
+        BKE_id_free(nullptr, mesh);
+        return false;
+      }
+      GPU_shader_bind(element_shader);
+      GPU_storagebuf_bind(element_in.buf(), 0);
+      GPU_storagebuf_bind(element_out.buf(), 1);
+      GPU_storagebuf_bind(element_params.buf(), 2);
+      ha_dispatch(element_shader, padded);
+      GPU_storagebuf_unbind(element_params.buf());
+      GPU_storagebuf_unbind(element_out.buf());
+      GPU_storagebuf_unbind(element_in.buf());
+      GPU_shader_unbind();
+      GPU_finish();
+
+      Array<float> host_out(int64_t(padded) * step.components);
+      element_out.download(host_out);
+
+      bke::SpanAttributeWriter<bool> writer = mesh_attributes.lookup_or_add_for_write_span<bool>(
+          step.attribute, domain);
+      if (!writer) {
+        BKE_id_free(nullptr, mesh);
+        return false;
+      }
+      for (const int element : IndexRange(count)) {
+        writer.span[element] = host_out[element] > 0.5f;
+      }
+      writer.finish();
+    }
+  }
+
   bke::GeometrySet output = input;
   output.replace_mesh(mesh);
   r_output = std::move(output);
@@ -1709,12 +1885,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
      * points the CPU reference is a few milliseconds, so a slow upload or a stalling readback is
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
-            "HA program: %d elements, %d step(s), %d attribute(s), %d store(s): upload %.2f ms, "
+            "HA program: %d elements, %d step(s), %d attribute(s), %d store(s), %d element "
+            "pass(es): upload %.2f ms, "
             "dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
             int(attributes_.size()),
             int(stores_.size()),
+            int(element_steps_.size()),
             upload_ms,
             dispatch_ms,
             int(steps_.size()),

@@ -2550,6 +2550,41 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
       LOCAL_GROUP_SIZE);
 }
 
+gpu::Shader *ha_shader_get_element(const StringRef key,
+                                   const StringRef glsl_value,
+                                   const StringRef glsl_selection,
+                                   const int components)
+{
+  const bool vector = components > 1;
+  const char *type = vector ? "vec3" : "float";
+  std::string body = std::string(HA_GLSL_HELPERS);
+  body += "void main()\n";
+  body += "{\n";
+  body += "  int index = int(gl_GlobalInvocationID.x);\n";
+  body += "  if (index >= int(params[0])) { return; }\n";
+  body += "  ";
+  body += type;
+  body += " value = ";
+  body += glsl_value;
+  body += ";\n";
+  body += "  if ((";
+  body += glsl_selection;
+  body += ") > 0.0) {\n";
+  body += "    element_out[index] = value;\n";
+  body += "  }\n";
+  body += "  else {\n";
+  body += "    element_out[index] = element_in[index];\n";
+  body += "  }\n";
+  body += "}\n";
+
+  const std::array<HaShaderResource, 3> resources = {{
+      {0, HaShaderQualifier::Read, type, "element_in[]"},
+      {1, HaShaderQualifier::Write, type, "element_out[]"},
+      {2, HaShaderQualifier::Read, "float", "params[]"},
+  }};
+  return ha_shader_get_source(key, body, as_span(resources), LOCAL_GROUP_SIZE);
+}
+
 gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                                          const StringRef glsl_value_expr,
                                          const StringRef combine,
