@@ -359,6 +359,9 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::NoiseTexture:
       /* The Perlin noise lives in the GLSL helpers; the CPU reference is the node evaluation. */
       return 0.0f;
+    case HaOp::WaveTexture:
+      /* Same: the wave is a helper; the CPU reference is the node evaluation. */
+      return 0.0f;
     case HaOp::Sin:
       return math::sin(eval_float(*expr.args[0], index, positions));
     case HaOp::Cos:
@@ -1017,6 +1020,17 @@ std::string emit(const HaExpr &expr)
              ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " + emit(*expr.args[4]) +
              ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
              std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
+    }
+    case HaOp::WaveTexture: {
+      const int wave_type = expr.param & 0x3;
+      const int bands_dir = (expr.param >> 2) & 0x3;
+      const int rings_dir = (expr.param >> 4) & 0x3;
+      const int profile = (expr.param >> 6) & 0x3;
+      return "ha_wave_texture(" + emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) + ", " +
+             emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " + emit(*expr.args[4]) + ", " +
+             emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " + std::to_string(wave_type) +
+             ", " + std::to_string(bands_dir) + ", " + std::to_string(rings_dir) + ", " +
+             std::to_string(profile) + ")";
     }
   }
   return "0.0";

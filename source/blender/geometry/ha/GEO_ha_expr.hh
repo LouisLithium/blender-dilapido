@@ -176,6 +176,12 @@ enum class HaOp {
    * A port of `BLI_noise.cc`, so the values match the CPU.
    */
   NoiseTexture,
+  /**
+   * `Wave Texture > Fac` (#HaExpr::param: wave type, bands/rings direction and profile packed in
+   * 2 bit fields each). Args: vector, scale, distortion, detail, detail scale, detail roughness,
+   * phase. A port of `node_shader_tex_wave.cc` on top of the Perlin fbm.
+   */
+  WaveTexture,
 };
 
 /** Bit of #HaExpr::param that enables clamping (`Mix` factor, `Map Range` result). */

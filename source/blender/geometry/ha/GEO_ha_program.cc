@@ -770,6 +770,50 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
   return &noise;
 }
 
+/**
+ * `ShaderNodeTexWave > Fac`. The node only uses `perlin_fbm` (lacunarity 2, normalized) for the
+ * distortion, so the whole thing is one helper call. `Color` is refused like the other textures.
+ */
+const HaExpr *compile_wave_texture(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  /* `Wave Texture` declares `Color` first and `Fac` second (the opposite order of `Noise
+   * Texture`), so the factor is output 1. */
+  if (socket_index != 1) {
+    fail(ctx, "Wave Texture: only the 'Fac' output is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto &storage = *static_cast<const NodeTexWave *>(node.storage);
+  if (node.input_sockets().size() < 7) {
+    fail(ctx, "Wave Texture: unexpected sockets");
+    return &ctx.pool.constant(0.0f);
+  }
+  /* Inputs: Vector(0), Scale(1), Distortion(2), Detail(3), Detail Scale(4),
+   * Detail Roughness(5), Phase Offset(6). */
+  const HaExpr *vector = node.input_socket(0).link != nullptr ?
+                             compile_input(ctx, node, 0) :
+                             &ctx.pool.add(HaType::Float3, HaOp::Position);
+  if (vector->type != HaType::Float3) {
+    fail(ctx, "Wave Texture: the vector input has to be a vector");
+    return &ctx.pool.constant(0.0f);
+  }
+  HaExpr &wave = ctx.pool.add(HaType::Float,
+                              HaOp::WaveTexture,
+                              {vector,
+                               compile_input(ctx, node, 1),
+                               compile_input(ctx, node, 2),
+                               compile_input(ctx, node, 3),
+                               compile_input(ctx, node, 4),
+                               compile_input(ctx, node, 5),
+                               compile_input(ctx, node, 6)});
+  if (!ctx.ok) {
+    fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return &ctx.pool.constant(0.0f);
+  }
+  wave.param = (storage.wave_type & 0x3) | ((storage.bands_direction & 0x3) << 2) |
+               ((storage.rings_direction & 0x3) << 4) | ((storage.wave_profile & 0x3) << 6);
+  return &wave;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -1017,6 +1061,9 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("ShaderNodeTexNoise"_ustr)) {
     result = compile_noise_texture(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeTexWave"_ustr)) {
+    result = compile_wave_texture(ctx, node, socket_index);
   }
   else {
     fail(ctx,
