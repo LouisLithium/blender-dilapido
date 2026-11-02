@@ -1109,6 +1109,11 @@ static void node_update_basis_from_declaration(TreeDrawContext &tree_draw_ctx,
     socket->flag &= ~SOCK_PANEL_COLLAPSED;
   }
 
+  /* Body buttons. Nodes that support panels are drawn from their declaration, which used to skip
+   * `draw_buttons` entirely: a property that belongs on the node itself (the `Backend` of an
+   * `HW Accelerate` zone) was then only reachable through the sidebar. */
+  node_update_basis_buttons(C, ntree, node, node.typeinfo->draw_buttons, block, locy);
+
   /* Gather flattened list of items in the node. */
   const Vector<FlatNodeItem> flat_items = make_flat_node_items(node);
   if (flat_items.is_empty()) {
@@ -3038,17 +3043,21 @@ static void node_draw_basis(const bContext &C,
       }
       iconofs -= iconbutw;
       block_emboss_set(&block, ui::EmbossType::None);
-      uiDefIconBut(&block,
-                   ui::ButtonType::But,
-                   on_device ? ICON_MEMORY : ICON_INFO,
-                   iconofs,
-                   rct.ymax - NODE_DY,
-                   iconbutw,
-                   UI_UNIT_Y,
-                   nullptr,
-                   0,
-                   0,
-                   StringRef(tip));
+      ui::Button *but = uiDefIconBut(&block,
+                                     ui::ButtonType::But,
+                                     on_device ? ICON_MEMORY : ICON_INFO,
+                                     iconofs,
+                                     rct.ymax - NODE_DY,
+                                     iconbutw,
+                                     UI_UNIT_Y,
+                                     nullptr,
+                                     0,
+                                     0,
+                                     "");
+      /* `Button::tip` is a `StringRef`, so passing the local string directly would dangle as soon
+       * as this function returns and the tooltip would show garbage. Build it lazily instead. */
+      button_func_quick_tooltip_set(
+          but, [tip = std::move(tip)](const ui::Button * /*but*/) { return tip; });
       block_emboss_set(&block, ui::EmbossType::Emboss);
     }
   }

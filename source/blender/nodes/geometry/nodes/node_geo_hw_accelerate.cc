@@ -56,12 +56,19 @@ static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *cur
     return;
   }
   layout.prop(current_node_ptr, "backend", UI_ITEM_NONE, "", ICON_NONE);
-  /* Be explicit about the fact that the zone is a scope, not a compiler: only the nodes that have a
-   * device implementation leave the CPU. */
-  layout.label(
-      TIP_("Nodes with a device implementation (the XPBD fluid solver and position fields) run on "
-           "the compute backend. The rest of the zone is evaluated on the CPU"),
-      ICON_INFO);
+}
+
+/**
+ * The node body gets the `Backend` dropdown too: it is the only property of the node, and having to
+ * open the sidebar for it made the zone feel like it had no settings at all.
+ */
+static void node_draw_buttons(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
+{
+  bNode &node = *static_cast<bNode *>(ptr->data);
+  if (node.type_legacy != GEO_NODE_HW_ACCELERATE_INPUT) {
+    return;
+  }
+  layout.prop(ptr, "backend", UI_ITEM_NONE, "", ICON_NONE);
 }
 
 /** \} */
@@ -112,6 +119,7 @@ static void node_register()
   ntype.declare = node_declare;
   ntype.labelfunc = node_label;
   ntype.no_muting = true;
+  ntype.draw_buttons = node_draw_buttons;
   ntype.draw_buttons_ex = node_layout_ex;
   bke::node_type_storage(ntype,
                          "NodeGeometryHwAccelerateInput",

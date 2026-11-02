@@ -7579,12 +7579,14 @@ static const EnumPropertyItem rna_enum_hw_accelerate_backend_items[] = {
      "AUTO",
      0,
      "Auto",
-     "Run on the compute backend and fall back to the CPU for unsupported nodes"},
+     "Use the compute backend for the nodes that have a device implementation and the CPU for the "
+     "rest of the zone"},
     {NODE_HW_ACCELERATE_BACKEND_STRICT,
      "STRICT",
      0,
      "Strict",
-     "Report a warning when a node inside the zone cannot use the compute backend"},
+     "Same as Auto, but report a warning whenever a node inside the zone cannot use the compute "
+     "backend"},
     {NODE_HW_ACCELERATE_BACKEND_FORCE_CPU,
      "FORCE_CPU",
      0,
@@ -7602,7 +7604,11 @@ static void def_geo_hw_accelerate_input(BlenderRNA *brna, StructRNA *srna)
   PropertyRNA *prop = RNA_def_property(srna, "backend", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_items(prop, rna_enum_hw_accelerate_backend_items);
   RNA_def_property_enum_sdna(prop, nullptr, "backend");
-  RNA_def_property_ui_text(prop, "Backend", "How the zone is executed");
+  RNA_def_property_ui_text(prop,
+                           "Backend",
+                           "How the zone is executed. A zone is a scope, not a compiler: only the "
+                           "nodes with a device implementation (the XPBD fluid solver and the "
+                           "position/field chains) leave the CPU");
   RNA_def_property_update(prop, NC_NODE | NA_EDITED, "rna_Node_update");
 }
 
