@@ -41,6 +41,7 @@
 
 namespace blender {
 struct bNodeTree;
+struct Material;
 namespace bke {
 struct GeometrySet;
 class bNodeTreeZone;
@@ -91,6 +92,12 @@ enum class HaElementDomain {
   Edge,
 };
 
+/** Type of the attribute an element pass writes. */
+enum class HaElementType {
+  Bool,
+  Int,
+};
+
 /**
  * One node that writes an attribute on a domain that has no positions of its own (FACE / EDGE).
  * Currently produced by `Set Shade Smooth`, which needs both of its fields to be constant: a field
@@ -101,10 +108,20 @@ struct HaElementStep {
   HaElementDomain domain = HaElementDomain::Face;
   /** 1 for a scalar attribute, 3 for a vector one. */
   int components = 1;
+  /** Attribute type written back (bool for `sharp_*`, int for `material_index`). */
+  HaElementType type = HaElementType::Bool;
   /** Scalar expression, evaluated with `int index` (the element index) in scope. */
   std::string glsl_value;
   /** Scalar expression; greater than zero means "write this element". */
   std::string glsl_selection;
+  /**
+   * `Set Material`: the value is the material's slot index on the mesh, which is only known at
+   * execution time (the material is appended there), so it replaces #glsl_value.
+   */
+  bool material_step = false;
+  struct Material *material = nullptr;
+  /** True when the selection is the constant `true`; the CPU takes a different slot path then. */
+  bool all_selected = true;
   /**
    * Value the attribute has when it does not exist yet. `Set Shade Smooth` creates `sharp_*` with
    * `true` (measured against the CPU), so unselected elements of a missing attribute read as sharp.

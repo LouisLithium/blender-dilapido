@@ -15,6 +15,7 @@
 #include "BKE_geometry_set.hh"
 #include "BKE_attribute.hh"
 #include "BKE_lib_id.hh"
+#include "BKE_material.hh"
 #include "BKE_mesh.h"
 #include "BKE_node.hh"
 #include "BKE_node_runtime.hh"
@@ -991,6 +992,56 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   return true;
 }
 
+/**
+ * `GeometryNodeSetMaterial`: writes `material_index` (FACE) for the selected faces. The material has
+ * to be a constant (a material *field* is not supported), and the slot index is resolved at
+ * execution time, when the material is appended to the result mesh exactly like the CPU does.
+ */
+bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElementStep &r_step)
+{
+  const Span<const bNodeSocket *> inputs = node.input_sockets();
+  if (inputs.size() < 3) {
+    fail(point_ctx, "Set Material: unexpected sockets");
+    return false;
+  }
+  r_step.domain = HaElementDomain::Face;
+  r_step.attribute = "material_index";
+  r_step.components = 1;
+  r_step.type = HaElementType::Int;
+  r_step.default_value = 0.0f;
+  r_step.material_step = true;
+
+  /* Inputs: Geometry(0), Selection(1), Material(2). */
+  const bNodeSocket &material_socket = node.input_socket(2);
+  if (material_socket.link != nullptr) {
+    fail(point_ctx, "Set Material: a linked 'Material' is not supported");
+    return false;
+  }
+  const auto *material_value = static_cast<const bNodeSocketValueMaterial *>(
+      material_socket.default_value);
+  r_step.material = material_value != nullptr ? material_value->value : nullptr;
+
+  HaExprPool element_pool;
+  Vector<HaAggregate> element_aggregates;
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.element_domain = true;
+  const HaExpr *selection = compile_input(ctx, node, 1);
+  if (!ctx.ok) {
+    fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return false;
+  }
+  if (selection->type != HaType::Float) {
+    fail(point_ctx, "Set Material: 'Selection' has to be a scalar");
+    return false;
+  }
+  r_step.glsl_selection = ha_emit_glsl_scalar(*selection);
+  /* The CPU takes a different path when every face is selected (it rebuilds the attribute instead of
+   * filling a mask), and that path also decides whether a default slot is added. */
+  r_step.all_selected = selection->op == HaOp::Const && selection->value[0] != 0.0f;
+  return true;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -1384,7 +1435,8 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
     }
     /* Nodes that write an attribute on a domain without positions are a pass-through for the
      * geometry; they become their own device pass. */
-    if (current->is_type("GeometryNodeSetShadeSmooth"_ustr)) {
+    if (current->is_type("GeometryNodeSetShadeSmooth"_ustr) ||
+        current->is_type("GeometryNodeSetMaterial"_ustr)) {
       if (element_nodes.size() >= MAX_ELEMENT_STEPS) {
         return fail(fmt::format("the zone contains more than {} element passes",
                                 MAX_ELEMENT_STEPS));
@@ -1469,8 +1521,12 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
 
   /* Then the FACE/EDGE passes, first -> last (`element_nodes` is stored last -> first). */
   for (const int i : element_nodes.index_range()) {
+    const bNode &element_node = *element_nodes[element_nodes.size() - 1 - i];
     HaElementStep step;
-    if (!compile_set_shade_smooth(ctx, *element_nodes[element_nodes.size() - 1 - i], step)) {
+    const bool ok = element_node.is_type("GeometryNodeSetMaterial"_ustr) ?
+                        compile_set_material(ctx, element_node, step) :
+                        compile_set_shade_smooth(ctx, element_node, step);
+    if (!ok) {
       return fail(ctx.reason.empty() ? std::string("the element node is not supported") :
                                       ctx.reason);
     }
@@ -1841,14 +1897,29 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       if (const std::optional<bke::AttributeMetaData> meta =
               src_attributes.lookup_meta_data(step.attribute))
       {
-        if (meta->domain == domain && meta->data_type == bke::AttrType::Bool) {
+        const bool type_matches = step.type == HaElementType::Int ?
+                                      meta->data_type == bke::AttrType::Int32 :
+                                      meta->data_type == bke::AttrType::Bool;
+        if (meta->domain == domain && type_matches) {
           attribute_exists = true;
-          const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(step.attribute,
+          if (step.type == HaElementType::Int) {
+            const bke::AttributeReader<int> reader = src_attributes.lookup<int>(step.attribute,
                                                                                domain);
-          if (reader) {
-            const VArray<bool> &values = reader.varray;
-            for (const int element : IndexRange(count)) {
-              host_in[element] = values[element] ? 1.0f : 0.0f;
+            if (reader) {
+              const VArray<int> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                host_in[element] = float(values[element]);
+              }
+            }
+          }
+          else {
+            const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(step.attribute,
+                                                                                 domain);
+            if (reader) {
+              const VArray<bool> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                host_in[element] = values[element] ? 1.0f : 0.0f;
+              }
             }
           }
         }
@@ -1859,6 +1930,32 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         std::fill_n(host_in.begin(), count, step.default_value);
       }
       element_in.upload(host_in);
+
+      /* `Set Material`: the value is the material's slot index on the result mesh, which is only
+       * known now. This mirrors `assign_material_to_id_geometry`: a partial selection gets a default
+       * slot first (so unselected faces keep a valid index), then the material is looked up and
+       * appended if it is not there yet. */
+      std::string value_expression = step.glsl_value;
+      if (step.material_step) {
+        if (!step.all_selected) {
+          BKE_id_material_eval_ensure_default_slot(&mesh->id);
+        }
+        int new_index = -1;
+        const int material_count = *BKE_id_material_len_p(&mesh->id);
+        if (Material **materials = *BKE_id_material_array_p(&mesh->id)) {
+          for (int material_i = 0; material_i < material_count; material_i++) {
+            if (materials[material_i] == step.material) {
+              new_index = material_i;
+              break;
+            }
+          }
+        }
+        if (new_index == -1) {
+          new_index = material_count;
+          BKE_id_material_eval_assign(&mesh->id, new_index + 1, step.material);
+        }
+        value_expression = std::to_string(new_index) + ".0";
+      }
 
       /* The attributes this step's fields read, taken from the same domain of the source mesh. */
       Array<HaBuffer> step_attribute_buffers(step.attributes.size());
@@ -1952,9 +2049,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       element_params.upload(element_params_host);
 
       gpu::Shader *element_shader = ha_shader_get_element(
-          "element|" + step.glsl_value + "|" + step.glsl_selection + "|" +
+          "element|" + value_expression + "|" + step.glsl_selection + "|" +
               std::to_string(step.components),
-          step.glsl_value,
+          value_expression,
           step.glsl_selection,
           step.components,
           Span<const HaShaderResource>(step_resources.data(), int64_t(step_resources.size())));
@@ -1982,16 +2079,30 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       Array<float> host_out(int64_t(padded) * step.components);
       element_out.download(host_out);
 
-      bke::SpanAttributeWriter<bool> writer = mesh_attributes.lookup_or_add_for_write_span<bool>(
-          step.attribute, domain);
-      if (!writer) {
-        BKE_id_free(nullptr, mesh);
-        return false;
+      if (step.type == HaElementType::Int) {
+        bke::SpanAttributeWriter<int> writer = mesh_attributes.lookup_or_add_for_write_span<int>(
+            step.attribute, domain);
+        if (!writer) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        for (const int element : IndexRange(count)) {
+          writer.span[element] = int(std::lround(host_out[element]));
+        }
+        writer.finish();
       }
-      for (const int element : IndexRange(count)) {
-        writer.span[element] = host_out[element] > 0.5f;
+      else {
+        bke::SpanAttributeWriter<bool> writer = mesh_attributes.lookup_or_add_for_write_span<bool>(
+            step.attribute, domain);
+        if (!writer) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        for (const int element : IndexRange(count)) {
+          writer.span[element] = host_out[element] > 0.5f;
+        }
+        writer.finish();
       }
-      writer.finish();
     }
   }
 
