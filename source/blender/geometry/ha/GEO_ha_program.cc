@@ -740,12 +740,6 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
   const bool is_1d = storage.dimensions == 1;
-  if (is_1d && socket_index == 1) {
-    /* The 1D colour is three separate fractals at seeded offsets; the offsets still differ from the
-     * CPU, so it is refused until that is fixed (the factor is exact). */
-    fail(ctx, "Noise Texture: the 1D 'Color' output is not supported yet");
-    return &ctx.pool.constant(0.0f);
-  }
   if (node.input_sockets().size() < 9) {
     fail(ctx, "Noise Texture: unexpected sockets");
     return &ctx.pool.constant(0.0f);
