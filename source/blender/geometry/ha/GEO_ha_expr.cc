@@ -364,6 +364,7 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
       return 0.0f;
     case HaOp::VoronoiTexture:
     case HaOp::VoronoiRadius:
+    case HaOp::VoronoiW:
       /* Same: the voronoi kernel is a helper; the CPU reference is the node evaluation. */
       return 0.0f;
     case HaOp::Sin:
@@ -1040,23 +1041,63 @@ std::string emit(const HaExpr &expr)
              std::to_string(profile) + ")";
     }
     case HaOp::VoronoiTexture:
-    case HaOp::VoronoiPosition: {
+    case HaOp::VoronoiPosition:
+    case HaOp::VoronoiW: {
       const int feature = expr.param & 0xF;
       const int metric = (expr.param >> 4) & 0xF;
       const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
-      const std::string args = emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) + ", " +
-                               emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " +
-                               emit(*expr.args[4]) + ", " + emit(*expr.args[5]) + ", " +
-                               emit(*expr.args[6]) + ", " + emit(*expr.args[7]) + ", " +
-                               std::to_string(feature) + ", " + std::to_string(metric) + ", " +
-                               (normalize ? "true" : "false");
-      return (expr.op == HaOp::VoronoiTexture ? "ha_voronoi_texture_3d(" :
-                                                "ha_voronoi_position_3d(") +
-             args + ")";
+      const int dimensions = (expr.param >> HA_PARAM_VORONOI_DIM_SHIFT) & 0x7;
+      /* Args: vector (vec3), w, scale, detail, roughness, lacunarity, smoothness, exponent,
+       * randomness. The 1D kernel only reads `w`, the 2D/3D kernels only the vector and the 4D
+       * kernel both. */
+      std::string args;
+      if (dimensions == 1) {
+        args = emit(*expr.args[1]);
+      }
+      else {
+        args = emit_as_vector(*expr.args[0]);
+        if (dimensions == 4) {
+          args += ", " + emit(*expr.args[1]);
+        }
+      }
+      for (int i = 2; i < 9; i++) {
+        args += ", " + emit(*expr.args[i]);
+      }
+      args += ", " + std::to_string(feature) + ", " + std::to_string(metric) + ", " +
+              (normalize ? "true" : "false");
+
+      const char *function = "ha_voronoi_texture_3d";
+      if (expr.op == HaOp::VoronoiTexture) {
+        function = dimensions == 1 ? "ha_voronoi_texture_1d" :
+                   dimensions == 2 ? "ha_voronoi_texture_2d" :
+                   dimensions == 3 ? "ha_voronoi_texture_3d" :
+                                     "ha_voronoi_texture_4d";
+      }
+      else if (expr.op == HaOp::VoronoiPosition) {
+        function = dimensions == 2 ? "ha_voronoi_position_2d" :
+                   dimensions == 3 ? "ha_voronoi_position_3d" :
+                                     "ha_voronoi_position_4d";
+      }
+      else {
+        function = dimensions == 1 ? "ha_voronoi_w_1d" : "ha_voronoi_w_4d";
+      }
+      return std::string(function) + "(" + args + ")";
     }
     case HaOp::VoronoiRadius: {
-      return "ha_voronoi_radius_3d(" + emit_as_vector(*expr.args[0]) + ", " +
-             emit(*expr.args[1]) + ", " + emit(*expr.args[2]) + ")";
+      const int dimensions = (expr.param >> HA_PARAM_VORONOI_DIM_SHIFT) & 0x7;
+      const std::string vector = emit_as_vector(*expr.args[0]);
+      const std::string w = emit(*expr.args[1]);
+      const std::string scale = emit(*expr.args[2]);
+      const std::string randomness = emit(*expr.args[3]);
+      if (dimensions == 1) {
+        return "ha_voronoi_radius_1d(" + w + ", " + scale + ", " + randomness + ")";
+      }
+      if (dimensions == 4) {
+        return "ha_voronoi_radius_4d(" + vector + ", " + w + ", " + scale + ", " + randomness +
+               ")";
+      }
+      return "ha_voronoi_radius_" + std::to_string(dimensions) + "d(" + vector + ", " + scale +
+             ", " + randomness + ")";
     }
   }
   return "0.0";

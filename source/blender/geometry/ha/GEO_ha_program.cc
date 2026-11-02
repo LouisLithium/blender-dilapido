@@ -815,16 +815,17 @@ const HaExpr *compile_wave_texture(CompileContext &ctx, const bNode &node, const
 }
 
 /**
- * `ShaderNodeTexVoronoi`, 3D. `Distance`, `Position` and the `N-Sphere Radius` output are
- * supported; `Color` is refused (the IR has no colour type) and so are the other dimensions.
+ * `ShaderNodeTexVoronoi`, 1D/2D/3D/4D. `Distance`, `Position`, `W` and the `N-Sphere Radius` output
+ * are supported; `Color` is refused (the IR has no colour type).
  */
 const HaExpr *compile_voronoi_texture(CompileContext &ctx,
                                       const bNode &node,
                                       const int socket_index)
 {
   const auto &storage = *static_cast<const NodeTexVoronoi *>(node.storage);
-  if (storage.dimensions != 3) {
-    fail(ctx, "Voronoi Texture: only the 3D dimensions are supported");
+  const int dimensions = storage.dimensions;
+  if (dimensions < 1 || dimensions > 4) {
+    fail(ctx, "Voronoi Texture: unsupported dimensions");
     return &ctx.pool.constant(0.0f);
   }
   if (node.input_sockets().size() < 9) {
@@ -833,27 +834,43 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
   }
 
   /* Outputs: Distance(0), Color(1), Position(2), W(3), Radius(4). */
-  if (socket_index == 1 || socket_index == 3) {
-    fail(ctx,
-         "Voronoi Texture: only the 'Distance', 'Position' and 'Radius' outputs are supported");
+  const int feature = storage.feature;
+  if (socket_index == 1) {
+    fail(ctx, "Voronoi Texture: the 'Color' output is not supported");
     return &ctx.pool.constant(0.0f);
   }
-  const int feature = storage.feature;
   if ((socket_index == 4) != (feature == 4)) {
     fail(ctx, "Voronoi Texture: the 'Radius' output only exists for the 'N-Sphere Radius' feature");
     return &ctx.pool.constant(0.0f);
   }
-  if (socket_index == 2 && feature >= 3) {
-    fail(ctx, "Voronoi Texture: this feature has no 'Position' output");
+  if (socket_index == 2 && (feature >= 3 || dimensions == 1)) {
+    fail(ctx, "Voronoi Texture: this feature and dimension have no 'Position' output");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (socket_index == 3 && dimensions != 1 && dimensions != 4) {
+    fail(ctx, "Voronoi Texture: the 'W' output only exists in the 1D and 4D dimensions");
     return &ctx.pool.constant(0.0f);
   }
 
-  const HaExpr *vector = node.input_socket(0).link != nullptr ?
-                             compile_input(ctx, node, 0) :
-                             &ctx.pool.add(HaType::Float3, HaOp::Position);
-  if (vector->type != HaType::Float3) {
-    fail(ctx, "Voronoi Texture: the vector input has to be a vector");
-    return &ctx.pool.constant(0.0f);
+  /* Args of every op: vector, w, scale, detail, roughness, lacunarity, smoothness, exponent,
+   * randomness. `vector` is unused in 1D, `w` in 2D/3D. */
+  const HaExpr *vector = &ctx.pool.constant(float3(0.0f));
+  if (dimensions != 1) {
+    vector = node.input_socket(0).link != nullptr ?
+                 compile_input(ctx, node, 0) :
+                 &ctx.pool.add(HaType::Float3, HaOp::Position);
+    if (vector->type != HaType::Float3) {
+      fail(ctx, "Voronoi Texture: the vector input has to be a vector");
+      return &ctx.pool.constant(0.0f);
+    }
+  }
+  const HaExpr *w = &ctx.pool.constant(0.0f);
+  if (dimensions == 1 || dimensions == 4) {
+    w = compile_input(ctx, node, 1);
+    if (w->type != HaType::Float) {
+      fail(ctx, "Voronoi Texture: 'W' has to be a scalar");
+      return &ctx.pool.constant(0.0f);
+    }
   }
   const HaExpr *scale = compile_input(ctx, node, 2);
   /* `randomness` is clamped to [0, 1] by the node. */
@@ -867,10 +884,15 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
     return &ctx.pool.constant(0.0f);
   }
 
+  const int param = (feature & 0xF) | ((storage.distance & 0xF) << 4) |
+                    (storage.normalize != 0 ? HA_PARAM_CLAMP : 0) |
+                    ((dimensions & 0x7) << HA_PARAM_VORONOI_DIM_SHIFT);
+
   if (socket_index == 4) {
     HaExpr &radius = ctx.pool.add(HaType::Float,
                                   HaOp::VoronoiRadius,
-                                  {vector, scale, randomness});
+                                  {vector, w, scale, randomness});
+    radius.param = param;
     return &radius;
   }
 
@@ -887,17 +909,22 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
                                HaOp::Clamp,
                                {halved, &ctx.pool.constant(0.0f), &ctx.pool.constant(0.5f)});
   }
-  const HaExpr *exponent = metric == 3 ? compile_input(ctx, node, 7) :
-                                        &ctx.pool.constant(0.0f);
+  /* The node only reads `Exponent` for `Minkowski` and not in 1D. */
+  const HaExpr *exponent = metric == 3 && dimensions != 1 ? compile_input(ctx, node, 7) :
+                                                            &ctx.pool.constant(0.0f);
   if (!ctx.ok) {
     fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return &ctx.pool.constant(0.0f);
   }
 
-  const bool is_position = socket_index == 2;
-  HaExpr &voronoi = ctx.pool.add(is_position ? HaType::Float3 : HaType::Float,
-                                 is_position ? HaOp::VoronoiPosition : HaOp::VoronoiTexture,
+  const HaOp op = socket_index == 2 ? HaOp::VoronoiPosition :
+                  socket_index == 3 ? HaOp::VoronoiW :
+                                      HaOp::VoronoiTexture;
+  const HaType type = socket_index == 2 ? HaType::Float3 : HaType::Float;
+  HaExpr &voronoi = ctx.pool.add(type,
+                                 op,
                                  {vector,
+                                  w,
                                   scale,
                                   detail,
                                   roughness,
@@ -905,8 +932,7 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
                                   smoothness,
                                   exponent,
                                   randomness});
-  voronoi.param = (feature & 0xF) | ((metric & 0xF) << 4) |
-                  (storage.normalize != 0 ? HA_PARAM_CLAMP : 0);
+  voronoi.param = param;
   return &voronoi;
 }
 

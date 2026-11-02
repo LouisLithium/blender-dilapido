@@ -188,11 +188,16 @@ enum class HaOp {
    * metric (bits 4-7) and `normalize` (bit 8). A port of the 3D path in `BLI_noise.cc`.
    */
   VoronoiTexture,
-  /** `Voronoi Texture > Position` (3D): same args and packing as #VoronoiTexture. */
+  /** `Voronoi Texture > Position` (2D/3D/4D): same args and packing as #VoronoiTexture. */
   VoronoiPosition,
-  /** `Voronoi Texture > Radius` (N-Sphere feature): args vector, scale, randomness. */
+  /** `Voronoi Texture > W` (1D/4D): same args and packing as #VoronoiTexture. */
+  VoronoiW,
+  /** `Voronoi Texture > Radius` (N-Sphere feature): args vector, w, scale, randomness. */
   VoronoiRadius,
 };
+
+/** Bit offset of the Voronoi dimension (1..4) in #HaExpr::param. */
+inline constexpr int HA_PARAM_VORONOI_DIM_SHIFT = 9;
 
 /** Bit of #HaExpr::param that enables clamping (`Mix` factor, `Map Range` result). */
 inline constexpr int HA_PARAM_CLAMP = 1 << 8;
