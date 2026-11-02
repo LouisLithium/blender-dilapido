@@ -69,6 +69,22 @@ struct HaProgramStep {
   std::string glsl_selection;
 };
 
+/** One POINT attribute the program reads, uploaded once per evaluation. */
+struct HaAttribute {
+  std::string name;
+  /** 1 for a float attribute, 3 for a vector one. */
+  int components = 1;
+};
+
+/** One `Store Named Attribute` node at the end of the chain (written back after the steps). */
+struct HaStore {
+  std::string name;
+  /** 1 for a float attribute, 3 for a vector one. */
+  int components = 1;
+  /** GLSL expression, evaluated with `vec3 position` (the *final* position) and `int index`. */
+  std::string glsl_value;
+};
+
 class HaZoneProgram {
  public:
   ~HaZoneProgram();
@@ -96,12 +112,28 @@ class HaZoneProgram {
     return int(steps_.size());
   }
 
+  /** Number of POINT attributes the program reads. */
+  int attribute_count() const
+  {
+    return int(attributes_.size());
+  }
+
+  /** Number of `Store Named Attribute` nodes the program writes back. */
+  int store_count() const
+  {
+    return int(stores_.size());
+  }
+
   /** Human readable form of the compiled chain, for the debug log. */
   std::string debug_description() const;
 
  private:
   Vector<HaProgramStep> steps_;
   Vector<HaAggregate> aggregates_;
+  /** Attributes read by the program, in binding order (slot 3 + index). */
+  Vector<HaAttribute> attributes_;
+  /** `Store Named Attribute` nodes, in evaluation order (all after the position chain). */
+  Vector<HaStore> stores_;
 };
 
 }  // namespace geometry::ha

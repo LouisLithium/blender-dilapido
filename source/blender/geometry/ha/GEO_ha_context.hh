@@ -182,14 +182,6 @@ class HaBufferInt {
   int64_t elements_ = 0;
 };
 
-/**
- * Returns a compute shader that writes `position_out[]` from \a glsl_position (a `vec3`
- * expression) for the elements where \a glsl_selection (a scalar expression) is not zero, and
- * copies the input position through otherwise. Cached by \a key. In scope of both expressions:
- * `vec3 position` (the current position) and `int index`.
- */
-gpu::Shader *ha_shader_get(StringRef key, StringRef glsl_position, StringRef glsl_selection);
-
 /** Access qualifier of one storage buffer binding, mirrors `gpu::shader::Qualifier`. */
 enum class HaShaderQualifier {
   Read,
@@ -206,6 +198,32 @@ struct HaShaderResource {
   /** GLSL declaration, e.g. `"position_in[]"`. */
   const char *name;
 };
+
+/**
+ * Returns a compute shader that writes `position_out[]` from \a glsl_position (a `vec3`
+ * expression) for the elements where \a glsl_selection (a scalar expression) is not zero, and
+ * copies the input position through otherwise. Cached by \a key. In scope of both expressions:
+ * `vec3 position` (the current position) and `int index`.
+ *
+ * \param extra_resources additional bindings starting at slot 3, used for the POINT attributes a
+ * program reads (declared as e.g. `attribute_0[]`, one float per element for a scalar attribute and
+ * three for a vector one).
+ */
+gpu::Shader *ha_shader_get(StringRef key,
+                           StringRef glsl_position,
+                           StringRef glsl_selection,
+                           Span<const HaShaderResource> extra_resources = {});
+
+/**
+ * Compiles a `Store Named Attribute` kernel: writes \a glsl_value (evaluated with `vec3 position`
+ * and `int index` in scope) into `store_out[]`, which has \a components floats per element. Used
+ * with the *final* position buffer bound as `position_in`, so the value field sees the geometry as
+ * it leaves the zone.
+ */
+gpu::Shader *ha_shader_get_store(StringRef key,
+                                 StringRef glsl_value,
+                                 int components,
+                                 Span<const HaShaderResource> extra_resources = {});
 
 /**
  * Compiles \a source (a complete `void main()`, without the storage buffer declarations) with the

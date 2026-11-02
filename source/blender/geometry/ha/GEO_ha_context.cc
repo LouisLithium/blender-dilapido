@@ -593,7 +593,7 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
 
   /* Version of the generated shader pipeline; bump whenever the resource layout or the kernel
    * templates change, so that the on-disk shader cache cannot return a stale binary. */
-  constexpr int HA_SHADER_VERSION = 4;
+  constexpr int HA_SHADER_VERSION = 5;
 
   /* Unique per program: the resource declaration macros are derived from this name, and the shader
    * cache uses it as part of its key. */
@@ -717,7 +717,8 @@ const char *HA_GLSL_HELPERS =
 
 gpu::Shader *ha_shader_get(const StringRef key,
                            const StringRef glsl_position,
-                           const StringRef glsl_selection)
+                           const StringRef glsl_selection,
+                           const Span<const HaShaderResource> extra_resources)
 {
   const std::string source =
       std::string(HA_GLSL_HELPERS) +
@@ -747,8 +748,58 @@ gpu::Shader *ha_shader_get(const StringRef key,
       "  }\n"
       "}\n";
 
+  Vector<HaShaderResource> resources;
+  for (const HaShaderResource &resource : POSITION_RESOURCES) {
+    resources.append(resource);
+  }
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
   return ha_shader_get_source(
-      key, source, as_span(POSITION_RESOURCES), LOCAL_GROUP_SIZE);
+      key,
+      source,
+      Span<const HaShaderResource>(resources.data(), int64_t(resources.size())),
+      LOCAL_GROUP_SIZE);
+}
+
+gpu::Shader *ha_shader_get_store(const StringRef key,
+                                 const StringRef glsl_value,
+                                 const int components,
+                                 const Span<const HaShaderResource> extra_resources)
+{
+  const bool vector = components > 1;
+  std::string body = std::string(HA_GLSL_HELPERS) +
+                     "void main()\n"
+                     "{\n"
+                     "  int index = int(gl_GlobalInvocationID.x);\n"
+                     "  int base = index * 3;\n"
+                     "  vec3 position = vec3(position_in[base], position_in[base + 1], "
+                     "position_in[base + 2]);\n"
+                     "  ";
+  if (vector) {
+    body += "vec3 value = " + std::string(glsl_value) +
+            ";\n"
+            "  store_out[index * 3] = value.x;\n"
+            "  store_out[index * 3 + 1] = value.y;\n"
+            "  store_out[index * 3 + 2] = value.z;\n";
+  }
+  else {
+    body += "store_out[index] = " + std::string(glsl_value) + ";\n";
+  }
+  body += "}\n";
+
+  Vector<HaShaderResource> resources;
+  resources.append({0, HaShaderQualifier::Read, "float", "position_in[]"});
+  resources.append({1, HaShaderQualifier::Write, "float", "store_out[]"});
+  resources.append({2, HaShaderQualifier::Read, "float", "aggregate[]"});
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
+  return ha_shader_get_source(
+      key,
+      body,
+      Span<const HaShaderResource>(resources.data(), int64_t(resources.size())),
+      LOCAL_GROUP_SIZE);
 }
 
 gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,

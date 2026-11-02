@@ -349,6 +349,10 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
       /* Reduction results are only available on the GPU; the CPU reference for them is the regular
        * node evaluation (the `Force CPU` path). */
       return 0.0f;
+    case HaOp::AttributeRead:
+      /* Attribute buffers are only uploaded for the device path; the CPU reference is the node
+       * evaluation. */
+      return 0.0f;
     case HaOp::Sin:
       return math::sin(eval_float(*expr.args[0], index, positions));
     case HaOp::Cos:
@@ -793,6 +797,14 @@ std::string emit(const HaExpr &expr)
              emit(*expr.args[2]) + ")";
     case HaOp::AggregateRead:
       return "aggregate[" + std::to_string(expr.aggregate_slot) + " * 3]";
+    case HaOp::AttributeRead: {
+      const std::string buffer = "attribute_" + std::to_string(expr.attribute_slot);
+      if (expr.type == HaType::Float3) {
+        return "vec3(" + buffer + "[index * 3], " + buffer + "[index * 3 + 1], " + buffer +
+               "[index * 3 + 2])";
+      }
+      return buffer + "[index]";
+    }
 
     /* --- Math node ---------------------------------------------------------------------- */
     case HaOp::Round:

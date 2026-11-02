@@ -11,6 +11,8 @@
 #include "BLI_math_vector_types.hh"
 
 #include "BKE_geometry_set.hh"
+#include "BKE_attribute.hh"
+#include "BKE_lib_id.hh"
 #include "BKE_mesh.h"
 #include "BKE_node.hh"
 #include "BKE_node_runtime.hh"
@@ -75,10 +77,13 @@ namespace {
 constexpr int MAX_EXPRESSION_DEPTH = 64;
 /** Upper bound for the number of geometry nodes in one zone body. Each one is a dispatch. */
 constexpr int MAX_CHAIN_STEPS = 16;
+/** Upper bound for the `Store Named Attribute` nodes after the chain. Each one is a dispatch. */
+constexpr int MAX_STORE_STEPS = 8;
 
 struct CompileContext {
   HaExprPool &pool;
   Vector<HaAggregate> &aggregates;
+  Vector<HaAttribute> &attributes;
   /** The zone input node, used to verify that reductions read the zone geometry. */
   const bNode *zone_input_node = nullptr;
   bool ok = true;
@@ -549,6 +554,115 @@ const HaExpr *compile_mix(CompileContext &ctx, const bNode &node, const int sock
   return &result;
 }
 
+/** `GeometryNodeInputNamedAttribute`: reads a POINT attribute uploaded with the positions. */
+const HaExpr *compile_named_attribute(CompileContext &ctx,
+                                      const bNode &node,
+                                      const int socket_index)
+{
+  if (socket_index != 0) {
+    /* The `Exists` output would need to know at compile time whether the attribute is there. */
+    fail(ctx, "Named Attribute: the 'Exists' output is not supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto &storage = *static_cast<const NodeGeometryInputNamedAttribute *>(node.storage);
+  int components;
+  switch (storage.data_type) {
+    case CD_PROP_FLOAT:
+      components = 1;
+      break;
+    case CD_PROP_FLOAT3:
+      components = 3;
+      break;
+    default:
+      fail(ctx, "Named Attribute: only the float and vector types are supported");
+      return &ctx.pool.constant(0.0f);
+  }
+  if (node.input_sockets().is_empty()) {
+    fail(ctx, "Named Attribute: missing the name input");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bNodeSocket &name_socket = node.input_socket(0);
+  if (name_socket.link != nullptr) {
+    fail(ctx, "Named Attribute: the name has to be a constant");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *value = static_cast<const bNodeSocketValueString *>(name_socket.default_value);
+  const std::string name = value != nullptr ? std::string(value->value) : std::string();
+  if (name.empty()) {
+    fail(ctx, "Named Attribute: the name is empty");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  int slot = -1;
+  for (const int i : ctx.attributes.index_range()) {
+    if (ctx.attributes[i].name == name && ctx.attributes[i].components == components) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    slot = int(ctx.attributes.size());
+    ctx.attributes.append({name, components});
+  }
+
+  HaExpr &read = ctx.pool.add(components == 1 ? HaType::Float : HaType::Float3,
+                              HaOp::AttributeRead);
+  read.attribute_slot = slot;
+  return &read;
+}
+
+/** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
+bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
+{
+  const auto &storage = *static_cast<const NodeGeometryStoreNamedAttribute *>(node.storage);
+  int components;
+  switch (storage.data_type) {
+    case CD_PROP_FLOAT:
+      components = 1;
+      break;
+    case CD_PROP_FLOAT3:
+      components = 3;
+      break;
+    default:
+      return fail(ctx, "Store Named Attribute: only the float and vector types are supported");
+  }
+  if (storage.domain != int8_t(bke::AttrDomain::Point)) {
+    return fail(ctx, "Store Named Attribute: only the point domain is supported");
+  }
+  if (node.input_sockets().size() < 4) {
+    return fail(ctx, "Store Named Attribute: unexpected sockets");
+  }
+  /* A partial write would have to blend with the previous values, which are not on the device. */
+  if (node.input_socket(1).link != nullptr) {
+    return fail(ctx, "Store Named Attribute: the 'Selection' input is not supported");
+  }
+  const bNodeSocket &name_socket = node.input_socket(2);
+  if (name_socket.link != nullptr) {
+    return fail(ctx, "Store Named Attribute: the name has to be a constant");
+  }
+  const auto *value = static_cast<const bNodeSocketValueString *>(name_socket.default_value);
+  const std::string name = value != nullptr ? std::string(value->value) : std::string();
+  if (name.empty()) {
+    return fail(ctx, "Store Named Attribute: the name is empty");
+  }
+
+  const HaExpr *compiled = compile_input(ctx, node, 3);
+  if (!ctx.ok) {
+    return false;
+  }
+  if (components == 1 && compiled->type != HaType::Float) {
+    return fail(ctx, "Store Named Attribute: expected a float value");
+  }
+  if (components == 3 && compiled->type != HaType::Float3) {
+    return fail(ctx, "Store Named Attribute: expected a vector value");
+  }
+
+  r_store.name = name;
+  r_store.components = components;
+  r_store.glsl_value = components == 1 ? ha_emit_glsl_scalar(*compiled) : ha_emit_glsl(*compiled);
+  return true;
+}
+
 /** `ShaderNodeMapRange` for the float and vector types. */
 const HaExpr *compile_map_range(CompileContext &ctx, const bNode &node, const int socket_index)
 {
@@ -736,6 +850,9 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   else if (node.is_type("ShaderNodeMapRange"_ustr)) {
     result = compile_map_range(ctx, node, socket_index);
   }
+  else if (node.is_type("GeometryNodeInputNamedAttribute"_ustr)) {
+    result = compile_named_attribute(ctx, node, socket_index);
+  }
   else {
     fail(ctx,
          fmt::format("node '{}' ({}) is not supported", node.name, node.idname));
@@ -822,11 +939,31 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
     return fail("the zone output is not connected");
   }
 
+  /* `Store Named Attribute` nodes may sit between the position chain and the zone output. They are
+   * evaluated on the geometry as it leaves the zone, so they all have to come *after* the chain (a
+   * store in the middle would need the positions at that point). */
+  Vector<const bNode *> store_nodes;
+  const bNode *current = zone_output_input.link->fromnode;
+  while (current->is_type("GeometryNodeStoreNamedAttribute"_ustr)) {
+    if (store_nodes.size() >= MAX_STORE_STEPS) {
+      return fail(fmt::format("the zone contains more than {} 'Store Named Attribute' nodes",
+                              MAX_STORE_STEPS));
+    }
+    store_nodes.append(current);
+    if (current->input_sockets().is_empty()) {
+      return fail("'Store Named Attribute' has no geometry input");
+    }
+    const bNodeSocket &geometry_input = current->input_socket(0);
+    if (geometry_input.link == nullptr) {
+      return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
+    }
+    current = geometry_input.link->fromnode;
+  }
+
   /* Walk back through the chain of `Set Position` nodes until the zone input is reached. The whole
    * chain is compiled into one program, so it costs one upload and one download no matter how many
    * nodes it contains. */
   Vector<const bNode *> chain;
-  const bNode *current = zone_output_input.link->fromnode;
   while (true) {
     if (chain.size() >= MAX_CHAIN_STEPS) {
       return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
@@ -853,7 +990,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
 
   HaExprPool pool;
   auto program = std::make_unique<HaZoneProgram>();
-  CompileContext ctx{pool, program->aggregates_};
+  CompileContext ctx{pool, program->aggregates_, program->attributes_};
   ctx.zone_input_node = input_node;
 
   /* Compile first step -> last step (`chain` is stored last -> first). */
@@ -885,6 +1022,15 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
     const HaExpr &final_position = pool.add(HaType::Float3, HaOp::Add, {base, offset});
     program->steps_.append(
         {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
+  }
+
+  /* Then the stores, first -> last (`store_nodes` is stored last -> first). */
+  for (const int i : store_nodes.index_range()) {
+    HaStore store;
+    if (!compile_store(ctx, *store_nodes[store_nodes.size() - 1 - i], store)) {
+      return fail(ctx.reason.empty() ? std::string("the store is not supported") : ctx.reason);
+    }
+    program->stores_.append(std::move(store));
   }
   return program;
 }
@@ -944,6 +1090,75 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   buffers[0].upload(host_input);
   const double upload_ms = timer.lap();
   ha_program_debug("uploaded");
+
+  /* The POINT attributes the program reads. They are taken from the *zone input* geometry: the
+   * steps of the chain only move points around, so the attribute values are the same for every
+   * step (a node that changes attributes has to invalidate this, see the header). */
+  /* One buffer per attribute. `Array` (not `Array<T, N>`, whose second parameter is only the inline
+   * capacity) so the elements actually exist. */
+  Array<HaBuffer> attribute_buffers(attributes_.size());
+  Vector<std::string> attribute_names;
+  Vector<HaShaderResource> extra_resources;
+  /* Reserve up front: the resource list points into the strings, and a reallocation of the vector
+   * would invalidate those pointers (small strings keep their characters inline). */
+  attribute_names.reserve(attributes_.size());
+  extra_resources.reserve(attributes_.size());
+  {
+    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    for (const int i : attributes_.index_range()) {
+      const HaAttribute &attribute = attributes_[i];
+      const int64_t total = int64_t(padded_count) * attribute.components;
+      Array<float> host(total, 0.0f);
+
+      const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
+          attribute.name);
+      if (meta.has_value()) {
+        if (meta->domain != bke::AttrDomain::Point) {
+          /* Interpolating from another domain is not implemented; the CPU path handles it. */
+          return false;
+        }
+        if (attribute.components == 1) {
+          if (!ELEM(meta->data_type, bke::AttrType::Float, bke::AttrType::Int32,
+                    bke::AttrType::Bool))
+          {
+            return false;
+          }
+          const bke::AttributeReader<float> reader = src_attributes.lookup<float>(
+              attribute.name, bke::AttrDomain::Point);
+          if (reader) {
+            const VArray<float> &values = reader.varray;
+            for (const int element : IndexRange(element_count)) {
+              host[element] = values[element];
+            }
+          }
+        }
+        else {
+          if (meta->data_type != bke::AttrType::Float3) {
+            return false;
+          }
+          const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(
+              attribute.name, bke::AttrDomain::Point);
+          if (reader) {
+            const VArray<float3> &values = reader.varray;
+            for (const int element : IndexRange(element_count)) {
+              const float3 value = values[element];
+              host[element * 3 + 0] = value.x;
+              host[element * 3 + 1] = value.y;
+              host[element * 3 + 2] = value.z;
+            }
+          }
+        }
+      }
+
+      if (!attribute_buffers[i].ensure(total)) {
+        return false;
+      }
+      attribute_buffers[i].upload(host);
+      attribute_names.append("attribute_" + std::to_string(i) + "[]");
+      extra_resources.append(
+          {3 + i, HaShaderQualifier::Read, "float", attribute_names.last().c_str()});
+    }
+  }
 
   /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
    * geometry (that is what `Attribute Statistic` is wired to). Two passes per aggregate: one
@@ -1010,7 +1225,10 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     const HaProgramStep &step = steps_[i];
     gpu::Shader *shader = ha_shader_get(step.glsl_position + '#' + step.glsl_selection,
                                         step.glsl_position,
-                                        step.glsl_selection);
+                                        step.glsl_selection,
+                                        Span<const HaShaderResource>(extra_resources.data(),
+                                                                     int64_t(
+                                                                         extra_resources.size())));
     if (shader == nullptr) {
       return false;
     }
@@ -1020,7 +1238,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     GPU_storagebuf_bind(src.buf(), 0);
     GPU_storagebuf_bind(dst.buf(), 1);
     GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
+    for (const int attribute_i : attributes_.index_range()) {
+      GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+    }
     ha_dispatch(shader, padded_count);
+    for (const int attribute_i : attributes_.index_range()) {
+      GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
+    }
     GPU_storagebuf_unbind(buffer_aggregate.buf());
     GPU_storagebuf_unbind(dst.buf());
     GPU_storagebuf_unbind(src.buf());
@@ -1037,6 +1261,43 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
 
   /* After `n` steps the result is in buffer `n % 2`. */
   const HaBuffer &result = buffers[steps_.size() % 2];
+
+  /* The stores read the *final* positions, so they run after the chain. */
+  Array<HaBuffer> store_buffers(stores_.size());
+  for (const int i : stores_.index_range()) {
+    const HaStore &store = stores_[i];
+    if (!store_buffers[i].ensure(int64_t(padded_count) * store.components)) {
+      return false;
+    }
+    gpu::Shader *shader = ha_shader_get_store("store|" + store.glsl_value,
+                                             store.glsl_value,
+                                             store.components,
+                                             Span<const HaShaderResource>(extra_resources.data(),
+                                                                          int64_t(
+                                                                              extra_resources.size())));
+    if (shader == nullptr) {
+      return false;
+    }
+    GPU_shader_bind(shader);
+    GPU_storagebuf_bind(result.buf(), 0);
+    GPU_storagebuf_bind(store_buffers[i].buf(), 1);
+    GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
+    for (const int attribute_i : attributes_.index_range()) {
+      GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+    }
+    ha_dispatch(shader, padded_count);
+    for (const int attribute_i : attributes_.index_range()) {
+      GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
+    }
+    GPU_storagebuf_unbind(buffer_aggregate.buf());
+    GPU_storagebuf_unbind(store_buffers[i].buf());
+    GPU_storagebuf_unbind(result.buf());
+    GPU_shader_unbind();
+  }
+  if (!stores_.is_empty()) {
+    GPU_finish();
+  }
+
   Array<float> host_output(padded_count * 3);
   result.download(host_output);
   const double download_ms = timer.lap();
@@ -1049,6 +1310,39 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   /* Positions changed, so the derived normals have to be recomputed. */
   mesh->tag_positions_changed();
 
+  /* Write the stored attributes back. */
+  if (!stores_.is_empty()) {
+    bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
+    for (const int i : stores_.index_range()) {
+      const HaStore &store = stores_[i];
+      Array<float> host_store(padded_count * store.components);
+      store_buffers[i].download(host_store);
+      if (store.components == 1) {
+        bke::SpanAttributeWriter<float> writer =
+            mesh_attributes.lookup_or_add_for_write_span<float>(store.name,
+                                                                bke::AttrDomain::Point);
+        if (!writer) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        writer.span.copy_from(host_store.as_span().take_front(element_count));
+        writer.finish();
+      }
+      else {
+        bke::SpanAttributeWriter<float3> writer =
+            mesh_attributes.lookup_or_add_for_write_span<float3>(store.name,
+                                                                bke::AttrDomain::Point);
+        if (!writer) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        writer.span.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_store.data()),
+                                           element_count));
+        writer.finish();
+      }
+    }
+  }
+
   bke::GeometrySet output = input;
   output.replace_mesh(mesh);
   r_output = std::move(output);
@@ -1057,10 +1351,12 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
      * points the CPU reference is a few milliseconds, so a slow upload or a stalling readback is
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
-            "HA program: %d elements, %d step(s): upload %.2f ms, dispatch %.2f ms (%d), "
-            "download %.2f ms, write %.2f ms\n",
+            "HA program: %d elements, %d step(s), %d attribute(s), %d store(s): upload %.2f ms, "
+            "dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
+            int(attributes_.size()),
+            int(stores_.size()),
             upload_ms,
             dispatch_ms,
             int(steps_.size()),

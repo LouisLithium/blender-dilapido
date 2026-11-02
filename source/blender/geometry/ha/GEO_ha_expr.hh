@@ -105,6 +105,12 @@ enum class HaOp {
    * #HaExpr::aggregate_slot indexes the program's aggregate buffer.
    */
   AggregateRead,
+  /**
+   * A POINT attribute uploaded for this evaluation (`Named Attribute`). #HaExpr::attribute_slot
+   * indexes the program's attribute list; the buffer has one float per element for a scalar
+   * attribute and three for a vector one.
+   */
+  AttributeRead,
 
   /* --- Math node: unary ---------------------------------------------------------------- */
   /** float -> float. Mirrors `math_functions.cc` / `multi_function_common.cc` exactly. */
@@ -169,6 +175,8 @@ struct HaExpr {
   float value[3] = {0.0f, 0.0f, 0.0f};
   /** Used by #HaOp::AggregateRead. */
   int aggregate_slot = -1;
+  /** Used by #HaOp::AttributeRead. */
+  int attribute_slot = -1;
   /** Used by the ops that need an operation selector (see #HaParam). */
   int param = 0;
   Vector<const HaExpr *> args;
