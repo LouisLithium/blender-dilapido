@@ -8,6 +8,8 @@
 
 #include "BLI_array.hh"
 #include "BLI_map.hh"
+#include "BLI_math_matrix.hh"
+#include "BLI_math_rotation.hh"
 #include "BLI_math_vector_types.hh"
 
 #include "BKE_geometry_set.hh"
@@ -611,6 +613,63 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
   return &read;
 }
 
+/**
+ * `GeometryNodeTransform` in the components mode with constant inputs. The matrix is built here (the
+ * IR has no matrix type) and emitted as three dot products plus a translation, which is exactly how
+ * `math::transform_point` evaluates `mat * vec4(p, 1)`.
+ *
+ * The `Matrix` mode and linked component inputs are refused: they would need a uniform (single)
+ * value in the expression language, which only knows per-element values.
+ */
+const HaExpr *compile_transform(CompileContext &ctx, const bNode &node, HaExprPool &pool)
+{
+  if (node.input_sockets().size() < 5) {
+    fail(ctx, "Transform Geometry: unexpected sockets");
+    return nullptr;
+  }
+  const auto *mode = static_cast<const bNodeSocketValueMenu *>(node.input_socket(1).default_value);
+  if (mode != nullptr && mode->value == GEO_NODE_TRANSFORM_MODE_MATRIX) {
+    fail(ctx, "Transform Geometry: the matrix mode is not supported");
+    return nullptr;
+  }
+  for (const int i : {2, 3, 4}) {
+    if (node.input_socket(i).link != nullptr) {
+      fail(ctx,
+           "Transform Geometry: translation, rotation and scale have to be constant values");
+      return nullptr;
+    }
+  }
+  const auto *translation_value = static_cast<const bNodeSocketValueVector *>(
+      node.input_socket(2).default_value);
+  const auto *rotation_value = static_cast<const bNodeSocketValueRotation *>(
+      node.input_socket(3).default_value);
+  const auto *scale_value = static_cast<const bNodeSocketValueVector *>(
+      node.input_socket(4).default_value);
+  if (translation_value == nullptr || rotation_value == nullptr || scale_value == nullptr) {
+    fail(ctx, "Transform Geometry: missing input values");
+    return nullptr;
+  }
+
+  const float3 translation(translation_value->value);
+  const float3 scale(scale_value->value);
+  const math::Quaternion rotation = math::to_quaternion(
+      math::EulerXYZ(float3(rotation_value->value_euler)));
+  const float4x4 mat = math::from_loc_rot_scale<float4x4>(translation, rotation, scale);
+
+  /* `float4x4` is column major, so row j is `(mat[0][j], mat[1][j], mat[2][j])`. */
+  const HaExpr *base = &pool.add(HaType::Float3, HaOp::Position);
+  const HaExpr *x = &pool.add(
+      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][0], mat[1][0], mat[2][0]))});
+  const HaExpr *y = &pool.add(
+      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][1], mat[1][1], mat[2][1]))});
+  const HaExpr *z = &pool.add(
+      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][2], mat[1][2], mat[2][2]))});
+  const HaExpr *combined = &pool.add(HaType::Float3, HaOp::Combine, {x, y, z});
+  return &pool.add(HaType::Float3,
+                   HaOp::Add,
+                   {combined, &pool.constant(float3(mat[3][0], mat[3][1], mat[3][2]))});
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -969,11 +1028,13 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
       return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
                               MAX_CHAIN_STEPS));
     }
-    if (!current->is_type("GeometryNodeSetPosition"_ustr)) {
+    if (!current->is_type("GeometryNodeSetPosition"_ustr) &&
+        !current->is_type("GeometryNodeTransform"_ustr))
+    {
       return fail(fmt::format("node '{}' ({}) is not supported", current->name, current->idname));
     }
     if (current->input_sockets().size() < 4 || current->output_sockets().is_empty()) {
-      return fail("'Set Position' has unexpected sockets");
+      return fail(fmt::format("'{}' has unexpected sockets", current->name));
     }
     chain.append(current);
 
@@ -996,6 +1057,16 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
   /* Compile first step -> last step (`chain` is stored last -> first). */
   for (const int i : chain.index_range()) {
     const bNode &node = *chain[chain.size() - 1 - i];
+
+    if (node.is_type("GeometryNodeTransform"_ustr)) {
+      const HaExpr *transformed = compile_transform(ctx, node, pool);
+      if (transformed == nullptr) {
+        return fail(ctx.reason.empty() ? std::string("the transform is not supported") : ctx.reason);
+      }
+      program->steps_.append(
+          {ha_emit_glsl(*transformed), ha_emit_glsl_scalar(pool.constant(1.0f))});
+      continue;
+    }
 
     /* `Set Position`: Geometry, Selection, Position, Offset.
      *
