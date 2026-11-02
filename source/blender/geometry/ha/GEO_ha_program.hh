@@ -131,6 +131,14 @@ struct HaElementStep {
   Vector<HaAttribute> attributes;
 };
 
+/** One `Flip Faces` node: reverses the winding of the selected faces (CORNER domain). */
+struct HaCornerStep {
+  /** Per-face scalar expression, evaluated with `int index` (the face index) in scope. */
+  std::string glsl_selection;
+  /** Face attributes read by the selection. */
+  Vector<HaAttribute> attributes;
+};
+
 class HaZoneProgram {
  public:
   ~HaZoneProgram();
@@ -176,6 +184,12 @@ class HaZoneProgram {
     return int(element_steps_.size());
   }
 
+  /** Number of `Flip Faces` passes. */
+  int corner_step_count() const
+  {
+    return int(corner_steps_.size());
+  }
+
   /** Human readable form of the compiled chain, for the debug log. */
   std::string debug_description() const;
 
@@ -188,6 +202,8 @@ class HaZoneProgram {
   Vector<HaStore> stores_;
   /** FACE / EDGE attribute passes (all after the stores; they do not touch positions). */
   Vector<HaElementStep> element_steps_;
+  /** `Flip Faces` passes (after the element passes; they rewrite the corner topology). */
+  Vector<HaCornerStep> corner_steps_;
 };
 
 }  // namespace geometry::ha

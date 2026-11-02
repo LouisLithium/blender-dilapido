@@ -238,6 +238,16 @@ gpu::Shader *ha_shader_get_element(StringRef key,
                                    Span<const HaShaderResource> extra_resources = {});
 
 /**
+ * Compiles a `Flip Faces` kernel: one invocation per face. For the selected faces the corner ring
+ * is reversed the way `bke::mesh_flip_faces` does it (`corner_verts` keeps its first corner and
+ * reverses the rest, `corner_edges` reverses everything but the last one); unselected faces are
+ * copied through. `face_offsets[]` is the mesh's face offset array, `params[0]` the face count.
+ */
+gpu::Shader *ha_shader_get_flip_faces(StringRef key,
+                                      StringRef glsl_selection,
+                                      Span<const HaShaderResource> extra_resources = {});
+
+/**
  * Compiles \a source (a complete `void main()`, without the storage buffer declarations) with the
  * given bindings and caches it by \a cache_key. The cache key is mixed with a hash of the source,
  * so editing a kernel can never hit a stale entry in the on-disk shader cache.

@@ -2597,6 +2597,58 @@ gpu::Shader *ha_shader_get_element(const StringRef key,
       LOCAL_GROUP_SIZE);
 }
 
+gpu::Shader *ha_shader_get_flip_faces(const StringRef key,
+                                      const StringRef glsl_selection,
+                                      const Span<const HaShaderResource> extra_resources)
+{
+  std::string body = std::string(HA_GLSL_HELPERS);
+  body += "void main()\n";
+  body += "{\n";
+  body += "  int index = int(gl_GlobalInvocationID.x);\n";
+  body += "  if (index >= int(params[0])) { return; }\n";
+  body += "  int start = face_offsets[index];\n";
+  body += "  int size = face_offsets[index + 1] - start;\n";
+  body += "  if (size <= 0) { return; }\n";
+  body += "  if ((";
+  body += glsl_selection;
+  body += ") > 0.0) {\n";
+  /* `bke::mesh_flip_faces` swaps `corner_verts[face[j + 1]]` with `corner_verts[face.last(j)]`, so
+   * the first corner stays and the rest is reversed; the edges are shifted by one, so it is the last
+   * edge that stays. */
+  body += "    for (int k = 0; k < size; k++) {\n";
+  body += "      int src = (k == 0) ? 0 : (size - k);\n";
+  body += "      corner_verts_out[start + k] = corner_verts_in[start + src];\n";
+  body += "    }\n";
+  body += "    for (int k = 0; k < size - 1; k++) {\n";
+  body += "      corner_edges_out[start + k] = corner_edges_in[start + (size - 2 - k)];\n";
+  body += "    }\n";
+  body += "    corner_edges_out[start + size - 1] = corner_edges_in[start + size - 1];\n";
+  body += "  }\n";
+  body += "  else {\n";
+  body += "    for (int k = 0; k < size; k++) {\n";
+  body += "      corner_verts_out[start + k] = corner_verts_in[start + k];\n";
+  body += "      corner_edges_out[start + k] = corner_edges_in[start + k];\n";
+  body += "    }\n";
+  body += "  }\n";
+  body += "}\n";
+
+  Vector<HaShaderResource> resources;
+  resources.append({0, HaShaderQualifier::Read, "int", "corner_verts_in[]"});
+  resources.append({1, HaShaderQualifier::Write, "int", "corner_verts_out[]"});
+  resources.append({2, HaShaderQualifier::Read, "int", "corner_edges_in[]"});
+  resources.append({3, HaShaderQualifier::Write, "int", "corner_edges_out[]"});
+  resources.append({4, HaShaderQualifier::Read, "int", "face_offsets[]"});
+  resources.append({5, HaShaderQualifier::Read, "float", "params[]"});
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
+  return ha_shader_get_source(
+      key,
+      body,
+      Span<const HaShaderResource>(resources.data(), int64_t(resources.size())),
+      LOCAL_GROUP_SIZE);
+}
+
 gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                                          const StringRef glsl_value_expr,
                                          const StringRef combine,

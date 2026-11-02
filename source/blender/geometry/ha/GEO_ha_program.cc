@@ -1042,6 +1042,133 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   return true;
 }
 
+/**
+ * `GeometryNodeFlipFaces`: reverses the winding of the selected faces. The selection is a FACE field,
+ * so it goes through the same element-domain context as the other element nodes.
+ */
+bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerStep &r_step)
+{
+  const Span<const bNodeSocket *> inputs = node.input_sockets();
+  if (inputs.size() < 2) {
+    fail(point_ctx, "Flip Faces: unexpected sockets");
+    return false;
+  }
+  HaExprPool element_pool;
+  Vector<HaAggregate> element_aggregates;
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.element_domain = true;
+  /* Inputs: Geometry(0), Selection(1). */
+  const HaExpr *selection = compile_input(ctx, node, 1);
+  if (!ctx.ok) {
+    fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return false;
+  }
+  if (selection->type != HaType::Float) {
+    fail(point_ctx, "Flip Faces: 'Selection' has to be a scalar");
+    return false;
+  }
+  r_step.glsl_selection = ha_emit_glsl_scalar(*selection);
+  return true;
+}
+
+/**
+ * Uploads the attributes a FACE/EDGE pass reads, from the matching domain of the source mesh.
+ * Returns false when an attribute cannot be represented (wrong domain or type), which makes the
+ * caller fall back to the CPU.
+ */
+bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
+                              const Span<const HaAttribute> attributes,
+                              const bke::AttrDomain domain,
+                              const int count,
+                              const int padded,
+                              Array<HaBuffer> &r_buffers,
+                              Vector<std::string> &r_names,
+                              Vector<HaShaderResource> &r_resources,
+                              const int first_slot)
+{
+  r_names.reserve(attributes.size());
+  r_resources.reserve(attributes.size());
+  for (const int attribute_i : attributes.index_range()) {
+    const HaAttribute &attribute = attributes[attribute_i];
+    const int64_t total = int64_t(padded) * attribute.components;
+    Array<float> host_attribute(total, 0.0f);
+    const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
+        attribute.name);
+    if (meta.has_value()) {
+      if (meta->domain != domain) {
+        /* Interpolating from another domain is not implemented; the CPU path handles it. */
+        return false;
+      }
+      if (attribute.components == 1) {
+        switch (meta->data_type) {
+          case bke::AttrType::Float: {
+            const bke::AttributeReader<float> reader = src_attributes.lookup<float>(attribute.name,
+                                                                                   domain);
+            if (reader) {
+              const VArray<float> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                host_attribute[element] = values[element];
+              }
+            }
+            break;
+          }
+          case bke::AttrType::Int32: {
+            const bke::AttributeReader<int> reader = src_attributes.lookup<int>(attribute.name,
+                                                                               domain);
+            if (reader) {
+              const VArray<int> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                host_attribute[element] = float(values[element]);
+              }
+            }
+            break;
+          }
+          case bke::AttrType::Bool: {
+            const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(attribute.name,
+                                                                                 domain);
+            if (reader) {
+              const VArray<bool> &values = reader.varray;
+              for (const int element : IndexRange(count)) {
+                host_attribute[element] = values[element] ? 1.0f : 0.0f;
+              }
+            }
+            break;
+          }
+          default:
+            return false;
+        }
+      }
+      else {
+        if (meta->data_type != bke::AttrType::Float3) {
+          return false;
+        }
+        const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(attribute.name,
+                                                                                 domain);
+        if (reader) {
+          const VArray<float3> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            const float3 value = values[element];
+            host_attribute[element * 3 + 0] = value.x;
+            host_attribute[element * 3 + 1] = value.y;
+            host_attribute[element * 3 + 2] = value.z;
+          }
+        }
+      }
+    }
+    if (!r_buffers[attribute_i].ensure(total)) {
+      return false;
+    }
+    r_buffers[attribute_i].upload(host_attribute);
+    r_names.append("attribute_" + std::to_string(attribute_i) + "[]");
+    r_resources.append({first_slot + attribute_i,
+                        HaShaderQualifier::Read,
+                        attribute.components == 3 ? "vec3" : "float",
+                        r_names.last().c_str()});
+  }
+  return true;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -1428,6 +1555,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
    * nodes it contains. */
   Vector<const bNode *> chain;
   Vector<const bNode *> element_nodes;
+  Vector<const bNode *> corner_nodes;
   while (true) {
     if (chain.size() >= MAX_CHAIN_STEPS) {
       return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
@@ -1436,12 +1564,18 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
     /* Nodes that write an attribute on a domain without positions are a pass-through for the
      * geometry; they become their own device pass. */
     if (current->is_type("GeometryNodeSetShadeSmooth"_ustr) ||
-        current->is_type("GeometryNodeSetMaterial"_ustr)) {
-      if (element_nodes.size() >= MAX_ELEMENT_STEPS) {
+        current->is_type("GeometryNodeSetMaterial"_ustr) ||
+        current->is_type("GeometryNodeFlipFaces"_ustr)) {
+      if (element_nodes.size() + corner_nodes.size() >= MAX_ELEMENT_STEPS) {
         return fail(fmt::format("the zone contains more than {} element passes",
                                 MAX_ELEMENT_STEPS));
       }
-      element_nodes.append(current);
+      if (current->is_type("GeometryNodeFlipFaces"_ustr)) {
+        corner_nodes.append(current);
+      }
+      else {
+        element_nodes.append(current);
+      }
       const bNodeSocket &geometry_input = current->input_socket(0);
       if (geometry_input.link == nullptr) {
         return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
@@ -1533,6 +1667,16 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
     if (!step.attribute.empty()) {
       program->element_steps_.append(std::move(step));
     }
+  }
+
+  /* Then the corner passes, first -> last (`corner_nodes` is stored last -> first). */
+  for (const int i : corner_nodes.index_range()) {
+    HaCornerStep step;
+    if (!compile_flip_faces(ctx, *corner_nodes[corner_nodes.size() - 1 - i], step)) {
+      return fail(ctx.reason.empty() ? std::string("the corner node is not supported") :
+                                      ctx.reason);
+    }
+    program->corner_steps_.append(std::move(step));
   }
 
   /* A zone that only contains element passes still needs one position step: the chain is what
@@ -1961,88 +2105,18 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       Array<HaBuffer> step_attribute_buffers(step.attributes.size());
       Vector<std::string> step_attribute_names;
       Vector<HaShaderResource> step_resources;
-      step_attribute_names.reserve(step.attributes.size());
-      step_resources.reserve(step.attributes.size());
-      for (const int attribute_i : step.attributes.index_range()) {
-        const HaAttribute &attribute = step.attributes[attribute_i];
-        const int64_t total = int64_t(padded) * attribute.components;
-        Array<float> host_attribute(total, 0.0f);
-        const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
-            attribute.name);
-        if (meta.has_value()) {
-          if (meta->domain != domain) {
-            /* Interpolating from another domain is not implemented; the CPU path handles it. */
-            BKE_id_free(nullptr, mesh);
-            return false;
-          }
-          if (attribute.components == 1) {
-            switch (meta->data_type) {
-              case bke::AttrType::Float: {
-                const bke::AttributeReader<float> reader = src_attributes.lookup<float>(
-                    attribute.name, domain);
-                if (reader) {
-                  const VArray<float> &values = reader.varray;
-                  for (const int element : IndexRange(count)) {
-                    host_attribute[element] = values[element];
-                  }
-                }
-                break;
-              }
-              case bke::AttrType::Int32: {
-                const bke::AttributeReader<int> reader = src_attributes.lookup<int>(
-                    attribute.name, domain);
-                if (reader) {
-                  const VArray<int> &values = reader.varray;
-                  for (const int element : IndexRange(count)) {
-                    host_attribute[element] = float(values[element]);
-                  }
-                }
-                break;
-              }
-              case bke::AttrType::Bool: {
-                const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(
-                    attribute.name, domain);
-                if (reader) {
-                  const VArray<bool> &values = reader.varray;
-                  for (const int element : IndexRange(count)) {
-                    host_attribute[element] = values[element] ? 1.0f : 0.0f;
-                  }
-                }
-                break;
-              }
-              default:
-                BKE_id_free(nullptr, mesh);
-                return false;
-            }
-          }
-          else {
-            if (meta->data_type != bke::AttrType::Float3) {
-              BKE_id_free(nullptr, mesh);
-              return false;
-            }
-            const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(
-                attribute.name, domain);
-            if (reader) {
-              const VArray<float3> &values = reader.varray;
-              for (const int element : IndexRange(count)) {
-                const float3 value = values[element];
-                host_attribute[element * 3 + 0] = value.x;
-                host_attribute[element * 3 + 1] = value.y;
-                host_attribute[element * 3 + 2] = value.z;
-              }
-            }
-          }
-        }
-        if (!step_attribute_buffers[attribute_i].ensure(total)) {
-          BKE_id_free(nullptr, mesh);
-          return false;
-        }
-        step_attribute_buffers[attribute_i].upload(host_attribute);
-        step_attribute_names.append("attribute_" + std::to_string(attribute_i) + "[]");
-        step_resources.append({3 + attribute_i,
-                               HaShaderQualifier::Read,
-                               attribute.components == 3 ? "vec3" : "float",
-                               step_attribute_names.last().c_str()});
+      if (!upload_domain_attributes(src_attributes,
+                                    Span<const HaAttribute>(step.attributes.data(),
+                                                            step.attributes.size()),
+                                    domain,
+                                    count,
+                                    padded,
+                                    step_attribute_buffers,
+                                    step_attribute_names,
+                                    step_resources,
+                                    3)) {
+        BKE_id_free(nullptr, mesh);
+        return false;
       }
 
       const std::array<float, 4> element_params_host{float(count), 0.0f, 0.0f, 0.0f};
@@ -2106,6 +2180,118 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
+  /* The `Flip Faces` passes: they rewrite the corner topology of the result mesh. */
+  if (!corner_steps_.is_empty()) {
+    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    /* `bke::mesh_flip_faces` also reverses every non-single CORNER attribute; this pass only handles
+     * the corner indices, so a mesh with such an attribute has to stay on the CPU. */
+    bool corner_attributes_unsupported = false;
+    src_attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
+      if (iter.domain != bke::AttrDomain::Corner) {
+        return;
+      }
+      if (ELEM(StringRef(iter.name), ".corner_vert", ".corner_edge")) {
+        return;
+      }
+      if (iter.data_type == bke::AttrType::String) {
+        return;
+      }
+      if (iter.storage_type == bke::AttrStorageType::Single) {
+        return;
+      }
+      corner_attributes_unsupported = true;
+    });
+    if (corner_attributes_unsupported) {
+      BKE_id_free(nullptr, mesh);
+      return false;
+    }
+    const int face_count = int(src_mesh->faces_num);
+    const int corner_count = int(src_mesh->corners_num);
+    if (face_count > 0 && corner_count > 0) {
+      const int padded_faces = (face_count + local_size - 1) / local_size * local_size;
+      const OffsetIndices<int> faces = src_mesh->faces();
+      const Span<int> face_offsets = faces.data();
+      for (const HaCornerStep &step : corner_steps_) {
+        HaBufferInt corner_verts_in;
+        HaBufferInt corner_verts_out;
+        HaBufferInt corner_edges_in;
+        HaBufferInt corner_edges_out;
+        HaBufferInt face_offsets_buffer;
+        HaBuffer corner_params_buffer;
+        if (!corner_verts_in.ensure(corner_count) || !corner_verts_out.ensure(corner_count) ||
+            !corner_edges_in.ensure(corner_count) || !corner_edges_out.ensure(corner_count) ||
+            !face_offsets_buffer.ensure(int64_t(face_offsets.size())) ||
+            !corner_params_buffer.ensure(4))
+        {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        corner_verts_in.upload(src_mesh->corner_verts());
+        corner_edges_in.upload(src_mesh->corner_edges());
+        face_offsets_buffer.upload(face_offsets);
+        const std::array<float, 4> corner_params{float(face_count), 0.0f, 0.0f, 0.0f};
+        corner_params_buffer.upload(corner_params);
+
+        Array<HaBuffer> step_attribute_buffers(step.attributes.size());
+        Vector<std::string> step_attribute_names;
+        Vector<HaShaderResource> step_resources;
+        if (!upload_domain_attributes(src_attributes,
+                                      Span<const HaAttribute>(step.attributes.data(),
+                                                              step.attributes.size()),
+                                      bke::AttrDomain::Face,
+                                      face_count,
+                                      padded_faces,
+                                      step_attribute_buffers,
+                                      step_attribute_names,
+                                      step_resources,
+                                      6))
+        {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+
+        gpu::Shader *corner_shader = ha_shader_get_flip_faces(
+            "flip|" + step.glsl_selection,
+            step.glsl_selection,
+            Span<const HaShaderResource>(step_resources.data(), int64_t(step_resources.size())));
+        if (corner_shader == nullptr) {
+          BKE_id_free(nullptr, mesh);
+          return false;
+        }
+        GPU_shader_bind(corner_shader);
+        GPU_storagebuf_bind(corner_verts_in.buf(), 0);
+        GPU_storagebuf_bind(corner_verts_out.buf(), 1);
+        GPU_storagebuf_bind(corner_edges_in.buf(), 2);
+        GPU_storagebuf_bind(corner_edges_out.buf(), 3);
+        GPU_storagebuf_bind(face_offsets_buffer.buf(), 4);
+        GPU_storagebuf_bind(corner_params_buffer.buf(), 5);
+        for (const int attribute_i : step.attributes.index_range()) {
+          GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 6 + attribute_i);
+        }
+        ha_dispatch(corner_shader, padded_faces);
+        for (const int attribute_i : step.attributes.index_range()) {
+          GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+        }
+        GPU_storagebuf_unbind(corner_params_buffer.buf());
+        GPU_storagebuf_unbind(face_offsets_buffer.buf());
+        GPU_storagebuf_unbind(corner_edges_out.buf());
+        GPU_storagebuf_unbind(corner_edges_in.buf());
+        GPU_storagebuf_unbind(corner_verts_out.buf());
+        GPU_storagebuf_unbind(corner_verts_in.buf());
+        GPU_shader_unbind();
+        GPU_finish();
+
+        Array<int> host_verts(corner_count);
+        Array<int> host_edges(corner_count);
+        corner_verts_out.download(host_verts);
+        corner_edges_out.download(host_edges);
+        mesh->corner_verts_for_write().copy_from(host_verts);
+        mesh->corner_edges_for_write().copy_from(host_edges);
+        mesh->tag_face_winding_changed();
+      }
+    }
+  }
+
   bke::GeometrySet output = input;
   output.replace_mesh(mesh);
   r_output = std::move(output);
@@ -2119,7 +2305,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
             "HA program: %d elements, %d step(s), %d attribute(s), %d store(s), %d element "
-            "pass(es), %d element attribute(s): upload %.2f ms, "
+            "pass(es), %d element attribute(s), %d corner pass(es): upload %.2f ms, "
             "dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
@@ -2127,6 +2313,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
             int(stores_.size()),
             int(element_steps_.size()),
             element_attribute_count,
+            int(corner_steps_.size()),
             upload_ms,
             dispatch_ms,
             int(steps_.size()),
