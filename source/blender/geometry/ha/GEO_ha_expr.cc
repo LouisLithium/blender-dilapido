@@ -353,6 +353,12 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
       /* Attribute buffers are only uploaded for the device path; the CPU reference is the node
        * evaluation. */
       return 0.0f;
+    case HaOp::WhiteNoise:
+      /* The hash lives in the GLSL helpers; the CPU reference is the node evaluation. */
+      return 0.0f;
+    case HaOp::NoiseTexture:
+      /* The Perlin noise lives in the GLSL helpers; the CPU reference is the node evaluation. */
+      return 0.0f;
     case HaOp::Sin:
       return math::sin(eval_float(*expr.args[0], index, positions));
     case HaOp::Cos:
@@ -988,6 +994,29 @@ std::string emit(const HaExpr &expr)
           break;
       }
       return "((" + a + " " + op + " " + b + ") ? 1.0 : 0.0)";
+    }
+    case HaOp::WhiteNoise: {
+      switch (expr.param) {
+        case 1:
+          return "ha_white_noise_1d(" + emit(*expr.args[0]) + ")";
+        case 2:
+          return "ha_white_noise_2d(" + emit_as_vector(*expr.args[0]) + ")";
+        case 3:
+          return "ha_white_noise_3d(" + emit_as_vector(*expr.args[0]) + ")";
+        case 4:
+          return "ha_white_noise_4d(" + emit_as_vector(*expr.args[0]) + ", " +
+                 emit(*expr.args[1]) + ")";
+        default:
+          return "0.0";
+      }
+    }
+    case HaOp::NoiseTexture: {
+      const int type = expr.param & 0xFF;
+      const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
+      return "ha_noise_texture_3d(" + emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) +
+             ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " + emit(*expr.args[4]) +
+             ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
+             std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
     }
   }
   return "0.0";

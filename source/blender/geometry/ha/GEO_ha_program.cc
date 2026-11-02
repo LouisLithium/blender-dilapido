@@ -670,6 +670,106 @@ const HaExpr *compile_transform(CompileContext &ctx, const bNode &node, HaExprPo
                    {combined, &pool.constant(float3(mat[3][0], mat[3][1], mat[3][2]))});
 }
 
+/**
+ * `ShaderNodeTexWhiteNoise > Value`. The vector input defaults to the position field when it is not
+ * linked, exactly like `Set Position > Position`. Only the `Value` output is supported: `Color` is
+ * an RGBA socket and the IR has no colour type, so returning a vector there could silently change
+ * the meaning of a downstream conversion.
+ */
+const HaExpr *compile_white_noise(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "White Noise Texture: only the 'Value' output is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const int dimensions = node.custom1;
+  if (dimensions < 1 || dimensions > 4) {
+    fail(ctx, "White Noise Texture: unsupported dimensions");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaExpr &noise = ctx.pool.add(HaType::Float, HaOp::WhiteNoise);
+  noise.param = dimensions;
+
+  if (dimensions != 1) {
+    const bNodeSocket &vector_socket = node.input_socket(0);
+    const HaExpr *vector = vector_socket.link != nullptr ?
+                               compile_input(ctx, node, 0) :
+                               &ctx.pool.add(HaType::Float3, HaOp::Position);
+    if (vector->type != HaType::Float3) {
+      fail(ctx, "White Noise Texture: the vector input has to be a vector");
+      return &ctx.pool.constant(0.0f);
+    }
+    noise.args.append(vector);
+  }
+  if (dimensions == 1 || dimensions == 4) {
+    const HaExpr *w = compile_input(ctx, node, 1);
+    if (w->type != HaType::Float) {
+      fail(ctx, "White Noise Texture: 'W' has to be a scalar");
+      return &ctx.pool.constant(0.0f);
+    }
+    noise.args.append(w);
+  }
+  return &noise;
+}
+
+/**
+ * `ShaderNodeTexNoise > Factor`, 3D. The vector defaults to the position field, `Scale` multiplies
+ * it, `Detail` is clamped to [0, 15] and `Roughness` to >= 0, exactly like the node. `Color` is
+ * refused for the same reason as in `White Noise Texture`.
+ */
+const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Noise Texture: only the 'Factor' output is supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto &storage = *static_cast<const NodeTexNoise *>(node.storage);
+  if (storage.dimensions != 3) {
+    fail(ctx, "Noise Texture: only the 3D dimensions are supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (node.input_sockets().size() < 9) {
+    fail(ctx, "Noise Texture: unexpected sockets");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  /* Inputs: Vector(0), W(1), Scale(2), Detail(3), Roughness(4), Lacunarity(5), Offset(6), Gain(7),
+   * Distortion(8). */
+  const HaExpr *vector = node.input_socket(0).link != nullptr ?
+                             compile_input(ctx, node, 0) :
+                             &ctx.pool.add(HaType::Float3, HaOp::Position);
+  if (vector->type != HaType::Float3) {
+    fail(ctx, "Noise Texture: the vector input has to be a vector");
+    return &ctx.pool.constant(0.0f);
+  }
+  const HaExpr *scale = compile_input(ctx, node, 2);
+  const HaExpr *position = &ctx.pool.add(HaType::Float3, HaOp::Mul, {vector, scale});
+  const HaExpr *detail = &ctx.pool.add(HaType::Float,
+                                       HaOp::Clamp,
+                                       {compile_input(ctx, node, 3),
+                                        &ctx.pool.constant(0.0f),
+                                        &ctx.pool.constant(15.0f)});
+  const HaExpr *roughness = &ctx.pool.add(HaType::Float,
+                                          HaOp::Max,
+                                          {compile_input(ctx, node, 4), &ctx.pool.constant(0.0f)});
+  const HaExpr *lacunarity = compile_input(ctx, node, 5);
+  const HaExpr *offset = compile_input(ctx, node, 6);
+  const HaExpr *gain = compile_input(ctx, node, 7);
+  const HaExpr *distortion = compile_input(ctx, node, 8);
+  if (!ctx.ok) {
+    fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaExpr &noise = ctx.pool.add(
+      HaType::Float,
+      HaOp::NoiseTexture,
+      {position, detail, roughness, lacunarity, offset, gain, distortion});
+  noise.param = int(storage.type) | (storage.normalize != 0 ? HA_PARAM_CLAMP : 0);
+  return &noise;
+}
+
 /** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
@@ -911,6 +1011,12 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("GeometryNodeInputNamedAttribute"_ustr)) {
     result = compile_named_attribute(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeTexWhiteNoise"_ustr)) {
+    result = compile_white_noise(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeTexNoise"_ustr)) {
+    result = compile_noise_texture(ctx, node, socket_index);
   }
   else {
     fail(ctx,

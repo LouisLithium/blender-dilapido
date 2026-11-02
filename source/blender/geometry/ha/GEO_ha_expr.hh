@@ -164,6 +164,18 @@ enum class HaOp {
   BoolMath,
   /** a, b -> 0 or 1 (#HaExpr::param: #HaParam::Compare*). */
   Compare,
+  /**
+   * `White Noise Texture > Value` (#HaExpr::param: dimensions 1..4). 1D takes `W`, 2D/3D take the
+   * vector, 4D takes the vector and `W`. The hash is a port of `BLI_noise.cc`, so it is bit
+   * identical to the CPU.
+   */
+  WhiteNoise,
+  /**
+   * `Noise Texture > Factor`, 3D (`#HaExpr::param`: noise type in the low byte, bit 8 = normalize).
+   * Args: position (vec3, already scaled), detail, roughness, lacunarity, offset, gain, distortion.
+   * A port of `BLI_noise.cc`, so the values match the CPU.
+   */
+  NoiseTexture,
 };
 
 /** Bit of #HaExpr::param that enables clamping (`Mix` factor, `Map Range` result). */
