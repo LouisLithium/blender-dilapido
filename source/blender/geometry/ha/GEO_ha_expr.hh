@@ -177,6 +177,11 @@ enum class HaOp {
    */
   NoiseTexture,
   /**
+   * `Noise Texture > Color`, 3D: the same packing as #NoiseTexture. Returns a vec3 (RGB); the node's
+   * alpha is always 1, and the IR has no RGBA type.
+   */
+  NoiseTextureColor,
+  /**
    * `Wave Texture > Fac` (#HaExpr::param: wave type, bands/rings direction and profile packed in
    * 2 bit fields each). Args: vector, scale, distortion, detail, detail scale, detail roughness,
    * phase. A port of `node_shader_tex_wave.cc` on top of the Perlin fbm.

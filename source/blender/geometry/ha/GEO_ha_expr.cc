@@ -500,6 +500,9 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::VoronoiPosition:
       /* The voronoi kernel lives in the GLSL helpers; the CPU reference is the node evaluation. */
       return float3(0.0f);
+    case HaOp::NoiseTextureColor:
+      /* Same, the three channels are separate fractals in the helper. */
+      return float3(0.0f);
     case HaOp::Combine:
       return float3(eval_float(*expr.args[0], index, positions),
                     eval_float(*expr.args[1], index, positions),
@@ -1027,6 +1030,14 @@ std::string emit(const HaExpr &expr)
       return "ha_noise_texture_3d(" + emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) +
              ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " + emit(*expr.args[4]) +
              ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
+             std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
+    }
+    case HaOp::NoiseTextureColor: {
+      const int type = expr.param & 0xFF;
+      const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
+      return "ha_noise_texture_color_3d(" + emit_as_vector(*expr.args[0]) + ", " +
+             emit(*expr.args[1]) + ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " +
+             emit(*expr.args[4]) + ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
              std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
     }
     case HaOp::WaveTexture: {

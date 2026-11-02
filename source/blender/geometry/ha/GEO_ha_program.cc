@@ -726,8 +726,10 @@ const HaExpr *compile_white_noise(CompileContext &ctx, const bNode &node, const 
  */
 const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, const int socket_index)
 {
-  if (socket_index != 0) {
-    fail(ctx, "Noise Texture: only the 'Factor' output is supported");
+  /* Outputs: Factor(0), Color(1). The color is RGB only: the IR has no RGBA, and the node's alpha is
+   * always 1. */
+  if (socket_index != 0 && socket_index != 1) {
+    fail(ctx, "Noise Texture: only the 'Factor' and 'Color' outputs are supported");
     return &ctx.pool.constant(0.0f);
   }
   const auto &storage = *static_cast<const NodeTexNoise *>(node.storage);
@@ -768,10 +770,9 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
 
-  HaExpr &noise = ctx.pool.add(
-      HaType::Float,
-      HaOp::NoiseTexture,
-      {position, detail, roughness, lacunarity, offset, gain, distortion});
+  HaExpr &noise = ctx.pool.add(socket_index == 1 ? HaType::Float3 : HaType::Float,
+                               socket_index == 1 ? HaOp::NoiseTextureColor : HaOp::NoiseTexture,
+                               {position, detail, roughness, lacunarity, offset, gain, distortion});
   noise.param = int(storage.type) | (storage.normalize != 0 ? HA_PARAM_CLAMP : 0);
   return &noise;
 }
