@@ -14,9 +14,11 @@
 
 #include "BKE_geometry_set.hh"
 #include "BKE_attribute.hh"
+#include "BKE_curves.hh"
 #include "BKE_lib_id.hh"
 #include "BKE_material.hh"
 #include "BKE_mesh.h"
+#include "BKE_pointcloud.hh"
 #include "BKE_node.hh"
 #include "BKE_node_runtime.hh"
 #include "BKE_node_tree_zones.hh"
@@ -1755,13 +1757,38 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                              bke::GeometrySet &r_output,
                              int *r_elements) const
 {
+  /* The zone works on every component that has a POINT domain: meshes, point clouds and curves. The
+   * FACE / EDGE / CORNER passes only exist on meshes (they are refused below). */
   const Mesh *src_mesh = input.get_mesh();
-  if (src_mesh == nullptr) {
+  const PointCloud *src_pointcloud = src_mesh == nullptr ? input.get_pointcloud() : nullptr;
+  const Curves *src_curves = (src_mesh == nullptr && src_pointcloud == nullptr) ?
+                                 input.get_curves() :
+                                 nullptr;
+  Span<float3> positions;
+  std::optional<bke::AttributeAccessor> input_attributes_storage;
+  if (src_mesh != nullptr) {
+    positions = src_mesh->vert_positions();
+    input_attributes_storage.emplace(src_mesh->attributes());
+  }
+  else if (src_pointcloud != nullptr) {
+    positions = src_pointcloud->positions();
+    input_attributes_storage.emplace(src_pointcloud->attributes());
+  }
+  else if (src_curves != nullptr) {
+    const bke::CurvesGeometry &geometry = src_curves->geometry.wrap();
+    positions = geometry.positions();
+    input_attributes_storage.emplace(geometry.attributes());
+  }
+  else {
     return false;
   }
-  const Span<float3> positions = src_mesh->vert_positions();
+  const bke::AttributeAccessor &input_attributes = *input_attributes_storage;
   const int element_count = int(positions.size());
   if (element_count <= 0 || steps_.is_empty()) {
+    return false;
+  }
+  if (src_mesh == nullptr && (!element_steps_.is_empty() || !corner_steps_.is_empty())) {
+    /* Those passes write FACE / EDGE / CORNER data, which only a mesh has. */
     return false;
   }
   /* This path binds its buffers itself, so the cache of #ha_bind_storage_buffers is stale from
@@ -1805,7 +1832,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   attribute_names.reserve(attributes_.size());
   extra_resources.reserve(attributes_.size());
   {
-    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    const bke::AttributeAccessor &src_attributes = input_attributes;
     for (const int i : attributes_.index_range()) {
       const HaAttribute &attribute = attributes_[i];
       const int64_t total = int64_t(padded_count) * attribute.components;
@@ -2004,26 +2031,52 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   const double download_ms = timer.lap();
   ha_program_debug("downloaded");
 
-  Mesh *mesh = BKE_mesh_copy_for_eval(*src_mesh);
-  MutableSpan<float3> dst_positions = mesh->vert_positions_for_write();
-  dst_positions.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_output.data()),
-                                       element_count));
-  /* Positions changed, so the derived normals have to be recomputed. */
-  mesh->tag_positions_changed();
+  bke::GeometrySet output = input;
+  Mesh *mesh = nullptr;
+  ID *dst_id = nullptr;
+  std::optional<bke::MutableAttributeAccessor> dst_attributes_storage;
+  const Span<float3> new_positions(reinterpret_cast<const float3 *>(host_output.data()),
+                                   element_count);
+  if (src_mesh != nullptr) {
+    mesh = BKE_mesh_copy_for_eval(*src_mesh);
+    mesh->vert_positions_for_write().copy_from(new_positions);
+    /* Positions changed, so the derived normals have to be recomputed. */
+    mesh->tag_positions_changed();
+    dst_id = &mesh->id;
+    dst_attributes_storage.emplace(mesh->attributes_for_write());
+    output.replace_mesh(mesh);
+  }
+  else if (src_pointcloud != nullptr) {
+    PointCloud *pointcloud = BKE_pointcloud_copy_for_eval(src_pointcloud);
+    pointcloud->positions_for_write().copy_from(new_positions);
+    pointcloud->tag_positions_changed();
+    dst_id = &pointcloud->id;
+    dst_attributes_storage.emplace(pointcloud->attributes_for_write());
+    output.replace_pointcloud(pointcloud);
+  }
+  else {
+    Curves *curves = BKE_curves_copy_for_eval(src_curves);
+    bke::CurvesGeometry &geometry = curves->geometry.wrap();
+    geometry.positions_for_write().copy_from(new_positions);
+    geometry.tag_positions_changed();
+    dst_id = &curves->id;
+    dst_attributes_storage.emplace(geometry.attributes_for_write());
+    output.replace_curves(curves);
+  }
+  bke::MutableAttributeAccessor dst_attributes = *dst_attributes_storage;
 
   /* Write the stored attributes back. */
   if (!stores_.is_empty()) {
-    bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
     for (const int i : stores_.index_range()) {
       const HaStore &store = stores_[i];
       Array<float> host_store(padded_count * store.components);
       store_buffers[i].download(host_store);
       if (store.components == 1) {
         bke::SpanAttributeWriter<float> writer =
-            mesh_attributes.lookup_or_add_for_write_span<float>(store.name,
-                                                                bke::AttrDomain::Point);
+            dst_attributes.lookup_or_add_for_write_span<float>(store.name,
+                                                               bke::AttrDomain::Point);
         if (!writer) {
-          BKE_id_free(nullptr, mesh);
+          BKE_id_free(nullptr, dst_id);
           return false;
         }
         writer.span.copy_from(host_store.as_span().take_front(element_count));
@@ -2031,10 +2084,10 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       }
       else {
         bke::SpanAttributeWriter<float3> writer =
-            mesh_attributes.lookup_or_add_for_write_span<float3>(store.name,
+            dst_attributes.lookup_or_add_for_write_span<float3>(store.name,
                                                                 bke::AttrDomain::Point);
         if (!writer) {
-          BKE_id_free(nullptr, mesh);
+          BKE_id_free(nullptr, dst_id);
           return false;
         }
         writer.span.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_store.data()),
@@ -2047,7 +2100,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   /* The FACE / EDGE passes: they do not touch positions, so they run after the chain and the
    * stores, writing straight into the result mesh. */
   if (!element_steps_.is_empty()) {
-    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    const bke::AttributeAccessor &src_attributes = input_attributes;
     bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
     for (const HaElementStep &step : element_steps_) {
       const bke::AttrDomain domain = step.domain == HaElementDomain::Face ? bke::AttrDomain::Face :
@@ -2212,7 +2265,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
 
   /* The `Flip Faces` passes: they rewrite the corner topology of the result mesh. */
   if (!corner_steps_.is_empty()) {
-    const bke::AttributeAccessor src_attributes = src_mesh->attributes();
+    const bke::AttributeAccessor &src_attributes = input_attributes;
     /* `bke::mesh_flip_faces` also reverses every non-single CORNER attribute; this pass only handles
      * the corner indices, so a mesh with such an attribute has to stay on the CPU. */
     bool corner_attributes_unsupported = false;
@@ -2322,8 +2375,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
-  bke::GeometrySet output = input;
-  output.replace_mesh(mesh);
+  /* The output component was replaced when the copy was made (mesh, point cloud or curves). */
   r_output = std::move(output);
   if (ha_program_debug_enabled()) {
     int element_attribute_count = 0;
