@@ -1024,21 +1024,27 @@ std::string emit(const HaExpr &expr)
           return "0.0";
       }
     }
-    case HaOp::NoiseTexture: {
-      const int type = expr.param & 0xFF;
-      const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
-      return "ha_noise_texture_3d(" + emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]) +
-             ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " + emit(*expr.args[4]) +
-             ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
-             std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
-    }
+    case HaOp::NoiseTexture:
     case HaOp::NoiseTextureColor: {
       const int type = expr.param & 0xFF;
       const bool normalize = (expr.param & HA_PARAM_CLAMP) != 0;
-      return "ha_noise_texture_color_3d(" + emit_as_vector(*expr.args[0]) + ", " +
-             emit(*expr.args[1]) + ", " + emit(*expr.args[2]) + ", " + emit(*expr.args[3]) + ", " +
-             emit(*expr.args[4]) + ", " + emit(*expr.args[5]) + ", " + emit(*expr.args[6]) + ", " +
-             std::to_string(type) + ", " + (normalize ? "true" : "false") + ")";
+      const int dimensions = (expr.param >> HA_PARAM_NOISE_DIM_SHIFT) & 0x7;
+      /* Args: vector (vec3), w, detail, roughness, lacunarity, offset, gain, distortion. The 1D
+       * kernel only reads `w`, the 3D one only the vector. */
+      std::string args = dimensions == 1 ? emit(*expr.args[1]) : emit_as_vector(*expr.args[0]);
+      for (int i = 2; i < 8; i++) {
+        args += ", " + emit(*expr.args[i]);
+      }
+      args += ", " + std::to_string(type) + ", " + (normalize ? "true" : "false");
+      const char *function = "ha_noise_texture_3d";
+      if (expr.op == HaOp::NoiseTextureColor) {
+        function = dimensions == 1 ? "ha_noise_texture_color_1d" :
+                                     "ha_noise_texture_color_3d";
+      }
+      else {
+        function = dimensions == 1 ? "ha_noise_texture_1d" : "ha_noise_texture_3d";
+      }
+      return std::string(function) + "(" + args + ")";
     }
     case HaOp::WaveTexture: {
       const int wave_type = expr.param & 0x3;

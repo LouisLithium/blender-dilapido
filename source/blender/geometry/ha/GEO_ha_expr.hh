@@ -204,6 +204,9 @@ enum class HaOp {
 /** Bit offset of the Voronoi dimension (1..4) in #HaExpr::param. */
 inline constexpr int HA_PARAM_VORONOI_DIM_SHIFT = 9;
 
+/** Bit offset of the Noise Texture dimension (1 or 3, 2D/4D pending) in #HaExpr::param. */
+inline constexpr int HA_PARAM_NOISE_DIM_SHIFT = 9;
+
 /** Bit of #HaExpr::param that enables clamping (`Mix` factor, `Map Range` result). */
 inline constexpr int HA_PARAM_CLAMP = 1 << 8;
 

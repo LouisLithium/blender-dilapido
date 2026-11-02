@@ -733,8 +733,15 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
   const auto &storage = *static_cast<const NodeTexNoise *>(node.storage);
-  if (storage.dimensions != 3) {
-    fail(ctx, "Noise Texture: only the 3D dimensions are supported");
+  if (storage.dimensions != 3 && storage.dimensions != 1) {
+    fail(ctx, "Noise Texture: only the 1D and 3D dimensions are supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bool is_1d = storage.dimensions == 1;
+  if (is_1d && socket_index == 1) {
+    /* The 1D colour is three separate fractals at seeded offsets; the offsets still differ from the
+     * CPU, so it is refused until that is fixed (the factor is exact). */
+    fail(ctx, "Noise Texture: the 1D 'Color' output is not supported yet");
     return &ctx.pool.constant(0.0f);
   }
   if (node.input_sockets().size() < 9) {
@@ -743,16 +750,29 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
   }
 
   /* Inputs: Vector(0), W(1), Scale(2), Detail(3), Roughness(4), Lacunarity(5), Offset(6), Gain(7),
-   * Distortion(8). */
-  const HaExpr *vector = node.input_socket(0).link != nullptr ?
-                             compile_input(ctx, node, 0) :
-                             &ctx.pool.add(HaType::Float3, HaOp::Position);
-  if (vector->type != HaType::Float3) {
-    fail(ctx, "Noise Texture: the vector input has to be a vector");
-    return &ctx.pool.constant(0.0f);
+   * Distortion(8). 1D uses `W * Scale`, 3D `Vector * Scale`. */
+  HaExpr *position = nullptr;
+  const HaExpr *w = &ctx.pool.constant(0.0f);
+  if (is_1d) {
+    const HaExpr *w_input = compile_input(ctx, node, 1);
+    if (w_input->type != HaType::Float) {
+      fail(ctx, "Noise Texture: 'W' has to be a scalar");
+      return &ctx.pool.constant(0.0f);
+    }
+    const HaExpr *scale_1d = compile_input(ctx, node, 2);
+    w = &ctx.pool.add(HaType::Float, HaOp::Mul, {w_input, scale_1d});
   }
-  const HaExpr *scale = compile_input(ctx, node, 2);
-  const HaExpr *position = &ctx.pool.add(HaType::Float3, HaOp::Mul, {vector, scale});
+  else {
+    const HaExpr *vector = node.input_socket(0).link != nullptr ?
+                               compile_input(ctx, node, 0) :
+                               &ctx.pool.add(HaType::Float3, HaOp::Position);
+    if (vector->type != HaType::Float3) {
+      fail(ctx, "Noise Texture: the vector input has to be a vector");
+      return &ctx.pool.constant(0.0f);
+    }
+    const HaExpr *scale = compile_input(ctx, node, 2);
+    position = &ctx.pool.add(HaType::Float3, HaOp::Mul, {vector, scale});
+  }
   const HaExpr *detail = &ctx.pool.add(HaType::Float,
                                        HaOp::Clamp,
                                        {compile_input(ctx, node, 3),
@@ -770,10 +790,19 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
 
+  const HaExpr *vector_arg = is_1d ? &ctx.pool.constant(float3(0.0f)) : position;
   HaExpr &noise = ctx.pool.add(socket_index == 1 ? HaType::Float3 : HaType::Float,
                                socket_index == 1 ? HaOp::NoiseTextureColor : HaOp::NoiseTexture,
-                               {position, detail, roughness, lacunarity, offset, gain, distortion});
-  noise.param = int(storage.type) | (storage.normalize != 0 ? HA_PARAM_CLAMP : 0);
+                               {vector_arg,
+                                w,
+                                detail,
+                                roughness,
+                                lacunarity,
+                                offset,
+                                gain,
+                                distortion});
+  noise.param = int(storage.type) | (storage.normalize != 0 ? HA_PARAM_CLAMP : 0) |
+                ((storage.dimensions & 0x7) << HA_PARAM_NOISE_DIM_SHIFT);
   return &noise;
 }
 
