@@ -735,8 +735,10 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
   const auto &storage = *static_cast<const NodeTexNoise *>(node.storage);
-  if (storage.dimensions != 3 && storage.dimensions != 2 && storage.dimensions != 1) {
-    fail(ctx, "Noise Texture: only the 1D, 2D and 3D dimensions are supported");
+  if (storage.dimensions != 4 && storage.dimensions != 3 && storage.dimensions != 2 &&
+      storage.dimensions != 1)
+  {
+    fail(ctx, "Noise Texture: only the 1D, 2D, 3D and 4D dimensions are supported");
     return &ctx.pool.constant(0.0f);
   }
   const bool is_1d = storage.dimensions == 1;
@@ -749,14 +751,14 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
    * Distortion(8). 1D uses `W * Scale`, 3D `Vector * Scale`. */
   HaExpr *position = nullptr;
   const HaExpr *w = &ctx.pool.constant(0.0f);
+  const HaExpr *scale = compile_input(ctx, node, 2);
   if (is_1d) {
     const HaExpr *w_input = compile_input(ctx, node, 1);
     if (w_input->type != HaType::Float) {
       fail(ctx, "Noise Texture: 'W' has to be a scalar");
       return &ctx.pool.constant(0.0f);
     }
-    const HaExpr *scale_1d = compile_input(ctx, node, 2);
-    w = &ctx.pool.add(HaType::Float, HaOp::Mul, {w_input, scale_1d});
+    w = &ctx.pool.add(HaType::Float, HaOp::Mul, {w_input, scale});
   }
   else {
     const HaExpr *vector = node.input_socket(0).link != nullptr ?
@@ -766,8 +768,16 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
       fail(ctx, "Noise Texture: the vector input has to be a vector");
       return &ctx.pool.constant(0.0f);
     }
-    const HaExpr *scale = compile_input(ctx, node, 2);
     position = &ctx.pool.add(HaType::Float3, HaOp::Mul, {vector, scale});
+    if (storage.dimensions == 4) {
+      /* 4D samples `vec4(vector * scale, w * scale)`. */
+      const HaExpr *w_input = compile_input(ctx, node, 1);
+      if (w_input->type != HaType::Float) {
+        fail(ctx, "Noise Texture: 'W' has to be a scalar");
+        return &ctx.pool.constant(0.0f);
+      }
+      w = &ctx.pool.add(HaType::Float, HaOp::Mul, {w_input, scale});
+    }
   }
   const HaExpr *detail = &ctx.pool.add(HaType::Float,
                                        HaOp::Clamp,

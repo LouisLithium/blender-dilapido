@@ -1031,7 +1031,16 @@ std::string emit(const HaExpr &expr)
       const int dimensions = (expr.param >> HA_PARAM_NOISE_DIM_SHIFT) & 0x7;
       /* Args: vector (vec3), w, detail, roughness, lacunarity, offset, gain, distortion. The 1D
        * kernel only reads `w`, the 3D one only the vector. */
-      std::string args = dimensions == 1 ? emit(*expr.args[1]) : emit_as_vector(*expr.args[0]);
+      std::string args;
+      if (dimensions == 1) {
+        args = emit(*expr.args[1]);
+      }
+      else if (dimensions == 4) {
+        args = emit_as_vector(*expr.args[0]) + ", " + emit(*expr.args[1]);
+      }
+      else {
+        args = emit_as_vector(*expr.args[0]);
+      }
       for (int i = 2; i < 8; i++) {
         args += ", " + emit(*expr.args[i]);
       }
@@ -1040,11 +1049,13 @@ std::string emit(const HaExpr &expr)
       if (expr.op == HaOp::NoiseTextureColor) {
         function = dimensions == 1 ? "ha_noise_texture_color_1d" :
                    dimensions == 2 ? "ha_noise_texture_color_2d" :
+                   dimensions == 4 ? "ha_noise_texture_color_4d" :
                                      "ha_noise_texture_color_3d";
       }
       else {
         function = dimensions == 1 ? "ha_noise_texture_1d" :
                    dimensions == 2 ? "ha_noise_texture_2d" :
+                   dimensions == 4 ? "ha_noise_texture_4d" :
                                      "ha_noise_texture_3d";
       }
       return std::string(function) + "(" + args + ")";
