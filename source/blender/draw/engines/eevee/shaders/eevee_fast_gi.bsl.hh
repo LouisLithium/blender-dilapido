@@ -740,6 +740,46 @@ struct Constants {
   [[specialization_constant(false)]] const bool ao_only;
 };
 
+/**
+ * Screen space occlusion for the volumetric GI term (Fast GI path).
+ *
+ * Returns the distance along the ray (from `origin_v`, in view space) to the first surface found
+ * in the depth buffer, or `t_max` when nothing occludes it. This is a cheap fixed step march: the
+ * Fast GI scan does not trace rays, but without this test a volume would light surfaces through
+ * walls. Being screen space, it cannot see occluders that are outside of the view or hidden behind
+ * the ray origin.
+ */
+float fast_gi_volume_occlusion(sampler2D hiz_tx,
+                               ViewMatrices view,
+                               float3 origin_v,
+                               float3 direction_v,
+                               float t_max,
+                               float jitter)
+{
+  const int steps = 10;
+  const float2 extent = float2(textureSize(hiz_tx, 0).xy);
+  float t_prev = 0.0f;
+  for (int i = 1; i <= steps; i++) {
+    const float t = t_max * (float(i) + jitter) / float(steps);
+    const float3 P = origin_v + direction_v * t;
+    const float3 ss_P = view.point_view_to_screen(P);
+    /* Outside of the view frustum: we cannot know, assume unoccluded (screen space limitation). */
+    if (any(lessThan(ss_P.xy, float2(0.0f))) || any(greaterThan(ss_P.xy, float2(1.0f))) ||
+        ss_P.z > 1.0f)
+    {
+      return t_max;
+    }
+    const float depth = texelFetch(hiz_tx, int2(ss_P.xy * extent), 0).r;
+    const float surface_vz = view.depth_screen_to_view(depth);
+    /* View space forward is -Z: a sample further away than the surface is occluded. */
+    if (P.z < surface_vz - max(0.02f, t * 0.02f)) {
+      return t_prev;
+    }
+    t_prev = t;
+  }
+  return t_max;
+}
+
 struct Scan {
   [[sampler(0)]] const sampler2D screen_radiance_tx;
   [[sampler(1)]] const sampler2D screen_normal_tx;
@@ -840,16 +880,28 @@ void scan([[work_group_id]] const uint3 group_id,
       const float phi = float(i) * 2.39996323f + phi_offset;
       const float3 dir = t * (r * cos(phi)) + b * (r * sin(phi)) +
                          wN * max(0.0f, sqrt(1.0f - r * r));
+      const float3 bounds_min = uni.uniform_buf.volume_grid.bounds_min;
+      const float3 bounds_size = uni.uniform_buf.volume_grid.bounds_size;
+      const VolumeGridRayRange range = volume_grid_ray_bounds(bounds_min, bounds_size, wP, dir, 1.0e6f);
+      if (!range.hit) {
+        continue;
+      }
+      /* Stop the medium integration at the first surface so that volumes do not light surfaces
+       * through geometry. */
+      const float3 dir_v = transform_direction(view.viewmat, dir);
+      const float t_occluded = fast_gi_volume_occlusion(
+          hiz.hiz_tx, view, vP, dir_v, range.t_far, noise.z);
+      if (t_occluded <= range.t_near) {
+        continue;
+      }
       const VolumeGridIntegration media = volume_grid_integrate(
           srt.volume_scatter_tx,
           srt.volume_extinct_tx,
-          uni.uniform_buf.volume_grid.bounds_min,
-          uni.uniform_buf.volume_grid.bounds_size,
+          bounds_min,
+          bounds_size,
           wP,
           dir,
-          /* The Fast GI scan has no scene occlusion for world space rays, so integrate the whole
-           * ray up to the grid exit. */
-          1.0e6f,
+          t_occluded,
           noise.x,
           steps);
       in_scatter += media.radiance;
