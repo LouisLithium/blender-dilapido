@@ -28,6 +28,7 @@
 #include "eevee_spherical_harmonics.bsl.hh"
 #include "eevee_uniform.bsl.hh"
 #include "eevee_utility_tx.bsl.hh"
+#include "eevee_volume_grid_lib.bsl.hh"
 #include "gpu_shader_math_matrix_transform_lib.glsl"
 #include "gpu_shader_math_vector_lib.glsl"
 #include "gpu_shader_utildefines_lib.glsl"
@@ -742,6 +743,9 @@ struct Constants {
 struct Scan {
   [[sampler(0)]] const sampler2D screen_radiance_tx;
   [[sampler(1)]] const sampler2D screen_normal_tx;
+  /* World space volume grid (volumetric GI). Bound even when the grid is disabled. */
+  [[sampler(4)]] const sampler3D volume_scatter_tx;
+  [[sampler(5)]] const sampler3D volume_extinct_tx;
 };
 
 [[metal_max_total_threads_per_threadgroup(400)]] /* Tweak performance on metal. */
@@ -811,6 +815,53 @@ void scan([[work_group_id]] const uint3 group_id,
       constants.step_count,
       false,
       constants.ao_only);
+
+  if (!constants.ao_only && (uni.uniform_buf.volume_grid.enabled != 0.0f)) {
+    /* Volumetric GI through the Fast GI (horizon scan) path. The scan does not trace rays, so the
+     * participating media is integrated along a few cosine distributed directions around the
+     * surface normal, then encoded as a cosine lobe around the normal. This makes
+     * `evaluate_lambert()` (at the resolve stage) return the in-scattered radiance of the media,
+     * which is what the ray traced path computes per ray. */
+    const float3 wP = view.point_view_to_world(vP);
+    const float3 wN = normalize(transform_direction(view.viewinv, vN));
+    /* Build a tangent frame around the normal. */
+    const float3 axis = (abs(wN.z) < 0.999f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+    const float3 t = normalize(cross(axis, wN));
+    const float3 b = cross(wN, t);
+
+    const int steps = int(uni.uniform_buf.volume_grid.samples.x);
+    float3 in_scatter = float3(0.0f);
+    /* A cosine distributed set of directions (golden angle spiral), rotated per pixel by the
+     * blue noise offset so that TAA averages the remaining error. */
+    const int dir_count = 8;
+    const float phi_offset = noise.y * 2.0f * M_PI;
+    for (int i = 0; i < dir_count; i++) {
+      const float r = sqrt((float(i) + 0.5f) / float(dir_count));
+      const float phi = float(i) * 2.39996323f + phi_offset;
+      const float3 dir = t * (r * cos(phi)) + b * (r * sin(phi)) +
+                         wN * max(0.0f, sqrt(1.0f - r * r));
+      const VolumeGridIntegration media = volume_grid_integrate(
+          srt.volume_scatter_tx,
+          srt.volume_extinct_tx,
+          uni.uniform_buf.volume_grid.bounds_min,
+          uni.uniform_buf.volume_grid.bounds_size,
+          wP,
+          dir,
+          /* The Fast GI scan has no scene occlusion for world space rays, so integrate the whole
+           * ray up to the grid exit. */
+          1.0e6f,
+          noise.x,
+          steps);
+      in_scatter += media.radiance;
+    }
+    /* Cosine distributed samples estimate `(1/pi) * integral(L * cos)` by a plain average. */
+    in_scatter /= float(dir_count);
+
+    /* `encode_signal_sample(d, A)` makes `evaluate_lambert(d)` return `A * 3/(4*pi)`.
+     * NOTE: The SH is stored in view space (it is rotated to world space at the resolve stage),
+     * so the direction must be the view space normal. */
+    result.encode_signal_sample(normalize(vN), float4(in_scatter * (4.0f * M_PI / 3.0f), 0.0f));
+  }
 
   sh_out.write(texel, result);
 }

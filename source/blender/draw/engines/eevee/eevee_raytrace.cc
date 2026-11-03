@@ -337,6 +337,10 @@ void RayTraceModule::sync()
     pass.shader_set(sh);
     pass.bind_texture("screen_radiance_tx", &downsampled_in_radiance_tx_, mipmap_linear);
     pass.bind_texture("screen_normal_tx", &downsampled_in_normal_tx_, mipmap_linear);
+    /* World space volume grid (volumetric GI). Bound by reference: the grid textures are
+     * reallocated every frame in `VolumeModule::end_sync`. */
+    pass.bind_texture(4, &inst_.volume.grid_result.scattering_tx_);
+    pass.bind_texture(5, &inst_.volume.grid_result.extinction_tx_);
     pass.bind_image("sh_0_img", &fast_gi_radiance_tx_[0]);
     pass.bind_image("sh_1_img", &fast_gi_radiance_tx_[1]);
     pass.bind_image("sh_2_img", &fast_gi_radiance_tx_[2]);

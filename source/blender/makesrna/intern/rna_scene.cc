@@ -8512,9 +8512,7 @@ static void rna_def_scene_eevee(BlenderRNA *brna)
       prop,
       "Volumetric GI",
       "Let volumetric materials bounce light onto surfaces and appear in reflections "
-      "(uses a world space volume radiance grid). Diffuse lighting requires the ray tracing "
-      "'Fast GI' option to be disabled, since the fast GI approximation does not use the "
-      "ray tracing pipeline");
+      "(uses a world space volume radiance grid)");
   RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
   RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
 
