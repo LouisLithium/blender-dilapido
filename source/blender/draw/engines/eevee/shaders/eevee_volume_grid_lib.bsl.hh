@@ -31,6 +31,29 @@ struct VolumeGridRayRange {
   float t_far;
 };
 
+/**
+ * World position to grid texture coordinate.
+ *
+ * NOTE: The grid is rasterized by an orthographic view looking down -Z (see
+ * `VolumeModule::grid_ensure`), so the stored Z axis is **mirrored** relative to world Z:
+ * voxel `z = 0` is at `bounds_min.z + bounds_size.z` and voxel `z = size.z - 1` is at
+ * `bounds_min.z`. Every consumer of the grid has to go through this function.
+ */
+float3 volume_grid_world_to_uvw(float3 bounds_min, float3 bounds_size, float3 P)
+{
+  float3 uvw = (P - bounds_min) / bounds_size;
+  uvw.z = 1.0f - uvw.z;
+  return uvw;
+}
+
+/* Inverse of `volume_grid_world_to_uvw()`, used by the lighting pass to know which world position
+ * a voxel represents. */
+float3 volume_grid_uvw_to_world(float3 bounds_min, float3 bounds_size, float3 uvw)
+{
+  float3 flipped = float3(uvw.x, uvw.y, 1.0f - uvw.z);
+  return bounds_min + flipped * bounds_size;
+}
+
 struct VolumeGridIntegration {
   /* Radiance of the media scattered towards the ray origin. */
   float3 radiance;
@@ -86,13 +109,12 @@ VolumeGridIntegration volume_grid_integrate(sampler3D scatter_tx,
   }
 
   const float dt = (range.t_far - range.t_near) / float(steps);
-  const float3 inv_size = 1.0f / bounds_size;
   /* Jitter the start of the integration to hide the banding of the fixed step count. */
   float t = range.t_near + jitter * dt;
 
   for (int i = 0; i < steps; i++) {
     const float3 X = origin + direction * t;
-    const float3 uvw = (X - bounds_min) * inv_size;
+    const float3 uvw = volume_grid_world_to_uvw(bounds_min, bounds_size, X);
     const float3 sigma_s = texture(scatter_tx, uvw).rgb;
     const float3 sigma_t = texture(extinct_tx, uvw).rgb;
 

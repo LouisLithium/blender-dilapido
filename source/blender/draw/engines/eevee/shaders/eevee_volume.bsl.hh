@@ -486,7 +486,8 @@ void grid_light_main([[resource_table]] GridLight &srt,
 
     GridLightCtx ctx;
     ctx.radiance = float3(0.0f);
-    ctx.P = bounds_min + uvw * bounds_size;
+    /* NOTE: The stored Z axis is mirrored (see `volume_grid_uvw_to_world`). */
+    ctx.P = volume_grid_uvw_to_world(bounds_min, bounds_size, uvw);
 
     /* No light culling for the world space grid (the screen space clustering is not valid
      * outside of the camera frustum). Same iteration order as `light::foreach`. */

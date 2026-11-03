@@ -706,7 +706,10 @@ void VolumeModule::grid_print_stats()
   double scatter_sum = 0.0;
   double extinct_sum = 0.0;
   double extinct_max = 0.0;
+  double centroid_z_num = 0.0;
+  double centroid_z_den = 0.0;
   int occupied = 0;
+  const float voxel_z = (grid_bounds_.max.z - grid_bounds_.min.z) / float(size.z);
   for (int64_t i = 0; i < voxel_count; i++) {
     const float sr = scatter[i * 4 + 0];
     const float sg = scatter[i * 4 + 1];
@@ -716,6 +719,15 @@ void VolumeModule::grid_print_stats()
     extinct_sum += et;
     extinct_max = math::max(extinct_max, double(et));
     occupied += (et > 1e-6f) ? 1 : 0;
+    if (et > 1e-6f) {
+      /* The grid is stored with a mirrored Z axis (see `volume_grid_world_to_uvw`), so voxel
+       * `iz` is at world `max.z - (iz + 0.5) * voxel_size`. */
+      const int64_t iz = i / (int64_t(size.x) * size.y);
+      const double world_z = double(grid_bounds_.max.z) -
+                             (double(iz) + 0.5) * double(voxel_z);
+      centroid_z_num += double(et) * world_z;
+      centroid_z_den += double(et);
+    }
   }
   printf("VOLUME_GRID_STATS: size=(%d %d %d) bounds_min=(%.4f %.4f %.4f) bounds_size=(%.4f %.4f %.4f)\n",
          size.x,
@@ -728,11 +740,12 @@ void VolumeModule::grid_print_stats()
          grid_bounds_.max.y - grid_bounds_.min.y,
          grid_bounds_.max.z - grid_bounds_.min.z);
   printf("VOLUME_GRID_STATS: scatter_mean=%.6f extinction_mean=%.6f extinction_max=%.6f "
-         "occupied=%.4f\n",
+         "occupied=%.4f centroid_z=%.4f\n",
          scatter_sum / double(voxel_count),
          extinct_sum / double(voxel_count),
          extinct_max,
-         double(occupied) / double(voxel_count));
+         double(occupied) / double(voxel_count),
+         (centroid_z_den > 0.0) ? (centroid_z_num / centroid_z_den) : 0.0);
   fflush(stdout);
 }
 
