@@ -1039,10 +1039,13 @@ std::string emit(const HaExpr &expr)
       const char *function = "ha_noise_texture_3d";
       if (expr.op == HaOp::NoiseTextureColor) {
         function = dimensions == 1 ? "ha_noise_texture_color_1d" :
+                   dimensions == 2 ? "ha_noise_texture_color_2d" :
                                      "ha_noise_texture_color_3d";
       }
       else {
-        function = dimensions == 1 ? "ha_noise_texture_1d" : "ha_noise_texture_3d";
+        function = dimensions == 1 ? "ha_noise_texture_1d" :
+                   dimensions == 2 ? "ha_noise_texture_2d" :
+                                     "ha_noise_texture_3d";
       }
       return std::string(function) + "(" + args + ")";
     }

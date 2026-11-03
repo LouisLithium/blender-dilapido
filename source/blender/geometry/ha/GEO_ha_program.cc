@@ -735,8 +735,8 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     return &ctx.pool.constant(0.0f);
   }
   const auto &storage = *static_cast<const NodeTexNoise *>(node.storage);
-  if (storage.dimensions != 3 && storage.dimensions != 1) {
-    fail(ctx, "Noise Texture: only the 1D and 3D dimensions are supported");
+  if (storage.dimensions != 3 && storage.dimensions != 2 && storage.dimensions != 1) {
+    fail(ctx, "Noise Texture: only the 1D, 2D and 3D dimensions are supported");
     return &ctx.pool.constant(0.0f);
   }
   const bool is_1d = storage.dimensions == 1;
