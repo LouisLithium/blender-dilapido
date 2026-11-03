@@ -89,7 +89,8 @@ void SyncModule::sync_common_passes(const Material &material,
 
 void SyncModule::sync_volume_passes(const ObjectHandle &ob_handle,
                                     const Material &material,
-                                    FunctionRef<void(const MaterialPass &, int)> sync_cb)
+                                    FunctionRef<void(const MaterialPass &, int)> sync_cb,
+                                    FunctionRef<void(const MaterialPass &, int)> grid_cb)
 {
   if (material.volume_occupancy.gpumat == nullptr || material.volume_material.gpumat == nullptr) {
     return;
@@ -99,8 +100,8 @@ void SyncModule::sync_volume_passes(const ObjectHandle &ob_handle,
 
   for (int instance : IndexRange(ob_handle.instances_count())) {
     /* TODO(fclem): This is against design. Sync shouldn't depend on view properties (camera). */
-    VolumeLayer *layer = inst_.pipelines.volume.register_and_get_layer(
-        VolumeObjectBounds(inst_.camera, ob_handle, instance));
+    VolumeObjectBounds object_bounds(inst_.camera, ob_handle, instance);
+    VolumeLayer *layer = inst_.pipelines.volume.register_and_get_layer(object_bounds);
 
     if (!layer) {
       continue;
@@ -115,6 +116,14 @@ void SyncModule::sync_volume_passes(const ObjectHandle &ob_handle,
                          layer->material_add(
                              ob_handle.object, blender_mat, material.volume_material.gpumat)},
             instance);
+
+    if (object_bounds.world_bounds) {
+      grid_cb(MaterialPass{material.volume_material.gpumat,
+                           layer->grid_material_add(ob_handle.object,
+                                                    blender_mat,
+                                                    material.volume_material.gpumat)},
+              instance);
+    }
   }
 }
 
@@ -239,14 +248,26 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
     synced_materials.append(&material);
 
     if (material.has_volume) {
-      sync_volume_passes(ob_handle, material, [&](const MaterialPass &pass, int instance) {
-        geometry_volume_call(pass.sub_pass,
-                             pass.gpumat,
-                             inst_.scene,
-                             ob_handle.object,
-                             geom,
-                             ob_handle.res_handle.sub_handle(instance));
-      });
+      sync_volume_passes(
+          ob_handle,
+          material,
+          [&](const MaterialPass &pass, int instance) {
+            geometry_volume_call(pass.sub_pass,
+                                 pass.gpumat,
+                                 inst_.scene,
+                                 ob_handle.object,
+                                 geom,
+                                 ob_handle.res_handle.sub_handle(instance));
+          },
+          [&](const MaterialPass &pass, int instance) {
+            /* Same geometry drawn into the world space volume grid. */
+            geometry_volume_call(pass.sub_pass,
+                                 pass.gpumat,
+                                 inst_.scene,
+                                 ob_handle.object,
+                                 geom,
+                                 ob_handle.res_handle.sub_handle(instance));
+          });
 
       /* Do not render surface if we are rendering a volume object
        * and do not have a surface closure. */
@@ -298,14 +319,26 @@ bool SyncModule::sync_sculpt(const ObjectRef &ob_ref)
     synced_materials.append(&material);
 
     if (material.has_volume) {
-      sync_volume_passes(ob_handle, material, [&](const MaterialPass &pass, int instance) {
-        geometry_volume_call(pass.sub_pass,
-                             pass.gpumat,
-                             inst_.scene,
-                             ob_handle.object,
-                             geom,
-                             ob_handle.res_handle.sub_handle(instance));
-      });
+      sync_volume_passes(
+          ob_handle,
+          material,
+          [&](const MaterialPass &pass, int instance) {
+            geometry_volume_call(pass.sub_pass,
+                                 pass.gpumat,
+                                 inst_.scene,
+                                 ob_handle.object,
+                                 geom,
+                                 ob_handle.res_handle.sub_handle(instance));
+          },
+          [&](const MaterialPass &pass, int instance) {
+            /* Same geometry drawn into the world space volume grid. */
+            geometry_volume_call(pass.sub_pass,
+                                 pass.gpumat,
+                                 inst_.scene,
+                                 ob_handle.object,
+                                 geom,
+                                 ob_handle.res_handle.sub_handle(instance));
+          });
 
       /* Do not render surface if we are rendering a volume object
        * and do not have a surface closure. */
@@ -424,19 +457,34 @@ void SyncModule::sync_volume(const ObjectRef &ob_ref)
   gpu::Batch *geom = inst_.volume.unit_cube_batch_get();
   bool is_rendered = false;
 
-  sync_volume_passes(ob_handle, material, [&](const MaterialPass &pass, int /*instance*/) {
-    if (pass.sub_pass == nullptr) {
-      return;
-    }
-    BLI_assert_msg(!ob_handle.is_range(),
-                   "volume_object_grids_init pass setup is object/instance specific.");
-    PassMain::Sub *object_pass = volume_sub_pass(
-        *pass.sub_pass, inst_.scene, ob_handle.object, pass.gpumat);
-    if (object_pass != nullptr) {
-      object_pass->draw(geom, ob_handle.res_handle);
-      is_rendered = true;
-    }
-  });
+  sync_volume_passes(
+      ob_handle,
+      material,
+      [&](const MaterialPass &pass, int /*instance*/) {
+        if (pass.sub_pass == nullptr) {
+          return;
+        }
+        BLI_assert_msg(!ob_handle.is_range(),
+                       "volume_object_grids_init pass setup is object/instance specific.");
+        PassMain::Sub *object_pass = volume_sub_pass(
+            *pass.sub_pass, inst_.scene, ob_handle.object, pass.gpumat);
+        if (object_pass != nullptr) {
+          object_pass->draw(geom, ob_handle.res_handle);
+          is_rendered = true;
+        }
+      },
+      [&](const MaterialPass &pass, int /*instance*/) {
+        if (pass.sub_pass == nullptr) {
+          return;
+        }
+        BLI_assert_msg(!ob_handle.is_range(),
+                       "volume_object_grids_init pass setup is object/instance specific.");
+        PassMain::Sub *object_pass = volume_sub_pass(
+            *pass.sub_pass, inst_.scene, ob_handle.object, pass.gpumat);
+        if (object_pass != nullptr) {
+          object_pass->draw(geom, ob_handle.res_handle);
+        }
+      });
 
   if (!is_rendered) {
     return;

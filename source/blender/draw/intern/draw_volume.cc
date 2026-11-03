@@ -14,11 +14,14 @@
 #include "DNA_fluid_types.h"
 #include "DNA_volume_types.h"
 
+#include "BLI_bounds.hh"
+#include "BLI_math_matrix.hh"
 #include "BLI_string.h"
 
 #include "BKE_global.hh"
 #include "BKE_mesh.hh"
 #include "BKE_modifier.hh"
+#include "BKE_object.hh"
 #include "BKE_volume.hh"
 #include "BKE_volume_render.hh"
 
@@ -33,6 +36,26 @@
 namespace blender::draw {
 
 using VolumeInfosBuf = draw::UniformBuffer<VolumeInfos>;
+
+/* World space Z range of the object bounds. Used by the world space volume grid pass to clamp the
+ * froxel column without an occupancy map. Exact for volume objects (box bounds), conservative for
+ * mesh volumes. */
+static float2 volume_object_grid_z(const Object *ob)
+{
+  const std::optional<Bounds<float3>> bounds = BKE_object_boundbox_get(ob);
+  if (!bounds.has_value()) {
+    return float2(0.0f);
+  }
+  float z_min = FLT_MAX;
+  float z_max = -FLT_MAX;
+  const float4x4 &matrix = ob->object_to_world();
+  for (const float3 &corner : bounds::corners(*bounds)) {
+    const float3 ws = math::transform_point(matrix, corner);
+    z_min = math::min(z_min, ws.z);
+    z_max = math::max(z_max, ws.z);
+  }
+  return float2(z_min, z_max);
+}
 
 struct VolumeUniformBufPool {
   Vector<VolumeInfosBuf *> ubos;
@@ -142,6 +165,7 @@ PassType *volume_object_grids_init(PassType &ps,
   volume_infos.color_mul = float4(1.0f);
   volume_infos.temperature_mul = 1.0f;
   volume_infos.temperature_bias = 0.0f;
+  volume_infos.grid_z_world = volume_object_grid_z(ob);
 
   PassType *sub = &ps.sub("Volume Object SubPass");
 
@@ -189,6 +213,7 @@ PassType *drw_volume_object_mesh_init(PassType &ps,
   volume_infos.color_mul = float4(1.0f);
   volume_infos.temperature_mul = 1.0f;
   volume_infos.temperature_bias = 0.0f;
+  volume_infos.grid_z_world = volume_object_grid_z(ob);
 
   bool has_fluid_modifier = (md = BKE_modifiers_findby_type(ob, eModifierType_Fluid)) &&
                             BKE_modifier_is_enabled(scene, md, eModifierMode_Realtime) &&

@@ -13,6 +13,12 @@
 #include "GPU_capabilities.hh"
 
 #include "GPU_debug.hh"
+#include "GPU_state.hh"
+#include "GPU_texture.hh"
+
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #include "eevee_instance.hh"
 #include "eevee_pipeline.hh"
@@ -67,12 +73,21 @@ void VolumeModule::init()
   data_.light_clamp = (data_.light_clamp > 0.0) ? data_.light_clamp : 1e20;
 
   use_reprojection_ = (scene_eval->eevee.flag & SCE_EEVEE_TAA_REPROJECTION) != 0;
+
+  /* Debug: print statistics about the world space volume grid (host readback). */
+  grid_stats_ = getenv("BLENDER_EEVEE_VOLUME_GRID_STATS") != nullptr;
 }
 
 void VolumeModule::begin_sync()
 {
   previous_objects_ = current_objects_;
   current_objects_.clear();
+
+  /* Sync runs before we know the volume bounds, but the scene settings are enough to know if the
+   * world space volume grid will be built this frame. */
+  const SceneEEVEE &eevee = inst_.scene->eevee;
+  grid_wanted_ = (eevee.flag & (SCE_EEVEE_VOLUMETRIC_GI | SCE_EEVEE_VOLUMETRIC_SHADOWS_SURFACE)) != 0 ||
+                 (getenv("BLENDER_EEVEE_VOLUME_GRID") != nullptr);
 }
 
 void VolumeModule::world_sync(const WorldHandle &world_handle)
@@ -177,6 +192,26 @@ void VolumeModule::end_sync()
     extinction_tx_.previous().free();
     integrated_scatter_tx_.free();
     integrated_transmit_tx_.free();
+
+    /* World space grid. */
+    grid_enabled_ = false;
+    grid_built_ = false;
+    grid_light_done_ = false;
+    grid_prop_scattering_tx_.free();
+    grid_prop_extinction_tx_.free();
+    grid_prop_emission_tx_.free();
+    grid_prop_phase_tx_.free();
+    grid_prop_phase_weight_tx_.free();
+    grid_dummy_occupancy_tx_.free();
+    grid_scatter_tx_.free();
+    grid_extinct_tx_.free();
+    grid_depth_tx_.free();
+
+    /* Make sure the consumers do not sample a stale grid. */
+    grid_result.scattering_tx_ = dummy_scatter_tx_;
+    grid_result.extinction_tx_ = dummy_transmit_tx_;
+    inst_.uniform_data.data.volume_grid.enabled = 0.0f;
+    inst_.uniform_data.data.volume_grid.bounds_size = float3(0.0f);
 
     /* Update references for bindings. */
     result.scattering_tx_ = dummy_scatter_tx_;
@@ -329,6 +364,8 @@ void VolumeModule::end_sync()
   /* Sync with the integration pass. */
   resolve_ps_.barrier(GPU_BARRIER_TEXTURE_FETCH);
   resolve_ps_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
+
+  grid_ensure();
 }
 
 void VolumeModule::set_view(View &main_view)
@@ -429,6 +466,276 @@ void VolumeModule::set_view(View &main_view)
   volume_view.sync(main_view.viewmat(), winmat_infinite);
 }
 
+void VolumeModule::grid_ensure()
+{
+  grid_enabled_ = false;
+  grid_built_ = false;
+  grid_light_done_ = false;
+  inst_.uniform_data.data.volume_grid.enabled = 0.0f;
+
+  std::optional<Bounds<float3>> bounds = inst_.pipelines.volume.object_world_bounds();
+  /* The world space volume grid feeds the volumetric GI and the volumetric shadows on surfaces. */
+  const SceneEEVEE &eevee = inst_.scene->eevee;
+  const bool grid_requested = grid_wanted_;
+  if (!enabled_ || !grid_requested || !bounds.has_value()) {
+    grid_free_resources();
+    return;
+  }
+
+  Bounds<float3> b = *bounds;
+  float3 extent = math::max(b.max - b.min, float3(1e-3f));
+  /* Small padding so that the grid does not clip the volume at its borders. */
+  const float3 pad = math::max(extent * 0.01f, float3(1e-4f));
+  b.min -= pad;
+  b.max += pad;
+  extent = b.max - b.min;
+
+  int res = eevee.volumetric_grid_resolution;
+  if (const char *env = getenv("BLENDER_EEVEE_VOLUME_GRID_RES")) {
+    res = atoi(env);
+  }
+  /* Old files have a zeroed value for the newly added field. */
+  if (res == 0) {
+    res = 96;
+  }
+  res = clamp_i(res, 8, 256);
+
+  /* Cubic voxels. */
+  const float voxel_size = math::reduce_max(extent) / float(res);
+  int3 size = int3(int(ceilf(extent.x / voxel_size)),
+                   int(ceilf(extent.y / voxel_size)),
+                   int(ceilf(extent.z / voxel_size)));
+  size = math::max(size, int3(1));
+  size = math::min(size, int3(res));
+
+  grid_bounds_ = b;
+  grid_size_ = size;
+
+  const float3 center = (b.min + b.max) * 0.5f;
+  const float eps = voxel_size * 0.5f;
+  /* Orthographic view looking down -Z: froxel Z=0 is at the grid max Z. */
+  const float4x4 viewmat = math::from_location<float4x4>(
+      float3(-center.x, -center.y, -(b.max.z + eps)));
+  const float4x4 winmat = math::projection::orthographic(
+      -extent.x * 0.5f, extent.x * 0.5f, -extent.y * 0.5f, extent.y * 0.5f, eps, extent.z + eps);
+  grid_view.sync(viewmat, winmat);
+
+  VolumesInfoData &gd = grid_volumes_data_;
+  gd = {};
+  gd.tex_size = size;
+  gd.inv_tex_size = 1.0f / float3(size);
+  gd.winmat_finite = winmat;
+  gd.wininv_finite = math::invert(winmat);
+  gd.winmat_stable = winmat;
+  gd.wininv_stable = math::invert(winmat);
+  /* View space Z (negative, as the view looks down -Z). */
+  gd.depth_near = -eps;
+  gd.depth_far = -(extent.z + eps);
+  gd.depth_distribution = 0.0f;
+  gd.history_depth_near = gd.depth_near;
+  gd.history_depth_far = gd.depth_far;
+  gd.history_depth_distribution = 0.0f;
+  gd.history_opacity = 0.0f;
+  gd.tile_size = 1;
+  gd.tile_size_lod = 0;
+  gd.coord_scale = float2(1.0f);
+  gd.main_view_extent = float2(size.xy());
+  gd.main_view_extent_inv = 1.0f / float2(size.xy());
+  gd.light_clamp = data_.light_clamp;
+  gd.shadow_steps = 0.0f;
+
+  const eGPUTextureUsage usage = GPU_TEXTURE_USAGE_SHADER_READ |
+                                 GPU_TEXTURE_USAGE_SHADER_WRITE;
+  grid_prop_scattering_tx_.ensure_3d(gpu::TextureFormat::UFLOAT_11_11_10, size, usage);
+  grid_prop_extinction_tx_.ensure_3d(gpu::TextureFormat::UFLOAT_11_11_10, size, usage);
+  grid_prop_emission_tx_.ensure_3d(gpu::TextureFormat::UFLOAT_11_11_10, size, usage);
+  grid_prop_phase_tx_.ensure_3d(gpu::TextureFormat::SFLOAT_16, size, usage);
+  grid_prop_phase_weight_tx_.ensure_3d(gpu::TextureFormat::SFLOAT_16, size, usage);
+  grid_dummy_occupancy_tx_.ensure_3d(gpu::TextureFormat::UINT_32,
+                                     int3(1),
+                                     usage | GPU_TEXTURE_USAGE_ATOMIC);
+  grid_scatter_tx_.ensure_3d(gpu::TextureFormat::SFLOAT_16_16_16_16,
+                             size,
+                             usage | GPU_TEXTURE_USAGE_HOST_READ);
+  grid_extinct_tx_.ensure_3d(gpu::TextureFormat::SFLOAT_16_16_16_16,
+                             size,
+                             usage | GPU_TEXTURE_USAGE_HOST_READ);
+  grid_depth_tx_.ensure_2d(gpu::TextureFormat::SFLOAT_32_DEPTH_UINT_8,
+                           size.xy(),
+                           GPU_TEXTURE_USAGE_ATTACHMENT);
+  grid_fb_.ensure(GPU_ATTACHMENT_TEXTURE(grid_depth_tx_));
+
+  grid_properties.scattering_tx_ = grid_prop_scattering_tx_;
+  grid_properties.extinction_tx_ = grid_prop_extinction_tx_;
+  grid_properties.emission_tx_ = grid_prop_emission_tx_;
+  grid_properties.phase_tx_ = grid_prop_phase_tx_;
+  grid_properties.phase_weight_tx_ = grid_prop_phase_weight_tx_;
+  grid_properties.occupancy_tx_ = grid_dummy_occupancy_tx_;
+  grid_result.scattering_tx_ = grid_scatter_tx_;
+  grid_result.extinction_tx_ = grid_extinct_tx_;
+
+  inst_.uniform_data.data.volume_grid.bounds_min = b.min;
+  inst_.uniform_data.data.volume_grid.bounds_size = extent;
+  inst_.uniform_data.data.volume_grid.mode = 0;
+  inst_.uniform_data.data.volume_grid.enabled = 1.0f;
+  int gi_samples = eevee.volumetric_grid_samples;
+  inst_.uniform_data.data.volume_grid.samples = float4(
+      float(gi_samples > 0 ? gi_samples : 8),
+      float(clamp_i(eevee.volumetric_shadow_samples, 1, 128)),
+      0.0f,
+      0.0f);
+
+  grid_light_ps_.init();
+  grid_light_ps_.shader_set(inst_.shaders.static_shader_get(VOLUME_GRID_LIGHT));
+  grid_light_ps_.bind_resources(inst_.uniform_data);
+  grid_light_ps_.bind_resources(inst_.lights);
+  grid_light_ps_.bind_image(VOLUME_PROP_SCATTERING_IMG_SLOT, &grid_prop_scattering_tx_);
+  grid_light_ps_.bind_image(VOLUME_PROP_EXTINCTION_IMG_SLOT, &grid_prop_extinction_tx_);
+  grid_light_ps_.bind_image(VOLUME_PROP_EMISSION_IMG_SLOT, &grid_prop_emission_tx_);
+  grid_light_ps_.bind_image(6, &grid_scatter_tx_);
+  grid_light_ps_.bind_image(7, &grid_extinct_tx_);
+  grid_light_ps_.barrier(GPU_BARRIER_SHADER_IMAGE_ACCESS);
+  grid_light_ps_.dispatch(math::divide_ceil(size, int3(VOLUME_GROUP_SIZE)));
+  /* The consumers (GI rays, surface lighting) sample these images as textures. */
+  grid_light_ps_.barrier(GPU_BARRIER_TEXTURE_FETCH);
+
+  grid_enabled_ = true;
+}
+
+void VolumeModule::grid_free_resources()
+{
+  if (!grid_enabled_ && !grid_depth_tx_.is_valid()) {
+    return;
+  }
+  /* Clear the binding pointers first, then detach and free. */
+  grid_properties.scattering_tx_ = nullptr;
+  grid_properties.extinction_tx_ = nullptr;
+  grid_properties.emission_tx_ = nullptr;
+  grid_properties.phase_tx_ = nullptr;
+  grid_properties.phase_weight_tx_ = nullptr;
+  grid_properties.occupancy_tx_ = nullptr;
+  grid_result.scattering_tx_ = dummy_scatter_tx_;
+  grid_result.extinction_tx_ = dummy_transmit_tx_;
+  /* Detach the framebuffer before freeing the attachment. */
+  grid_fb_.ensure(GPU_ATTACHMENT_NONE);
+  grid_prop_scattering_tx_.free();
+  grid_prop_extinction_tx_.free();
+  grid_prop_emission_tx_.free();
+  grid_prop_phase_tx_.free();
+  grid_prop_phase_weight_tx_.free();
+  grid_dummy_occupancy_tx_.free();
+  grid_scatter_tx_.free();
+  grid_extinct_tx_.free();
+  grid_depth_tx_.free();
+  grid_enabled_ = false;
+  /* Fall back to dummy textures so that the consumers can bind something valid. */
+  grid_result.scattering_tx_ = dummy_scatter_tx_;
+  grid_result.extinction_tx_ = dummy_transmit_tx_;
+  inst_.uniform_data.data.volume_grid.enabled = 0.0f;
+  inst_.uniform_data.data.volume_grid.bounds_size = float3(0.0f);
+}
+
+void VolumeModule::draw_grid_prepass()
+{
+  if (!grid_enabled_ || grid_built_) {
+    return;
+  }
+  grid_built_ = true;
+
+  GPU_debug_group_begin("Volume.Grid");
+
+  grid_prop_scattering_tx_.clear(float4(0.0f));
+  grid_prop_extinction_tx_.clear(float4(0.0f));
+  grid_prop_emission_tx_.clear(float4(0.0f));
+  grid_prop_phase_tx_.clear(float4(0.0f));
+  grid_prop_phase_weight_tx_.clear(float4(0.0f));
+  grid_dummy_occupancy_tx_.clear(uint4(0u));
+
+  /* Copy the main uniform data so that materials behave identically in both passes, then
+   * override the volume view with the grid view. */
+  grid_uniform_data_ = static_cast<const UniformData &>(inst_.uniform_data.data);
+  grid_uniform_data_.volumes = grid_volumes_data_;
+  grid_uniform_data_.volume_grid.bounds_min = grid_bounds_.min;
+  grid_uniform_data_.volume_grid.bounds_size = grid_bounds_.max - grid_bounds_.min;
+  grid_uniform_data_.volume_grid.mode = 1;
+  grid_uniform_data_.push_update();
+
+  grid_fb_.bind();
+  grid_view.visibility_test(false);
+  inst_.pipelines.volume.render_grid(grid_view);
+
+  GPU_debug_group_end();
+}
+
+void VolumeModule::draw_grid_light(View &view)
+{
+  if (!grid_enabled_ || grid_light_done_) {
+    return;
+  }
+  grid_light_done_ = true;
+
+  inst_.manager->submit(grid_light_ps_, view);
+
+  if (grid_stats_) {
+    grid_print_stats();
+  }
+}
+
+void VolumeModule::grid_print_stats()
+{
+  /* Debug helper: read back the lit grid and print statistics. This is the reference used to
+   * validate the world space lighting (M1) and the GI integration (M2). Only used by the
+   * regression probes, hence the GPU stall. */
+  GPU_finish();
+  const int3 size = grid_size_;
+  const int64_t voxel_count = int64_t(size.x) * size.y * size.z;
+
+  const size_t scatter_bytes = GPU_texture_read_size_get(grid_scatter_tx_, GPU_DATA_FLOAT, 0);
+  const size_t extinct_bytes = GPU_texture_read_size_get(grid_extinct_tx_, GPU_DATA_FLOAT, 0);
+  if (scatter_bytes == 0 || extinct_bytes == 0) {
+    printf("VOLUME_GRID_STATS: readback failed\n");
+    fflush(stdout);
+    return;
+  }
+
+  std::vector<float> scatter(scatter_bytes / sizeof(float));
+  std::vector<float> extinct(extinct_bytes / sizeof(float));
+  GPU_texture_read(grid_scatter_tx_, GPU_DATA_FLOAT, 0, scatter.data());
+  GPU_texture_read(grid_extinct_tx_, GPU_DATA_FLOAT, 0, extinct.data());
+
+  double scatter_sum = 0.0;
+  double extinct_sum = 0.0;
+  double extinct_max = 0.0;
+  int occupied = 0;
+  for (int64_t i = 0; i < voxel_count; i++) {
+    const float sr = scatter[i * 4 + 0];
+    const float sg = scatter[i * 4 + 1];
+    const float sb = scatter[i * 4 + 2];
+    const float et = extinct[i * 4 + 0];
+    scatter_sum += double(sr + sg + sb) / 3.0;
+    extinct_sum += et;
+    extinct_max = math::max(extinct_max, double(et));
+    occupied += (et > 1e-6f) ? 1 : 0;
+  }
+  printf("VOLUME_GRID_STATS: size=(%d %d %d) bounds_min=(%.4f %.4f %.4f) bounds_size=(%.4f %.4f %.4f)\n",
+         size.x,
+         size.y,
+         size.z,
+         grid_bounds_.min.x,
+         grid_bounds_.min.y,
+         grid_bounds_.min.z,
+         grid_bounds_.max.x - grid_bounds_.min.x,
+         grid_bounds_.max.y - grid_bounds_.min.y,
+         grid_bounds_.max.z - grid_bounds_.min.z);
+  printf("VOLUME_GRID_STATS: scatter_mean=%.6f extinction_mean=%.6f extinction_max=%.6f "
+         "occupied=%.4f\n",
+         scatter_sum / double(voxel_count),
+         extinct_sum / double(voxel_count),
+         extinct_max,
+         double(occupied) / double(voxel_count));
+  fflush(stdout);
+}
+
 void VolumeModule::draw_prepass(View &main_view)
 {
   if (!enabled_) {
@@ -446,6 +753,7 @@ void VolumeModule::draw_prepass(View &main_view)
   if (!current_objects_.is_empty()) {
     inst_.pipelines.volume.render(volume_view, occupancy_tx_);
   }
+  draw_grid_prepass();
   GPU_debug_group_end();
 }
 

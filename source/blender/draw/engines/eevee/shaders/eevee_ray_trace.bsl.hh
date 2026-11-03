@@ -15,6 +15,7 @@
 #include "eevee_sampling_lib.bsl.hh"
 #include "eevee_spherical_harmonics.bsl.hh"
 #include "eevee_uniform.bsl.hh"
+#include "eevee_volume_grid_lib.bsl.hh"
 
 namespace eevee::raytrace {
 
@@ -31,6 +32,10 @@ struct Resources {
   [[sampler(2)]] sampler2D radiance_back_tx;
   [[sampler(4)]] sampler2D hiz_front_tx;
   [[sampler(5)]] sampler2D hiz_back_tx;
+
+  /* World space volume grid (volumetric GI). Uses dummy 3D textures when unavailable. */
+  [[sampler(VOLUME_SCATTERING_TEX_SLOT)]] sampler3D volume_scatter_tx;
+  [[sampler(VOLUME_TRANSMITTANCE_TEX_SLOT)]] sampler3D volume_extinct_tx;
 
   [[image(0, read, SFLOAT_16_16_16_16)]] const image2D ray_data_img;
   [[image(1, write, RAYTRACE_RAYTIME_FORMAT)]] image2D ray_time_img;
@@ -191,6 +196,24 @@ void trace([[resource_table]] Resources &srt,
     radiance = lightprobes.eval_direction(samp, ray.origin, ray.direction, roughness);
     /* Set point really far for correct reprojection of background. */
     hit.time = 10000.0f;
+  }
+
+  if (uni.uniform_buf.volume_grid.enabled != 0.0f) {
+    /* Volumetric GI: integrate the participating media along the ray. The media is represented
+     * in world space, so it is visible to the ray even when the volume is off-screen. Note that
+     * the ray hit radiance (`radiance_front_tx`) does not contain the camera path volumetrics,
+     * which are composited later, so this is the only time the medium is added along this path. */
+    const VolumeGridIntegration media = volume_grid_integrate(
+        srt.volume_scatter_tx,
+        srt.volume_extinct_tx,
+        uni.uniform_buf.volume_grid.bounds_min,
+        uni.uniform_buf.volume_grid.bounds_size,
+        ray.origin,
+        ray.direction,
+        hit.time,
+        rand_trace,
+        int(uni.uniform_buf.volume_grid.samples.x));
+    radiance = radiance * media.transmittance + media.radiance;
   }
 
   radiance = colorspace::brightness_clamp_max(radiance, uni.uniform_buf.clamp.surface_indirect);

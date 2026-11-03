@@ -533,6 +533,9 @@ struct [[host_shared]] VolumeInfos {
   float temperature_mul;
   float temperature_bias;
   float _pad;
+  /** World space Z range of the object bounds. Used by the world space volume grid pass. */
+  float2 grid_z_world;
+  float2 _pad2;
 };
 
 struct [[host_shared]] CurvesInfos {

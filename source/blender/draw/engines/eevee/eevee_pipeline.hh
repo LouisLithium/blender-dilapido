@@ -534,6 +534,8 @@ struct VolumeObjectBounds {
   std::optional<Bounds<float2>> screen_bounds;
   /* Combined bounds in Z. Allow tighter integration bounds. */
   std::optional<Bounds<float>> z_range;
+  /* World space bounds. Used to build the world space volume grid. */
+  std::optional<Bounds<float3>> world_bounds;
 
   VolumeObjectBounds(const Camera &camera, const ObjectHandle &ob_handle, int instance_index);
 };
@@ -556,6 +558,9 @@ class VolumeLayer {
   /* Sub-passes of volume_layer_ps. */
   PassMain::Sub *occupancy_ps_;
   PassMain::Sub *material_ps_;
+  /* World space volume grid pass (same materials, different render target). */
+  PassMain volume_grid_ps_ = {"Volume.Grid"};
+  PassMain::Sub *grid_material_ps_ = nullptr;
   /* List of bounds from all objects contained inside this pass. */
   Vector<std::optional<Bounds<float2>>> object_bounds_;
   /* Combined bounds from object_bounds_. */
@@ -573,6 +578,9 @@ class VolumeLayer {
   PassMain::Sub *material_add(const Object *ob,
                               const blender::Material *blender_mat,
                               GPUMaterial *gpumat);
+  PassMain::Sub *grid_material_add(const Object *ob,
+                                   const blender::Material *blender_mat,
+                                   GPUMaterial *gpumat);
 
   /* Return true if the given bounds overlaps any of the contained object in this layer. */
   bool bounds_overlaps(const VolumeObjectBounds &object_bounds) const;
@@ -581,6 +589,8 @@ class VolumeLayer {
 
   void sync();
   void render(View &view, Texture &occupancy_tx);
+  /* Render the objects into the world space volume grid. */
+  void render_grid(View &view);
 };
 
 class VolumePipeline {
@@ -591,6 +601,8 @@ class VolumePipeline {
 
   /* Combined bounds in Z. Allow tighter integration bounds. */
   std::optional<Bounds<float>> object_integration_range_;
+  /* Combined world space bounds of all volume objects. Used to size the volume grid. */
+  std::optional<Bounds<float3>> object_world_bounds_;
   /* Aggregated properties of all volume objects. */
   bool has_scatter_ = false;
   bool has_absorption_ = false;
@@ -600,10 +612,13 @@ class VolumePipeline {
 
   void sync();
   void render(View &view, Texture &occupancy_tx);
+  /* Render all volume objects into the world space volume grid. */
+  void render_grid(View &view);
 
   VolumeLayer *register_and_get_layer(const VolumeObjectBounds &object_bounds);
 
   std::optional<Bounds<float>> object_integration_range() const;
+  std::optional<Bounds<float3>> object_world_bounds() const;
 
   bool has_scatter() const
   {

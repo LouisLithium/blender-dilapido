@@ -8506,6 +8506,42 @@ static void rna_def_scene_eevee(BlenderRNA *brna)
   RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
   RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
 
+  prop = RNA_def_property(srna, "use_volumetric_gi", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_VOLUMETRIC_GI);
+  RNA_def_property_ui_text(
+      prop,
+      "Volumetric GI",
+      "Let volumetric materials bounce light onto surfaces and appear in reflections "
+      "(uses a world space volume radiance grid). Diffuse lighting requires the ray tracing "
+      "'Fast GI' option to be disabled, since the fast GI approximation does not use the "
+      "ray tracing pipeline");
+  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
+  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
+  prop = RNA_def_property(srna, "volumetric_grid_resolution", PROP_INT, PROP_NONE);
+  RNA_def_property_range(prop, 16, 256);
+  RNA_def_property_ui_text(prop,
+                           "Volume Grid Resolution",
+                           "Resolution of the world space volume radiance grid along its longest axis");
+  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
+  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
+  prop = RNA_def_property(srna, "volumetric_grid_samples", PROP_INT, PROP_NONE);
+  RNA_def_property_range(prop, 1, 64);
+  RNA_def_property_ui_text(prop,
+                           "Volume GI Samples",
+                           "Number of samples taken along each ray when integrating the volume grid");
+  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
+  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
+  prop = RNA_def_property(srna, "use_volumetric_shadows_surface", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_VOLUMETRIC_SHADOWS_SURFACE);
+  RNA_def_property_ui_text(prop,
+                           "Volumetric Shadows on Surfaces",
+                           "Cast shadows from volumetric materials onto surfaces");
+  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
+  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
   prop = RNA_def_property(srna, "use_volume_custom_range", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_VOLUME_CUSTOM_RANGE);
   RNA_def_property_ui_text(prop,

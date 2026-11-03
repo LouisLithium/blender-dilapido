@@ -347,6 +347,14 @@ class RENDER_PT_eevee_volumes(RenderButtonsPanel, Panel):
         col = layout.column()
         col.prop(props, "volumetric_ray_depth", text="Max Depth")
 
+        col = layout.column(heading="Lighting")
+        col.prop(props, "use_volumetric_gi", text="Volumetric GI")
+        sub = col.column(align=True)
+        sub.active = props.use_volumetric_gi
+        sub.prop(props, "volumetric_grid_resolution", text="Grid Resolution")
+        sub.prop(props, "volumetric_grid_samples", text="GI Samples")
+        col.prop(props, "use_volumetric_shadows_surface", text="Shadow Surfaces")
+
 
 class RENDER_PT_eevee_volumes_range(RenderButtonsPanel, Panel):
     bl_label = "Custom Range"

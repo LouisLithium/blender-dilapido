@@ -415,6 +415,8 @@ void LookdevModule::sync_pass(PassSimple &pass,
   pass.bind_resources(inst_.uniform_data);
   pass.bind_resources(inst_.lights);
   pass.bind_resources(inst_.shadows);
+  pass.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+  pass.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
   pass.bind_resources(inst_.volume.result);
   pass.bind_resources(inst_.sampling);
   pass.bind_resources(inst_.hiz_buffer.front);

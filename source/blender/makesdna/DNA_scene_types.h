@@ -2640,6 +2640,10 @@ enum eSceneEEVEE_Flag : int {
   SCE_EEVEE_SHADOW_JITTERED_VIEWPORT = (1 << 26),
   SCE_EEVEE_VOLUME_CUSTOM_RANGE = (1 << 27),
   SCE_EEVEE_FAST_GI_ENABLED = (1 << 28),
+  /** World space volume radiance grid feeds the screen space GI rays (volumetric GI). */
+  SCE_EEVEE_VOLUMETRIC_GI = (1 << 29),
+  /** The same world space grid attenuates the direct lighting of surfaces (volumetric shadows). */
+  SCE_EEVEE_VOLUMETRIC_SHADOWS_SURFACE = (1 << 30),
 };
 ENUM_OPERATORS(eSceneEEVEE_Flag)
 
@@ -2670,6 +2674,11 @@ struct SceneEEVEE {
   float volumetric_light_clamp = 0.0f;
   int volumetric_shadow_samples = 16;
   int volumetric_ray_depth = 16;
+
+  /* World space volume radiance grid (volumetric GI and volumetric shadows on surfaces).
+   * 0 means "use the default" so that files written before this was added still work. */
+  int volumetric_grid_resolution = 96;
+  int volumetric_grid_samples = 8;
 
   DNA_DEPRECATED float gtao_distance = 0;
   DNA_DEPRECATED float gtao_thickness = 0;

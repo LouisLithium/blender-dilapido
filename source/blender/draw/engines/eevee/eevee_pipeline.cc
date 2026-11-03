@@ -419,6 +419,8 @@ void ForwardPipeline::sync()
       opaque_ps_.bind_resources(inst_.uniform_data);
       opaque_ps_.bind_resources(inst_.lights);
       opaque_ps_.bind_resources(inst_.shadows);
+      opaque_ps_.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+      opaque_ps_.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
       opaque_ps_.bind_resources(inst_.volume.result);
       opaque_ps_.bind_resources(inst_.sampling);
       opaque_ps_.bind_resources(inst_.hiz_buffer.front);
@@ -461,6 +463,8 @@ void ForwardPipeline::sync()
     sub.bind_resources(inst_.uniform_data);
     sub.bind_resources(inst_.lights);
     sub.bind_resources(inst_.shadows);
+    sub.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+    sub.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
     sub.bind_resources(inst_.volume.result);
     sub.bind_resources(inst_.sampling);
     sub.bind_resources(inst_.hiz_buffer.front);
@@ -964,6 +968,8 @@ void DeferredLayer::end_sync(bool is_first_pass,
           sub.bind_resources(inst_.hiz_buffer.front);
           sub.bind_resources(inst_.sphere_probes);
           sub.bind_resources(inst_.volume_probes);
+          sub.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+          sub.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
           uint8_t compare_mask = uint8_t(StencilBits::CLOSURE_COUNT_0) |
                                  uint8_t(StencilBits::CLOSURE_COUNT_1) |
                                  uint8_t(StencilBits::TRANSMISSION);
@@ -1097,6 +1103,10 @@ gpu::Texture *DeferredLayer::render(View &render_view,
   inst_.volume_probes.set_view(render_view);
   inst_.sphere_probes.set_view(render_view);
   inst_.shadows.render(render_view, extent);
+
+  /* Compute the world space volume grid lighting once shadow maps are ready.
+   * This must happen before the ray tracing pass so that volumetric GI can sample it. */
+  inst_.volume.draw_grid_light(render_view);
 
   inst_.gbuffer.bind(gbuffer_fb);
   inst_.manager->submit(gbuffer_ps_, render_view);
@@ -1314,6 +1324,28 @@ void VolumeLayer::sync()
     pass.bind_resources(inst_.sampling);
     material_ps_ = &pass;
   }
+
+  /* World space volume grid pass. Same materials, different view and render target. */
+  if (inst_.volume.grid_wanted()) {
+    volume_grid_ps_.init();
+    {
+      PassMain::Sub &pass = volume_grid_ps_.sub("grid_material_ps");
+      /* One fragment per (x, y) column: cull back faces instead of using a stencil (there is no
+       * depth attachment for the grid render target). */
+      pass.state_set(DRW_STATE_CULL_BACK);
+      pass.barrier(GPU_BARRIER_SHADER_IMAGE_ACCESS);
+      pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
+      pass.bind_ubo(UNIFORM_BUF_SLOT, &inst_.volume.grid_uniform_data_);
+      pass.bind_ubo(PIPELINE_BUF_SLOT, &inst_.uniform_data.pipeline);
+      pass.bind_ubo(RAYTRACE_BUF_SLOT, &inst_.uniform_data.raytrace);
+      pass.bind_resources(inst_.volume.grid_properties);
+      pass.bind_resources(inst_.sampling);
+      grid_material_ps_ = &pass;
+    }
+  }
+  else {
+    grid_material_ps_ = nullptr;
+  }
 }
 
 PassMain::Sub *VolumeLayer::occupancy_add(const Object *ob,
@@ -1349,6 +1381,24 @@ PassMain::Sub *VolumeLayer::material_add(const Object *ob,
   if (GPU_material_flag_get(gpumat, GPU_MATFLAG_VOLUME_ABSORPTION)) {
     has_absorption = true;
   }
+  return pass;
+}
+
+PassMain::Sub *VolumeLayer::grid_material_add(const Object *ob,
+                                              const blender::Material * /*blender_mat*/,
+                                              GPUMaterial *gpumat)
+{
+  BLI_assert_msg((ob->type == OB_VOLUME) || GPU_material_has_volume_output(gpumat),
+                 "Only volume material should be added here");
+  UNUSED_VARS_NDEBUG(ob);
+
+  if (grid_material_ps_ == nullptr) {
+    return nullptr;
+  }
+  PassMain::Sub *pass = &grid_material_ps_->sub(GPU_material_get_name(gpumat));
+  /* No deferred texture loading: this pass is submitted after the camera volume pass and the
+   * material textures must be bound immediately. */
+  pass->material_set(*inst_.manager, gpumat, false, inst_.anisotropic_filtering);
   return pass;
 }
 
@@ -1392,6 +1442,14 @@ void VolumeLayer::render(View &view, Texture &occupancy_tx)
   inst_.manager->submit(volume_layer_ps_, view);
 }
 
+void VolumeLayer::render_grid(View &view)
+{
+  if (is_empty || grid_material_ps_ == nullptr) {
+    return;
+  }
+  inst_.manager->submit(volume_grid_ps_, view);
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -1401,6 +1459,7 @@ void VolumeLayer::render(View &view, Texture &occupancy_tx)
 void VolumePipeline::sync()
 {
   object_integration_range_ = std::nullopt;
+  object_world_bounds_ = std::nullopt;
   has_scatter_ = false;
   has_absorption_ = false;
   for (auto &layer : layers_) {
@@ -1412,6 +1471,13 @@ void VolumePipeline::render(View &view, Texture &occupancy_tx)
 {
   for (auto &layer : layers_) {
     layer->render(view, occupancy_tx);
+  }
+}
+
+void VolumePipeline::render_grid(View &view)
+{
+  for (auto &layer : layers_) {
+    layer->render_grid(view);
   }
 }
 
@@ -1432,6 +1498,7 @@ VolumeObjectBounds::VolumeObjectBounds(const Camera &camera,
 
   screen_bounds = std::nullopt;
   z_range = std::nullopt;
+  world_bounds = std::nullopt;
 
   for (const float3 &l_corner : corners) {
     float3 ws_corner = math::transform_point(ob_handle.object_to_world(instance_index), l_corner);
@@ -1439,6 +1506,7 @@ VolumeObjectBounds::VolumeObjectBounds(const Camera &camera,
     float3 vs_corner = math::transform_point(view_matrix, ws_corner);
     float3 ss_corner = math::project_point(projection_matrix, vs_corner);
 
+    world_bounds = bounds::min_max(world_bounds, ws_corner);
     z_range = bounds::min_max(z_range, vs_corner.z);
     if (camera.is_perspective() && vs_corner.z >= 1.0e-8f) {
       /* If the object is crossing the z=0 plane, we can't determine its 2D bounds easily.
@@ -1461,6 +1529,7 @@ VolumeLayer *VolumePipeline::register_and_get_layer(const VolumeObjectBounds &ob
   }
 
   object_integration_range_ = bounds::merge(object_integration_range_, object_bounds.z_range);
+  object_world_bounds_ = bounds::merge(object_world_bounds_, object_bounds.world_bounds);
 
   /* Do linear search in all layers in order. This can be optimized. */
   for (auto &layer : layers_) {
@@ -1478,6 +1547,11 @@ VolumeLayer *VolumePipeline::register_and_get_layer(const VolumeObjectBounds &ob
 std::optional<Bounds<float>> VolumePipeline::object_integration_range() const
 {
   return object_integration_range_;
+}
+
+std::optional<Bounds<float3>> VolumePipeline::object_world_bounds() const
+{
+  return object_world_bounds_;
 }
 
 bool VolumePipeline::use_hit_list() const
@@ -1524,6 +1598,8 @@ void DeferredProbePipeline::end_sync()
     pass.bind_resources(inst_.sampling);
     pass.bind_resources(inst_.hiz_buffer.front);
     pass.bind_resources(inst_.volume_probes);
+    pass.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+    pass.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
     pass.barrier(GPU_BARRIER_TEXTURE_FETCH | GPU_BARRIER_SHADER_IMAGE_ACCESS);
     pass.draw_procedural(GPU_PRIM_TRIS, 1, 3);
   }
@@ -1624,6 +1700,8 @@ void PlanarProbePipeline::end_sync()
     pass.bind_resources(inst_.hiz_buffer.front);
     pass.bind_resources(inst_.sphere_probes);
     pass.bind_resources(inst_.volume_probes);
+    pass.bind_texture(VOLUME_GRID_SCATTERING_TEX_SLOT, &inst_.volume.grid_result.scattering_tx_);
+    pass.bind_texture(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT, &inst_.volume.grid_result.extinction_tx_);
     pass.barrier(GPU_BARRIER_TEXTURE_FETCH | GPU_BARRIER_SHADER_IMAGE_ACCESS);
     pass.draw_procedural(GPU_PRIM_TRIS, 1, 3);
   }

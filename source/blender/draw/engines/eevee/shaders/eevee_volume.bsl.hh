@@ -15,6 +15,7 @@
 #include "eevee_lightprobe_volume.bsl.hh"
 #include "eevee_renderpass.bsl.hh"
 #include "eevee_shadow.bsl.hh"
+#include "eevee_volume_grid_lib.bsl.hh"
 #include "eevee_volume_lib.bsl.hh"
 #include "eevee_volume_shared.hh"
 #include "gpu_shader_fullscreen_lib.glsl"
@@ -410,4 +411,101 @@ PipelineCompute scatter(scatter_main, Scatter{.use_volume_light = false});
 PipelineCompute scatter_with_lights(scatter_main, Scatter{.use_volume_light = true});
 PipelineCompute integration(integration_main);
 PipelineGraphic resolve(resolve_vert, resolve_frag);
+
+/* -------------------------------------------------------------------- */
+/** \name World Space Volume Grid
+ * \{ */
+
+/* Volumetric radiance grid lighting: evaluates the direct light (with shadow maps) for every
+ * voxel of the world space grid and stores the in-scattered radiance (per unit length) and the
+ * extinction. Isotropic phase function is used since the grid is view independent. */
+struct GridLight {
+  [[image(VOLUME_PROP_SCATTERING_IMG_SLOT, read, UFLOAT_11_11_10)]] image3D in_scattering_img;
+  [[image(VOLUME_PROP_EXTINCTION_IMG_SLOT, read, UFLOAT_11_11_10)]] image3D in_extinction_img;
+  [[image(VOLUME_PROP_EMISSION_IMG_SLOT, read, UFLOAT_11_11_10)]] image3D in_emission_img;
+  /* NOTE: Use slots that do not collide with the input image slots (0..5) and that stay below
+   * `GL_MAX_IMAGE_UNITS` (8 on some drivers) so that the pass is portable. */
+  [[image(6, write, SFLOAT_16_16_16_16)]] image3D out_scattering_img;
+  [[image(7, write, SFLOAT_16_16_16_16)]] image3D out_extinction_img;
+};
+
+struct GridLightCtx {
+  float3 radiance;
+  float3 P;
+
+  void eval_single([[resource_table]] GridLight &srt, LightData light, const bool is_directional)
+  {
+    if (light.power[LIGHT_VOLUME] == 0.0f) {
+      return;
+    }
+
+    LightVector lv = light_shape_vector_get(light, is_directional, P);
+    float attenuation = light_attenuation_volume(light, is_directional, lv);
+    if (attenuation < LIGHT_ATTENUATION_THRESHOLD) {
+      return;
+    }
+
+    /* TODO(M3): Apply shadow map visibility. Needs the shadow sampler to be bound safely. */
+    radiance += volume_light(light, is_directional, lv) * attenuation;
+  }
+
+  void eval_directional([[resource_table]] GridLight &srt, uint /*l_idx*/, LightData light)
+  {
+    eval_single(srt, light, true);
+  }
+
+  void eval_local([[resource_table]] GridLight &srt, uint /*l_idx*/, LightData light)
+  {
+    eval_single(srt, light, false);
+  }
+};
+
+[[compute, local_size(VOLUME_GROUP_SIZE, VOLUME_GROUP_SIZE, VOLUME_GROUP_SIZE)]]
+void grid_light_main([[resource_table]] GridLight &srt,
+                     [[resource_table]] const LightRenderData &light_data,
+                     [[resource_table]] const Uniform &uni,
+                     [[global_invocation_id]] const uint3 global_id)
+{
+  int3 voxel = int3(global_id);
+  int3 size = imageSize(srt.in_scattering_img);
+  if (any(greaterThanEqual(voxel, size))) {
+    return;
+  }
+
+  float3 sigma_s = imageLoadFast(srt.in_scattering_img, voxel).rgb;
+  float3 sigma_t = imageLoadFast(srt.in_extinction_img, voxel).rgb;
+  float3 emission = imageLoadFast(srt.in_emission_img, voxel).rgb;
+
+  /* Emission is already a radiance. Scattering is multiplied by the isotropic phase function. */
+  float3 in_scatter = emission;
+
+  if (reduce_max(sigma_s) > 0.0f) {
+    const float3 bounds_min = uni.uniform_buf.volume_grid.bounds_min;
+    const float3 bounds_size = uni.uniform_buf.volume_grid.bounds_size;
+    const float3 uvw = (float3(voxel) + 0.5f) / float3(size);
+
+    GridLightCtx ctx;
+    ctx.radiance = float3(0.0f);
+    ctx.P = bounds_min + uvw * bounds_size;
+
+    /* No light culling for the world space grid (the screen space clustering is not valid
+     * outside of the camera frustum). Same iteration order as `light::foreach`. */
+    const LightCullingData &culling = light_data.light_cull_buf;
+    for (uint i = culling.local_lights_len; i < culling.items_count; i++) {
+      ctx.eval_directional(srt, i, light_data.light_buf[i]);
+    }
+    for (uint i = 0; i < culling.visible_count; i++) {
+      ctx.eval_local(srt, i, light_data.light_buf[i]);
+    }
+
+    in_scatter += sigma_s * ctx.radiance * (1.0f / (4.0f * M_PI));
+  }
+
+  imageStoreFast(srt.out_scattering_img, voxel, float4(in_scatter, 1.0f));
+  imageStoreFast(srt.out_extinction_img, voxel, float4(sigma_t, 1.0f));
+}
+
+PipelineCompute grid_light(grid_light_main);
+
+/** \} */
 }  // namespace eevee::volume

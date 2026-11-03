@@ -240,6 +240,11 @@
 #define GBUF_NORMAL_TEX_SLOT 18
 #define GBUF_HEADER_TEX_SLOT 19
 
+/* World space volume grid, sampled by the surface lighting (volumetric shadows).
+ * NOTE: These slots must stay free in every pass that binds `LightEvalData`. */
+#define VOLUME_GRID_SCATTERING_TEX_SLOT 0
+#define VOLUME_GRID_TRANSMITTANCE_TEX_SLOT 1
+
 /* Images. */
 #define RBUFS_COLOR_SLOT 0
 #define RBUFS_VALUE_SLOT 1

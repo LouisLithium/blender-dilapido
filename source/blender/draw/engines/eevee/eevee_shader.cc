@@ -262,7 +262,8 @@ ShaderGroups ShaderModule::static_shaders_load(const ShaderGroups request_bits,
                                        VOLUME_OCCUPANCY_CONVERT,
                                        VOLUME_RESOLVE,
                                        VOLUME_SCATTER,
-                                       VOLUME_SCATTER_WITH_LIGHTS};
+                                       VOLUME_SCATTER_WITH_LIGHTS,
+                                       VOLUME_GRID_LIGHT};
     request(VOLUME_EVAL_SHADERS, AS_SPAN(shader_list));
   }
 #undef AS_SPAN
@@ -566,6 +567,8 @@ const char *ShaderModule::static_shader_create_info_name_get(eShaderType shader_
       return "eevee_volume_scatter";
     case VOLUME_SCATTER_WITH_LIGHTS:
       return "eevee_volume_scatter_with_lights";
+    case VOLUME_GRID_LIGHT:
+      return "eevee_volume_grid_light";
     /* To avoid compiler warning about missing case. */
     case MAX_SHADER_TYPE:
       return "";

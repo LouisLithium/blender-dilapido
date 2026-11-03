@@ -165,6 +165,33 @@ void surf_volume([[resource_table]] SurfVolume &srt,
     prop = srt.eval_froxel(uni, view, obj, ob_infos, froxel, jitter);
   }
 
+  if (uni.uniform_buf.volume_grid.mode != 0) {
+    /* World space volume grid: each fragment is one (x, y) column of the grid.
+     * The Z range comes from the object world bounds (per draw UBO), so no occupancy texture is
+     * needed. Draws are issued sequentially per object, so the additive writes are race free. */
+    const auto &drw_volume = buffer_get(draw_volume_infos, drw_volume);
+    const int z_len = imageSize(srt.out_scattering_img).z;
+    const float grid_min_z = uni.uniform_buf.volume_grid.bounds_min.z;
+    const float grid_size_z = max(1e-6f, uni.uniform_buf.volume_grid.bounds_size.z);
+    /* The grid view looks down -Z: froxel Z=0 is at the grid max Z. */
+    const float z_near = clamp(
+        (grid_min_z + grid_size_z - drw_volume.grid_z_world.y) / grid_size_z, 0.0f, 1.0f);
+    const float z_far = clamp(
+        (grid_min_z + grid_size_z - drw_volume.grid_z_world.x) / grid_size_z, 0.0f, 1.0f);
+    const int z_start = clamp(int(z_near * float(z_len)), 0, z_len);
+    const int z_end = clamp(int(z_far * float(z_len)), 0, z_len);
+    for (int z = z_start; z < z_end; z++) {
+      froxel.z = z;
+      if (!srt.is_homogenous) [[static_branch]] {
+        /* NOTE: No jitter here: every slice of the world space grid is evaluated at its own
+         * center, otherwise a constant offset would bias the whole column. */
+        prop = srt.eval_froxel(uni, view, obj, ob_infos, froxel, 0.0f);
+      }
+      srt.write_froxel(froxel, prop);
+    }
+    return;
+  }
+
   occupancy::Bits occupancy;
 
   if (!srt.is_world) [[static_branch]] {

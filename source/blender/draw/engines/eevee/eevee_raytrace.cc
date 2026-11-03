@@ -179,6 +179,11 @@ void RayTraceModule::sync()
     pass.bind_texture("radiance_back_tx", &screen_radiance_back_tx_);
     pass.bind_texture("hiz_front_tx", &inst_.hiz_buffer.front.ref_tx_);
     pass.bind_texture("hiz_back_tx", &inst_.hiz_buffer.back.ref_tx_);
+    /* World space volume grid (volumetric GI). Bound by reference: the grid textures are
+     * reallocated on every frame (in `VolumeModule::end_sync`) after this pass is set up.
+     * Dummy 3D textures are used when the grid is disabled. */
+    pass.bind_texture("volume_scatter_tx", &inst_.volume.grid_result.scattering_tx_);
+    pass.bind_texture("volume_extinct_tx", &inst_.volume.grid_result.extinction_tx_);
     /* Still bind front to hiz_tx for validation layers. */
     pass.bind_resources(inst_.hiz_buffer.front);
     pass.bind_texture("depth_tx", &depth_tx);

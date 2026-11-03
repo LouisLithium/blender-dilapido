@@ -10,6 +10,7 @@
 #include "eevee_shadow.bsl.hh"
 #include "eevee_shadow_tracing.bsl.hh"
 #include "eevee_thickness_lib.bsl.hh"
+#include "eevee_volume_grid_lib.bsl.hh"
 #include "gpu_shader_utildefines_lib.glsl"
 
 #if !defined(SRT_CONSTANT_light_closure_eval_count_reflect)
@@ -40,6 +41,11 @@ namespace eevee {
 struct LightEvalData {
   [[resource_table]] srt_t<ShadowRenderData> shadow_data;
   [[resource_table]] srt_t<UtilityTexture> utility_tx;
+
+  /* World space volume grid, used to attenuate the direct lighting of surfaces
+   * (volumetric shadows). Bound even when the grid is disabled. */
+  [[sampler(VOLUME_GRID_SCATTERING_TEX_SLOT)]] sampler3D volume_scatter_tx;
+  [[sampler(VOLUME_GRID_TRANSMITTANCE_TEX_SLOT)]] sampler3D volume_extinct_tx;
 
   [[compilation_constant]] int light_closure_eval_count_reflect;
   [[compilation_constant]] int light_closure_eval_count_transmit;
@@ -75,7 +81,7 @@ void eval_single_closure(sampler2DArray util_tx,
                          ClosureLight &cl,
                          float3 V,
                          float attenuation,
-                         float shadow)
+                         float3 shadow)
 {
   attenuation *= power_get(light, cl.type);
   if (attenuation < 1e-30f) {
@@ -83,7 +89,7 @@ void eval_single_closure(sampler2DArray util_tx,
   }
   float ltc_result = light_ltc(util_tx, light, cl.N, V, lv, cl.ltc_mat, vertices);
   float3 out_radiance = light.color * ltc_result;
-  float visibility = shadow * attenuation;
+  float3 visibility = shadow * attenuation;
   cl.light_shadowed += visibility * out_radiance;
   cl.light_unshadowed += attenuation * out_radiance;
 }
@@ -156,6 +162,27 @@ template<bool is_transmission> struct EvalCtx {
                            ray_step_count);
     }
 
+    float3 shadow_rgb = float3(shadow);
+    if (uni.uniform_buf.volume_grid.enabled != 0.0f) {
+      /* Volumetric shadows: the participating media between the surface and the light absorbs
+       * and scatters a part of the incoming light. This is the same world space grid as the one
+       * used for volumetric GI. Only the transmittance is of interest here. */
+      const float t_max = is_directional ? 1.0e6f : lv.dist;
+      /* Cheap per pixel dithering to hide the fixed step count (TAA averages it out). */
+      const float rng = fract(52.9829189f * fract(dot(texel, float2(0.06711056f, 0.00583715f))));
+      const VolumeGridIntegration media = volume_grid_integrate(
+          srt.volume_scatter_tx,
+          srt.volume_extinct_tx,
+          uni.uniform_buf.volume_grid.bounds_min,
+          uni.uniform_buf.volume_grid.bounds_size,
+          P,
+          lv.L,
+          t_max,
+          rng,
+          int(uni.uniform_buf.volume_grid.samples.y));
+      shadow_rgb *= media.transmittance;
+    }
+
     if (is_translucent_with_thickness) {
       /* This makes the LTC compute the solid angle of the light (still with the cosine term
        * applied but that still works great enough in practice). */
@@ -173,13 +200,13 @@ template<bool is_transmission> struct EvalCtx {
       if (is_transmission) [[static_branch]] {
         if (srt.light_closure_eval_count_transmit > i) [[static_branch]] {
           eval_single_closure(
-              util_tx, light, lv, light_shape_vertices, stack.cl[i], V, attenuation, shadow);
+              util_tx, light, lv, light_shape_vertices, stack.cl[i], V, attenuation, shadow_rgb);
         }
       }
       else {
         if (srt.light_closure_eval_count_reflect > i) [[static_branch]] {
           eval_single_closure(
-              util_tx, light, lv, light_shape_vertices, stack.cl[i], V, attenuation, shadow);
+              util_tx, light, lv, light_shape_vertices, stack.cl[i], V, attenuation, shadow_rgb);
         }
       }
     }

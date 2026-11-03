@@ -41,6 +41,7 @@
 #include "GPU_batch_utils.hh"
 
 #include "eevee_sync.hh"
+#include "eevee_uniform_shared.hh"
 #include "eevee_volume_shared.hh"
 
 namespace blender::eevee {
@@ -120,6 +121,42 @@ class VolumeModule {
 
   gpu::Batch *cube_batch_ = GPU_batch_unit_cube();
 
+  /* ---- World space volume grid ---- */
+  bool grid_wanted_ = false;
+  bool grid_enabled_ = false;
+  bool grid_built_ = false;
+  bool grid_light_done_ = false;
+  bool grid_stats_ = false;
+  int3 grid_size_ = int3(0);
+  Bounds<float3> grid_bounds_ = {float3(0.0f), float3(1.0f)};
+  VolumesInfoData grid_volumes_data_ = {};
+  View grid_view = {"Volume Grid View"};
+
+  /* Declared before the textures so that the framebuffer outlives its attachments (C++ destroys
+   * members in reverse declaration order and `Texture::~Texture` touches its attached FB). */
+  Framebuffer grid_fb_ = {"Volume.GridFB"};
+
+  Texture grid_prop_scattering_tx_ = {"grid_prop_scattering_tx"};
+  Texture grid_prop_extinction_tx_ = {"grid_prop_extinction_tx"};
+  Texture grid_prop_emission_tx_ = {"grid_prop_emission_tx"};
+  Texture grid_prop_phase_tx_ = {"grid_prop_phase_tx"};
+  Texture grid_prop_phase_weight_tx_ = {"grid_prop_phase_weight_tx"};
+  /* Dummy 1x1x1 texture to satisfy the occupancy binding of the volume material shader. */
+  Texture grid_dummy_occupancy_tx_ = {"grid_dummy_occupancy_tx"};
+  Texture grid_scatter_tx_ = {"grid_scatter_tx"};
+  Texture grid_extinct_tx_ = {"grid_extinct_tx"};
+  Texture grid_depth_tx_ = {"grid_depth_tx"};
+
+  PassSimple grid_light_ps_ = {"Volumes.GridLight"};
+
+  /* Allocate / update the grid resources for the current frame. */
+  void grid_ensure();
+  /* Free the grid resources. Called at the end of the frame to avoid keeping GPU objects alive
+   * across frames (they are rebuilt every frame). */
+  void grid_free_resources();
+  /* Read back the lit grid and print statistics (debug helper). */
+  void grid_print_stats();
+
  public:
   VolumeModule(Instance &inst, VolumesInfoData &data) : inst_(inst), data_(data)
   {
@@ -127,12 +164,78 @@ class VolumeModule {
         gpu::TextureFormat::UNORM_8_8_8_8, int3(1), GPU_TEXTURE_USAGE_SHADER_READ, float4(0.0f));
     dummy_transmit_tx_.ensure_3d(
         gpu::TextureFormat::UNORM_8_8_8_8, int3(1), GPU_TEXTURE_USAGE_SHADER_READ, float4(1.0f));
+    /* Consumers of the grid always bind something valid. */
+    grid_result.scattering_tx_ = dummy_scatter_tx_;
+    grid_result.extinction_tx_ = dummy_transmit_tx_;
   };
 
   ~VolumeModule()
   {
     GPU_BATCH_DISCARD_SAFE(cube_batch_);
   }
+
+  /* -------------------------------------------------------------------- */
+  /** \name World space volume grid (volumetric GI / shadows).
+   * \{ */
+
+  /* True if the grid is valid this frame. */
+  bool grid_enabled() const
+  {
+    return grid_enabled_;
+  }
+  /* True if the world space volume grid should be built this frame (scene settings). */
+  bool grid_wanted() const
+  {
+    return grid_wanted_;
+  }
+  /* World space bounds of the grid. */
+  const Bounds<float3> &grid_bounds() const
+  {
+    return grid_bounds_;
+  }
+
+  /* Render all volume objects into the world space grid (material properties only). */
+  void draw_grid_prepass();
+  /* Compute the in-scattered radiance of the grid (needs shadow maps to be rendered). */
+  void draw_grid_light(View &view);
+
+  /* Uniform buffer for the grid passes. It is a copy of the main uniform data with the volume
+   * view replaced by the grid view, so that materials behave identically in both passes. */
+  draw::UniformBuffer<UniformData> grid_uniform_data_ = {"VolumeGridUniformDataBuf"};
+
+  /* Grid material properties, written by the volume material passes. */
+  struct {
+    gpu::Texture *scattering_tx_ = nullptr;
+    gpu::Texture *extinction_tx_ = nullptr;
+    gpu::Texture *emission_tx_ = nullptr;
+    gpu::Texture *phase_tx_ = nullptr;
+    gpu::Texture *phase_weight_tx_ = nullptr;
+    gpu::Texture *occupancy_tx_ = nullptr;
+
+    template<typename PassType> void bind_resources(PassType &pass)
+    {
+      pass.bind_image(VOLUME_PROP_SCATTERING_IMG_SLOT, &scattering_tx_);
+      pass.bind_image(VOLUME_PROP_EXTINCTION_IMG_SLOT, &extinction_tx_);
+      pass.bind_image(VOLUME_PROP_EMISSION_IMG_SLOT, &emission_tx_);
+      pass.bind_image(VOLUME_PROP_PHASE_IMG_SLOT, &phase_tx_);
+      pass.bind_image(VOLUME_PROP_PHASE_WEIGHT_IMG_SLOT, &phase_weight_tx_);
+      pass.bind_image(VOLUME_OCCUPANCY_SLOT, &occupancy_tx_);
+    }
+  } grid_properties;
+
+  /* Lit grid: in-scattered radiance (RGB) and extinction (RGB). */
+  struct {
+    gpu::Texture *scattering_tx_ = nullptr;
+    gpu::Texture *extinction_tx_ = nullptr;
+
+    template<typename PassType> void bind_resources(PassType &pass)
+    {
+      pass.bind_texture(VOLUME_SCATTERING_TEX_SLOT, &scattering_tx_);
+      pass.bind_texture(VOLUME_TRANSMITTANCE_TEX_SLOT, &extinction_tx_);
+    }
+  } grid_result;
+
+  /** \} */
 
   bool needs_shadow_tagging() const
   {

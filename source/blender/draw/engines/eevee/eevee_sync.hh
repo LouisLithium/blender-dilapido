@@ -74,7 +74,8 @@ class SyncModule {
                           FunctionRef<void(const MaterialPass &)> sync_cb);
   void sync_volume_passes(const ObjectHandle &ob_handle,
                           const Material &material,
-                          FunctionRef<void(const MaterialPass &, int)> sync_cb);
+                          FunctionRef<void(const MaterialPass &, int)> sync_cb,
+                          FunctionRef<void(const MaterialPass &, int)> grid_cb);
   void sync_alpha_blended_passes(const ObjectHandle &ob_handle,
                                  const Material &material,
                                  FunctionRef<void(const MaterialPass &, int)> sync_cb);

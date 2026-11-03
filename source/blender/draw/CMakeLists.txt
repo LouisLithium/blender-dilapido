@@ -486,6 +486,7 @@ set(GLSL_SRC
   engines/eevee/shaders/eevee_utility_tx.bsl.hh
   engines/eevee/shaders/eevee_velocity.bsl.hh
   engines/eevee/shaders/eevee_volume.bsl.hh
+  engines/eevee/shaders/eevee_volume_grid_lib.bsl.hh
   engines/eevee/shaders/eevee_volume_lib.bsl.hh
 
   engines/eevee/eevee_camera_shared.hh

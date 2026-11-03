@@ -96,6 +96,23 @@ struct [[host_shared]] PipelineInfoData {
   bool32_t _pad2;
 };
 
+/**
+ * World space volumetric radiance grid.
+ * This is a view independent representation of the participating media used for
+ * volumetric GI (ray traced) and volumetric shadows.
+ */
+struct [[host_shared]] VolumeGridInfoData {
+  /* World space bounds of the grid. */
+  packed_float3 bounds_min;
+  /* Non-zero when rendering into the world space volume grid. */
+  int mode;
+  packed_float3 bounds_size;
+  /* Non-zero when the grid can be sampled by the shading passes. */
+  float enabled;
+  /* x: number of samples along a GI ray. y: number of samples along a surface shadow ray. */
+  float4 samples;
+};
+
 /* Combines data from several modules to avoid wasting binding slots. */
 struct [[host_shared]] UniformData {
   struct AOData ao;
@@ -106,6 +123,7 @@ struct [[host_shared]] UniformData {
   struct RenderBuffersInfoData render_pass;
   struct ShadowSceneData shadow;
   struct VolumesInfoData volumes;
+  struct VolumeGridInfoData volume_grid;
   struct SceneData scene;
 };
 
