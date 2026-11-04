@@ -412,6 +412,12 @@ struct FluidChunkData {
    */
   std::shared_ptr<geometry::ha::HaSdfGrid> sdf;
   bool sdf_ready = false;
+  /**
+   * Distance field of the coupled solids (cloth, soft bodies), rebuilt once per frame. The device
+   * samples it for the hard contact and appends the contacts so the reaction can be given back.
+   */
+  std::shared_ptr<geometry::ha::HaSdfGrid> coupled_sdf;
+  bool coupled_sdf_ready = false;
   /** Hash of the collider and the field resolution that produced #sdf. */
   uint64_t sdf_hash = 0;
   /** Wall clock when the device work of the current frame started, for the debug log. */
@@ -5437,6 +5443,105 @@ class XpbdSolverStep {
   }
 
   /**
+   * Applies the hard contacts of the coupled distance field to the solid vertices. Each contact is
+   * a fluid particle index and the position correction that the device applied to it; the closest
+   * triangle is looked up on the host and the conjugate correction (split by inverse mass, scaled
+   * by the coupling) is spread over its vertices with the barycentric weights.
+   */
+  void simulate__gpu_coupled_sdf_reaction(FluidChunkData &fluid,
+                                          const int chunk_i,
+                                          const Span<int> indices,
+                                          const Span<float3> pushes,
+                                          const int solver_refs_i)
+  {
+    if (indices.is_empty() || coupled_surfaces_.is_empty()) {
+      return;
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    const IndexRange points = chunk.points_range;
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    const Span<float3> fluid_positions = refs[chunk.data_key_i].positions.slice(points);
+    const Span<float> fluid_inv_masses = geo_data.inv_masses.as_span().slice(points);
+    const Span<float> coupling = geo_data.fluid_coupling.as_span().slice(points);
+    CoupledSurface &surface = coupled_surfaces_[0];
+    if (surface.mesh == nullptr) {
+      return;
+    }
+    const Span<int3> corner_tris = surface.mesh->corner_tris();
+    const Span<int> corner_verts = surface.mesh->corner_verts();
+    const Span<float3> surface_positions = surface.mesh->vert_positions();
+    const Span<float> surface_inv_masses = geometries_.data[surface.geometry_i]->inv_masses;
+
+    for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+      scratch.correction_sums.fill(float3(0.0f));
+      scratch.weight_sums.fill(0.0f);
+    }
+    FluidChunkData::CoupledVertexScratch *scratch = nullptr;
+    for (FluidChunkData::CoupledVertexScratch &candidate : fluid.coupled_scratch) {
+      if (candidate.geometry_i == surface.geometry_i) {
+        scratch = &candidate;
+        break;
+      }
+    }
+    if (scratch == nullptr) {
+      return;
+    }
+
+    for (const int k : indices.index_range()) {
+      const int i = indices[k];
+      const float3 &push = pushes[k];
+      if (push.x == 0.0f && push.y == 0.0f && push.z == 0.0f) {
+        continue;
+      }
+      const float c = coupling[i];
+      if (!(c > 0.0f)) {
+        continue;
+      }
+      BVHTreeNearest nearest;
+      nearest.index = -1;
+      BLI_bvhtree_find_nearest(surface.bvh.tree,
+                               fluid_positions[i],
+                               &nearest,
+                               surface.bvh.nearest_callback,
+                               &surface.bvh);
+      if (nearest.index < 0 || nearest.index >= corner_tris.size()) {
+        continue;
+      }
+      const int3 &tri = corner_tris[nearest.index];
+      const int3 verts(corner_verts[tri.x], corner_verts[tri.y], corner_verts[tri.z]);
+      const float3 nearest_co(nearest.co[0], nearest.co[1], nearest.co[2]);
+      const float3 weights = triangle_weights(surface_positions[verts[0]],
+                                              surface_positions[verts[1]],
+                                              surface_positions[verts[2]],
+                                              nearest_co);
+      const float inv_m_i = fluid_inv_masses[i];
+      for (const int v : IndexRange(3)) {
+        const int vertex_i = verts[v];
+        const float weight = weights[v];
+        if (weight <= 0.0f || surface_inv_masses[vertex_i] <= 0.0f) {
+          continue;
+        }
+        const float inv_m_v = surface_inv_masses[vertex_i];
+        /* Conjugate of the fluid push, split by inverse mass and scaled by the coupling. */
+        const float share = inv_m_v / (inv_m_i + inv_m_v);
+        scratch->correction_sums[vertex_i] += push * (-c * share * weight);
+        scratch->weight_sums[vertex_i] += weight;
+      }
+    }
+
+    const MutableSpan<float3> positions = refs[surface.geometry_i].positions;
+    for (const int vertex_i : scratch->weight_sums.index_range()) {
+      if (scratch->weight_sums[vertex_i] <= 0.0f) {
+        continue;
+      }
+      /* A contact is an independent impulse: a vertex touched by more water is pushed more, so the
+       * contributions are summed (the density reaction averages instead, because it is a field). */
+      positions[vertex_i] += scratch->correction_sums[vertex_i];
+    }
+  }
+
+  /**
    * Gives the contact impulses of a chunk back to the triangles of the coupled surfaces. The
    * normal multiplier of a contact is the impulse that stopped the fluid point (in position units,
    * so the momentum of the surface is `-lambda * normal`), which is spread over the three vertices
@@ -5603,15 +5708,10 @@ class XpbdSolverStep {
     if (!fluid.active) {
       return "not a fluid";
     }
-    if (fluid.has_coupled) {
-      /* The device density coupling is implemented (M115), but the density constraint is unilateral:
-       * it only resists *compression*. A fast or under-dense fluid at the cloth never compresses
-       * (lambda stays 0), so the reaction is 0 and the water passes through. The CPU path also has
-       * the hard point/triangle contact of `CoupledFaceContacts`, which is what actually catches
-       * fast water; that contact is CPU only. Keep coupled fluids on the CPU until the device has
-       * an equivalent hard contact. */
-      return "coupled with another geometry";
-    }
+    /* Coupled fluids run on the device: the density coupling is complemented by a distance field of
+     * the coupled solids (built once per frame) that the device samples for the hard contact. The
+     * density constraint alone is unilateral and misses fast / under-dense water; the field catches
+     * it, and its contacts are given back to the solid vertices once per frame. */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
      * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
@@ -5824,6 +5924,72 @@ class XpbdSolverStep {
                   double(band_width));
   }
 
+  /**
+   * Builds a distance field of the coupled solids (cloth, soft bodies) once per frame. The device
+   * samples it for the hard contact, which is what the density coupling alone cannot do for fast or
+   * under-dense water. The field is rebuilt per frame (not per substep) because the solids move
+   * slowly compared to the fluid substeps, and the build is the expensive part.
+   */
+  void prepare_coupled_sdf(FluidChunkData &fluid, const GeometryData &geo_data)
+  {
+    fluid.coupled_sdf_ready = false;
+    fluid.coupled_sdf.reset();
+    if (!fluid.has_coupled || coupled_surfaces_.is_empty()) {
+      return;
+    }
+    const CoupledSurface &surface = coupled_surfaces_[0];
+    if (surface.mesh == nullptr || surface.mesh->corner_tris().is_empty()) {
+      return;
+    }
+    const Mesh &mesh = *surface.mesh;
+    const Span<float3> positions = mesh.vert_positions();
+    if (positions.is_empty()) {
+      return;
+    }
+    float3 bbox_min = positions[0];
+    float3 bbox_max = positions[0];
+    for (const float3 &position : positions) {
+      bbox_min = math::min(bbox_min, position);
+      bbox_max = math::max(bbox_max, position);
+    }
+    /* The fluid is outside the solid, which fixes the sign of an open mesh (a cloth sheet). */
+    const Span<float3> fluid_positions = geo_data.position_attr.span;
+    if (fluid_positions.is_empty()) {
+      return;
+    }
+    float3 fluid_min = fluid_positions[0];
+    float3 fluid_max = fluid_positions[0];
+    for (const float3 &position : fluid_positions) {
+      fluid_min = math::min(fluid_min, position);
+      fluid_max = math::max(fluid_max, position);
+    }
+    const float voxel = std::max(1e-4f, 0.5f * fluid.support_radius);
+    const float band = std::max(4.0f * voxel, 2.0f * fluid.support_radius);
+    const float3 region_min = bbox_min - float3(band);
+    const float3 region_max = bbox_max + float3(band);
+    auto grid = std::make_shared<geometry::ha::HaSdfGrid>();
+    if (!geometry::ha::ha_sdf_build(positions,
+                                    mesh.corner_verts(),
+                                    mesh.corner_tris(),
+                                    voxel,
+                                    band,
+                                    region_min,
+                                    region_max,
+                                    (fluid_min + fluid_max) * 0.5f,
+                                    *grid))
+    {
+      return;
+    }
+    fluid.coupled_sdf = grid;
+    fluid.coupled_sdf_ready = grid->is_valid();
+    debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                  std::getenv("XPBD_GPU_DEBUG") != nullptr,
+                  "XPBD_GPU coupled sdf baked voxels=%lld spacing=%.4f band=%.4f\n",
+                  (long long)grid->voxels_num(),
+                  double(grid->spacing),
+                  double(band));
+  }
+
   void prepare_fluid_gpu()
   {
     gpu_rejection_reason_.clear();
@@ -5949,6 +6115,20 @@ class XpbdSolverStep {
                       (long long)fluid.sdf->voxels_num(),
                       double(fluid.sdf->spacing));
       }
+      /* Distance field of the coupled solids for the hard contact. The density coupling alone is
+       * unilateral and misses fast / under-dense water; this field catches it on the device. */
+      if (fluid.gpu_active) {
+        this->prepare_coupled_sdf(fluid, geo_data);
+      }
+      if (fluid.gpu_active && fluid.coupled_sdf_ready) {
+        fluid.gpu_fluid.bind_coupled_sdf(*fluid.coupled_sdf,
+                                         0.5f * fluid.support_radius,
+                                         0.5f,
+                                         fluid.support_radius);
+      }
+      else if (fluid.gpu_active) {
+        fluid.gpu_fluid.clear_coupled_sdf();
+      }
       debug_gpu_log("BLENDER_XPBD_GPU_LOG",
                     print,
                     "XPBD_GPU backend=%s particles=%d substeps=%d iterations=%d support_radius=%g%s%s\n",
@@ -6016,6 +6196,24 @@ class XpbdSolverStep {
       Array<float3> corrections(fluid.gpu_fluid.coupled_count());
       if (fluid.gpu_fluid.download_coupled_reaction(corrections.as_mutable_span())) {
         this->simulate__gpu_coupled_reaction(fluid, corrections, solver_refs_i);
+      }
+    }
+    /* Hard contacts with the coupled distance field, also once per frame. */
+    if (ok && download_result) {
+      const int max_contacts = int(points.size());
+      Array<int> contact_indices(max_contacts);
+      Array<float3> contact_push(max_contacts);
+      int contact_count = 0;
+      if (fluid.gpu_fluid.download_coupled_contacts(contact_indices.as_mutable_span(),
+                                                   contact_push.as_mutable_span(),
+                                                   contact_count))
+      {
+        this->simulate__gpu_coupled_sdf_reaction(
+            fluid,
+            chunk_i,
+            contact_indices.as_span().take_front(contact_count),
+            contact_push.as_span().take_front(contact_count),
+            solver_refs_i);
       }
     }
     if (gathers_contacts) {

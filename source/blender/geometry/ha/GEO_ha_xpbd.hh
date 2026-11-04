@@ -339,6 +339,28 @@ class HaXpbdFluid {
   /** Drops the distance field, so the collider contacts are gathered on the host again. */
   void clear_sdf();
 
+  /**
+   * Uploads a distance field of the *coupled* solids (cloth, soft bodies), rebuilt by the solver
+   * once per frame. The device samples it like the collider field and pushes the fluid away, and
+   * every contact is appended to a small list so the host can give the impulse back to the solid
+   * vertices.
+   */
+  bool bind_coupled_sdf(const HaSdfGrid &grid,
+                        float radius,
+                        float friction,
+                        float max_correction);
+
+  void clear_coupled_sdf();
+
+  /**
+   * Copies the coupled contacts of the frame to the host: the fluid particle index (within this
+   * chunk) and the position correction that was applied to it. The list accumulates over all
+   * substeps and iterations, so the reaction is applied once per frame.
+   */
+  bool download_coupled_contacts(MutableSpan<int> r_indices,
+                                 MutableSpan<float3> r_push,
+                                 int &r_count) const;
+
   bool has_sdf() const
   {
     return sdf_active_;
@@ -404,6 +426,15 @@ class HaXpbdFluid {
   /** 12 floats: origin, spacing, dims, radius, friction, max correction, enabled, unused. */
   HaBuffer sdf_params_;
   HaBuffer sdf_data_;
+  /** The same for the coupled solids (cloth, soft bodies). */
+  bool coupled_sdf_active_ = false;
+  HaBuffer coupled_sdf_params_;
+  HaBuffer coupled_sdf_data_;
+  /** Coupled contacts of the frame: count, particle indices and the position correction. */
+  HaBufferInt coupled_contact_count_;
+  HaBufferInt coupled_contact_indices_;
+  HaBuffer coupled_contact_push_;
+  int coupled_contact_capacity_ = 0;
 
   /** Packed per particle properties, see #HA_PROP_STRIDE. */
   HaBuffer props_;

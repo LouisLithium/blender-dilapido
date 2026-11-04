@@ -799,7 +799,9 @@ enum FluidParamIndex {
   FLUID_PARAM_COUPLED_CAPACITY = 20,
   /** Number of coupled samples, i.e. the element count of the reaction pass. */
   FLUID_PARAM_COUPLED_COUNT = 21,
-  FLUID_PARAM_COUNT_TOTAL = 22,
+  /** Capacity of the coupled contact list (particle index + push vector). */
+  FLUID_PARAM_COUPLED_CONTACT_CAPACITY = 22,
+  FLUID_PARAM_COUNT_TOTAL = 23,
 };
 
 /** Collider contacts: `face position`, `normal`, `collider motion` and `collider velocity`. */
@@ -1779,6 +1781,54 @@ const char *KERNEL_SDF_CONTACT =
     "  particle_state[i * HA_STATE + 7] = 1.0;\n"
     "}\n";
 
+/**
+ * Contact with the distance field of the *coupled* solids. It uses the same `sdf_data` /
+ * `sdf_params` helper as the collider field (the buffers bound to those slots are the coupled
+ * ones), pushes the fluid particle out and appends the correction to the frame contact list. The
+ * host spreads that list over the solid vertices, which is the reaction of the fluid on the cloth.
+ */
+const char *KERNEL_COUPLED_SDF_CONTACT =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= int(params[0])) { return; }\n"
+    "  if (sdf_params[10] <= 0.0) { return; }\n"
+    "  if (props[i * HA_PROP + 1] <= 0.0) { return; }\n"
+    "  int base = i * 3;\n"
+    "  vec3 p = vec3(position_io[base + 0], position_io[base + 1], position_io[base + 2]);\n"
+    "  float distance_to_surface = 0.0;\n"
+    "  vec3 normal = vec3(0.0, 0.0, 1.0);\n"
+    "  ha_sdf_value_normal(p, distance_to_surface, normal);\n"
+    "  float contact_radius = sdf_params[7];\n"
+    "  if (distance_to_surface >= contact_radius) { return; }\n"
+    "  float push = contact_radius - distance_to_surface;\n"
+    "  float max_correction = sdf_params[9];\n"
+    "  if (max_correction > 0.0) { push = min(push, max_correction); }\n"
+    "  vec3 correction = normal * push;\n"
+    "  if (!ha_is_finite(correction)) { return; }\n"
+    "  position_io[base + 0] += correction.x;\n"
+    "  position_io[base + 1] += correction.y;\n"
+    "  position_io[base + 2] += correction.z;\n"
+    "  int slot = atomicAdd(coupled_contact_count[0], 1);\n"
+    "  if (slot < int(params[22])) {\n"
+    "    coupled_contact_indices[slot] = i;\n"
+    "    coupled_contact_push[slot * 3 + 0] = correction.x;\n"
+    "    coupled_contact_push[slot * 3 + 1] = correction.y;\n"
+    "    coupled_contact_push[slot * 3 + 2] = correction.z;\n"
+    "  }\n"
+    "}\n";
+
+std::array<HaShaderResource, 8> COUPLED_SDF_CONTACT_RESOURCES = {{
+    {0, HaShaderQualifier::ReadWrite, "float", "position_io[]"},
+    {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
+    {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
+    {3, HaShaderQualifier::Read, "float", "props[]"},
+    {4, HaShaderQualifier::Read, "float", "params[]"},
+    {5, HaShaderQualifier::ReadWrite, "int", "coupled_contact_count[]"},
+    {6, HaShaderQualifier::Write, "int", "coupled_contact_indices[]"},
+    {7, HaShaderQualifier::Write, "float", "coupled_contact_push[]"},
+}};
+
 /** No-slip friction against the collider, after the fluid velocity layer. */
 const char *KERNEL_SDF_FRICTION =
     "void main()\n"
@@ -1870,6 +1920,102 @@ void HaXpbdFluid::clear_sdf()
   sdf_active_ = false;
   sdf_data_.free();
   sdf_params_.free();
+}
+
+bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
+                                   const float radius,
+                                   const float friction,
+                                   const float max_correction)
+{
+  if (!ready_) {
+    last_error_ = "not bound";
+    return false;
+  }
+  if (!grid.is_valid()) {
+    this->clear_coupled_sdf();
+    return false;
+  }
+  HaContextGuard guard;
+  if (!guard.is_valid()) {
+    last_error_ = "no GPU context";
+    return false;
+  }
+  if (!coupled_sdf_data_.ensure(grid.data.size()) || !coupled_sdf_params_.ensure(12)) {
+    last_error_ = "coupled sdf allocation failed";
+    this->clear_coupled_sdf();
+    return false;
+  }
+  coupled_sdf_data_.upload(grid.data.as_span());
+  const std::array<float, 12> params{grid.origin.x,
+                                     grid.origin.y,
+                                     grid.origin.z,
+                                     grid.spacing,
+                                     float(grid.dims.x),
+                                     float(grid.dims.y),
+                                     float(grid.dims.z),
+                                     radius,
+                                     friction,
+                                     max_correction,
+                                     1.0f,
+                                     0.0f};
+  coupled_sdf_params_.upload(params);
+
+  const int capacity = std::max(64, particle_count_ * 4);
+  if (!coupled_contact_count_.ensure(1) || !coupled_contact_indices_.ensure(capacity) ||
+      !coupled_contact_push_.ensure(int64_t(capacity) * 3))
+  {
+    last_error_ = "coupled contact allocation failed";
+    this->clear_coupled_sdf();
+    return false;
+  }
+  coupled_contact_capacity_ = capacity;
+  coupled_contact_count_.clear_to_zero();
+  std::array<float, FLUID_PARAM_COUNT_TOTAL> fluid_params{};
+  params_.download(fluid_params);
+  fluid_params[FLUID_PARAM_COUPLED_CONTACT_CAPACITY] = float(capacity);
+  params_.upload(fluid_params);
+
+  coupled_sdf_active_ = true;
+  return true;
+}
+
+void HaXpbdFluid::clear_coupled_sdf()
+{
+  coupled_sdf_active_ = false;
+  coupled_sdf_data_.free();
+  coupled_sdf_params_.free();
+  coupled_contact_count_.free();
+  coupled_contact_indices_.free();
+  coupled_contact_push_.free();
+  coupled_contact_capacity_ = 0;
+}
+
+bool HaXpbdFluid::download_coupled_contacts(MutableSpan<int> r_indices,
+                                            MutableSpan<float3> r_push,
+                                            int &r_count) const
+{
+  r_count = 0;
+  if (!coupled_sdf_active_ || coupled_contact_count_.size() < 1) {
+    return true;
+  }
+  int count = 0;
+  if (!coupled_contact_count_.read_one(count)) {
+    return false;
+  }
+  count = std::min(count, coupled_contact_capacity_);
+  count = int(std::min<int64_t>(count, r_indices.size()));
+  count = int(std::min<int64_t>(count, r_push.size()));
+  if (count <= 0) {
+    return true;
+  }
+  coupled_contact_indices_.download(r_indices.take_front(count));
+  Array<float> push(int64_t(count) * 3);
+  coupled_contact_push_.download(push.as_mutable_span().take_front(int64_t(count) * 3));
+  for (const int i : IndexRange(count)) {
+    r_push[i] = float3(push[i * 3 + 0], push[i * 3 + 1], push[i * 3 + 2]);
+  }
+  r_count = count;
+  return true;
 }
 
 HaXpbdFluid::~HaXpbdFluid()
@@ -2640,6 +2786,27 @@ bool HaXpbdFluid::iterate()
                                             props_.buf(),
                                             params_.buf()};
     dispatch_pass(sdf_contact, buffer_span(buffers), count);
+    stats_.passes++;
+  }
+  if (coupled_sdf_active_) {
+    gpu::Shader *coupled_contact = ha_shader_get_source(
+        "xpbd|coupled_sdf_contact",
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_COUPLED_SDF_CONTACT,
+        as_span(COUPLED_SDF_CONTACT_RESOURCES),
+        LOCAL_GROUP_SIZE);
+    if (coupled_contact == nullptr) {
+      last_error_ = "shader creation failed";
+      return false;
+    }
+    std::array<gpu::StorageBuf *, 8> buffers{grid_.positions.buf(),
+                                             coupled_sdf_data_.buf(),
+                                             coupled_sdf_params_.buf(),
+                                             props_.buf(),
+                                             params_.buf(),
+                                             coupled_contact_count_.buf(),
+                                             coupled_contact_indices_.buf(),
+                                             coupled_contact_push_.buf()};
+    dispatch_pass(coupled_contact, buffer_span(buffers), count);
     stats_.passes++;
   }
   if (contact_count_ > 0) {

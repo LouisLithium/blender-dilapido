@@ -145,42 +145,56 @@ void build_one_sided_field(const Span<float3> positions,
                            const float band_width,
                            const MutableSpan<float> r_data)
 {
-  threading::parallel_for(IndexRange(dims.z), 1, [&](const IndexRange z_range) {
-    for (const int z : z_range) {
-      for (const int y : IndexRange(dims.y)) {
-        for (const int x : IndexRange(dims.x)) {
+  /* Splat each triangle into the voxels of its own bounding box (plus the band) instead of testing
+   * every triangle for every voxel. The whole grid is initialized to `+band` (outside); the voxels
+   * that are actually near a triangle get the signed distance of the closest one. The contact only
+   * uses the band, so the far voxels do not need a better value. */
+  r_data.fill(band_width);
+  const int64_t voxel_count = int64_t(dims.x) * dims.y * dims.z;
+  Vector<float> best_dist_sq(voxel_count, 1e30f);
+  const float band_sq = band_width * band_width;
+
+  for (const int3 &tri : corner_tris) {
+    const float3 &v0 = positions[tri.x];
+    const float3 &v1 = positions[tri.y];
+    const float3 &v2 = positions[tri.z];
+    const float3 normal = math::normalize(math::cross(v1 - v0, v2 - v0));
+    if (!(std::isfinite(normal.x) && std::isfinite(normal.y) && std::isfinite(normal.z))) {
+      continue;
+    }
+    const float3 tri_min = math::min(math::min(v0, v1), v2) - float3(band_width);
+    const float3 tri_max = math::max(math::max(v0, v1), v2) + float3(band_width);
+    const int3 lo(std::max(0, int(std::floor((tri_min.x - origin.x) / spacing - 0.5f))),
+                  std::max(0, int(std::floor((tri_min.y - origin.y) / spacing - 0.5f))),
+                  std::max(0, int(std::floor((tri_min.z - origin.z) / spacing - 0.5f))));
+    const int3 hi(std::min(dims.x - 1, int(std::ceil((tri_max.x - origin.x) / spacing - 0.5f))),
+                  std::min(dims.y - 1, int(std::ceil((tri_max.y - origin.y) / spacing - 0.5f))),
+                  std::min(dims.z - 1, int(std::ceil((tri_max.z - origin.z) / spacing - 0.5f))));
+    const float a[3] = {v0.x, v0.y, v0.z};
+    const float b[3] = {v1.x, v1.y, v1.z};
+    const float c[3] = {v2.x, v2.y, v2.z};
+    for (int z = lo.z; z <= hi.z; z++) {
+      for (int y = lo.y; y <= hi.y; y++) {
+        for (int x = lo.x; x <= hi.x; x++) {
           const float3 center = origin + (float3(x, y, z) + 0.5f) * spacing;
-          float best_dist_sq = 1e30f;
-          float best_signed = 0.0f;
-          for (const int3 &tri : corner_tris) {
-            const float3 &v0 = positions[tri.x];
-            const float3 &v1 = positions[tri.y];
-            const float3 &v2 = positions[tri.z];
-            const float3 normal = math::normalize(math::cross(v1 - v0, v2 - v0));
-            if (!(std::isfinite(normal.x) && std::isfinite(normal.y) &&
-                  std::isfinite(normal.z)))
-            {
-              continue;
-            }
-            const float point[3] = {center.x, center.y, center.z};
-            const float a[3] = {v0.x, v0.y, v0.z};
-            const float b[3] = {v1.x, v1.y, v1.z};
-            const float c[3] = {v2.x, v2.y, v2.z};
-            float closest[3];
-            closest_on_tri_to_point_v3(closest, point, a, b, c);
-            const float3 closest_v(closest[0], closest[1], closest[2]);
-            const float dist_sq = math::length_squared(center - closest_v);
-            if (dist_sq < best_dist_sq) {
-              best_dist_sq = dist_sq;
-              best_signed = math::dot(center - closest_v, normal);
-            }
+          const float point[3] = {center.x, center.y, center.z};
+          float closest[3];
+          closest_on_tri_to_point_v3(closest, point, a, b, c);
+          const float3 closest_v(closest[0], closest[1], closest[2]);
+          const float dist_sq = math::length_squared(center - closest_v);
+          if (dist_sq > band_sq) {
+            continue;
           }
-          r_data[int64_t(z) * dims.y * dims.x + int64_t(y) * dims.x + x] =
-              std::clamp(best_signed, -band_width, band_width);
+          const int64_t index = (int64_t(z) * dims.y + int64_t(y)) * dims.x + x;
+          if (dist_sq < best_dist_sq[index]) {
+            best_dist_sq[index] = dist_sq;
+            r_data[index] = std::clamp(
+                math::dot(center - closest_v, normal), -band_width, band_width);
+          }
         }
       }
     }
-  });
+  }
 }
 
 bool ha_sdf_build(const Span<float3> positions,
