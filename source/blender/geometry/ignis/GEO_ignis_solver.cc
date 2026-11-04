@@ -1325,6 +1325,87 @@ void filter_flame(State &state, const Settings &settings)
   }
 }
 
+/**
+ * Removes the voxels of the adaptive domain whose selected field is below `Domain Threshold`.
+ *
+ * Every field of a failing voxel is deactivated, so the next frame's smoke tree, pressure domain,
+ * velocity band and rendering domain all shrink. `abs()` is used so that a negative temperature
+ * (cold smoke) is pruned by magnitude as well.
+ */
+void apply_domain_mask(State &state, const Settings &settings, Stats &r_stats)
+{
+  r_stats.domain_removed = 0;
+  if (!settings.use_domain_mask) {
+    return;
+  }
+  if (!state.density || !state.temperature || !state.fuel || !state.velocity) {
+    return;
+  }
+
+  const openvdb::FloatGrid *field = nullptr;
+  switch (settings.domain_field) {
+    case DomainField::Density:
+      field = state.density.get();
+      break;
+    case DomainField::Temperature:
+      field = state.temperature.get();
+      break;
+    case DomainField::Fuel:
+      field = state.fuel.get();
+      break;
+    case DomainField::Flame:
+      field = state.flame.get();
+      break;
+  }
+  if (field == nullptr) {
+    /* An old state may not have the selected grid. Density always exists, so use it instead of
+     * silently doing nothing. */
+    field = state.density.get();
+  }
+
+  /* The adaptive domain is the active set of `density`; the other fields may be sparse or missing
+   * on some of its voxels (e.g. `flame` is empty before the fuel burns), so sample the selected
+   * field on every density voxel instead of iterating the selected field itself. A missing value is
+   * the grid background (0), which is what the threshold should see. */
+  const openvdb::FloatGrid::ConstAccessor values = field->getConstAccessor();
+  const float threshold = std::max(0.0f, settings.domain_threshold);
+  Vector<Coord> removed;
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+    if (std::abs(values.getValue(iter.getCoord())) < threshold) {
+      removed.append(iter.getCoord());
+    }
+  }
+  if (removed.is_empty()) {
+    return;
+  }
+
+  auto &density = state.density->tree();
+  auto &temperature = state.temperature->tree();
+  auto &fuel = state.fuel->tree();
+  auto *flame = state.flame ? &state.flame->tree() : nullptr;
+  auto *pressure = state.pressure ? &state.pressure->tree() : nullptr;
+  auto &velocity = state.velocity->tree();
+  for (const Coord &coord : removed) {
+    density.setValueOff(coord, 0.0f);
+    temperature.setValueOff(coord, 0.0f);
+    fuel.setValueOff(coord, 0.0f);
+    if (flame != nullptr) {
+      flame->setValueOff(coord, 0.0f);
+    }
+    if (pressure != nullptr) {
+      pressure->setValueOff(coord, 0.0f);
+    }
+    velocity.setValueOff(coord, openvdb::Vec3f(0.0f));
+  }
+  r_stats.domain_removed = int(removed.size());
+  if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
+    printf("IGNIS_DEBUG domain mask: field=%d threshold=%.4g removed=%d\n",
+           int(settings.domain_field),
+           double(settings.domain_threshold),
+           r_stats.domain_removed);
+  }
+}
+
 void clip_to_bounds(State &state, const Settings &settings)
 {
   if (!settings.use_bounds) {
@@ -1399,6 +1480,8 @@ Volume *solve_frame(const Volume *previous,
       r_stats.solid_voxels = int(solids.count());
       carve_solids(state, solids);
     }
+    /* Do not mask the seeding / paused frame: it only shows the sources, and a field like `flame`
+     * is still empty there. The next simulated frame applies the mask. */
     state.density->tree().prune(1e-5f);
     r_stats.active_voxels = int(state.density->activeVoxelCount());
     Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
@@ -1504,6 +1587,7 @@ Volume *solve_frame(const Volume *previous,
   }
 
   filter_flame(state, settings);
+  apply_domain_mask(state, settings, r_stats);
   state.density->tree().prune(1e-5f);
   state.temperature->tree().prune(1e-5f);
   state.fuel->tree().prune(1e-5f);

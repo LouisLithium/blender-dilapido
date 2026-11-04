@@ -76,6 +76,10 @@ const FlatBundleTypePtr &IgnisSettingsBundle::get_bundle_type()
     b.add<decl::Bool>("use_bounds"_ustr);
     b.add<decl::Vector>("bounds_min"_ustr);
     b.add<decl::Vector>("bounds_max"_ustr);
+    b.add<decl::Bool>("use_domain_mask"_ustr);
+    b.add<decl::Int>("domain_field"_ustr).min(0).description(
+        "0 = Density, 1 = Temperature, 2 = Fuel, 3 = Flame");
+    b.add<decl::Float>("domain_threshold"_ustr).min(0.0f);
     b.add<decl::Vector>("gravity"_ustr);
     b.add<decl::Float>("buoyancy"_ustr);
     b.add<decl::Float>("ambient_temperature"_ustr);
@@ -214,6 +218,11 @@ geometry::ignis::Settings read_settings(const Bundle &world)
   settings.use_bounds = read_bool(s, "use_bounds", settings.use_bounds);
   settings.bounds_min = read_vector(s, "bounds_min", settings.bounds_min);
   settings.bounds_max = read_vector(s, "bounds_max", settings.bounds_max);
+  settings.use_domain_mask = read_bool(s, "use_domain_mask", settings.use_domain_mask);
+  settings.domain_field = geometry::ignis::DomainField(
+      std::clamp(read_int(s, "domain_field", int(settings.domain_field)), 0, 3));
+  settings.domain_threshold = std::max(read_float(s, "domain_threshold", settings.domain_threshold),
+                                       0.0f);
   settings.gravity = read_vector(s, "gravity", settings.gravity);
   settings.buoyancy = read_float(s, "buoyancy", settings.buoyancy);
   settings.ambient_temperature = read_float(s, "ambient_temperature", settings.ambient_temperature);
@@ -308,6 +317,7 @@ BundlePtr stats_to_bundle(const Stats &stats)
   bundle.add(*BundleKey::from_str("divergence_before"), float(stats.divergence_before));
   bundle.add(*BundleKey::from_str("divergence_after"), float(stats.divergence_after));
   bundle.add(*BundleKey::from_str("solid_voxels"), stats.solid_voxels);
+  bundle.add(*BundleKey::from_str("domain_removed"), stats.domain_removed);
   bundle.add(*BundleKey::from_str("cfl_limited"), stats.cfl_limited);
   bundle.add(*BundleKey::from_str("resized"), stats.resized);
   bundle.add(*BundleKey::from_str("milliseconds"), float(stats.milliseconds));

@@ -64,12 +64,25 @@ enum class AdvectionLimiter : int {
   Revert = 2,
 };
 
+/** Scalar field that decides whether a voxel still belongs to the adaptive domain. */
+enum class DomainField : int {
+  Density = 0,
+  Temperature = 1,
+  Fuel = 2,
+  Flame = 3,
+};
+
 struct Settings {
   /* Domain. */
   float voxel_size = 0.05f;
   bool use_bounds = false;
   float3 bounds_min = float3(0.0f);
   float3 bounds_max = float3(1.0f);
+  /* Adaptive domain mask: remove the voxels whose selected field is below the threshold. The
+   * default is off for hand-built worlds; the `Ignis Dynamics` asset enables it by default. */
+  bool use_domain_mask = false;
+  DomainField domain_field = DomainField::Density;
+  float domain_threshold = 1e-3f;
 
 
   /* Stepping. */
@@ -118,6 +131,8 @@ struct Stats {
   float divergence_after = 0.0f;
   /** Voxels of the frame that ended up inside a collider and were removed. */
   int solid_voxels = 0;
+  /** Voxels removed by the adaptive domain mask (all fields of the voxel are deleted). */
+  int domain_removed = 0;
   /** Emitters that contributed to the frame (every volume of the source geometry). */
   int sources = 0;
   bool cfl_limited = false;
