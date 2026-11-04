@@ -475,6 +475,9 @@ struct SdfCacheEntry {
   uint64_t hash = 0;
   float voxel_size = 0.0f;
   float band_width = 0.0f;
+  /** World space box the field was built for; the fluid may move inside it without a rebake. */
+  float3 region_min = float3(0.0f);
+  float3 region_max = float3(0.0f);
   std::shared_ptr<geometry::ha::HaSdfGrid> grid;
 };
 static std::mutex sdf_cache_mutex;
@@ -5612,19 +5615,21 @@ class XpbdSolverStep {
       }
     }
 
-    /* `chunks_data_` is reinitialized every frame, so the cache has to live outside the per-chunk
-     * state. A single entry is enough for the common case of one static collider; a second
-     * collider simply replaces it. */
-    {
-      std::lock_guard<std::mutex> lock(sdf_cache_mutex);
-      if (sdf_cache.grid && sdf_cache.hash == hash && sdf_cache.voxel_size == voxel_size &&
-          sdf_cache.band_width == band_width && sdf_cache.grid->is_valid())
-      {
-        fluid.sdf = sdf_cache.grid;
-        fluid.sdf_hash = hash;
-        fluid.sdf_ready = true;
-        return;
-      }
+    /* Build the field only where the fluid can touch the collider: a 20 m ground plane otherwise
+     * costs 4.4 M voxels and ~0.5 s (GUI) / 2.6 s (headless -t 1) to bake. The region is the
+     * intersection of the fluid bounding box (plus a margin for its movement) and the collider
+     * bounding box (plus the band). For a floor this is a thin slab around z = 0, not the whole
+     * 20 m plane. The cache entry keeps the region, so the fluid can move inside it without a
+     * rebake. */
+    const Span<float3> fluid_positions = geo_data.position_attr.span;
+    if (fluid_positions.is_empty()) {
+      return;
+    }
+    float3 fluid_min = fluid_positions[0];
+    float3 fluid_max = fluid_positions[0];
+    for (const float3 &position : fluid_positions) {
+      fluid_min = math::min(fluid_min, position);
+      fluid_max = math::max(fluid_max, position);
     }
 
     const Span<float3> local_positions = mesh.vert_positions();
@@ -5634,12 +5639,65 @@ class XpbdSolverStep {
         world_positions[i] = math::transform_point(collider.end_transform, local_positions[i]);
       }
     });
+    float3 collider_min = world_positions[0];
+    float3 collider_max = world_positions[0];
+    for (const float3 &position : world_positions) {
+      collider_min = math::min(collider_min, position);
+      collider_max = math::max(collider_max, position);
+    }
+
+    /* A small margin in X/Y (the fluid barely moves sideways) and a generous one in Z (a falling
+     * fluid may still be a couple of metres above the floor). The Z extent of the field itself is
+     * clipped to the collider, so the large Z margin costs nothing. */
+    const float margin_xy = std::max(0.5f, 8.0f * band_width);
+    const float margin_z = std::max(2.0f, 8.0f * band_width);
+    const float3 fluid_pad_min(fluid_min.x - margin_xy, fluid_min.y - margin_xy,
+                               fluid_min.z - margin_z);
+    const float3 fluid_pad_max(fluid_max.x + margin_xy, fluid_max.y + margin_xy,
+                               fluid_max.z + margin_z);
+    const float3 region_min = math::max(fluid_pad_min, collider_min - float3(band_width));
+    const float3 region_max = math::min(fluid_pad_max, collider_max + float3(band_width));
+    if (region_min.x > region_max.x || region_min.y > region_max.y ||
+        region_min.z > region_max.z)
+    {
+      /* The fluid is nowhere near this collider; no contacts and no field needed. */
+      fluid.sdf_hash = 0;
+      return;
+    }
+
+    /* `chunks_data_` is reinitialized every frame, so the cache has to live outside the per-chunk
+     * state. A single entry is enough for the common case of one static collider; a second
+     * collider simply replaces it. */
+    {
+      std::lock_guard<std::mutex> lock(sdf_cache_mutex);
+      const bool region_same = std::abs(region_min.x - sdf_cache.region_min.x) < 1e-4f &&
+                               std::abs(region_min.y - sdf_cache.region_min.y) < 1e-4f &&
+                               std::abs(region_min.z - sdf_cache.region_min.z) < 1e-4f &&
+                               std::abs(region_max.x - sdf_cache.region_max.x) < 1e-4f &&
+                               std::abs(region_max.y - sdf_cache.region_max.y) < 1e-4f &&
+                               std::abs(region_max.z - sdf_cache.region_max.z) < 1e-4f;
+      const bool fluid_inside = fluid_min.x >= sdf_cache.region_min.x &&
+                                fluid_max.x <= sdf_cache.region_max.x &&
+                                fluid_min.y >= sdf_cache.region_min.y &&
+                                fluid_max.y <= sdf_cache.region_max.y;
+      if (sdf_cache.grid && sdf_cache.hash == hash && sdf_cache.voxel_size == voxel_size &&
+          sdf_cache.band_width == band_width && sdf_cache.grid->is_valid() &&
+          (region_same || fluid_inside))
+      {
+        fluid.sdf = sdf_cache.grid;
+        fluid.sdf_hash = hash;
+        fluid.sdf_ready = true;
+        return;
+      }
+    }
     auto grid = std::make_shared<geometry::ha::HaSdfGrid>();
     if (!geometry::ha::ha_sdf_build(world_positions,
                                     mesh.corner_verts(),
                                     mesh.corner_tris(),
                                     voxel_size,
                                     band_width,
+                                    region_min,
+                                    region_max,
                                     *grid))
     {
       fluid.sdf_hash = 0;
@@ -5650,6 +5708,8 @@ class XpbdSolverStep {
       sdf_cache.hash = hash;
       sdf_cache.voxel_size = voxel_size;
       sdf_cache.band_width = band_width;
+      sdf_cache.region_min = region_min;
+      sdf_cache.region_max = region_max;
       sdf_cache.grid = grid;
     }
     fluid.sdf = grid;

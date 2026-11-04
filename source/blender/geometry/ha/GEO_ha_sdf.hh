@@ -66,6 +66,9 @@ struct HaSdfGrid {
  * \param band_width: Half width of the narrow band in world units. It has to be at least as large as
  *   the movement of one particle during one substep (plus the particle radius), otherwise a fast
  *   particle can cross the whole band of a thin collider and never see a contact.
+ * \param region_min/region_max: World space box the field is built for. Only the triangles that
+ *   intersect the box are clipped and rasterized, and the dense lattice covers the box. A large
+ *   collider (a 20 m ground plane) therefore costs only the part the fluid can reach.
  * \param r_grid: Filled on success. Callers usually cache it and only rebuild when the geometry
  *   changes (see the geometry hash in the solver).
  */
@@ -74,6 +77,8 @@ bool ha_sdf_build(Span<float3> positions,
                   Span<int3> corner_tris,
                   float voxel_size,
                   float band_width,
+                  const float3 &region_min,
+                  const float3 &region_max,
                   HaSdfGrid &r_grid);
 
 /** Interpolates the field on the host, used by the debug output and the tests. */

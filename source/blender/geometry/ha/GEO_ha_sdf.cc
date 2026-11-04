@@ -11,6 +11,7 @@
 #  include "GEO_ha_sdf.hh"
 
 #  include "BLI_math_base.hh"
+#  include "BLI_math_vector.hh"
 #  include "BLI_task.hh"
 
 #  include "BKE_volume_grid.hh"
@@ -75,39 +76,106 @@ float ha_sdf_sample(const HaSdfGrid &grid, const float3 &position)
   return math::interpolate(c0, c1, fraction.z);
 }
 
+/**
+ * Clips one triangle against the six planes of \a region and appends the visible polygon as a
+ * triangle fan. The clipped mesh only has to cover the part of the collider the fluid can reach;
+ * a 20 m ground plane then costs a few centimetres of field instead of the whole plane.
+ */
+void clip_triangle_to_region(const float3 &v0,
+                             const float3 &v1,
+                             const float3 &v2,
+                             const float3 &region_min,
+                             const float3 &region_max,
+                             Vector<float3> &r_positions,
+                             Vector<int> &r_corner_verts,
+                             Vector<int3> &r_corner_tris)
+{
+  Vector<float3> poly{v0, v1, v2};
+  auto clip = [&](const float3 &normal, const float plane_distance) {
+    Vector<float3> out;
+    out.reserve(poly.size() + 1);
+    for (const int i : poly.index_range()) {
+      const float3 &a = poly[i];
+      const float3 &b = poly[(i + 1) % poly.size()];
+      const float da = math::dot(normal, a) - plane_distance;
+      const float db = math::dot(normal, b) - plane_distance;
+      if (da >= 0.0f) {
+        out.append(a);
+      }
+      if ((da > 0.0f && db < 0.0f) || (da < 0.0f && db > 0.0f)) {
+        const float t = da / (da - db);
+        out.append(a + (b - a) * t);
+      }
+    }
+    poly = std::move(out);
+  };
+  clip(float3(1.0f, 0.0f, 0.0f), region_min.x);
+  clip(float3(-1.0f, 0.0f, 0.0f), -region_max.x);
+  clip(float3(0.0f, 1.0f, 0.0f), region_min.y);
+  clip(float3(0.0f, -1.0f, 0.0f), -region_max.y);
+  clip(float3(0.0f, 0.0f, 1.0f), region_min.z);
+  clip(float3(0.0f, 0.0f, -1.0f), -region_max.z);
+  if (poly.size() < 3) {
+    return;
+  }
+  const int base = int(r_positions.size());
+  for (const int i : poly.index_range()) {
+    r_positions.append(poly[i]);
+    r_corner_verts.append(base + i);
+  }
+  for (int i = 1; i + 1 < poly.size(); i++) {
+    r_corner_tris.append(int3(base, base + i, base + i + 1));
+  }
+}
+
 bool ha_sdf_build(const Span<float3> positions,
                   const Span<int> corner_verts,
                   const Span<int3> corner_tris,
                   float voxel_size,
                   const float band_width,
+                  const float3 &region_min,
+                  const float3 &region_max,
                   HaSdfGrid &r_grid)
 {
   if (positions.is_empty() || corner_tris.is_empty() || voxel_size <= 0.0f || band_width <= 0.0f) {
     return false;
   }
+  const float3 rmin = math::min(region_min, region_max);
+  const float3 rmax = math::max(region_min, region_max);
+  const float3 extent = math::max(rmax - rmin, float3(1e-6f));
 
-  float3 bbox_min = positions[0];
-  float3 bbox_max = positions[0];
-  for (const float3 &position : positions) {
-    bbox_min = float3(std::min(bbox_min.x, position.x),
-                      std::min(bbox_min.y, position.y),
-                      std::min(bbox_min.z, position.z));
-    bbox_max = float3(std::max(bbox_max.x, position.x),
-                      std::max(bbox_max.y, position.y),
-                      std::max(bbox_max.z, position.z));
+  Vector<float3> clipped_positions;
+  Vector<int> clipped_corner_verts;
+  Vector<int3> clipped_corner_tris;
+  for (const int3 &tri : corner_tris) {
+    clip_triangle_to_region(positions[corner_verts[tri.x]],
+                            positions[corner_verts[tri.y]],
+                            positions[corner_verts[tri.z]],
+                            rmin,
+                            rmax,
+                            clipped_positions,
+                            clipped_corner_verts,
+                            clipped_corner_tris);
   }
-  const float3 extent = bbox_max - bbox_min;
+  if (clipped_corner_tris.is_empty()) {
+    r_grid.clear();
+    return false;
+  }
+
   voxel_size = clamp_voxel_size(extent, band_width, voxel_size);
   const int band_voxels = std::max(3, int(std::ceil(band_width / voxel_size)));
 
-  bke::VolumeGrid<float> volume_grid = geometry::mesh_to_sdf_grid(
-      positions, corner_verts, corner_tris, voxel_size, float(band_voxels));
+  bke::VolumeGrid<float> volume_grid = geometry::mesh_to_sdf_grid(clipped_positions.as_span(),
+                                                                  clipped_corner_verts.as_span(),
+                                                                  clipped_corner_tris.as_span(),
+                                                                  voxel_size,
+                                                                  float(band_voxels));
   bke::VolumeTreeAccessToken token;
   const openvdb::FloatGrid &level_set = volume_grid.grid(token);
   openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> sampler(level_set);
 
   r_grid.spacing = voxel_size;
-  r_grid.origin = bbox_min - float3(band_voxels * voxel_size);
+  r_grid.origin = rmin - float3(band_voxels * voxel_size);
   r_grid.dims = int3(std::max(1, int(std::ceil(extent.x / voxel_size)) + 2 * band_voxels + 1),
                      std::max(1, int(std::ceil(extent.y / voxel_size)) + 2 * band_voxels + 1),
                      std::max(1, int(std::ceil(extent.z / voxel_size)) + 2 * band_voxels + 1));
