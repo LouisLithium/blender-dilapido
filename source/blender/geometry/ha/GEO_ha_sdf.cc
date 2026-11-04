@@ -205,6 +205,7 @@ bool ha_sdf_build(const Span<float3> positions,
                   const float3 &region_min,
                   const float3 &region_max,
                   const float3 &reference_point,
+                  const bool one_sided,
                   HaSdfGrid &r_grid)
 {
   if (positions.is_empty() || corner_tris.is_empty() || voxel_size <= 0.0f || band_width <= 0.0f) {
@@ -235,15 +236,6 @@ bool ha_sdf_build(const Span<float3> positions,
   voxel_size = clamp_voxel_size(extent, band_width, voxel_size);
   const int band_voxels = std::max(3, int(std::ceil(band_width / voxel_size)));
 
-  bke::VolumeGrid<float> volume_grid = geometry::mesh_to_sdf_grid(clipped_positions.as_span(),
-                                                                  clipped_corner_verts.as_span(),
-                                                                  clipped_corner_tris.as_span(),
-                                                                  voxel_size,
-                                                                  float(band_voxels));
-  bke::VolumeTreeAccessToken token;
-  const openvdb::FloatGrid &level_set = volume_grid.grid(token);
-  openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> sampler(level_set);
-
   r_grid.spacing = voxel_size;
   r_grid.origin = rmin - float3(band_voxels * voxel_size);
   r_grid.dims = int3(std::max(1, int(std::ceil(extent.x / voxel_size)) + 2 * band_voxels + 1),
@@ -258,6 +250,30 @@ bool ha_sdf_build(const Span<float3> positions,
   const int3 dims = r_grid.dims;
   const float3 origin = r_grid.origin;
   const float spacing = r_grid.spacing;
+
+  if (one_sided) {
+    /* A sheet has fluid on both sides, so there is no meaningful "outside": keep the sign of the
+     * triangle normals and never flip it. The contact kernel pushes every particle away from the
+     * surface on the side it is already on. This is also much cheaper than a level set (no OpenVDB
+     * bake), which matters because the field is rebuilt from the moving cloth every frame. */
+    build_one_sided_field(clipped_positions.as_span(),
+                          clipped_corner_tris.as_span(),
+                          origin,
+                          spacing,
+                          dims,
+                          band_width,
+                          r_grid.data.as_mutable_span());
+    return true;
+  }
+
+  bke::VolumeGrid<float> volume_grid = geometry::mesh_to_sdf_grid(clipped_positions.as_span(),
+                                                                  clipped_corner_verts.as_span(),
+                                                                  clipped_corner_tris.as_span(),
+                                                                  voxel_size,
+                                                                  float(band_voxels));
+  bke::VolumeTreeAccessToken token;
+  const openvdb::FloatGrid &level_set = volume_grid.grid(token);
+  openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> sampler(level_set);
   /* Outside of the narrow band the level set is a constant (+band), which is exactly what the
    * sampler returns, so the whole dense box is well defined. */
   threading::parallel_for(IndexRange(dims.z), 1, [&](const IndexRange z_range) {

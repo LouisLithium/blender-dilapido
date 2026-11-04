@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -1796,19 +1797,54 @@ const char *KERNEL_COUPLED_SDF_CONTACT =
     "  if (props[i * HA_PROP + 1] <= 0.0) { return; }\n"
     "  int base = i * 3;\n"
     "  vec3 p = vec3(position_io[base + 0], position_io[base + 1], position_io[base + 2]);\n"
+    "  // Outside the field the sampler clamps to the border, which would report a fake contact\n"
+    "  // (and a border gradient). Only particles inside the field can touch the coupled solid.\n"
+    "  vec3 origin = vec3(sdf_params[0], sdf_params[1], sdf_params[2]);\n"
+    "  float spacing = sdf_params[3];\n"
+    "  ivec3 dims = ivec3(int(sdf_params[4]), int(sdf_params[5]), int(sdf_params[6]));\n"
+    "  vec3 local = (p - origin) / spacing - vec3(0.5);\n"
+    "  if (local.x < 0.0 || local.y < 0.0 || local.z < 0.0 ||\n"
+    "      local.x > float(dims.x - 1) || local.y > float(dims.y - 1) ||\n"
+    "      local.z > float(dims.z - 1)) { return; }\n"
     "  float distance_to_surface = 0.0;\n"
     "  vec3 normal = vec3(0.0, 0.0, 1.0);\n"
     "  ha_sdf_value_normal(p, distance_to_surface, normal);\n"
     "  float contact_radius = sdf_params[7];\n"
-    "  if (distance_to_surface >= contact_radius) { return; }\n"
-    "  float push = contact_radius - distance_to_surface;\n"
+    "  float band = sdf_params[11];\n"
+    "  float distance_abs = abs(distance_to_surface);\n"
+    "  // Outside the band the one-sided field is a constant (+band), so there is nothing to do.\n"
+    "  if (distance_abs >= band) { return; }\n"
+    "  // A sheet has fluid on both sides. The particle belongs on the side it was on at the start of\n"
+    "  // the substep, so a fast particle cannot cross the sheet in one step. Without the previous\n"
+    "  // sample a particle that slipped below the cloth would be pushed further down (through it),\n"
+    "  // and one that was pushed above it would keep being pushed up until it left the band.\n"
+    "  float side = distance_to_surface >= 0.0 ? 1.0 : -1.0;\n"
+    "  vec3 p_prev = vec3(prev_positions[base + 0], prev_positions[base + 1],\n"
+    "                     prev_positions[base + 2]);\n"
+    "  float distance_prev = 0.0;\n"
+    "  vec3 normal_prev = vec3(0.0, 0.0, 1.0);\n"
+    "  ha_sdf_value_normal(p_prev, distance_prev, normal_prev);\n"
+    "  if (distance_prev * distance_to_surface < 0.0) {\n"
+    "    side = distance_prev >= 0.0 ? 1.0 : -1.0;\n"
+    "  }\n"
+    "  vec3 outward = normal * side;\n"
+    "  float signed_distance = side * distance_to_surface;\n"
+    "  // Penetration always has to be resolved, but a particle that is already outside the surface\n"
+    "  // and moving away must be left alone. Without this the projection kept pushing the water off\n"
+    "  // the cloth every iteration, which fed the velocity layer and blew the fluid up.\n"
+    "  if (signed_distance >= 0.0) {\n"
+    "    if (signed_distance >= contact_radius) { return; }\n"
+    "    if (dot(p - p_prev, outward) > 0.0) { return; }\n"
+    "  }\n"
+    "  float push = contact_radius - signed_distance;\n"
     "  float max_correction = sdf_params[9];\n"
     "  if (max_correction > 0.0) { push = min(push, max_correction); }\n"
-    "  vec3 correction = normal * push;\n"
+    "  vec3 correction = outward * push;\n"
     "  if (!ha_is_finite(correction)) { return; }\n"
     "  position_io[base + 0] += correction.x;\n"
     "  position_io[base + 1] += correction.y;\n"
     "  position_io[base + 2] += correction.z;\n"
+    "  coupled_push_flags[i] = 1;\n"
     "  int slot = atomicAdd(coupled_contact_count[0], 1);\n"
     "  if (slot < int(params[22])) {\n"
     "    coupled_contact_indices[slot] = i;\n"
@@ -1818,7 +1854,7 @@ const char *KERNEL_COUPLED_SDF_CONTACT =
     "  }\n"
     "}\n";
 
-std::array<HaShaderResource, 8> COUPLED_SDF_CONTACT_RESOURCES = {{
+std::array<HaShaderResource, 10> COUPLED_SDF_CONTACT_RESOURCES = {{
     {0, HaShaderQualifier::ReadWrite, "float", "position_io[]"},
     {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
     {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
@@ -1827,6 +1863,46 @@ std::array<HaShaderResource, 8> COUPLED_SDF_CONTACT_RESOURCES = {{
     {5, HaShaderQualifier::ReadWrite, "int", "coupled_contact_count[]"},
     {6, HaShaderQualifier::Write, "int", "coupled_contact_indices[]"},
     {7, HaShaderQualifier::Write, "float", "coupled_contact_push[]"},
+    {8, HaShaderQualifier::Read, "float", "prev_positions[]"},
+    {9, HaShaderQualifier::Write, "int", "coupled_push_flags[]"},
+}};
+
+/**
+ * Velocity layer of the coupled contact. A position projection turns the depenetration into
+ * outward velocity (`v = (p - p_prev) / dt`), and on a sheet that is exactly what launched the
+ * water off the cloth. The particles that the contact moved this substep therefore get their
+ * normal velocity removed: the contact is inelastic and they can only slide along the surface.
+ */
+const char *KERNEL_COUPLED_SDF_VELOCITY =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= int(params[0])) { return; }\n"
+    "  if (sdf_params[10] <= 0.0) { return; }\n"
+    "  if (coupled_push_flags[i] == 0) { return; }\n"
+    "  coupled_push_flags[i] = 0;\n"
+    "  int base = i * 3;\n"
+    "  vec3 p = vec3(position_io[base + 0], position_io[base + 1], position_io[base + 2]);\n"
+    "  float d = 0.0;\n"
+    "  vec3 normal = vec3(0.0, 0.0, 1.0);\n"
+    "  ha_sdf_value_normal(p, d, normal);\n"
+    "  float side = d >= 0.0 ? 1.0 : -1.0;\n"
+    "  vec3 outward = normal * side;\n"
+    "  vec3 v = vec3(velocity_io[base + 0], velocity_io[base + 1], velocity_io[base + 2]);\n"
+    "  v -= outward * dot(v, outward);\n"
+    "  velocity_io[base + 0] = v.x;\n"
+    "  velocity_io[base + 1] = v.y;\n"
+    "  velocity_io[base + 2] = v.z;\n"
+    "}\n";
+
+std::array<HaShaderResource, 7> COUPLED_SDF_VELOCITY_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "position_io[]"},
+    {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
+    {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
+    {3, HaShaderQualifier::ReadWrite, "float", "velocity_io[]"},
+    {4, HaShaderQualifier::ReadWrite, "int", "coupled_push_flags[]"},
+    {5, HaShaderQualifier::Read, "float", "props[]"},
+    {6, HaShaderQualifier::Read, "float", "params[]"},
 }};
 
 /** No-slip friction against the collider, after the fluid velocity layer. */
@@ -1925,7 +2001,8 @@ void HaXpbdFluid::clear_sdf()
 bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
                                    const float radius,
                                    const float friction,
-                                   const float max_correction)
+                                   const float max_correction,
+                                   const float band)
 {
   if (!ready_) {
     last_error_ = "not bound";
@@ -1957,12 +2034,13 @@ bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
                                      friction,
                                      max_correction,
                                      1.0f,
-                                     0.0f};
+                                     band};
   coupled_sdf_params_.upload(params);
 
   const int capacity = std::max(64, particle_count_ * 4);
   if (!coupled_contact_count_.ensure(1) || !coupled_contact_indices_.ensure(capacity) ||
-      !coupled_contact_push_.ensure(int64_t(capacity) * 3))
+      !coupled_contact_push_.ensure(int64_t(capacity) * 3) ||
+      !coupled_push_flags_.ensure(particle_count_))
   {
     last_error_ = "coupled contact allocation failed";
     this->clear_coupled_sdf();
@@ -1970,6 +2048,7 @@ bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
   }
   coupled_contact_capacity_ = capacity;
   coupled_contact_count_.clear_to_zero();
+  coupled_push_flags_.clear_to_zero();
   std::array<float, FLUID_PARAM_COUNT_TOTAL> fluid_params{};
   params_.download(fluid_params);
   fluid_params[FLUID_PARAM_COUPLED_CONTACT_CAPACITY] = float(capacity);
@@ -1987,6 +2066,7 @@ void HaXpbdFluid::clear_coupled_sdf()
   coupled_contact_count_.free();
   coupled_contact_indices_.free();
   coupled_contact_push_.free();
+  coupled_push_flags_.free();
   coupled_contact_capacity_ = 0;
 }
 
@@ -2014,6 +2094,25 @@ bool HaXpbdFluid::download_coupled_contacts(MutableSpan<int> r_indices,
   for (const int i : IndexRange(count)) {
     r_push[i] = float3(push[i * 3 + 0], push[i * 3 + 1], push[i * 3 + 2]);
   }
+  if (getenv("XPBD_GPU_DEBUG") != nullptr) {
+    float max_len = 0.0f;
+    float sum_z = 0.0f;
+    int up = 0;
+    int down = 0;
+    for (const int i : IndexRange(count)) {
+      const float3 &p = r_push[i];
+      max_len = std::max(max_len, std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z));
+      sum_z += p.z;
+      up += p.z > 0.0f ? 1 : 0;
+      down += p.z < 0.0f ? 1 : 0;
+    }
+    printf("XPBD_GPU coupled contacts count=%d max_push=%.4f mean_z=%.4f up=%d down=%d\n",
+           count,
+           double(max_len),
+           double(sum_z / float(std::max(1, count))),
+           up,
+           down);
+  }
   r_count = count;
   return true;
 }
@@ -2025,6 +2124,7 @@ HaXpbdFluid::~HaXpbdFluid()
 
 void HaXpbdFluid::free()
 {
+  this->clear_coupled_sdf();
   grid_.free();
   boundary_grid_.free();
   props_.free();
@@ -2798,14 +2898,16 @@ bool HaXpbdFluid::iterate()
       last_error_ = "shader creation failed";
       return false;
     }
-    std::array<gpu::StorageBuf *, 8> buffers{grid_.positions.buf(),
-                                             coupled_sdf_data_.buf(),
-                                             coupled_sdf_params_.buf(),
-                                             props_.buf(),
-                                             params_.buf(),
-                                             coupled_contact_count_.buf(),
-                                             coupled_contact_indices_.buf(),
-                                             coupled_contact_push_.buf()};
+    std::array<gpu::StorageBuf *, 10> buffers{grid_.positions.buf(),
+                                              coupled_sdf_data_.buf(),
+                                              coupled_sdf_params_.buf(),
+                                              props_.buf(),
+                                              params_.buf(),
+                                              coupled_contact_count_.buf(),
+                                              coupled_contact_indices_.buf(),
+                                              coupled_contact_push_.buf(),
+                                              prev_positions_.buf(),
+                                              coupled_push_flags_.buf()};
     dispatch_pass(coupled_contact, buffer_span(buffers), count);
     stats_.passes++;
   }
@@ -2951,6 +3053,27 @@ bool HaXpbdFluid::finish_substep()
                                             params_.buf(),
                                             props_.buf()};
     dispatch_pass(sdf_friction, buffer_span(buffers), count);
+    stats_.passes++;
+  }
+  if (coupled_sdf_active_) {
+    /* Runs last so nothing adds the outward velocity back. */
+    gpu::Shader *coupled_velocity = ha_shader_get_source(
+        "xpbd|coupled_sdf_velocity",
+        std::string(GLSL_PRELUDE) + GLSL_SDF_HELPERS + KERNEL_COUPLED_SDF_VELOCITY,
+        as_span(COUPLED_SDF_VELOCITY_RESOURCES),
+        LOCAL_GROUP_SIZE);
+    if (coupled_velocity == nullptr) {
+      last_error_ = "shader creation failed";
+      return false;
+    }
+    std::array<gpu::StorageBuf *, 7> buffers{grid_.positions.buf(),
+                                             coupled_sdf_data_.buf(),
+                                             coupled_sdf_params_.buf(),
+                                             velocity_current().buf(),
+                                             coupled_push_flags_.buf(),
+                                             props_.buf(),
+                                             params_.buf()};
+    dispatch_pass(coupled_velocity, buffer_span(buffers), count);
     stats_.passes++;
   }
   stats_.velocity_ms = time_now_ms() - velocity_start;

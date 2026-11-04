@@ -348,7 +348,8 @@ class HaXpbdFluid {
   bool bind_coupled_sdf(const HaSdfGrid &grid,
                         float radius,
                         float friction,
-                        float max_correction);
+                        float max_correction,
+                        float band);
 
   void clear_coupled_sdf();
 
@@ -435,6 +436,12 @@ class HaXpbdFluid {
   HaBufferInt coupled_contact_indices_;
   HaBuffer coupled_contact_push_;
   int coupled_contact_capacity_ = 0;
+  /**
+   * One int per particle, set by the coupled contact when it moved the particle this substep. The
+   * velocity layer uses it to cancel the outward velocity that the position correction would
+   * otherwise turn into a projectile, then clears it for the next substep.
+   */
+  HaBufferInt coupled_push_flags_;
 
   /** Packed per particle properties, see #HA_PROP_STRIDE. */
   HaBuffer props_;

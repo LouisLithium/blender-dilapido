@@ -418,6 +418,8 @@ struct FluidChunkData {
    */
   std::shared_ptr<geometry::ha::HaSdfGrid> coupled_sdf;
   bool coupled_sdf_ready = false;
+  /** Half width of the coupled field's band, needed by the crossing check of the contact. */
+  float coupled_sdf_band = 0.0f;
   /** Hash of the collider and the field resolution that produced #sdf. */
   uint64_t sdf_hash = 0;
   /** Wall clock when the device work of the current frame started, for the debug log. */
@@ -5531,13 +5533,22 @@ class XpbdSolverStep {
     }
 
     const MutableSpan<float3> positions = refs[surface.geometry_i].positions;
+    /* The whole frame's contacts are applied at once (one readback per frame), so a dense contact
+     * patch can sum to far more than one substep's impulse and blow the cloth up. Clamp the total
+     * per vertex to one support radius, which is the order of a single substep's correction. */
+    const float max_reaction = fluid.support_radius;
     for (const int vertex_i : scratch->weight_sums.index_range()) {
       if (scratch->weight_sums[vertex_i] <= 0.0f) {
         continue;
       }
       /* A contact is an independent impulse: a vertex touched by more water is pushed more, so the
        * contributions are summed (the density reaction averages instead, because it is a field). */
-      positions[vertex_i] += scratch->correction_sums[vertex_i];
+      float3 correction = scratch->correction_sums[vertex_i];
+      const float length = math::length(correction);
+      if (max_reaction > 0.0f && length > max_reaction) {
+        correction *= max_reaction / length;
+      }
+      positions[vertex_i] += correction;
     }
   }
 
@@ -5898,6 +5909,7 @@ class XpbdSolverStep {
                                     region_min,
                                     region_max,
                                     (fluid_min + fluid_max) * 0.5f,
+                                    /*one_sided=*/false,
                                     *grid))
     {
       fluid.sdf_hash = 0;
@@ -5976,12 +5988,14 @@ class XpbdSolverStep {
                                     region_min,
                                     region_max,
                                     (fluid_min + fluid_max) * 0.5f,
+                                    /*one_sided=*/true,
                                     *grid))
     {
       return;
     }
     fluid.coupled_sdf = grid;
     fluid.coupled_sdf_ready = grid->is_valid();
+    fluid.coupled_sdf_band = band;
     debug_gpu_log("BLENDER_XPBD_GPU_LOG",
                   std::getenv("XPBD_GPU_DEBUG") != nullptr,
                   "XPBD_GPU coupled sdf baked voxels=%lld spacing=%.4f band=%.4f\n",
@@ -6117,14 +6131,24 @@ class XpbdSolverStep {
       }
       /* Distance field of the coupled solids for the hard contact. The density coupling alone is
        * unilateral and misses fast / under-dense water; this field catches it on the device. */
-      if (fluid.gpu_active) {
+      const char *no_coupled_sdf = std::getenv("BLENDER_NO_COUPLED_SDF");
+      const bool coupled_sdf_enabled = no_coupled_sdf == nullptr || StringRef(no_coupled_sdf) != "1";
+      if (fluid.gpu_active && coupled_sdf_enabled) {
         this->prepare_coupled_sdf(fluid, geo_data);
       }
+      else {
+        fluid.coupled_sdf_ready = false;
+        fluid.coupled_sdf.reset();
+      }
       if (fluid.gpu_active && fluid.coupled_sdf_ready) {
+        /* One particle radius per iteration. A larger correction brings a deep crossing back in a
+         * single iteration, but it also teleports the particle sideways along a tilted sheet,
+         * which is what made the water spray out (measured: 3x the lateral spread). */
         fluid.gpu_fluid.bind_coupled_sdf(*fluid.coupled_sdf,
                                          0.5f * fluid.support_radius,
                                          0.5f,
-                                         fluid.support_radius);
+                                         /*max_correction=*/0.5f * fluid.support_radius,
+                                         fluid.coupled_sdf_band);
       }
       else if (fluid.gpu_active) {
         fluid.gpu_fluid.clear_coupled_sdf();

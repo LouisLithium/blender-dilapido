@@ -72,6 +72,12 @@ struct HaSdfGrid {
  * \param reference_point: A point known to be outside the solid collider (the fluid center). The
  *   level set sign of an open mesh (a single plane) is ambiguous, so the field is flipped when the
  *   distance at this point is negative.
+ * \param one_sided: Builds the field from the triangle normals instead of OpenVDB and keeps that
+ *   sign. A sheet (cloth, soft body surface) has fluid on *both* sides, so a single global sign is
+ *   meaningless and flipping it (as #reference_point does) turns the water into a projectile the
+ *   moment the fluid center crosses the sheet. The contact kernel pushes every particle away from
+ *   the surface on the side it is already on, which only needs the sign to be consistent with the
+ *   triangle winding.
  * \param r_grid: Filled on success. Callers usually cache it and only rebuild when the geometry
  *   changes (see the geometry hash in the solver).
  */
@@ -83,6 +89,7 @@ bool ha_sdf_build(Span<float3> positions,
                   const float3 &region_min,
                   const float3 &region_max,
                   const float3 &reference_point,
+                  bool one_sided,
                   HaSdfGrid &r_grid);
 
 /** Interpolates the field on the host, used by the debug output and the tests. */
