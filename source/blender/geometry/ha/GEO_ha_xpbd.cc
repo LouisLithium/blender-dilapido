@@ -1811,35 +1811,19 @@ const char *KERNEL_COUPLED_SDF_CONTACT =
     "  ha_sdf_value_normal(p, distance_to_surface, normal);\n"
     "  float contact_radius = sdf_params[7];\n"
     "  float band = sdf_params[11];\n"
-    "  float distance_abs = abs(distance_to_surface);\n"
-    "  // Outside the band the one-sided field is a constant (+band), so there is nothing to do.\n"
-    "  if (distance_abs >= band) { return; }\n"
-    "  // A sheet has fluid on both sides. The particle belongs on the side it was on at the start of\n"
-    "  // the substep, so a fast particle cannot cross the sheet in one step. Without the previous\n"
-    "  // sample a particle that slipped below the cloth would be pushed further down (through it),\n"
-    "  // and one that was pushed above it would keep being pushed up until it left the band.\n"
-    "  float side = distance_to_surface >= 0.0 ? 1.0 : -1.0;\n"
-    "  vec3 p_prev = vec3(prev_positions[base + 0], prev_positions[base + 1],\n"
-    "                     prev_positions[base + 2]);\n"
-    "  float distance_prev = 0.0;\n"
-    "  vec3 normal_prev = vec3(0.0, 0.0, 1.0);\n"
-    "  ha_sdf_value_normal(p_prev, distance_prev, normal_prev);\n"
-    "  if (distance_prev * distance_to_surface < 0.0) {\n"
-    "    side = distance_prev >= 0.0 ? 1.0 : -1.0;\n"
-    "  }\n"
-    "  vec3 outward = normal * side;\n"
-    "  float signed_distance = side * distance_to_surface;\n"
-    "  // Penetration always has to be resolved, but a particle that is already outside the surface\n"
-    "  // and moving away must be left alone. Without this the projection kept pushing the water off\n"
-    "  // the cloth every iteration, which fed the velocity layer and blew the fluid up.\n"
-    "  if (signed_distance >= 0.0) {\n"
-    "    if (signed_distance >= contact_radius) { return; }\n"
-    "    if (dot(p - p_prev, outward) > 0.0) { return; }\n"
-    "  }\n"
+    "  if (abs(distance_to_surface) >= band) { return; }\n"
+    "  // The fluid lives on the positive side of the sheet (the side the triangle normals point to).\n"
+    "  // Always push it back there. A side dependent push treated a particle that slipped through as\n"
+    "  // a legitimate lower layer and pushed it further down, which is why the whole column ended up\n"
+    "  // below the cloth. The velocity layer cancels the outward velocity this creates, so the water\n"
+    "  // is held instead of being launched (that was the M117 explosion).\n"
+    "  float signed_distance = distance_to_surface;\n"
+    "  if (signed_distance >= contact_radius) { return; }\n"
     "  float push = contact_radius - signed_distance;\n"
     "  float max_correction = sdf_params[9];\n"
     "  if (max_correction > 0.0) { push = min(push, max_correction); }\n"
-    "  vec3 correction = outward * push;\n"
+    "  vec3 correction = normal * push;\n"
+    "  if (signed_distance < 0.0) { atomicAdd(coupled_crossings[0], 1); }\n"
     "  if (!ha_is_finite(correction)) { return; }\n"
     "  position_io[base + 0] += correction.x;\n"
     "  position_io[base + 1] += correction.y;\n"
@@ -1854,7 +1838,7 @@ const char *KERNEL_COUPLED_SDF_CONTACT =
     "  }\n"
     "}\n";
 
-std::array<HaShaderResource, 10> COUPLED_SDF_CONTACT_RESOURCES = {{
+std::array<HaShaderResource, 11> COUPLED_SDF_CONTACT_RESOURCES = {{
     {0, HaShaderQualifier::ReadWrite, "float", "position_io[]"},
     {1, HaShaderQualifier::Read, "float", "sdf_data[]"},
     {2, HaShaderQualifier::Read, "float", "sdf_params[]"},
@@ -1865,6 +1849,7 @@ std::array<HaShaderResource, 10> COUPLED_SDF_CONTACT_RESOURCES = {{
     {7, HaShaderQualifier::Write, "float", "coupled_contact_push[]"},
     {8, HaShaderQualifier::Read, "float", "prev_positions[]"},
     {9, HaShaderQualifier::Write, "int", "coupled_push_flags[]"},
+    {10, HaShaderQualifier::ReadWrite, "int", "coupled_crossings[]"},
 }};
 
 /**
@@ -2040,7 +2025,7 @@ bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
   const int capacity = std::max(64, particle_count_ * 4);
   if (!coupled_contact_count_.ensure(1) || !coupled_contact_indices_.ensure(capacity) ||
       !coupled_contact_push_.ensure(int64_t(capacity) * 3) ||
-      !coupled_push_flags_.ensure(particle_count_))
+      !coupled_push_flags_.ensure(particle_count_) || !coupled_crossings_.ensure(1))
   {
     last_error_ = "coupled contact allocation failed";
     this->clear_coupled_sdf();
@@ -2049,6 +2034,7 @@ bool HaXpbdFluid::bind_coupled_sdf(const HaSdfGrid &grid,
   coupled_contact_capacity_ = capacity;
   coupled_contact_count_.clear_to_zero();
   coupled_push_flags_.clear_to_zero();
+  coupled_crossings_.clear_to_zero();
   std::array<float, FLUID_PARAM_COUNT_TOTAL> fluid_params{};
   params_.download(fluid_params);
   fluid_params[FLUID_PARAM_COUPLED_CONTACT_CAPACITY] = float(capacity);
@@ -2067,6 +2053,7 @@ void HaXpbdFluid::clear_coupled_sdf()
   coupled_contact_indices_.free();
   coupled_contact_push_.free();
   coupled_push_flags_.free();
+  coupled_crossings_.free();
   coupled_contact_capacity_ = 0;
 }
 
@@ -2106,12 +2093,16 @@ bool HaXpbdFluid::download_coupled_contacts(MutableSpan<int> r_indices,
       up += p.z > 0.0f ? 1 : 0;
       down += p.z < 0.0f ? 1 : 0;
     }
-    printf("XPBD_GPU coupled contacts count=%d max_push=%.4f mean_z=%.4f up=%d down=%d\n",
+    int crossings = 0;
+    coupled_crossings_.read_one(crossings);
+    printf("XPBD_GPU coupled contacts count=%d max_push=%.4f mean_z=%.4f up=%d down=%d "
+           "crossings=%d\n",
            count,
            double(max_len),
            double(sum_z / float(std::max(1, count))),
            up,
-           down);
+           down,
+           crossings);
   }
   r_count = count;
   return true;
@@ -2898,7 +2889,7 @@ bool HaXpbdFluid::iterate()
       last_error_ = "shader creation failed";
       return false;
     }
-    std::array<gpu::StorageBuf *, 10> buffers{grid_.positions.buf(),
+    std::array<gpu::StorageBuf *, 11> buffers{grid_.positions.buf(),
                                               coupled_sdf_data_.buf(),
                                               coupled_sdf_params_.buf(),
                                               props_.buf(),
@@ -2907,7 +2898,8 @@ bool HaXpbdFluid::iterate()
                                               coupled_contact_indices_.buf(),
                                               coupled_contact_push_.buf(),
                                               prev_positions_.buf(),
-                                              coupled_push_flags_.buf()};
+                                              coupled_push_flags_.buf(),
+                                              coupled_crossings_.buf()};
     dispatch_pass(coupled_contact, buffer_span(buffers), count);
     stats_.passes++;
   }

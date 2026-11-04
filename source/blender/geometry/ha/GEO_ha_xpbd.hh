@@ -442,6 +442,8 @@ class HaXpbdFluid {
    * otherwise turn into a projectile, then clears it for the next substep.
    */
   HaBufferInt coupled_push_flags_;
+  /** Number of crossing rewinds of the current frame, for the debug log. */
+  HaBufferInt coupled_crossings_;
 
   /** Packed per particle properties, see #HA_PROP_STRIDE. */
   HaBuffer props_;

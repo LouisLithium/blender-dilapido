@@ -5719,10 +5719,17 @@ class XpbdSolverStep {
     if (!fluid.active) {
       return "not a fluid";
     }
-    /* Coupled fluids run on the device: the density coupling is complemented by a distance field of
-     * the coupled solids (built once per frame) that the device samples for the hard contact. The
-     * density constraint alone is unilateral and misses fast / under-dense water; the field catches
-     * it, and its contacts are given back to the solid vertices once per frame. */
+    if (fluid.has_coupled) {
+      return "coupled with another geometry";
+    }
+    /* The device hard contact with the coupled solids (a distance field of the cloth) is not robust
+     * enough for a dense falling column. Measured on `HWA_test` (132k particles, 5 substeps): the
+     * whole column ends up below the cloth, because the density pressure pushes the bottom of the
+     * column through the field faster than a position projection can push it back, and a side
+     * dependent push then treats the leaked water as a legitimate lower layer. The CPU path holds
+     * the same scene perfectly (0 particles below the cloth) because it solves the compliant
+     * point/triangle contacts together with the density constraint. Correctness first: coupled
+     * fluids stay on the CPU until the device has an equivalent compliant contact. */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
      * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
@@ -6002,6 +6009,16 @@ class XpbdSolverStep {
                   (long long)grid->voxels_num(),
                   double(grid->spacing),
                   double(band));
+    if (std::getenv("XPBD_GPU_DEBUG_FIELD") != nullptr && grid->is_valid()) {
+      const int cx = grid->dims.x / 2;
+      const int cy = grid->dims.y / 2;
+      printf("XPBD_GPU field z-slice:");
+      for (int z = 0; z < grid->dims.z; z++) {
+        const int64_t index = (int64_t(z) * grid->dims.y + cy) * grid->dims.x + cx;
+        printf(" %.2f", double(grid->data[index]));
+      }
+      printf("\n");
+    }
   }
 
   void prepare_fluid_gpu()
@@ -6141,13 +6158,14 @@ class XpbdSolverStep {
         fluid.coupled_sdf.reset();
       }
       if (fluid.gpu_active && fluid.coupled_sdf_ready) {
-        /* One particle radius per iteration. A larger correction brings a deep crossing back in a
-         * single iteration, but it also teleports the particle sideways along a tilted sheet,
-         * which is what made the water spray out (measured: 3x the lateral spread). */
+        /* Hold the fluid one support radius away from the sheet and push up to one support radius per
+         * iteration. A thin shell (half a support radius) could not keep a whole falling column out:
+         * the density pressure pushes the bottom of the column in faster than the shell pushes it
+         * back, and the column ends up below the cloth. */
         fluid.gpu_fluid.bind_coupled_sdf(*fluid.coupled_sdf,
-                                         0.5f * fluid.support_radius,
+                                         fluid.support_radius,
                                          0.5f,
-                                         /*max_correction=*/0.5f * fluid.support_radius,
+                                         fluid.support_radius,
                                          fluid.coupled_sdf_band);
       }
       else if (fluid.gpu_active) {

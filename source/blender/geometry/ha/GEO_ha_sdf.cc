@@ -143,16 +143,19 @@ void build_one_sided_field(const Span<float3> positions,
                            const float spacing,
                            const int3 &dims,
                            const float band_width,
+                           const float splat_band,
                            const MutableSpan<float> r_data)
 {
-  /* Splat each triangle into the voxels of its own bounding box (plus the band) instead of testing
-   * every triangle for every voxel. The whole grid is initialized to `+band` (outside); the voxels
-   * that are actually near a triangle get the signed distance of the closest one. The contact only
-   * uses the band, so the far voxels do not need a better value. */
+  /* Splat each triangle into the voxels of its own bounding box (plus `splat_band`) instead of
+   * testing every triangle for every voxel. The value is the signed distance clamped to `+/-band`,
+   * so voxels outside the band still get the sign of the closest triangle. That matters: a particle
+   * that crossed the sheet lands beyond the band, and the crossing check compares the sign before
+   * and after. A constant `+band` fill there would make the far side look like the near side and
+   * the particle would never be caught. */
   r_data.fill(band_width);
   const int64_t voxel_count = int64_t(dims.x) * dims.y * dims.z;
   Vector<float> best_dist_sq(voxel_count, 1e30f);
-  const float band_sq = band_width * band_width;
+  const float splat_band_sq = splat_band * splat_band;
 
   for (const int3 &tri : corner_tris) {
     const float3 &v0 = positions[tri.x];
@@ -162,8 +165,8 @@ void build_one_sided_field(const Span<float3> positions,
     if (!(std::isfinite(normal.x) && std::isfinite(normal.y) && std::isfinite(normal.z))) {
       continue;
     }
-    const float3 tri_min = math::min(math::min(v0, v1), v2) - float3(band_width);
-    const float3 tri_max = math::max(math::max(v0, v1), v2) + float3(band_width);
+    const float3 tri_min = math::min(math::min(v0, v1), v2) - float3(splat_band);
+    const float3 tri_max = math::max(math::max(v0, v1), v2) + float3(splat_band);
     const int3 lo(std::max(0, int(std::floor((tri_min.x - origin.x) / spacing - 0.5f))),
                   std::max(0, int(std::floor((tri_min.y - origin.y) / spacing - 0.5f))),
                   std::max(0, int(std::floor((tri_min.z - origin.z) / spacing - 0.5f))));
@@ -182,7 +185,7 @@ void build_one_sided_field(const Span<float3> positions,
           closest_on_tri_to_point_v3(closest, point, a, b, c);
           const float3 closest_v(closest[0], closest[1], closest[2]);
           const float dist_sq = math::length_squared(center - closest_v);
-          if (dist_sq > band_sq) {
+          if (dist_sq > splat_band_sq) {
             continue;
           }
           const int64_t index = (int64_t(z) * dims.y + int64_t(y)) * dims.x + x;
@@ -251,6 +254,9 @@ bool ha_sdf_build(const Span<float3> positions,
   const float3 origin = r_grid.origin;
   const float spacing = r_grid.spacing;
 
+  /* The grid extends one band beyond the requested region, so splat that far to give every voxel a
+   * sign (the value itself stays clamped to the band). */
+  const float splat_band = band_width + float(band_voxels) * voxel_size;
   if (one_sided) {
     /* A sheet has fluid on both sides, so there is no meaningful "outside": keep the sign of the
      * triangle normals and never flip it. The contact kernel pushes every particle away from the
@@ -262,6 +268,7 @@ bool ha_sdf_build(const Span<float3> positions,
                           spacing,
                           dims,
                           band_width,
+                          splat_band,
                           r_grid.data.as_mutable_span());
     return true;
   }
@@ -304,6 +311,7 @@ bool ha_sdf_build(const Span<float3> positions,
                           r_grid.spacing,
                           r_grid.dims,
                           band_width,
+                          splat_band,
                           r_grid.data.as_mutable_span());
   }
   /* The sign of a level set built from an *open* mesh (a single plane, the common floor) is
