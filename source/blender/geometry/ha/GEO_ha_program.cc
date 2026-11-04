@@ -12,6 +12,7 @@
 #include "BLI_math_rotation.hh"
 #include "BLI_math_vector_types.hh"
 
+#include "BKE_anim_data.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_attribute.hh"
 #include "BKE_curves.hh"
@@ -23,6 +24,8 @@
 #include "BKE_node_runtime.hh"
 #include "BKE_node_tree_zones.hh"
 
+#include "DNA_action_types.h"
+#include "DNA_anim_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_node_types.h"
 
@@ -93,6 +96,8 @@ struct CompileContext {
   Vector<HaAttribute> &attributes;
   /** The zone input node, used to verify that reductions read the zone geometry. */
   const bNode *zone_input_node = nullptr;
+  /** The tree, used to reject animated socket values that would change the shader source. */
+  const bNodeTree *tree = nullptr;
   bool ok = true;
   int depth = 0;
   /** Why the compilation stopped, in a form the node UI can show. */
@@ -168,6 +173,46 @@ int read_int_default(const bNodeSocket &socket)
 {
   const auto *value = static_cast<const bNodeSocketValueInt *>(socket.default_value);
   return value != nullptr ? value->value : 0;
+}
+
+/**
+ * True when the default value of \a socket is driven by a driver or an action.
+ *
+ * Such a value changes without the node tree changing, so inlining it into the shader source
+ * would produce a new program (and a new shader compilation) every frame. The field zone in
+ * `HWA_test.blend` did exactly that with a `frame * 0.1` driver on a `Vector Math` input:
+ * 1.3 s per frame on the device instead of 19 ms. Uniform parameters are the long term fix; until
+ * then the zone falls back to the CPU, which is correct and much faster than recompiling.
+ */
+bool socket_value_is_animated(const bNodeTree &tree, const bNodeSocket &socket)
+{
+  const AnimData *adt = BKE_animdata_from_id(&tree.id);
+  if (adt == nullptr) {
+    return false;
+  }
+  const bNode *node = socket.runtime->owner_node;
+  if (node == nullptr) {
+    return false;
+  }
+  const std::string path = fmt::format(
+      "nodes[\"{}\"].inputs[{}].default_value", node->name, socket.index());
+  for (const FCurve *fcu = static_cast<const FCurve *>(adt->drivers.first); fcu != nullptr;
+       fcu = fcu->next)
+  {
+    if (fcu->rna_path != nullptr && path == fcu->rna_path) {
+      return true;
+    }
+  }
+  if (adt->action != nullptr) {
+    for (const FCurve *fcu = static_cast<const FCurve *>(adt->action->curves.first); fcu != nullptr;
+         fcu = fcu->next)
+    {
+      if (fcu->rna_path != nullptr && path == fcu->rna_path) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 const HaExpr *compile_input(CompileContext &ctx, const bNode &node, const int socket_index)
@@ -1008,6 +1053,7 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
   ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
 
   /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
@@ -1061,6 +1107,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
   ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
   const HaExpr *selection = compile_input(ctx, node, 1);
   if (!ctx.ok) {
@@ -1093,6 +1140,7 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
   ctx.zone_input_node = point_ctx.zone_input_node;
+  ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
   /* Inputs: Geometry(0), Selection(1). */
   const HaExpr *selection = compile_input(ctx, node, 1);
@@ -1493,6 +1541,15 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
 const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket)
 {
   if (socket.link == nullptr) {
+    if (ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, socket)) {
+      const bNode *node = socket.runtime->owner_node;
+      fail(ctx,
+           fmt::format("node '{}': input '{}' is animated by a driver; the device shader would be "
+                       "rebuilt every frame",
+                       node != nullptr ? node->name : "",
+                       socket.name));
+      return &ctx.pool.constant(0.0f);
+    }
     switch (socket.type) {
       case SOCK_FLOAT:
         return &ctx.pool.constant(read_float_default(socket));
@@ -1536,7 +1593,7 @@ void aggregate_op_strings(const HaAggregateOp op, std::string &r_combine, std::s
 
 HaZoneProgram::~HaZoneProgram() = default;
 
-std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree*/,
+std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
                                                         const bke::bNodeTreeZone &zone,
                                                         std::string *r_reason)
 {
@@ -1647,6 +1704,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree & /*tree
   auto program = std::make_unique<HaZoneProgram>();
   CompileContext ctx{pool, program->aggregates_, program->attributes_};
   ctx.zone_input_node = input_node;
+  ctx.tree = &tree;
 
   /* Compile first step -> last step (`chain` is stored last -> first). */
   for (const int i : chain.index_range()) {
