@@ -11,6 +11,7 @@
 #  include "GEO_ha_sdf.hh"
 
 #  include "BLI_math_base.hh"
+#  include "BLI_math_geom.hh"
 #  include "BLI_math_vector.hh"
 #  include "BLI_task.hh"
 
@@ -128,6 +129,60 @@ void clip_triangle_to_region(const float3 &v0,
   }
 }
 
+/**
+ * Signed distance from the triangle soup, using the normal of the closest triangle for the sign.
+ *
+ * OpenVDB builds the level set from the winding of a *closed* mesh. For an open mesh (a single
+ * plane, the common floor) it can produce a field that is positive everywhere, i.e. with no
+ * "inside" at all, and the device contact never triggers (the fluid falls straight through). This
+ * fallback gives a one-sided field with the correct sign, which is all the contact needs.
+ */
+void build_one_sided_field(const Span<float3> positions,
+                           const Span<int3> corner_tris,
+                           const float3 &origin,
+                           const float spacing,
+                           const int3 &dims,
+                           const float band_width,
+                           const MutableSpan<float> r_data)
+{
+  threading::parallel_for(IndexRange(dims.z), 1, [&](const IndexRange z_range) {
+    for (const int z : z_range) {
+      for (const int y : IndexRange(dims.y)) {
+        for (const int x : IndexRange(dims.x)) {
+          const float3 center = origin + (float3(x, y, z) + 0.5f) * spacing;
+          float best_dist_sq = 1e30f;
+          float best_signed = 0.0f;
+          for (const int3 &tri : corner_tris) {
+            const float3 &v0 = positions[tri.x];
+            const float3 &v1 = positions[tri.y];
+            const float3 &v2 = positions[tri.z];
+            const float3 normal = math::normalize(math::cross(v1 - v0, v2 - v0));
+            if (!(std::isfinite(normal.x) && std::isfinite(normal.y) &&
+                  std::isfinite(normal.z)))
+            {
+              continue;
+            }
+            const float point[3] = {center.x, center.y, center.z};
+            const float a[3] = {v0.x, v0.y, v0.z};
+            const float b[3] = {v1.x, v1.y, v1.z};
+            const float c[3] = {v2.x, v2.y, v2.z};
+            float closest[3];
+            closest_on_tri_to_point_v3(closest, point, a, b, c);
+            const float3 closest_v(closest[0], closest[1], closest[2]);
+            const float dist_sq = math::length_squared(center - closest_v);
+            if (dist_sq < best_dist_sq) {
+              best_dist_sq = dist_sq;
+              best_signed = math::dot(center - closest_v, normal);
+            }
+          }
+          r_data[int64_t(z) * dims.y * dims.x + int64_t(y) * dims.x + x] =
+              std::clamp(best_signed, -band_width, band_width);
+        }
+      }
+    }
+  });
+}
+
 bool ha_sdf_build(const Span<float3> positions,
                   const Span<int> corner_verts,
                   const Span<int3> corner_tris,
@@ -135,6 +190,7 @@ bool ha_sdf_build(const Span<float3> positions,
                   const float band_width,
                   const float3 &region_min,
                   const float3 &region_max,
+                  const float3 &reference_point,
                   HaSdfGrid &r_grid)
 {
   if (positions.is_empty() || corner_tris.is_empty() || voxel_size <= 0.0f || band_width <= 0.0f) {
@@ -202,6 +258,33 @@ bool ha_sdf_build(const Span<float3> positions,
       }
     }
   });
+  /* An open mesh can come out of OpenVDB with no negative side at all. Rebuild it one-sided from
+   * the triangle normals in that case (the fluid is then pushed away from the surface). */
+  bool has_negative = false;
+  for (const float value : r_grid.data) {
+    if (value < 0.0f) {
+      has_negative = true;
+      break;
+    }
+  }
+  if (!has_negative) {
+    build_one_sided_field(clipped_positions.as_span(),
+                          clipped_corner_tris.as_span(),
+                          r_grid.origin,
+                          r_grid.spacing,
+                          r_grid.dims,
+                          band_width,
+                          r_grid.data.as_mutable_span());
+  }
+  /* The sign of a level set built from an *open* mesh (a single plane, the common floor) is
+   * ambiguous: OpenVDB picks a side from the winding, which can put the "outside" below the floor.
+   * The fluid is always outside the solid collider, so if the field says the reference point is
+   * inside, flip the whole grid. That flips the gradient the contact uses as well. */
+  if (ha_sdf_sample(r_grid, reference_point) < 0.0f) {
+    for (float &value : r_grid.data) {
+      value = -value;
+    }
+  }
   return true;
 }
 

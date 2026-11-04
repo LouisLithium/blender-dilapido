@@ -26,11 +26,13 @@
 namespace blender::geometry::ha {
 
 /** Floats per particle in the packed property buffer of #HaXpbdFluid. */
-inline constexpr int HA_PROP_STRIDE = 10;
+inline constexpr int HA_PROP_STRIDE = 11;
 /** Floats per particle in the packed solver state buffer of #HaXpbdFluid. */
 inline constexpr int HA_STATE_STRIDE = 8;
 /** Floats per boundary particle (`xyz` + mass). */
 inline constexpr int HA_BOUNDARY_STRIDE = 4;
+/** Floats per coupled particle (`xyz` + mass + inverse mass). */
+inline constexpr int HA_COUPLED_STRIDE = 5;
 /** Indices inside one particle block of the packed solver state buffer. */
 enum HaStateIndex {
   HA_STATE_LAMBDA = 0,
@@ -52,6 +54,8 @@ enum HaPropIndex {
   HA_PROP_SURFACE_TENSION = 7,
   HA_PROP_FRICTION = 8,
   HA_PROP_USE_BOUNDARY = 9,
+  /** Strength of the two way coupling with the solids of the same world (0 disables it). */
+  HA_PROP_COUPLING = 10,
 };
 
 /**
@@ -191,12 +195,21 @@ struct HaXpbdFluidInputs {
   Span<float> boundary_friction;
   /** `true` where the particles may use the collider boundary particles, `false` otherwise. */
   Span<bool> use_boundary;
+  /** Strength of the two way coupling per fluid particle (0 disables the reaction). */
+  Span<float> coupling;
   /**
    * Particles sampled on the colliders (Akinci et al.), refreshed once per frame by the solver.
    * They take part in the density estimate and push the fluid away, but never move.
    */
   Span<float3> boundary_positions;
   Span<float> boundary_masses;
+  /**
+   * Samples of the other simulated geometries of the world (cloth, soft bodies), refreshed once
+   * per substep. They take part in the density estimate and the reaction pushes them back.
+   */
+  Span<float3> coupled_positions;
+  Span<float> coupled_masses;
+  Span<float> coupled_inv_masses;
 };
 
   /** Coarse timings of one substep, filled by #HaXpbdFluid::substep. */
@@ -290,6 +303,21 @@ class HaXpbdFluid {
   bool begin_substep(const ContactHook &contact_hook = {});
   bool iterate();
   bool finish_substep();
+
+  /**
+   * Uploads the samples of the coupled solids and rebuilds their grid. The solver refreshes the
+   * sample positions from the solid vertices once per substep, so this has to run before
+   * #begin_substep (which builds the fluid -> coupled neighbour list).
+   */
+  bool update_coupled(Span<float3> positions, Span<float> masses, Span<float> inv_masses);
+
+  /** Copies the reaction of the last #iterate back to the host, three floats per coupled sample. */
+  bool download_coupled_reaction(MutableSpan<float3> r_corrections) const;
+
+  int coupled_count() const
+  {
+    return coupled_count_;
+  }
 
   /** Uploads the contacts gathered on the host for the current substep. */
   bool set_contacts(const HaXpbdContacts &contacts);
@@ -400,6 +428,17 @@ class HaXpbdFluid {
   HaBufferInt boundary_counts_;
   int boundary_count_ = 0;
   int boundary_capacity_ = 0;
+  /** xyz + mass + inverse mass, #HA_COUPLED_STRIDE floats per coupled particle. */
+  HaBuffer coupled_particles_;
+  HaXpbdGrid coupled_grid_;
+  /** CSR list of the coupled samples around each *fluid* particle. */
+  HaBufferInt coupled_offsets_;
+  HaBufferInt coupled_indices_;
+  HaBufferInt coupled_counts_;
+  int coupled_count_ = 0;
+  int coupled_capacity_ = 0;
+  /** Three floats per coupled particle: the reaction of the last iteration. */
+  HaBuffer coupled_reaction_;
   /** Per frame constants, see the `FluidParamIndex` enum in the implementation. */
   HaBuffer params_;
 
@@ -415,6 +454,8 @@ class HaXpbdFluid {
 
   /** Builds the CSR list of the boundary particles around every fluid particle. */
   bool build_boundary_neighbors(int pass_offset);
+  /** Builds the CSR list of the coupled samples around every fluid particle. */
+  bool build_coupled_neighbors(int pass_offset);
 
   /** Alternates between #velocities_ and #velocities_tmp_ (XSPH needs a ping pong buffer). */
   bool velocities_in_tmp_ = false;

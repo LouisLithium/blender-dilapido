@@ -5348,6 +5348,85 @@ class XpbdSolverStep {
   }
 
   /**
+   * Refreshes the coupled sample positions of a device fluid from the solid vertices and uploads
+   * them. The CPU path does the same in #simulate__update_fluid_boundary__chunk; the device fluid
+   * skips that function (it rebuilds its own grid), so it needs its own refresh once per substep.
+   */
+  void simulate__update_gpu_coupled(FluidChunkData &fluid, const int solver_refs_i)
+  {
+    if (!fluid.has_coupled || !fluid.gpu_active) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int i : fluid.coupled_geometry.index_range()) {
+      const Span<float3> positions = refs[fluid.coupled_geometry[i]].positions;
+      const int3 &verts = fluid.coupled_vertices[i];
+      const float3 &weights = fluid.coupled_weights[i];
+      fluid.coupled_positions[i] = positions[verts[0]] * weights.x +
+                                   positions[verts[1]] * weights.y +
+                                   positions[verts[2]] * weights.z;
+    }
+    fluid.gpu_fluid.update_coupled(fluid.coupled_positions,
+                                   fluid.coupled_masses,
+                                   fluid.coupled_inv_masses);
+  }
+
+  /**
+   * Applies the reaction of a device fluid to the solid vertices. The spread is the same as
+   * #simulate__fluid_boundary_reaction: barycentric weights, averaged per vertex so the result does
+   * not depend on the resolution of the solid.
+   */
+  void simulate__gpu_coupled_reaction(FluidChunkData &fluid,
+                                      const Span<float3> corrections,
+                                      const int solver_refs_i)
+  {
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+      scratch.correction_sums.fill(float3(0.0f));
+      scratch.weight_sums.fill(0.0f);
+    }
+    for (const int i : fluid.coupled_geometry.index_range()) {
+      const float3 &correction = corrections[i];
+      if (correction.x == 0.0f && correction.y == 0.0f && correction.z == 0.0f) {
+        continue;
+      }
+      const int geometry_i = fluid.coupled_geometry[i];
+      FluidChunkData::CoupledVertexScratch *scratch = nullptr;
+      for (FluidChunkData::CoupledVertexScratch &candidate : fluid.coupled_scratch) {
+        if (candidate.geometry_i == geometry_i) {
+          scratch = &candidate;
+          break;
+        }
+      }
+      if (scratch == nullptr) {
+        continue;
+      }
+      const int3 &verts = fluid.coupled_vertices[i];
+      const float3 &weights = fluid.coupled_weights[i];
+      const Span<float> inv_masses = geometries_.data[geometry_i]->inv_masses;
+      for (const int k : IndexRange(3)) {
+        const int vertex_i = verts[k];
+        const float weight = weights[k];
+        if (weight <= 0.0f || inv_masses[vertex_i] <= 0.0f) {
+          continue;
+        }
+        scratch->correction_sums[vertex_i] += correction * weight;
+        scratch->weight_sums[vertex_i] += weight;
+      }
+    }
+    for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+      const MutableSpan<float3> positions = refs[scratch.geometry_i].positions;
+      for (const int vertex_i : scratch.weight_sums.index_range()) {
+        const float weight_sum = scratch.weight_sums[vertex_i];
+        if (weight_sum <= 0.0f) {
+          continue;
+        }
+        positions[vertex_i] += scratch.correction_sums[vertex_i] / weight_sum;
+      }
+    }
+  }
+
+  /**
    * Gives the contact impulses of a chunk back to the triangles of the coupled surfaces. The
    * normal multiplier of a contact is the impulse that stopped the fluid point (in position units,
    * so the momentum of the surface is `-lambda * normal`), which is spread over the three vertices
@@ -5514,13 +5593,10 @@ class XpbdSolverStep {
     if (!fluid.active) {
       return "not a fluid";
     }
-    if (fluid.has_coupled) {
-      /* This is a correctness rejection, not a performance one: the device path has no coupling
-       * yet, so running it would silently drop the interaction with the cloth/soft body. The fluid
-       * would then accelerate freely and could tunnel through the (narrow band) collider field.
-       * `Backend = Strict` and `BLENDER_XPBD_GPU=1` must not bypass it. */
-      return "coupled with another geometry";
-    }
+    /* Coupled fluids are supported on the device since M115: the density/delta passes include the
+     * coupled samples and a reaction pass gives the pressure back to the solid vertices. The hard
+     * point/triangle contacts of `CoupledFaceContacts` are still CPU only; the density coupling is
+     * what holds the water. */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
      * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
@@ -5592,7 +5668,12 @@ class XpbdSolverStep {
     const float voxel_size = std::max(1e-4f, 0.5f * fluid.support_radius);
     /* The band has to be wider than one substep of movement plus the radius, otherwise a fast
      * particle can cross the whole band of a thin collider. */
-    const float band_width = std::max(4.0f * voxel_size, 2.0f * fluid.support_radius);
+    /* Wide enough that a particle moving a full substep cannot cross the band in one step: the
+     * device solves the contact by sampling the field, and once a particle is deeper than the band
+     * the sample returns the background value and the contact is lost (observed with a fluid
+     * falling onto a floor: min z went to -7 m). The band costs voxels only in the slab around the
+     * collider, so the extra safety is cheap. */
+    const float band_width = std::max(4.0f * voxel_size, 4.0f * fluid.support_radius);
 
     /* Content hash, not the mesh pointer: the geometry nodes evaluation hands out a new mesh every
      * frame, so a pointer based key rebuilt the field on every single frame (measured: 5.2 s per
@@ -5701,6 +5782,7 @@ class XpbdSolverStep {
                                     band_width,
                                     region_min,
                                     region_max,
+                                    (fluid_min + fluid_max) * 0.5f,
                                     *grid))
     {
       fluid.sdf_hash = 0;
@@ -5810,8 +5892,12 @@ class XpbdSolverStep {
       inputs.surface_tension = geo_data.fluid_surface_tension.as_span().slice(points);
       inputs.boundary_friction = geo_data.fluid_boundary_friction.as_span().slice(points);
       inputs.use_boundary = geo_data.fluid_use_boundary.as_span().slice(points);
+      inputs.coupling = geo_data.fluid_coupling.as_span().slice(points);
       inputs.boundary_positions = fluid.boundary_positions.as_span();
       inputs.boundary_masses = fluid.boundary_masses.as_span();
+      inputs.coupled_positions = fluid.coupled_positions;
+      inputs.coupled_masses = fluid.coupled_masses;
+      inputs.coupled_inv_masses = fluid.coupled_inv_masses;
 
       fluid.gpu_start_ms = time_now_ms();
       fluid.gpu_active = fluid.gpu_fluid.bind(inputs,
@@ -5835,7 +5921,12 @@ class XpbdSolverStep {
                            .friction,
                        0.0f,
                        1.0f),
-            0.1f * fluid.support_radius);
+            /* The device pushes a particle out of the field by at most this much per iteration.
+             * 0.1 * support radius (3 mm for a 3 cm support) was slower than a fast particle falls,
+             * so the fluid sank through the band before the contact could catch up. One support
+             * radius per iteration (30 mm) resolves a deeply penetrated particle in a couple of
+             * iterations without a single large jump. */
+            fluid.support_radius);
         debug_gpu_log("BLENDER_XPBD_GPU_LOG",
                       print,
                       "XPBD_GPU collision backend=%s voxels=%lld spacing=%g\n",
@@ -5899,7 +5990,19 @@ class XpbdSolverStep {
       };
     }
 
+    /* The coupled samples follow the solid vertices, so refresh them once per substep (the CPU
+     * path does the same in `simulate__update_fluid_boundary__chunk`). */
+    this->simulate__update_gpu_coupled(fluid, solver_refs_i);
+
     const bool ok = fluid.gpu_fluid.substep(constraint_iterations_, hook);
+    /* The reaction of the whole frame (all substeps and iterations) is read back once, at the end
+     * of the last substep: a readback per substep costs ~100 ms of Vulkan stall overhead. */
+    if (ok && download_result && fluid.gpu_fluid.coupled_count() > 0) {
+      Array<float3> corrections(fluid.gpu_fluid.coupled_count());
+      if (fluid.gpu_fluid.download_coupled_reaction(corrections.as_mutable_span())) {
+        this->simulate__gpu_coupled_reaction(fluid, corrections, solver_refs_i);
+      }
+    }
     if (gathers_contacts) {
       /* Seed the next gather with the multipliers the device ended up with. */
       ExternalFaceContacts &contacts = chunks_data_[chunk_i].external_face_contacts;

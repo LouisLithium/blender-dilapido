@@ -19,6 +19,7 @@
 
 #include "BLI_array.hh"
 #include "BLI_math_base.hh"
+#include "BLI_vector.hh"
 
 #include "GPU_shader.hh"
 #include "GPU_state.hh"
@@ -57,7 +58,7 @@ double time_now_ms()
 
 /** Helpers shared by all kernels; the hash has to match `FluidParticleGrid::hash_cell`. */
 const char *GLSL_PRELUDE =
-    "#define HA_PROP 10\n"
+    "#define HA_PROP 11\n"
     "#define HA_STATE 8\n"
     "uint ha_hash_cell(int cx, int cy, int cz)\n"
     "{\n"
@@ -793,7 +794,12 @@ enum FluidParamIndex {
   FLUID_PARAM_BOUNDARY_TABLE_SIZE = 16,
   FLUID_PARAM_BOUNDARY_CAPACITY = 17,
   FLUID_PARAM_CONTACT_COUNT = 18,
-  FLUID_PARAM_COUNT_TOTAL = 20,
+  /** Hash table size of the coupled samples, for the fluid -> coupled query. */
+  FLUID_PARAM_COUPLED_TABLE_SIZE = 19,
+  FLUID_PARAM_COUPLED_CAPACITY = 20,
+  /** Number of coupled samples, i.e. the element count of the reaction pass. */
+  FLUID_PARAM_COUPLED_COUNT = 21,
+  FLUID_PARAM_COUNT_TOTAL = 22,
 };
 
 /** Collider contacts: `face position`, `normal`, `collider motion` and `collider velocity`. */
@@ -841,7 +847,8 @@ const char *FLUID_PROLOGUE =
  */
 std::string fluid_neighbor_loops(const char *fluid_body,
                                  const char *boundary_body,
-                                 const bool with_boundary)
+                                 const bool with_boundary,
+                                 const char *coupled_body = nullptr)
 {
   std::string source;
   source += "  for (int k = neighbor_offsets[i]; k < neighbor_offsets[i + 1]; k++) {\n";
@@ -870,19 +877,39 @@ std::string fluid_neighbor_loops(const char *fluid_body,
     source += "    }\n";
     source += "  }\n";
   }
+  if (coupled_body != nullptr) {
+    /* The coupled samples of the other simulated geometries are *always* part of the density
+     * estimate (they are what makes the coupling hold water), so unlike the collider boundary they
+     * are not gated by `use_boundary`. They can move, so the reaction pass gives them their own
+     * inverse mass. */
+    source += "  for (int kc = coupled_offsets[i]; kc < coupled_offsets[i + 1]; kc++) {\n";
+    source += "    int c = coupled_indices[kc];\n";
+    source += "    int cb = c * 5;\n";
+    source += "    vec3 coupled_pos = vec3(coupled_in[cb + 0], coupled_in[cb + 1],\n";
+    source += "                            coupled_in[cb + 2]);\n";
+    source += "    vec3 r_vec_c = p_i - coupled_pos;\n";
+    source += "    float r_sq_c = dot(r_vec_c, r_vec_c);\n";
+    source += "    if (r_sq_c >= params[3]) { continue; }\n";
+    source += "    float mass_c = coupled_in[cb + 3];\n";
+    source += coupled_body;
+    source += "  }\n";
+  }
   return source;
 }
 
 std::string fluid_kernel(const char *prologue,
                          const char *fluid_body,
                          const char *boundary_body,
-                         const char *epilogue)
+                         const char *epilogue,
+                         const char *coupled_body = nullptr)
 {
   const bool with_boundary = boundary_body != nullptr;
+  const bool with_coupled = coupled_body != nullptr;
   std::string source = std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + "void main()\n{\n";
   source += FLUID_PROLOGUE;
   source += prologue;
-  source += fluid_neighbor_loops(fluid_body, with_boundary ? boundary_body : "", with_boundary);
+  source += fluid_neighbor_loops(
+      fluid_body, with_boundary ? boundary_body : "", with_boundary, coupled_body);
   source += epilogue;
   source += "}\n";
   return source;
@@ -1029,6 +1056,96 @@ const char *DELTA_BOUNDARY_LOOP =
     "      float r_b = sqrt(r_sq_b);\n"
     "      correction += lambda_i * mass_b * (-(ha_spiky_length(r_b) / r_b) * r_vec_b);\n";
 
+/* --- coupled solids (two way coupling) ---------------------------------- */
+
+/**
+ * The coupled samples of the other simulated geometries are always part of the density estimate,
+ * exactly like `xpbd::fluid_solve_density_iteration` accumulates `coupled`: they add to the density,
+ * to the solid fraction (for the no-slip friction) and to the gradient, but not to the per
+ * neighbour gradient sum of the denominator (they are not fluid particles).
+ */
+const char *DENSITY_COUPLED_LOOP =
+    "    float weight = ha_poly6(r_sq_c);\n"
+    "    boundary_density += mass_c * weight;\n"
+    "    boundary_weight += weight;\n"
+    "    if (r_sq_c >= 1e-12) {\n"
+    "      float r_c = sqrt(r_sq_c);\n"
+    "      sum_gradient += mass_c * (-(ha_spiky_length(r_c) / r_c) * r_vec_c);\n"
+    "    }\n";
+
+const char *DELTA_COUPLED_LOOP =
+    "    if (r_sq_c >= 1e-12) {\n"
+    "      float r_c = sqrt(r_sq_c);\n"
+    "      correction += lambda_i * mass_c * (-(ha_spiky_length(r_c) / r_c) * r_vec_c);\n"
+    "    }\n";
+
+/**
+ * Reaction of the fluid pressure on the coupled samples, the device mirror of
+ * `xpbd::fluid_apply_boundary_reaction`. One invocation per coupled sample: query the fluid grid
+ * around it and accumulate
+ *
+ *     dm_j = -lambda_i * m_i * grad_j W_ij / rho0_i
+ *
+ * (the sign of `r_vec` is flipped because the gradient is taken with respect to the coupled
+ * particle). The host downloads this buffer after every iteration and spreads it over the vertices
+ * of the solid.
+ */
+const char *KERNEL_COUPLED_REACTION =
+    "void main()\n"
+    "{\n"
+    "  int c = int(gl_GlobalInvocationID.x);\n"
+    "  if (c >= int(params[21])) { return; }\n"
+    "  int cb = c * 5;\n"
+    "  vec3 coupled_pos = vec3(coupled_in[cb + 0], coupled_in[cb + 1], coupled_in[cb + 2]);\n"
+    "  vec3 correction = vec3(0.0);\n"
+    "  if (coupled_in[cb + 4] > 0.0) {\n"
+    "    int table_size = int(params[19]);\n"
+    "    int mask = table_size - 1;\n"
+    "    float inv_cell_size = 1.0 / params[2];\n"
+    "    int cx = int(floor(coupled_pos.x * inv_cell_size));\n"
+    "    int cy = int(floor(coupled_pos.y * inv_cell_size));\n"
+    "    int cz = int(floor(coupled_pos.z * inv_cell_size));\n"
+    "    for (int dz = -1; dz <= 1; dz++) {\n"
+    "      for (int dy = -1; dy <= 1; dy++) {\n"
+    "        for (int dx = -1; dx <= 1; dx++) {\n"
+    "          int nx = cx + dx;\n"
+    "          int ny = cy + dy;\n"
+    "          int nz = cz + dz;\n"
+    "          int bucket = int(ha_hash_cell(nx, ny, nz) & uint(mask));\n"
+    "          int begin = bucket_offsets[bucket];\n"
+    "          int end = begin + bucket_counts[bucket];\n"
+    "          for (int k = begin; k < end; k++) {\n"
+    "            int i = sorted_in[k];\n"
+    "            if (cells[i * 3 + 0] != nx || cells[i * 3 + 1] != ny ||\n"
+    "                cells[i * 3 + 2] != nz) { continue; }\n"
+    "            vec3 fluid_pos = vec3(position_in[i * 3 + 0], position_in[i * 3 + 1],\n"
+    "                                  position_in[i * 3 + 2]);\n"
+    "            vec3 r_vec = coupled_pos - fluid_pos;\n"
+    "            float r_sq = dot(r_vec, r_vec);\n"
+    "            if (r_sq >= params[3] || r_sq < 1e-12) { continue; }\n"
+    "            float lambda_i = particle_state[i * HA_STATE + 0] *\n"
+    "                             props[i * HA_PROP + 10];\n"
+    "            if (lambda_i == 0.0) { continue; }\n"
+    "            float r = sqrt(r_sq);\n"
+    "            correction += lambda_i * props[i * HA_PROP + 0] *\n"
+    "                          (-(ha_spiky_length(r) / r) * r_vec) /\n"
+    "                          props[i * HA_PROP + 2];\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    float max_correction = params[11];\n"
+    "    float length = length(correction);\n"
+    "    if (max_correction > 0.0 && length > max_correction) {\n"
+    "      correction *= max_correction / length;\n"
+    "    }\n"
+    "    if (!ha_is_finite(correction)) { correction = vec3(0.0); }\n"
+    "  }\n"
+    "  coupled_reaction_out[c * 3 + 0] += correction.x;\n"
+    "  coupled_reaction_out[c * 3 + 1] += correction.y;\n"
+    "  coupled_reaction_out[c * 3 + 2] += correction.z;\n"
+    "}\n";
+
 const char *DELTA_EPILOGUE =
     "  correction *= 1.0 / props[i * HA_PROP + 2];\n"
     "  float max_correction = params[11];\n"
@@ -1154,13 +1271,20 @@ const char *XSPH_EPILOGUE =
  * cell is computed from its own position instead of read from the target grid. Emitted twice
  * (counting and filling) like the fluid neighbour kernels.
  */
-std::string boundary_query_kernel(const bool counting)
+std::string neighbor_query_kernel(const bool counting,
+                                  const char *positions_base,
+                                  const int positions_stride,
+                                  const char *counts_name,
+                                  const char *offsets_name,
+                                  const char *indices_name,
+                                  const int table_size_param,
+                                  const int capacity_param)
 {
   std::string source = std::string(GLSL_PRELUDE) + "void main()\n{\n";
   source += "  int i = int(gl_GlobalInvocationID.x);\n";
   source += "  int particle_count = int(params[0]);\n";
   source += "  if (i >= particle_count) { return; }\n";
-  source += "  int table_size = int(params[16]);\n";
+  source += "  int table_size = int(params[" + std::to_string(table_size_param) + "]);\n";
   source += "  int mask = table_size - 1;\n";
   source += "  float inv_cell_size = 1.0 / params[2];\n";
   source += "  float r_sq_max = params[3];\n";
@@ -1172,7 +1296,7 @@ std::string boundary_query_kernel(const bool counting)
   source += "  int cz = int(floor(p_i.z * inv_cell_size));\n";
   source += "  int count = 0;\n";
   if (!counting) {
-    source += "  int write_i = offsets_out[i];\n";
+    source += "  int write_i = " + std::string(offsets_name) + "[i];\n";
   }
   source += "  for (int dz = -1; dz <= 1; dz++) {\n";
   source += "    for (int dy = -1; dy <= 1; dy++) {\n";
@@ -1184,20 +1308,23 @@ std::string boundary_query_kernel(const bool counting)
   source += "        int begin = bucket_offsets[bucket];\n";
   source += "        int end = begin + bucket_counts[bucket];\n";
   source += "        for (int k = begin; k < end; k++) {\n";
-  source += "          int boundary_i = sorted_in[k];\n";
-  source += "          int cb = boundary_i * 3;\n";
+  source += "          int target_i = sorted_in[k];\n";
+  source += "          int cb = target_i * 3;\n";
   source += "          if (cells[cb + 0] != nx || cells[cb + 1] != ny || cells[cb + 2] != nz) {\n";
   source += "            continue;\n";
   source += "          }\n";
-  source += "          int bp = boundary_i * 4;\n";
-  source += "          vec3 r_vec = p_i - vec3(boundary_in[bp + 0], boundary_in[bp + 1],\n";
-  source += "                                  boundary_in[bp + 2]);\n";
+  source += "          int bp = target_i * " + std::to_string(positions_stride) + ";\n";
+  source += "          vec3 r_vec = p_i - vec3(" + std::string(positions_base) + "[bp + 0],\n";
+  source += "                                  " + std::string(positions_base) + "[bp + 1],\n";
+  source += "                                  " + std::string(positions_base) + "[bp + 2]);\n";
   source += "          if (dot(r_vec, r_vec) >= r_sq_max) { continue; }\n";
   if (counting) {
     source += "          count += 1;\n";
   }
   else {
-    source += "          if (write_i < int(params[17])) { boundary_indices[write_i] = boundary_i; }\n";
+    source += "          if (write_i < int(params[" + std::to_string(capacity_param) + "])) {\n";
+    source += "            " + std::string(indices_name) + "[write_i] = target_i;\n";
+    source += "          }\n";
     source += "          write_i += 1;\n";
   }
   source += "        }\n";
@@ -1205,10 +1332,34 @@ std::string boundary_query_kernel(const bool counting)
   source += "    }\n";
   source += "  }\n";
   if (counting) {
-    source += "  boundary_counts[i] = count;\n";
+    source += "  " + std::string(counts_name) + "[i] = count;\n";
   }
   source += "}\n";
   return source;
+}
+
+std::string boundary_query_kernel(const bool counting)
+{
+  return neighbor_query_kernel(counting,
+                               "boundary_in",
+                               4,
+                               "boundary_counts",
+                               "boundary_offsets",
+                               "boundary_indices",
+                               FLUID_PARAM_BOUNDARY_TABLE_SIZE,
+                               FLUID_PARAM_BOUNDARY_CAPACITY);
+}
+
+std::string coupled_query_kernel(const bool counting)
+{
+  return neighbor_query_kernel(counting,
+                               "coupled_in",
+                               5,
+                               "coupled_counts",
+                               "coupled_offsets",
+                               "coupled_indices",
+                               FLUID_PARAM_COUPLED_TABLE_SIZE,
+                               FLUID_PARAM_COUPLED_CAPACITY);
 }
 
 /* --- collider contacts --------------------------------------------------- */
@@ -1423,9 +1574,78 @@ std::array<HaShaderResource, 9> BOUNDARY_FILL_RESOURCES = {{
     {3, HaShaderQualifier::Read, "int", "bucket_offsets[]"},
     {4, HaShaderQualifier::Read, "int", "bucket_counts[]"},
     {5, HaShaderQualifier::Read, "int", "sorted_in[]"},
-    {6, HaShaderQualifier::Read, "int", "offsets_out[]"},
+    {6, HaShaderQualifier::Read, "int", "boundary_offsets[]"},
     {7, HaShaderQualifier::Write, "int", "boundary_indices[]"},
     {8, HaShaderQualifier::Read, "float", "params[]"},
+}};
+
+/** Coupled samples: the same query as the boundary particles, against the coupled grid. */
+std::array<HaShaderResource, 8> COUPLED_COUNT_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "position_in[]"},
+    {1, HaShaderQualifier::Read, "float", "coupled_in[]"},
+    {2, HaShaderQualifier::Read, "int", "cells[]"},
+    {3, HaShaderQualifier::Read, "int", "bucket_offsets[]"},
+    {4, HaShaderQualifier::Read, "int", "bucket_counts[]"},
+    {5, HaShaderQualifier::Read, "int", "sorted_in[]"},
+    {6, HaShaderQualifier::Write, "int", "coupled_counts[]"},
+    {7, HaShaderQualifier::Read, "float", "params[]"},
+}};
+
+std::array<HaShaderResource, 9> COUPLED_FILL_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "position_in[]"},
+    {1, HaShaderQualifier::Read, "float", "coupled_in[]"},
+    {2, HaShaderQualifier::Read, "int", "cells[]"},
+    {3, HaShaderQualifier::Read, "int", "bucket_offsets[]"},
+    {4, HaShaderQualifier::Read, "int", "bucket_counts[]"},
+    {5, HaShaderQualifier::Read, "int", "sorted_in[]"},
+    {6, HaShaderQualifier::Read, "int", "coupled_offsets[]"},
+    {7, HaShaderQualifier::Write, "int", "coupled_indices[]"},
+    {8, HaShaderQualifier::Read, "float", "params[]"},
+}};
+
+/**
+ * The density and delta passes share their layout: the fluid particles, then the optional collider
+ * boundary set and the optional coupled solid set, in that order.
+ */
+Vector<HaShaderResource> fluid_step_resources(const bool with_boundary, const bool with_coupled)
+{
+  Vector<HaShaderResource> resources;
+  resources.append(HaShaderResource{0, HaShaderQualifier::Read, "float", "position_in[]"});
+  resources.append(HaShaderResource{1, HaShaderQualifier::Read, "int", "neighbor_offsets[]"});
+  resources.append(HaShaderResource{2, HaShaderQualifier::Read, "int", "neighbor_indices[]"});
+  resources.append(HaShaderResource{3, HaShaderQualifier::Read, "float", "props[]"});
+  resources.append(HaShaderResource{4, HaShaderQualifier::ReadWrite, "float", "particle_state[]"});
+  resources.append(HaShaderResource{5, HaShaderQualifier::Read, "float", "params[]"});
+  int slot = 6;
+  if (with_boundary) {
+    resources.append(HaShaderResource{slot++, HaShaderQualifier::Read, "float", "boundary_in[]"});
+    resources.append(
+        HaShaderResource{slot++, HaShaderQualifier::Read, "int", "boundary_offsets[]"});
+    resources.append(
+        HaShaderResource{slot++, HaShaderQualifier::Read, "int", "boundary_indices[]"});
+  }
+  if (with_coupled) {
+    resources.append(HaShaderResource{slot++, HaShaderQualifier::Read, "float", "coupled_in[]"});
+    resources.append(
+        HaShaderResource{slot++, HaShaderQualifier::Read, "int", "coupled_offsets[]"});
+    resources.append(
+        HaShaderResource{slot++, HaShaderQualifier::Read, "int", "coupled_indices[]"});
+  }
+  return resources;
+}
+
+/** Reaction of the fluid on the coupled samples: one invocation per coupled sample. */
+std::array<HaShaderResource, 10> COUPLED_REACTION_RESOURCES = {{
+    {0, HaShaderQualifier::Read, "float", "coupled_in[]"},
+    {1, HaShaderQualifier::Write, "float", "coupled_reaction_out[]"},
+    {2, HaShaderQualifier::Read, "float", "position_in[]"},
+    {3, HaShaderQualifier::Read, "float", "props[]"},
+    {4, HaShaderQualifier::Read, "float", "particle_state[]"},
+    {5, HaShaderQualifier::Read, "float", "params[]"},
+    {6, HaShaderQualifier::Read, "int", "cells[]"},
+    {7, HaShaderQualifier::Read, "int", "bucket_offsets[]"},
+    {8, HaShaderQualifier::Read, "int", "bucket_counts[]"},
+    {9, HaShaderQualifier::Read, "int", "sorted_in[]"},
 }};
 
 std::array<HaShaderResource, 8> CONTACT_POSITION_RESOURCES = {{
@@ -1671,6 +1891,14 @@ void HaXpbdFluid::free()
   boundary_offsets_.free();
   boundary_indices_.free();
   boundary_counts_.free();
+  coupled_particles_.free();
+  coupled_grid_.free();
+  coupled_offsets_.free();
+  coupled_indices_.free();
+  coupled_counts_.free();
+  coupled_reaction_.free();
+  coupled_count_ = 0;
+  coupled_capacity_ = 0;
   contact_vec_.free();
   contact_scalar_.free();
   contact_points_.free();
@@ -1822,6 +2050,7 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
       int(inputs.surface_tension.size()) != particle_count ||
       int(inputs.boundary_friction.size()) != particle_count ||
       int(inputs.use_boundary.size()) != particle_count ||
+      int(inputs.coupling.size()) != particle_count ||
       int(inputs.boundary_masses.size()) != boundary_count)
   {
     last_error_ = "input size mismatch";
@@ -1877,6 +2106,7 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
     host_props[prop_base + HA_PROP_SURFACE_TENSION] = inputs.surface_tension[i];
     host_props[prop_base + HA_PROP_FRICTION] = inputs.boundary_friction[i];
     host_props[prop_base + HA_PROP_USE_BOUNDARY] = inputs.use_boundary[i] ? 1.0f : 0.0f;
+    host_props[prop_base + HA_PROP_COUPLING] = inputs.coupling[i];
   }
   grid_.positions.upload(host_positions);
   velocities_.upload(host_velocities);
@@ -1947,10 +2177,174 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
                                                                       0);
   params[FLUID_PARAM_BOUNDARY_CAPACITY] = 0.0f;
   params[FLUID_PARAM_CONTACT_COUNT] = 0.0f;
+  /* Coupled solids: the hash table size only depends on the sample count, and the CSR capacity is
+   * the same heuristic as the collider boundary list (the fill pass clamps to it). */
+  int coupled_table_size = 1024;
+  while (coupled_table_size < int(inputs.coupled_positions.size()) * 2 &&
+         coupled_table_size < (1 << 22))
+  {
+    coupled_table_size <<= 1;
+  }
+  params[FLUID_PARAM_COUPLED_TABLE_SIZE] = float(coupled_table_size);
+  params[FLUID_PARAM_COUPLED_CAPACITY] = float(std::max(64, particle_count * 48));
+  params[FLUID_PARAM_COUPLED_COUNT] = float(inputs.coupled_positions.size());
   params_.upload(params);
+
+  if (!inputs.coupled_positions.is_empty()) {
+    if (!this->update_coupled(inputs.coupled_positions,
+                              inputs.coupled_masses,
+                              inputs.coupled_inv_masses))
+    {
+      last_error_ = "coupled allocation failed";
+      return false;
+    }
+  }
+  else {
+    coupled_count_ = 0;
+  }
+  if (coupled_count_ > 0) {
+    /* The reaction accumulates over the whole frame (all substeps and iterations); the solver reads
+     * it back once per frame. A readback per substep costs ~100 ms of Vulkan stall overhead. */
+    Array<float> zeros(int64_t(coupled_count_) * 3);
+    zeros.fill(0.0f);
+    coupled_reaction_.upload(zeros);
+  }
 
   contact_count_ = 0;
   ready_ = true;
+  return true;
+}
+
+bool HaXpbdFluid::update_coupled(Span<float3> positions,
+                                 Span<float> masses,
+                                 Span<float> inv_masses)
+{
+  const int count = int(positions.size());
+  coupled_count_ = count;
+  if (count == 0) {
+    return true;
+  }
+  if (int(masses.size()) != count || int(inv_masses.size()) != count) {
+    last_error_ = "coupled size mismatch";
+    return false;
+  }
+  HaContextGuard guard;
+  if (!guard.is_valid()) {
+    last_error_ = "no GPU context";
+    return false;
+  }
+  if (!coupled_particles_.ensure(int64_t(count) * HA_COUPLED_STRIDE) ||
+      !coupled_reaction_.ensure(int64_t(count) * 3))
+  {
+    last_error_ = "coupled allocation failed";
+    return false;
+  }
+  Array<float> host_particles(int64_t(count) * HA_COUPLED_STRIDE);
+  Array<float> host_positions(int64_t(count) * 3);
+  for (const int i : IndexRange(count)) {
+    const float3 &position = positions[i];
+    host_particles[i * HA_COUPLED_STRIDE + 0] = position.x;
+    host_particles[i * HA_COUPLED_STRIDE + 1] = position.y;
+    host_particles[i * HA_COUPLED_STRIDE + 2] = position.z;
+    host_particles[i * HA_COUPLED_STRIDE + 3] = masses[i];
+    host_particles[i * HA_COUPLED_STRIDE + 4] = inv_masses[i];
+    host_positions[i * 3 + 0] = position.x;
+    host_positions[i * 3 + 1] = position.y;
+    host_positions[i * 3 + 2] = position.z;
+  }
+  coupled_particles_.upload(host_particles);
+  if (!ha_xpbd_grid_prepare(coupled_grid_, count, support_radius_)) {
+    last_error_ = "coupled grid failed";
+    return false;
+  }
+  coupled_grid_.positions.upload(host_positions);
+  if (!ha_xpbd_grid_build_device(coupled_grid_)) {
+    last_error_ = "coupled grid failed";
+    return false;
+  }
+  return true;
+}
+
+bool HaXpbdFluid::download_coupled_reaction(MutableSpan<float3> r_corrections) const
+{
+  if (coupled_count_ == 0) {
+    return true;
+  }
+  if (int(r_corrections.size()) < coupled_count_) {
+    return false;
+  }
+  Array<float> host(int64_t(coupled_count_) * 3);
+  coupled_reaction_.download(host);
+  for (const int i : IndexRange(coupled_count_)) {
+    r_corrections[i] = float3(host[i * 3 + 0], host[i * 3 + 1], host[i * 3 + 2]);
+  }
+  return true;
+}
+
+bool HaXpbdFluid::build_coupled_neighbors(const int pass_offset)
+{
+  if (coupled_count_ == 0) {
+    return true;
+  }
+  int pass_count = pass_offset;
+  gpu::Shader *count_shader = ha_shader_get_source("xpbd|coupled_count",
+                                                   coupled_query_kernel(true),
+                                                   as_span(COUPLED_COUNT_RESOURCES),
+                                                   LOCAL_GROUP_SIZE);
+  gpu::Shader *fill_shader = ha_shader_get_source("xpbd|coupled_fill",
+                                                  coupled_query_kernel(false),
+                                                  as_span(COUPLED_FILL_RESOURCES),
+                                                  LOCAL_GROUP_SIZE);
+  if (count_shader == nullptr || fill_shader == nullptr) {
+    return false;
+  }
+  if (!coupled_counts_.ensure(particle_count_)) {
+    return false;
+  }
+  {
+    std::array<gpu::StorageBuf *, 8> buffers{grid_.positions.buf(),
+                                             coupled_particles_.buf(),
+                                             coupled_grid_.cells.buf(),
+                                             coupled_grid_.bucket_offsets.buf(),
+                                             coupled_grid_.bucket_counts.buf(),
+                                             coupled_grid_.sorted.buf(),
+                                             coupled_counts_.buf(),
+                                             params_.buf()};
+    dispatch_pass(count_shader, buffer_span(buffers), particle_count_);
+    pass_count++;
+  }
+  /* Use the coupled grid's scan scratch, not the fluid grid's: the fluid one holds the total that
+   * #ha_xpbd_neighbors_total reads, and overwriting it made the diagnostics report 0 neighbours. */
+  if (!scan_counts(
+          coupled_grid_, coupled_counts_, coupled_offsets_, nullptr, particle_count_, pass_count))
+  {
+    return false;
+  }
+  const int capacity = std::max(coupled_capacity_, std::max(64, particle_count_ * 48));
+  if (capacity != coupled_capacity_) {
+    if (!coupled_indices_.ensure(capacity)) {
+      return false;
+    }
+    coupled_capacity_ = capacity;
+    std::array<float, FLUID_PARAM_COUNT_TOTAL> params{};
+    params_.download(params);
+    params[FLUID_PARAM_COUPLED_CAPACITY] = float(capacity);
+    params_.upload(params);
+  }
+  {
+    std::array<gpu::StorageBuf *, 9> buffers{grid_.positions.buf(),
+                                             coupled_particles_.buf(),
+                                             coupled_grid_.cells.buf(),
+                                             coupled_grid_.bucket_offsets.buf(),
+                                             coupled_grid_.bucket_counts.buf(),
+                                             coupled_grid_.sorted.buf(),
+                                             coupled_offsets_.buf(),
+                                             coupled_indices_.buf(),
+                                             params_.buf()};
+    dispatch_pass(fill_shader, buffer_span(buffers), particle_count_);
+    pass_count++;
+  }
+  stats_.passes += pass_count - pass_offset;
   return true;
 }
 
@@ -2066,7 +2460,10 @@ bool HaXpbdFluid::begin_substep(const ContactHook &contact_hook)
     last_error_ = "boundary neighbour pass failed";
     return false;
   }
-
+  if (!this->build_coupled_neighbors(stats_.passes)) {
+    last_error_ = "coupled neighbour pass failed";
+    return false;
+  }
   const double solve_start = time_now_ms();
   gpu::Shader *predict = ha_shader_get_source("xpbd|predict",
                                               std::string(GLSL_PRELUDE) + KERNEL_PREDICT,
@@ -2109,20 +2506,29 @@ bool HaXpbdFluid::iterate()
   }
   const int count = particle_count_;
   const bool with_boundary = boundary_count_ > 0;
+  const bool with_coupled = coupled_count_ > 0;
 
+  Vector<HaShaderResource> step_resources = fluid_step_resources(with_boundary, with_coupled);
+  const Span<const HaShaderResource> step_span(step_resources.data(), step_resources.size());
   gpu::Shader *density = ha_shader_get_source(
-      "xpbd|density",
-      fluid_kernel(
-          DENSITY_PROLOGUE, DENSITY_LOOP, with_boundary ? DENSITY_BOUNDARY_LOOP : nullptr,
-          DENSITY_EPILOGUE),
-      with_boundary ? as_span(DENSITY_RESOURCES) : as_span(DENSITY_RESOURCES_NO_BOUNDARY),
+      with_coupled ? (with_boundary ? "xpbd|density_bc" : "xpbd|density_c") :
+                     (with_boundary ? "xpbd|density_b" : "xpbd|density"),
+      fluid_kernel(DENSITY_PROLOGUE,
+                   DENSITY_LOOP,
+                   with_boundary ? DENSITY_BOUNDARY_LOOP : nullptr,
+                   DENSITY_EPILOGUE,
+                   with_coupled ? DENSITY_COUPLED_LOOP : nullptr),
+      step_span,
       LOCAL_GROUP_SIZE);
   gpu::Shader *delta = ha_shader_get_source(
-      "xpbd|delta_apply",
-      fluid_kernel(
-          DELTA_PROLOGUE, DELTA_LOOP, with_boundary ? DELTA_BOUNDARY_LOOP : nullptr,
-          DELTA_EPILOGUE),
-      with_boundary ? as_span(DELTA_RESOURCES) : as_span(DELTA_RESOURCES_NO_BOUNDARY),
+      with_coupled ? (with_boundary ? "xpbd|delta_bc" : "xpbd|delta_c") :
+                     (with_boundary ? "xpbd|delta_b" : "xpbd|delta"),
+      fluid_kernel(DELTA_PROLOGUE,
+                   DELTA_LOOP,
+                   with_boundary ? DELTA_BOUNDARY_LOOP : nullptr,
+                   DELTA_EPILOGUE,
+                   with_coupled ? DELTA_COUPLED_LOOP : nullptr),
+      step_span,
       LOCAL_GROUP_SIZE);
   gpu::Shader *apply = ha_shader_get_source("xpbd|apply",
                                             std::string(GLSL_PRELUDE) + KERNEL_APPLY_CORRECTION,
@@ -2133,44 +2539,63 @@ bool HaXpbdFluid::iterate()
       std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + KERNEL_CONTACT_POSITION,
       as_span(CONTACT_POSITION_RESOURCES),
       LOCAL_GROUP_SIZE);
-  if (density == nullptr || delta == nullptr || apply == nullptr || contact_position == nullptr) {
+  gpu::Shader *coupled_reaction = nullptr;
+  if (with_coupled) {
+    coupled_reaction = ha_shader_get_source(
+        "xpbd|coupled_reaction",
+        std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + KERNEL_COUPLED_REACTION,
+        as_span(COUPLED_REACTION_RESOURCES),
+        LOCAL_GROUP_SIZE);
+  }
+  if (density == nullptr || delta == nullptr || apply == nullptr ||
+      contact_position == nullptr || (with_coupled && coupled_reaction == nullptr))
+  {
     last_error_ = "shader creation failed";
     return false;
   }
 
   const double iteration_start = time_now_ms();
-  /* The buffer list has to match the bound shader variant (with or without boundary particles),
-   * binding a null buffer to an unused slot crashes the driver. */
-  const int density_buffer_count = with_boundary ? 9 : 6;
-  {
-    std::array<gpu::StorageBuf *, 9> buffers{grid_.positions.buf(),
-                                             grid_.neighbor_offsets.buf(),
-                                             grid_.neighbor_indices.buf(),
-                                             props_.buf(),
-                                             particle_state_.buf(),
-                                             params_.buf(),
-                                             boundary_particles_.buf(),
-                                             boundary_offsets_.buf(),
-                                             boundary_indices_.buf()};
-    dispatch_pass(
-        density, Span<gpu::StorageBuf *>(buffers.data(), density_buffer_count), count);
+  /* The buffer list has to match the bound shader variant (with or without boundary particles and
+   * coupled solids), binding a null buffer to an unused slot crashes the driver. */
+  Vector<gpu::StorageBuf *> step_buffers;
+  step_buffers.append(grid_.positions.buf());
+  step_buffers.append(grid_.neighbor_offsets.buf());
+  step_buffers.append(grid_.neighbor_indices.buf());
+  step_buffers.append(props_.buf());
+  step_buffers.append(particle_state_.buf());
+  step_buffers.append(params_.buf());
+  if (with_boundary) {
+    step_buffers.append(boundary_particles_.buf());
+    step_buffers.append(boundary_offsets_.buf());
+    step_buffers.append(boundary_indices_.buf());
   }
-  {
-    std::array<gpu::StorageBuf *, 9> buffers{grid_.positions.buf(),
-                                             grid_.neighbor_offsets.buf(),
-                                             grid_.neighbor_indices.buf(),
-                                             props_.buf(),
-                                             particle_state_.buf(),
-                                             params_.buf(),
-                                             boundary_particles_.buf(),
-                                             boundary_offsets_.buf(),
-                                             boundary_indices_.buf()};
-    dispatch_pass(delta, Span<gpu::StorageBuf *>(buffers.data(), density_buffer_count), count);
+  if (with_coupled) {
+    step_buffers.append(coupled_particles_.buf());
+    step_buffers.append(coupled_offsets_.buf());
+    step_buffers.append(coupled_indices_.buf());
   }
+  const Span<gpu::StorageBuf *> step_span_buffers(step_buffers.data(), step_buffers.size());
+  dispatch_pass(density, step_span_buffers, count);
+  dispatch_pass(delta, step_span_buffers, count);
   {
     std::array<gpu::StorageBuf *, 4> buffers{
         grid_.positions.buf(), particle_state_.buf(), props_.buf(), params_.buf()};
     dispatch_pass(apply, buffer_span(buffers), count);
+  }
+  if (with_coupled) {
+    /* The reaction uses the *corrected* positions, like `fluid_apply_boundary_reaction` on the
+     * CPU (which runs after the density iteration applied its correction). */
+    std::array<gpu::StorageBuf *, 10> buffers{coupled_particles_.buf(),
+                                              coupled_reaction_.buf(),
+                                              grid_.positions.buf(),
+                                              props_.buf(),
+                                              particle_state_.buf(),
+                                              params_.buf(),
+                                              grid_.cells.buf(),
+                                              grid_.bucket_offsets.buf(),
+                                              grid_.bucket_counts.buf(),
+                                              grid_.sorted.buf()};
+    dispatch_pass(coupled_reaction, buffer_span(buffers), coupled_count_);
   }
   if (sdf_active_) {
     gpu::Shader *sdf_contact = ha_shader_get_source(
@@ -2202,7 +2627,7 @@ bool HaXpbdFluid::iterate()
                                              params_.buf()};
     dispatch_pass(contact_position, buffer_span(buffers), contact_count_);
   }
-  stats_.passes += 3;
+  stats_.passes += with_coupled ? 4 : 3;
   stats_.solve_ms += time_now_ms() - iteration_start;
   return true;
 }

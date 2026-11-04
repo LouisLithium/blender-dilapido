@@ -69,6 +69,9 @@ struct HaSdfGrid {
  * \param region_min/region_max: World space box the field is built for. Only the triangles that
  *   intersect the box are clipped and rasterized, and the dense lattice covers the box. A large
  *   collider (a 20 m ground plane) therefore costs only the part the fluid can reach.
+ * \param reference_point: A point known to be outside the solid collider (the fluid center). The
+ *   level set sign of an open mesh (a single plane) is ambiguous, so the field is flipped when the
+ *   distance at this point is negative.
  * \param r_grid: Filled on success. Callers usually cache it and only rebuild when the geometry
  *   changes (see the geometry hash in the solver).
  */
@@ -79,6 +82,7 @@ bool ha_sdf_build(Span<float3> positions,
                   float band_width,
                   const float3 &region_min,
                   const float3 &region_max,
+                  const float3 &reference_point,
                   HaSdfGrid &r_grid);
 
 /** Interpolates the field on the host, used by the debug output and the tests. */
