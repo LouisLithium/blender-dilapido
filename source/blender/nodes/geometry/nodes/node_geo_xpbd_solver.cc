@@ -5515,7 +5515,10 @@ class XpbdSolverStep {
       return "not a fluid";
     }
     if (fluid.has_coupled) {
-      r_soft = true;
+      /* This is a correctness rejection, not a performance one: the device path has no coupling
+       * yet, so running it would silently drop the interaction with the cloth/soft body. The fluid
+       * would then accelerate freely and could tunnel through the (narrow band) collider field.
+       * `Backend = Strict` and `BLENDER_XPBD_GPU=1` must not bypass it. */
       return "coupled with another geometry";
     }
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
@@ -5758,6 +5761,9 @@ class XpbdSolverStep {
         if (gpu_rejection_reason_.empty()) {
           gpu_rejection_reason_ = rejection;
         }
+        /* Only the "small fluid" performance rejection is soft: an explicit device request
+         * (`Strict`, `BLENDER_XPBD_GPU=1`) may override it. Correctness rejections (coupling,
+         * curves, constraints, split chunks) never get here with `soft_rejection` set. */
         const bool ignore_soft = force_gpu || gpu_backend_request_ == 2; /* Backend = Strict */
         if (!(ignore_soft && soft_rejection)) {
           debug_gpu_log("BLENDER_XPBD_GPU_LOG",
