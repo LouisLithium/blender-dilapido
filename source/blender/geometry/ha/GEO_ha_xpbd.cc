@@ -1899,6 +1899,7 @@ void HaXpbdFluid::free()
   coupled_reaction_.free();
   coupled_count_ = 0;
   coupled_capacity_ = 0;
+  coupled_table_size_ = 0;
   contact_vec_.free();
   contact_scalar_.free();
   contact_points_.free();
@@ -2188,6 +2189,7 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
   params[FLUID_PARAM_COUPLED_TABLE_SIZE] = float(coupled_table_size);
   params[FLUID_PARAM_COUPLED_CAPACITY] = float(std::max(64, particle_count * 48));
   params[FLUID_PARAM_COUPLED_COUNT] = float(inputs.coupled_positions.size());
+  coupled_table_size_ = coupled_table_size;
   params_.upload(params);
 
   if (!inputs.coupled_positions.is_empty()) {
@@ -2262,6 +2264,17 @@ bool HaXpbdFluid::update_coupled(Span<float3> positions,
     last_error_ = "coupled grid failed";
     return false;
   }
+  /* The fluid -> coupled query masks the hash with the coupled table size. The sample count (and
+   * therefore the table size) changes when the coupling is first detected, so the parameter has to
+   * follow the grid. A stale (smaller) mask made the query read only a fraction of the buckets and
+   * the coupled samples never entered the density. */
+  if (coupled_grid_.table_size != coupled_table_size_) {
+    coupled_table_size_ = coupled_grid_.table_size;
+    std::array<float, FLUID_PARAM_COUNT_TOTAL> params{};
+    params_.download(params);
+    params[FLUID_PARAM_COUPLED_TABLE_SIZE] = float(coupled_table_size_);
+    params_.upload(params);
+  }
   return true;
 }
 
@@ -2315,10 +2328,23 @@ bool HaXpbdFluid::build_coupled_neighbors(const int pass_offset)
   }
   /* Use the coupled grid's scan scratch, not the fluid grid's: the fluid one holds the total that
    * #ha_xpbd_neighbors_total reads, and overwriting it made the diagnostics report 0 neighbours. */
-  if (!scan_counts(
-          coupled_grid_, coupled_counts_, coupled_offsets_, nullptr, particle_count_, pass_count))
+  const bool debug = std::getenv("XPBD_GPU_DEBUG") != nullptr;
+  int coupled_total = 0;
+  if (!scan_counts(coupled_grid_,
+                   coupled_counts_,
+                   coupled_offsets_,
+                   debug ? &coupled_total : nullptr,
+                   particle_count_,
+                   pass_count))
   {
     return false;
+  }
+  if (debug) {
+    printf("XPBD_GPU coupled samples=%d pairs=%d table=%d\n",
+           coupled_count_,
+           coupled_total,
+           coupled_grid_.table_size);
+    fflush(stdout);
   }
   const int capacity = std::max(coupled_capacity_, std::max(64, particle_count_ * 48));
   if (capacity != coupled_capacity_) {

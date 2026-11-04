@@ -437,6 +437,8 @@ class HaXpbdFluid {
   HaBufferInt coupled_counts_;
   int coupled_count_ = 0;
   int coupled_capacity_ = 0;
+  /** Hash table size currently stored in `params[FLUID_PARAM_COUPLED_TABLE_SIZE]`. */
+  int coupled_table_size_ = 0;
   /** Three floats per coupled particle: the reaction of the last iteration. */
   HaBuffer coupled_reaction_;
   /** Per frame constants, see the `FluidParamIndex` enum in the implementation. */

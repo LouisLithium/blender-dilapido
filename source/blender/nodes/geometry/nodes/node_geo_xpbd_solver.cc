@@ -5380,6 +5380,16 @@ class XpbdSolverStep {
                                       const Span<float3> corrections,
                                       const int solver_refs_i)
   {
+    if (std::getenv("XPBD_GPU_DEBUG") != nullptr) {
+      float max_len = 0.0f;
+      for (const float3 &c : corrections) {
+        max_len = std::max(max_len, math::length(c));
+      }
+      printf("XPBD_GPU coupled reaction count=%d max=%g\n",
+             int(corrections.size()),
+             double(max_len));
+      fflush(stdout);
+    }
     const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
     for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
       scratch.correction_sums.fill(float3(0.0f));
@@ -5593,10 +5603,15 @@ class XpbdSolverStep {
     if (!fluid.active) {
       return "not a fluid";
     }
-    /* Coupled fluids are supported on the device since M115: the density/delta passes include the
-     * coupled samples and a reaction pass gives the pressure back to the solid vertices. The hard
-     * point/triangle contacts of `CoupledFaceContacts` are still CPU only; the density coupling is
-     * what holds the water. */
+    if (fluid.has_coupled) {
+      /* The device density coupling is implemented (M115), but the density constraint is unilateral:
+       * it only resists *compression*. A fast or under-dense fluid at the cloth never compresses
+       * (lambda stays 0), so the reaction is 0 and the water passes through. The CPU path also has
+       * the hard point/triangle contact of `CoupledFaceContacts`, which is what actually catches
+       * fast water; that contact is CPU only. Keep coupled fluids on the CPU until the device has
+       * an equivalent hard contact. */
+      return "coupled with another geometry";
+    }
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
      * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
