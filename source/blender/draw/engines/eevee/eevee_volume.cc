@@ -212,6 +212,7 @@ void VolumeModule::end_sync()
     grid_result.extinction_tx_ = dummy_transmit_tx_;
     inst_.uniform_data.data.volume_grid.enabled = 0.0f;
     inst_.uniform_data.data.volume_grid.bounds_size = float3(0.0f);
+    inst_.uniform_data.data.volume_grid.samples = float4(0.0f);
 
     /* Update references for bindings. */
     result.scattering_tx_ = dummy_scatter_tx_;
@@ -472,6 +473,7 @@ void VolumeModule::grid_ensure()
   grid_built_ = false;
   grid_light_done_ = false;
   inst_.uniform_data.data.volume_grid.enabled = 0.0f;
+  inst_.uniform_data.data.volume_grid.samples = float4(0.0f);
 
   std::optional<Bounds<float3>> bounds = inst_.pipelines.volume.object_world_bounds();
   /* The world space volume grid feeds the volumetric GI and the volumetric shadows on surfaces. */
@@ -578,10 +580,14 @@ void VolumeModule::grid_ensure()
   inst_.uniform_data.data.volume_grid.bounds_size = extent;
   inst_.uniform_data.data.volume_grid.mode = 0;
   inst_.uniform_data.data.volume_grid.enabled = 1.0f;
+  /* The grid itself is shared by both features, but each one has to be able to opt out
+   * independently. A sample count of zero means "this consumer does not use the grid". */
+  const bool gi_enabled = (eevee.flag & SCE_EEVEE_VOLUMETRIC_GI) != 0;
+  const bool shadow_surface_enabled = (eevee.flag & SCE_EEVEE_VOLUMETRIC_SHADOWS_SURFACE) != 0;
   int gi_samples = eevee.volumetric_grid_samples;
   inst_.uniform_data.data.volume_grid.samples = float4(
-      float(gi_samples > 0 ? gi_samples : 8),
-      float(clamp_i(eevee.volumetric_shadow_samples, 1, 128)),
+      gi_enabled ? float(gi_samples > 0 ? gi_samples : 8) : 0.0f,
+      shadow_surface_enabled ? float(clamp_i(eevee.volumetric_shadow_samples, 1, 128)) : 0.0f,
       0.0f,
       0.0f);
 
@@ -633,6 +639,7 @@ void VolumeModule::grid_free_resources()
   grid_result.extinction_tx_ = dummy_transmit_tx_;
   inst_.uniform_data.data.volume_grid.enabled = 0.0f;
   inst_.uniform_data.data.volume_grid.bounds_size = float3(0.0f);
+  inst_.uniform_data.data.volume_grid.samples = float4(0.0f);
 }
 
 void VolumeModule::draw_grid_prepass()

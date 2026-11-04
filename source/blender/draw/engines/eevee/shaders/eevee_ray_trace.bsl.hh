@@ -198,7 +198,8 @@ void trace([[resource_table]] Resources &srt,
     hit.time = 10000.0f;
   }
 
-  if (uni.uniform_buf.volume_grid.enabled != 0.0f) {
+  if (uni.uniform_buf.volume_grid.enabled != 0.0f &&
+      uni.uniform_buf.volume_grid.samples.x > 0.0f) {
     /* Volumetric GI: integrate the participating media along the ray. The media is represented
      * in world space, so it is visible to the ray even when the volume is off-screen. Note that
      * the ray hit radiance (`radiance_front_tx`) does not contain the camera path volumetrics,

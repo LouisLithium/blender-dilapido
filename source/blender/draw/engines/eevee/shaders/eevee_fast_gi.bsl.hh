@@ -856,7 +856,8 @@ void scan([[work_group_id]] const uint3 group_id,
       false,
       constants.ao_only);
 
-  if (!constants.ao_only && (uni.uniform_buf.volume_grid.enabled != 0.0f)) {
+  if (!constants.ao_only && (uni.uniform_buf.volume_grid.enabled != 0.0f) &&
+      (uni.uniform_buf.volume_grid.samples.x > 0.0f)) {
     /* Volumetric GI through the Fast GI (horizon scan) path. The scan does not trace rays, so the
      * participating media is integrated along a few cosine distributed directions around the
      * surface normal, then encoded as a cosine lobe around the normal. This makes

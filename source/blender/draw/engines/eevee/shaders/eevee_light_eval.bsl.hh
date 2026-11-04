@@ -163,7 +163,8 @@ template<bool is_transmission> struct EvalCtx {
     }
 
     float3 shadow_rgb = float3(shadow);
-    if (uni.uniform_buf.volume_grid.enabled != 0.0f) {
+    if (uni.uniform_buf.volume_grid.enabled != 0.0f &&
+        uni.uniform_buf.volume_grid.samples.y > 0.0f) {
       /* Volumetric shadows: the participating media between the surface and the light absorbs
        * and scatters a part of the incoming light. This is the same world space grid as the one
        * used for volumetric GI. Only the transmittance is of interest here. */
