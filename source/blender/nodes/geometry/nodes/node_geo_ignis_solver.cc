@@ -32,10 +32,16 @@
 
 #include "NOD_bundle_type.hh"
 #include "NOD_geometry_nodes_bundle.hh"
+#include "NOD_geometry_nodes_lazy_function.hh"
 #include "NOD_geometry_nodes_physics_bundles.hh"
 
 #include "node_geometry_util.hh"
 
+#include "UI_interface_layout.hh"
+#include "UI_resources.hh"
+
+#include "GEO_ha_context.hh"
+#include "GEO_ha_status.hh"
 #include "GEO_ignis_solver.hh"
 
 namespace blender::nodes::node_geo_ignis_solver_cc {
@@ -244,7 +250,15 @@ geometry::ignis::Settings read_settings(const Bundle &world)
   return settings;
 }
 
-/** Appends the mesh of one collider bundle. `Dilapido Collider` bakes the transform in already. */
+/**
+ * Appends the mesh of one collider bundle.
+ *
+ * `Dilapido Collider` bakes the transform into the geometry, so `mesh` is already the pose of this
+ * frame. The `previous` bundle written by `Set Previous World Items` holds the mesh and the
+ * transform of the previous frame; with `Sweep` on the solver rasterizes several poses between the
+ * two so a fast collider cannot jump over the smoke, and with `Deforming` on it interpolates the
+ * vertices instead of the object transform.
+ */
 void append_collider(const Bundle &bundle, Vector<geometry::ignis::Collider> &r_colliders)
 {
   const GeometrySet *geometry = lookup_geometry(bundle, "geometry");
@@ -257,6 +271,28 @@ void append_collider(const Bundle &bundle, Vector<geometry::ignis::Collider> &r_
   }
   geometry::ignis::Collider collider;
   collider.mesh = mesh;
+  collider.sweep = read_bool(bundle, "sweep", true);
+  collider.deforming = read_bool(bundle, "deforming", false);
+  if (const float4x4 *transform = bundle.lookup_ptr<float4x4>(*BundleKey::from_str("transform"))) {
+    collider.transform = *transform;
+  }
+  if (const BundlePtr *previous_ptr = bundle.lookup_ptr<BundlePtr>(
+          *BundleKey::from_str("previous")))
+  {
+    if (*previous_ptr) {
+      const Bundle &previous = **previous_ptr;
+      if (const GeometrySet *previous_geometry = lookup_geometry(previous, "geometry")) {
+        collider.previous_mesh = previous_geometry->get_mesh();
+        collider.has_previous = collider.previous_mesh != nullptr;
+      }
+      if (const float4x4 *previous_transform = previous.lookup_ptr<float4x4>(
+              *BundleKey::from_str("transform")))
+      {
+        collider.previous_transform = *previous_transform;
+        collider.has_previous_transform = true;
+      }
+    }
+  }
   r_colliders.append(collider);
 }
 
@@ -295,6 +331,11 @@ void gather_effectors(const Bundle &effectors,
   consume(effectors);
   const Vector<std::string> paths = gather_bundle_paths_by_bundle_type(effectors, is_effector);
   for (const StringRef path : paths) {
+    /* `Set Previous World Items` nests a copy of every effector under `previous`; that copy is the
+     * pose of the previous frame of a collider already in the list, not another collider. */
+    if (path.find("previous") != std::string::npos) {
+      continue;
+    }
     const BundlePtr *bundle_ptr = effectors.lookup_path_ptr<BundlePtr>(path);
     if (!bundle_ptr || !*bundle_ptr) {
       continue;
@@ -321,6 +362,8 @@ BundlePtr stats_to_bundle(const Stats &stats)
   bundle.add(*BundleKey::from_str("cfl_limited"), stats.cfl_limited);
   bundle.add(*BundleKey::from_str("resized"), stats.resized);
   bundle.add(*BundleKey::from_str("milliseconds"), float(stats.milliseconds));
+  bundle.add(*BundleKey::from_str("device"), stats.device);
+  bundle.add(*BundleKey::from_str("device_passes"), stats.device_passes);
   return bundle_ptr;
 }
 
@@ -356,6 +399,15 @@ static void node_geo_exec(GeoNodeExecParams params)
     return;
   }
   const float delta_time = params.extract_input<float>("Delta Time"_ustr);
+
+  /* `HW Accelerate` zone the solver is evaluated in, if any (0 = outside of a zone). The zone
+   * wrapper puts the request into the evaluation data, see `GeoNodesUserData::ha_backend_request`. */
+  const GeoNodesUserData &user_data = *static_cast<const GeoNodesUserData *>(params.user_data());
+  const int backend_request = user_data.ha_backend_request ? *user_data.ha_backend_request : 0;
+  if (std::getenv("BLENDER_IGNIS_HA_DEBUG") != nullptr) {
+    fprintf(stderr, "IGNIS_HA node %s: backend_request=%d\n", params.node().name, backend_request);
+    fflush(stderr);
+  }
 
   geometry::ignis::Settings settings = read_settings(*world_ptr);
 
@@ -398,6 +450,17 @@ static void node_geo_exec(GeoNodeExecParams params)
            double(acceleration.y),
            double(acceleration.z),
            delta_time);
+    for (const geometry::ignis::Collider &collider : colliders) {
+      printf("IGNIS_DEBUG collider: sweep %d, deforming %d, previous mesh %s, previous "
+             "transform %s, velocity %.3f %.3f %.3f\n",
+             int(collider.sweep),
+             int(collider.deforming),
+             collider.has_previous ? "yes" : "no",
+             collider.has_previous_transform ? "yes" : "no",
+             double(collider.velocity.x),
+             double(collider.velocity.y),
+             double(collider.velocity.z));
+    }
   }
 
   Stats stats;
@@ -407,7 +470,49 @@ static void node_geo_exec(GeoNodeExecParams params)
       Span<const geometry::ignis::Collider>(colliders.data(), colliders.size()),
       settings,
       delta_time,
-      stats);
+      stats,
+      backend_request);
+
+  /* Report what the `HW Accelerate` zone actually did. A silent fallback is what makes a backend
+   * hard to trust, so the reason is shown on the node (badge + warning) whenever the user asked for
+   * the device. `Force CPU` is an explicit choice and gets no badge. */
+  if (backend_request != 0) {
+    const bNodeTree &tree = params.node().owner_tree();
+    const bNode &node = params.node();
+    if (stats.device) {
+      geometry::ha::HaNodeStatus status;
+      status.state = geometry::ha::HaNodeState::Device;
+      status.backend = geometry::ha::ha_gpu_backend_name();
+      status.elements = stats.active_voxels;
+      geometry::ha::ha_status_set(tree, node, status);
+    }
+    else if (backend_request == 3) {
+      geometry::ha::ha_status_clear(tree, node);
+    }
+    else {
+      geometry::ha::HaNodeStatus status;
+      status.state = geometry::ha::HaNodeState::Fallback;
+      status.backend = geometry::ha::ha_gpu_backend_name();
+      status.reason = stats.device_fallback_reason.empty() ?
+                          std::string("the smoke is solved on the CPU") :
+                          stats.device_fallback_reason;
+      geometry::ha::ha_status_set(tree, node, status);
+      if (backend_request == 2) {
+        params.error_message_add(
+            NodeWarningType::Warning,
+            TIP_("HW Accelerate zone (Strict): the smoke is solved on the CPU (") + status.reason +
+                ")");
+      }
+      else {
+        params.error_message_add(
+            NodeWarningType::Info,
+            TIP_("HW Accelerate zone: the smoke is solved on the CPU (") + status.reason + ")");
+      }
+    }
+  }
+  else {
+    geometry::ha::ha_status_clear(params.node().owner_tree(), params.node());
+  }
 
   /* Only the state changes, everything else in the world is passed through. `add` does nothing when
    * the item already exists, so the state has to overwrite it. */
@@ -429,6 +534,23 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 }
 
+static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *current_node_ptr)
+{
+  bNode &node = *static_cast<bNode *>(current_node_ptr->data);
+  geometry::ha::HaNodeStatus status;
+  if (!geometry::ha::ha_status_get(node.owner_tree(), node, status)) {
+    return;
+  }
+  layout.separator();
+  if (status.state == geometry::ha::HaNodeState::Device) {
+    layout.label("Device: " + status.backend + " · " + std::to_string(status.elements) + " voxels",
+                 ICON_MEMORY);
+  }
+  else {
+    layout.label("CPU: " + status.reason, ICON_INFO);
+  }
+}
+
 static void node_register()
 {
   static bke::bNodeType ntype;
@@ -441,6 +563,7 @@ static void node_register()
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.declare = node_declare;
+  ntype.draw_buttons_ex = node_layout_ex;
   ntype.default_width = bke::NodeWidth::_180;
   bke::node_register_type(ntype);
 }

@@ -72,6 +72,7 @@ set(SRC
 
   ha/GEO_ha_context.cc
   ha/GEO_ha_expr.cc
+  ha/GEO_ha_ignis.cc
   ha/GEO_ha_program.cc
   ha/GEO_ha_sdf.cc
   ha/GEO_ha_status.cc

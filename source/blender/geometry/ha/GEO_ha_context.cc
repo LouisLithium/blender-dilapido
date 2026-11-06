@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -199,6 +200,8 @@ struct HaGuardState {
 
 thread_local HaGuardState g_guard_state;
 
+/** Why the last guard of this thread failed, shown by the nodes that wanted the device. */
+thread_local const char *g_context_error = "";
 
 }  // namespace
 
@@ -212,7 +215,9 @@ thread_local HaGuardState g_guard_state;
  */
 HaContextGuard::HaContextGuard()
 {
+  g_context_error = "";
   if (!ha_gpu_available()) {
+    g_context_error = "the GPU backend is not initialized (or BLENDER_HA_NO_GPU is set)";
     return;
   }
   if (g_guard_state.depth > 0) {
@@ -220,6 +225,9 @@ HaContextGuard::HaContextGuard()
     nested_ = true;
     g_guard_state.depth++;
     valid_ = g_guard_state.valid;
+    if (!valid_) {
+      g_context_error = "the enclosing HA scope has no GPU context";
+    }
     return;
   }
 
@@ -232,6 +240,7 @@ HaContextGuard::HaContextGuard()
     g_guard_state = {1, true, false, false};
     valid_ = true;
     if (!this->accept_current_context()) {
+      g_context_error = "GPU context mismatch (HA objects were created in another context)";
       valid_ = false;
       g_guard_state = {};
     }
@@ -248,11 +257,15 @@ HaContextGuard::HaContextGuard()
     g_guard_state = {1, true, false, false};
     valid_ = GPU_context_active_get() != nullptr && this->accept_current_context();
     if (!valid_) {
+      g_context_error = "the draw context could not be activated (is a 3D viewport open?)";
       DRW_gpu_context_disable();
       borrowed_draw_context_ = false;
       g_guard_state = {};
     }
     return;
+  }
+  else if (!G.background) {
+    g_context_error = "no draw context to borrow (open a 3D viewport or use the main thread)";
   }
 
   /* 3. Background mode (no window, nothing to draw): our own context, serialized behind the mutex.
@@ -261,6 +274,7 @@ HaContextGuard::HaContextGuard()
   owning_mutex_ = true;
 
   if (ha_context() == nullptr && !ha_create_context()) {
+    g_context_error = "could not create a GPU context (background mode, or not on the main thread)";
     ha_context_mutex().unlock();
     owning_mutex_ = false;
     return;
@@ -274,6 +288,7 @@ HaContextGuard::HaContextGuard()
   enabled_by_us_ = true;
   valid_ = this->accept_current_context();
   if (!valid_) {
+    g_context_error = "GPU context mismatch after activating the dedicated context";
     GPU_context_end_frame(ha_context());
     gpu::GPU_deactivate_secondary_context(ha_secondary_context());
     if (g_guard_state.previous_ghost_context != nullptr) {
@@ -305,9 +320,12 @@ bool HaContextGuard::accept_current_context()
     return true;
   }
   if (expected != context) {
-    /* Shaders and storage buffers belong to the context they were created in. Never mix them. */
-    ha_debug("context mismatch, falling back to the CPU");
-    return false;
+    /* Shaders belong to the context that created them (they are cached per context), and the
+     * binding cache is global, so switching context is fine as long as the bindings are forgotten.
+     * This happens when a node is evaluated on the main thread (window context) on one frame and on
+     * a worker thread (the draw manager's shared viewport context) on the next. */
+    ha_bindings_invalidate();
+    ha_objects_context() = context;
   }
   return true;
 }
@@ -388,6 +406,11 @@ bool ha_scope_allows_gpu()
 {
   const HaScopeBackend backend = ha_scope_backend();
   return backend == HaScopeBackend::Auto || backend == HaScopeBackend::Strict;
+}
+
+const char *ha_context_error()
+{
+  return g_context_error;
 }
 
 /** \} */
@@ -581,8 +604,19 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
                                  const int local_group_size)
 {
   /* Mixing the source into the key means an edited kernel can never hit a stale entry in the
-   * in-memory cache or in the on-disk shader cache (the info name below is derived from it). */
-  std::string key(cache_key);
+   * in-memory cache or in the on-disk shader cache (the info name below is derived from it). The
+   * GPU context is part of the key as well: Blender uses a window context on the main thread and a
+   * separate shared context for viewports, and shader objects belong to the context that created
+   * them. Without this, the first evaluation pinned every later evaluation to one of the two and
+   * the other one fell back with a "context mismatch" (measured in the GUI: occasionally, depending
+   * on which thread evaluated the node). */
+  GPUContext *context = GPU_context_active_get();
+  if (context == nullptr) {
+    return nullptr;
+  }
+  std::string key = std::to_string(reinterpret_cast<uintptr_t>(context));
+  key += '|';
+  key += cache_key;
   key += '#';
   key += std::to_string(std::hash<std::string>{}(std::string(source)));
   if (gpu::Shader **found = shader_cache().lookup_ptr(key)) {

@@ -16,8 +16,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
+#include <optional>
+#include <string>
 
 #include "BLI_array.hh"
 #include "BLI_math_base.hh"
@@ -31,6 +34,7 @@
 #include "BKE_volume.hh"
 
 #include "GEO_ignis_solver.hh"
+#include "GEO_ha_ignis.hh"
 
 #ifdef WITH_OPENVDB
 #  include "BKE_volume_grid.hh"
@@ -578,6 +582,19 @@ struct SolidMask {
                                    (int64_t(y) + int64_t(max.y() - min.y() + 1) * int64_t(z))] != 0;
   }
 
+  /** The collider index + 1 of a solid voxel, or 0. */
+  int8_t id(const Coord &coord) const
+  {
+    if (cells.is_empty() || !this->contains(coord)) {
+      return 0;
+    }
+    const int64_t x = coord.x() - min.x();
+    const int64_t y = coord.y() - min.y();
+    const int64_t z = coord.z() - min.z();
+    return cells[int64_t(x) + int64_t(max.x() - min.x() + 1) *
+                                   (int64_t(y) + int64_t(max.y() - min.y() + 1) * int64_t(z))];
+  }
+
   int64_t count() const
   {
     int64_t total = 0;
@@ -594,7 +611,8 @@ void mark_triangle(SolidMask &mask,
                    const float3 a,
                    const float3 b,
                    const float3 c,
-                   const float radius)
+                   const float radius,
+                   const int8_t value)
 {
   const float voxel = float(transform.voxelSize()[0]);
   const float3 grow(radius + voxel);
@@ -635,7 +653,7 @@ void mark_triangle(SolidMask &mask,
         const int64_t ix = x - mask.min.x();
         const int64_t iy = y - mask.min.y();
         const int64_t iz = z - mask.min.z();
-        mask.cells[ix + int64_t(dim_x) * (iy + int64_t(dim_y) * iz)] = 1;
+        mask.cells[ix + int64_t(dim_x) * (iy + int64_t(dim_y) * iz)] = value;
       }
     }
   }
@@ -653,45 +671,244 @@ openvdb::CoordBBox solid_region(const State &state, const Settings &settings)
   return box;
 }
 
-/** Rasterizes the colliders into the solid mask of the frame. */
-SolidMask build_solid_mask(const openvdb::math::Transform &transform,
-                           const Span<const Collider> colliders,
-                           const openvdb::CoordBBox &region)
+/**
+ * The shape of the colliders of one frame.
+ *
+ * The colliders are rasterized as a thin shell (that is all an open mesh can give), so the interior
+ * of a closed mesh is filled separately: a solid volume is what the pressure solve needs, and it is
+ * also what tells `carve` that a voxel is inside the object rather than in the one voxel thick shell
+ * around its surface. Carving the shell of a descending collider would remove a layer of smoke above
+ * it every frame (the "collider eats the smoke" artifact), so the shell is only carved when the
+ * collider does not move.
+ */
+struct ColliderMasks {
+  /** Union of the collider poses over the frame, used for the wall and the pressure domain. */
+  SolidMask swept;
+  /** The pose of the last substep, used to impose the collider velocity on the smoke. */
+  SolidMask current;
+  /** The current pose with the interior of the closed meshes filled in (the solid volume). */
+  SolidMask filled;
+  /** Voxels that may be removed: interiors, plus the shell of colliders that do not move. */
+  SolidMask carve;
+};
+
+static void init_solid_mask(SolidMask &mask, const openvdb::CoordBBox &region)
 {
-  SolidMask mask;
-  if (colliders.is_empty() || region.empty()) {
-    return mask;
-  }
   mask.min = region.min();
   mask.max = region.max();
   const int dim_x = mask.max.x() - mask.min.x() + 1;
   const int dim_y = mask.max.y() - mask.min.y() + 1;
   const int dim_z = mask.max.z() - mask.min.z() + 1;
   mask.cells = Array<int8_t>(int64_t(dim_x) * dim_y * dim_z, 0);
+}
+
+/**
+ * Flood fills the outside of the current shell from the border of the mask, which marks every cell
+ * that is not reachable from the outside as interior. For an open mesh (a ground plane) everything
+ * is reachable, so #r_filled stays a shell and nothing is carved.
+ */
+static void fill_collider_interior(const SolidMask &shell,
+                                   Span<Collider> colliders,
+                                   SolidMask &r_filled,
+                                   SolidMask &r_carve)
+{
+  r_filled = shell;
+  const openvdb::CoordBBox region(shell.min, shell.max);
+  init_solid_mask(r_carve, region);
+  if (shell.empty()) {
+    return;
+  }
+  const int dim_x = shell.max.x() - shell.min.x() + 1;
+  const int dim_y = shell.max.y() - shell.min.y() + 1;
+  const int dim_z = shell.max.z() - shell.min.z() + 1;
+  const int64_t cells = int64_t(dim_x) * dim_y * dim_z;
+  auto index_of = [&](const int x, const int y, const int z) -> int64_t {
+    return int64_t(x) + int64_t(dim_x) * (int64_t(y) + int64_t(dim_y) * int64_t(z));
+  };
+
+  Array<uint8_t> outside(cells, 0);
+  Vector<int64_t> stack;
+  stack.reserve(int64_t(cells) / 4 + 1);
+  auto push_if_free = [&](const int x, const int y, const int z) {
+    if (x < 0 || y < 0 || z < 0 || x >= dim_x || y >= dim_y || z >= dim_z) {
+      return;
+    }
+    const int64_t index = index_of(x, y, z);
+    if (!outside[index] && shell.cells[index] == 0) {
+      outside[index] = 1;
+      stack.append(index);
+    }
+  };
+  for (int z = 0; z < dim_z; z++) {
+    for (int y = 0; y < dim_y; y++) {
+      push_if_free(0, y, z);
+      push_if_free(dim_x - 1, y, z);
+    }
+  }
+  for (int z = 0; z < dim_z; z++) {
+    for (int x = 0; x < dim_x; x++) {
+      push_if_free(x, 0, z);
+      push_if_free(x, dim_y - 1, z);
+    }
+  }
+  for (int y = 0; y < dim_y; y++) {
+    for (int x = 0; x < dim_x; x++) {
+      push_if_free(x, y, 0);
+      push_if_free(x, y, dim_z - 1);
+    }
+  }
+
+  while (!stack.is_empty()) {
+    const int64_t index = stack.pop_last();
+    const int x = int(index % dim_x);
+    const int y = int((index / dim_x) % dim_y);
+    const int z = int(index / (int64_t(dim_x) * dim_y));
+    push_if_free(x + 1, y, z);
+    push_if_free(x - 1, y, z);
+    push_if_free(x, y + 1, z);
+    push_if_free(x, y - 1, z);
+    push_if_free(x, y, z + 1);
+    push_if_free(x, y, z - 1);
+  }
+
+  /* A moving collider must not carve at all: the smoke it pushes out of the way has to stay in the
+   * domain. Deleting the cells it occupies (or the ones the swept shell touches) is what makes a
+   * falling object look like it eats the smoke. The pressure solve and the velocity clamp keep the
+   * smoke out of the solid volume instead; when the collider has passed, the smoke is still there. */
+  bool any_moving = false;
+  for (const Collider &collider : colliders) {
+    if (math::length_squared(collider.velocity) > 0.0f) {
+      any_moving = true;
+      break;
+    }
+  }
+
+  for (int64_t i = 0; i < cells; i++) {
+    if (outside[i]) {
+      continue;
+    }
+    r_filled.cells[i] = 1;
+    if (!any_moving) {
+      r_carve.cells[i] = 1;
+    }
+  }
+}
+
+/**
+ * Rasterizes the colliders into a solid mask for the frame.
+ *
+ * Colliders are sampled at several poses between the previous and the current frame (when `Sweep`
+ * is on), so a fast mover cannot jump over the smoke. Each cell stores the collider index + 1, which
+ * lets the velocity pass know how the wall at that cell moves. `Deforming` interpolates the vertices
+ * of the previous mesh instead of the object transform.
+ */
+ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
+                                   MutableSpan<Collider> colliders,
+                                   const openvdb::CoordBBox &region,
+                                   const float delta_time)
+{
+  ColliderMasks masks;
+  if (colliders.is_empty() || region.empty()) {
+    return masks;
+  }
+  init_solid_mask(masks.swept, region);
+  init_solid_mask(masks.current, region);
 
   /* A voxel is solid when its center is within half a voxel diagonal of the surface, so the shell
    * has no holes even where a triangle is smaller than a voxel. */
-  const float radius = float(transform.voxelSize()[0]) * 0.9f;
-  for (const Collider &collider : colliders) {
-    if (collider.mesh == nullptr) {
+  const float voxel = float(transform.voxelSize()[0]);
+  const float radius = voxel * 0.9f;
+  for (const int collider_i : colliders.index_range()) {
+    Collider &collider = colliders[collider_i];
+    const Mesh *mesh = collider.mesh;
+    if (mesh == nullptr) {
       continue;
     }
-    const Span<float3> positions = collider.mesh->vert_positions();
-    const Span<int> corner_verts = collider.mesh->corner_verts();
-    const Span<int3> corner_tris = collider.mesh->corner_tris();
+    const Span<float3> positions = mesh->vert_positions();
+    const Span<int> corner_verts = mesh->corner_verts();
+    const Span<int3> corner_tris = mesh->corner_tris();
     if (positions.is_empty() || corner_tris.is_empty()) {
       continue;
     }
-    for (const int3 &tri : corner_tris) {
-      mark_triangle(mask,
-                    transform,
-                    positions[corner_verts[tri.x]],
-                    positions[corner_verts[tri.y]],
-                    positions[corner_verts[tri.z]],
-                    radius);
+    const int8_t value = int8_t(std::min(collider_i + 1, 127));
+
+    const Mesh *previous_mesh = collider.previous_mesh;
+    const bool deforming = collider.deforming && previous_mesh != nullptr;
+    const Span<float3> previous_positions = deforming ? previous_mesh->vert_positions() : Span<float3>();
+    const Span<int> previous_corner_verts = deforming ? previous_mesh->corner_verts() : Span<int>();
+    const bool can_deform = deforming && previous_positions.size() == positions.size() &&
+                            previous_corner_verts.size() == corner_verts.size();
+    const bool can_sweep_rigid = collider.has_previous_transform && !can_deform;
+    const float4x4 delta = can_sweep_rigid ? collider.previous_transform *
+                                                math::invert(collider.transform) :
+                                            float4x4::identity();
+
+    /* How far the collider moves this frame: it decides how many poses the swept mask needs. */
+    float max_motion = 0.0f;
+    if (can_deform) {
+      for (const int i : positions.index_range()) {
+        max_motion = std::max(max_motion, math::distance(positions[i], previous_positions[i]));
+      }
+    }
+    else if (can_sweep_rigid) {
+      for (const int i : positions.index_range()) {
+        max_motion = std::max(
+            max_motion, math::distance(positions[i], math::transform_point(delta, positions[i])));
+      }
+    }
+
+    /* Average motion per second, used to push the smoke out of the way. */
+    if (delta_time > 0.0f) {
+      if (can_sweep_rigid) {
+        const float3 current_origin = math::transform_point(collider.transform, float3(0.0f));
+        const float3 previous_origin = math::transform_point(collider.previous_transform, float3(0.0f));
+        collider.velocity = (current_origin - previous_origin) / delta_time;
+      }
+      else if (can_deform) {
+        float3 sum(0.0f);
+        for (const int i : positions.index_range()) {
+          sum += positions[i] - previous_positions[i];
+        }
+        if (!positions.is_empty()) {
+          collider.velocity = sum / (float(positions.size()) * delta_time);
+        }
+      }
+    }
+
+    const int samples = (collider.sweep && (can_deform || can_sweep_rigid)) ?
+                            std::clamp(int(std::ceil(max_motion / std::max(voxel, 1e-5f))), 1, 16) :
+                            0;
+
+    for (int sample = 0; sample <= samples; sample++) {
+      const float t = samples == 0 ? 1.0f : float(sample) / float(samples);
+      float4x4 rigid = float4x4::identity();
+      if (can_sweep_rigid && sample < samples) {
+        rigid = math::interpolate(delta, float4x4::identity(), t);
+      }
+      for (const int3 &tri : corner_tris) {
+        const int i0 = corner_verts[tri.x];
+        const int i1 = corner_verts[tri.y];
+        const int i2 = corner_verts[tri.z];
+        float3 a, b, c;
+        if (can_deform) {
+          a = math::interpolate(previous_positions[i0], positions[i0], t);
+          b = math::interpolate(previous_positions[i1], positions[i1], t);
+          c = math::interpolate(previous_positions[i2], positions[i2], t);
+        }
+        else {
+          a = math::transform_point(rigid, positions[i0]);
+          b = math::transform_point(rigid, positions[i1]);
+          c = math::transform_point(rigid, positions[i2]);
+        }
+        mark_triangle(masks.swept, transform, a, b, c, radius, value);
+        if (sample == samples) {
+          mark_triangle(masks.current, transform, a, b, c, radius, value);
+        }
+      }
     }
   }
-  return mask;
+  fill_collider_interior(masks.current, colliders, masks.filled, masks.carve);
+  return masks;
 }
 
 /** Removes the smoke and stops the velocity inside the colliders. */
@@ -729,13 +946,19 @@ void carve_solids(State &state, const SolidMask &mask)
 }
 
 /**
- * Stops the velocity from pointing into a collider.
+ * Stops the velocity from pointing into a collider and follows a moving wall.
  *
  * The pressure solve treats a solid as `p = 0`, i.e. as a wall, but the collocated velocity has no
  * face to project onto, so the component that pushes the smoke into the wall is simply clipped: the
- * smoke slides along the surface instead of being eaten by the carve.
+ * smoke slides along the surface instead of being eaten by the carve. With a moving collider the
+ * clip is against the wall velocity (relative normal velocity), not against zero, so a descending
+ * lid pushes the smoke ahead of it while smoke beside or above the moving surface is free to slide
+ * (free slip). Imposing the wall velocity unconditionally would drag the smoke along with the
+ * collider, which is what makes falling objects look like they swallow the smoke.
  */
-void clamp_velocity_at_solids(State &state, const SolidMask &mask)
+void clamp_velocity_at_solids(State &state,
+                              const SolidMask &mask,
+                              Span<Collider> colliders)
 {
   if (mask.empty()) {
     return;
@@ -748,6 +971,17 @@ void clamp_velocity_at_solids(State &state, const SolidMask &mask)
   threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
                           [&](const IndexRange range) {
     openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    auto wall_velocity = [&](const Coord &coord) -> std::optional<float3> {
+      const int8_t id = mask.id(coord);
+      if (id == 0 || id > colliders.size()) {
+        return std::nullopt;
+      }
+      const float3 wall = colliders[id - 1].velocity;
+      if (math::length_squared(wall) <= 0.0f) {
+        return std::nullopt;
+      }
+      return wall;
+    };
     for (const int64_t i : range) {
       const Coord &coord = coords[i];
       if (mask.is_solid(coord)) {
@@ -756,22 +990,28 @@ void clamp_velocity_at_solids(State &state, const SolidMask &mask)
       }
       openvdb::Vec3f value = velocity.getValue(coord);
       if (mask.is_solid(coord.offsetBy(1, 0, 0))) {
-        value.x() = std::min(value.x(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(1, 0, 0));
+        value.x() = wall ? std::min(value.x(), wall->x) : std::min(value.x(), 0.0f);
       }
       if (mask.is_solid(coord.offsetBy(-1, 0, 0))) {
-        value.x() = std::max(value.x(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(-1, 0, 0));
+        value.x() = wall ? std::max(value.x(), wall->x) : std::max(value.x(), 0.0f);
       }
       if (mask.is_solid(coord.offsetBy(0, 1, 0))) {
-        value.y() = std::min(value.y(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 1, 0));
+        value.y() = wall ? std::min(value.y(), wall->y) : std::min(value.y(), 0.0f);
       }
       if (mask.is_solid(coord.offsetBy(0, -1, 0))) {
-        value.y() = std::max(value.y(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, -1, 0));
+        value.y() = wall ? std::max(value.y(), wall->y) : std::max(value.y(), 0.0f);
       }
       if (mask.is_solid(coord.offsetBy(0, 0, 1))) {
-        value.z() = std::min(value.z(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 0, 1));
+        value.z() = wall ? std::min(value.z(), wall->z) : std::min(value.z(), 0.0f);
       }
       if (mask.is_solid(coord.offsetBy(0, 0, -1))) {
-        value.z() = std::max(value.z(), 0.0f);
+        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 0, -1));
+        value.z() = wall ? std::max(value.z(), wall->z) : std::max(value.z(), 0.0f);
       }
       velocity.setValue(coord, value);
     }
@@ -1440,13 +1680,506 @@ void clip_to_bounds(State &state, const Settings &settings)
 
 }  // namespace
 
+/**
+ * Converts the sparse state to a dense box, runs the device solver and converts the result back.
+ *
+ * The conversion (reading the volume, sampling the emitters at the state's voxel centers, the
+ * collider shell) is the part that is inherently CPU work; every pass that scales with the number
+ * of voxels runs on the device. Returns null with \a r_reason when the device path cannot run.
+ */
+static Volume *solve_frame_device(const Volume *previous,
+                                  const Span<const Volume *> sources,
+                                  const Span<const Collider> colliders,
+                                  const Settings &settings,
+                                  const float delta_time,
+                                  Stats &r_stats,
+                                  std::string &r_reason)
+{
+  namespace ha = geometry::ha;
+
+  if (!ha::ignis_device_available()) {
+    r_reason = "no GPU backend";
+    return nullptr;
+  }
+  const float voxel_size = std::max(1e-5f, settings.voxel_size);
+
+  State state;
+  if (previous != nullptr) {
+    state = read_state(*previous);
+  }
+  const bool resolution_ok = state.valid() && state.velocity != nullptr &&
+                             std::abs(state.voxel_size() - voxel_size) <= 1e-6f * voxel_size;
+  if (!resolution_ok) {
+    init_state(state, voxel_size);
+    r_stats.resized = true;
+  }
+  const openvdb::math::Transform &transform = state.density->transform();
+  const float dt = std::max(0.0f, delta_time);
+
+  int substeps = std::clamp(settings.substeps, 1, 64);
+  bool cfl_limited = false;
+  if (dt > 0.0f) {
+    float max_speed = 0.0f;
+    for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
+      max_speed = std::max(max_speed, iter.getValue().length());
+    }
+    if (max_speed > 0.0f) {
+      const int required = int(std::ceil(dt * max_speed / (std::max(0.1f, settings.cfl) *
+                                                          voxel_size)));
+      if (required > substeps) {
+        const int limit = std::max(1, settings.max_substeps);
+        substeps = std::min(required, limit);
+        cfl_limited = required > limit;
+      }
+    }
+  }
+  else {
+    substeps = 0;
+  }
+
+  /* The box has to contain every voxel the CPU solver would touch: the smoke, the emitters, and the
+   * air the smoke can move into this frame plus the velocity band radius. */
+  openvdb::CoordBBox box;
+  bool box_valid = false;
+  if (state.density->activeVoxelCount() > 0) {
+    box = state.density->evalActiveVoxelBoundingBox();
+    box_valid = !box.empty();
+  }
+  for (const Volume *source : sources) {
+    const bke::VolumeGridData *data = BKE_volume_grid_find(source, grids::density);
+    if (data == nullptr) {
+      continue;
+    }
+    bke::VolumeTreeAccessToken token;
+    const openvdb::GridBase &base = data->grid(token);
+    if (base.type() != openvdb::FloatGrid::gridType()) {
+      continue;
+    }
+    const openvdb::FloatGrid &grid = static_cast<const openvdb::FloatGrid &>(base);
+    const openvdb::CoordBBox source_box = grid.evalActiveVoxelBoundingBox();
+    if (source_box.empty()) {
+      continue;
+    }
+    const openvdb::Vec3d min_world = grid.transform().indexToWorld(source_box.min());
+    const openvdb::Vec3d max_world = grid.transform().indexToWorld(source_box.max());
+    const openvdb::CoordBBox in_state(
+        transform.worldToIndexCellCentered(min_world),
+        transform.worldToIndexCellCentered(max_world));
+    if (!box_valid) {
+      box = in_state;
+      box_valid = true;
+    }
+    else {
+      box.expand(in_state);
+    }
+  }
+  if (!box_valid) {
+    /* Nothing to simulate yet: hand out an empty volume, like the CPU path does. */
+    State empty = state;
+    empty.flame = create_float_grid(empty.density->transformPtr());
+    Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
+    write_state(*volume, empty);
+    r_stats.device = true;
+    r_stats.substeps_used = 0;
+    return volume;
+  }
+
+  const int radius = solver_radius(settings);
+  int margin = radius + 2 + int(std::ceil(std::max(1.0f, settings.cfl))) * std::max(1, substeps) + 2;
+  margin = std::min(margin, 64);
+  box.expand(margin);
+
+  if (settings.use_bounds) {
+    const float3 lo = math::min(settings.bounds_min, settings.bounds_max);
+    const float3 hi = math::max(settings.bounds_min, settings.bounds_max);
+    const int pad = radius + 3;
+    const openvdb::CoordBBox bounds(
+        transform.worldToIndexCellCentered(openvdb::Vec3d(lo.x, lo.y, lo.z)),
+        transform.worldToIndexCellCentered(openvdb::Vec3d(hi.x, hi.y, hi.z)));
+    openvdb::CoordBBox padded = bounds;
+    padded.expand(pad);
+    box.intersect(padded);
+    if (box.empty()) {
+      r_reason = "the bounds do not overlap the simulation";
+      return nullptr;
+    }
+  }
+
+  const openvdb::Coord bmin = box.min();
+  const openvdb::Coord bmax = box.max();
+  const int64_t dim_x = int64_t(bmax.x()) - bmin.x() + 1;
+  const int64_t dim_y = int64_t(bmax.y()) - bmin.y() + 1;
+  const int64_t dim_z = int64_t(bmax.z()) - bmin.z() + 1;
+  const int64_t cells = dim_x * dim_y * dim_z;
+  int64_t budget = 2097152;
+  if (const char *value = std::getenv("BLENDER_IGNIS_GPU_MAX_VOXELS")) {
+    const int64_t parsed = std::atoll(value);
+    if (parsed > 0) {
+      budget = parsed;
+    }
+  }
+  if (cells > budget) {
+    r_reason = "the simulation needs " + std::to_string(cells) +
+               " voxels, above the device budget of " + std::to_string(budget);
+    return nullptr;
+  }
+
+  Array<float> scalars;
+  Array<float> velocity;
+  Array<float> pressure;
+  Array<int32_t> mask;
+  Array<int32_t> current_mask;
+  Array<int32_t> carve_mask;
+  Array<float> collider_velocities;
+  Array<float> source_values;
+  scalars.reinitialize(int(cells * 4));
+  velocity.reinitialize(int(cells * 3));
+  pressure.reinitialize(int(cells));
+  mask.reinitialize(int(cells));
+  current_mask.reinitialize(int(cells));
+  carve_mask.reinitialize(int(cells));
+  collider_velocities.reinitialize(int(colliders.size()) * 3);
+  source_values.reinitialize(int(cells * 7));
+  scalars.fill(0.0f);
+  velocity.fill(0.0f);
+  pressure.fill(0.0f);
+  mask.fill(0);
+  current_mask.fill(0);
+  carve_mask.fill(0);
+  collider_velocities.fill(0.0f);
+  source_values.fill(0.0f);
+
+  auto inside = [&](const openvdb::Coord &coord) {
+    return coord.x() >= bmin.x() && coord.x() <= bmax.x() && coord.y() >= bmin.y() &&
+           coord.y() <= bmax.y() && coord.z() >= bmin.z() && coord.z() <= bmax.z();
+  };
+  auto flat = [&](const openvdb::Coord &coord) {
+    return int64_t(coord.x() - bmin.x()) +
+           dim_x * (int64_t(coord.y() - bmin.y()) + dim_y * int64_t(coord.z() - bmin.z()));
+  };
+
+  /* Sparse to dense: only the active voxels are visited, everything else stays zero. */
+  if (state.density) {
+    for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+      if (inside(iter.getCoord())) {
+        scalars[flat(iter.getCoord()) * 4 + 0] = iter.getValue();
+      }
+    }
+  }
+  if (state.temperature) {
+    for (auto iter = state.temperature->cbeginValueOn(); iter; ++iter) {
+      if (inside(iter.getCoord())) {
+        scalars[flat(iter.getCoord()) * 4 + 1] = iter.getValue();
+      }
+    }
+  }
+  if (state.fuel) {
+    for (auto iter = state.fuel->cbeginValueOn(); iter; ++iter) {
+      if (inside(iter.getCoord())) {
+        scalars[flat(iter.getCoord()) * 4 + 2] = iter.getValue();
+      }
+    }
+  }
+  if (state.velocity) {
+    for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
+      if (!inside(iter.getCoord())) {
+        continue;
+      }
+      const int64_t i = flat(iter.getCoord()) * 3;
+      velocity[i + 0] = iter.getValue().x();
+      velocity[i + 1] = iter.getValue().y();
+      velocity[i + 2] = iter.getValue().z();
+    }
+  }
+  if (state.pressure) {
+    for (auto iter = state.pressure->cbeginValueOn(); iter; ++iter) {
+      if (inside(iter.getCoord())) {
+        pressure[flat(iter.getCoord())] = iter.getValue();
+      }
+    }
+  }
+
+  /* Collider shell (the CPU path rebuilds it once per frame as well). */
+  int solid_voxels = 0;
+  if (!colliders.is_empty()) {
+    Array<Collider> collider_data;
+    collider_data.reinitialize(colliders.size());
+    for (const int i : colliders.index_range()) {
+      collider_data[i] = colliders[i];
+    }
+    const ColliderMasks masks = build_collider_masks(transform,
+                                                     collider_data.as_mutable_span(),
+                                                     box,
+                                                     dt);
+    solid_voxels = int(masks.filled.count());
+    for (const int i : collider_data.index_range()) {
+      const float3 &velocity = collider_data[i].velocity;
+      collider_velocities[i * 3 + 0] = velocity.x;
+      collider_velocities[i * 3 + 1] = velocity.y;
+      collider_velocities[i * 3 + 2] = velocity.z;
+    }
+    for (int64_t z = 0; z < dim_z; z++) {
+      for (int64_t y = 0; y < dim_y; y++) {
+        for (int64_t x = 0; x < dim_x; x++) {
+          const openvdb::Coord coord(int(bmin.x() + x), int(bmin.y() + y), int(bmin.z() + z));
+          const int64_t index = x + dim_x * (y + dim_y * z);
+          if (masks.filled.id(coord) != 0) {
+            mask[index] = ha::IGNIS_MASK_SOLID;
+          }
+          const int8_t current_id = masks.current.id(coord);
+          if (current_id != 0) {
+            current_mask[index] = (int32_t(current_id) << 8) | ha::IGNIS_MASK_SOLID;
+          }
+          if (masks.carve.id(coord) != 0) {
+            carve_mask[index] = ha::IGNIS_MASK_SOLID;
+          }
+        }
+      }
+    }
+  }
+
+  /* Emitters: sampled once at the voxel centers of the state, exactly like `add_source_volume`. */
+  for (const Volume *source : sources) {
+    const bke::VolumeGridData *density_data = BKE_volume_grid_find(source, grids::density);
+    if (density_data == nullptr) {
+      continue;
+    }
+    bke::VolumeTreeAccessToken density_token;
+    const openvdb::GridBase &density_base = density_data->grid(density_token);
+    if (density_base.type() != openvdb::FloatGrid::gridType()) {
+      continue;
+    }
+    const openvdb::FloatGrid &source_density = static_cast<const openvdb::FloatGrid &>(density_base);
+    if (source_density.activeVoxelCount() == 0) {
+      continue;
+    }
+    const openvdb::FloatGrid *source_temperature = nullptr;
+    const openvdb::FloatGrid *source_fuel = nullptr;
+    const openvdb::Vec3fGrid *source_velocity = nullptr;
+    bke::VolumeTreeAccessToken temperature_token;
+    bke::VolumeTreeAccessToken fuel_token;
+    bke::VolumeTreeAccessToken velocity_token;
+    if (const bke::VolumeGridData *data = BKE_volume_grid_find(source, grids::temperature)) {
+      const openvdb::GridBase &base = data->grid(temperature_token);
+      if (base.type() == openvdb::FloatGrid::gridType()) {
+        source_temperature = static_cast<const openvdb::FloatGrid *>(&base);
+      }
+    }
+    if (const bke::VolumeGridData *data = BKE_volume_grid_find(source, grids::fuel)) {
+      const openvdb::GridBase &base = data->grid(fuel_token);
+      if (base.type() == openvdb::FloatGrid::gridType()) {
+        source_fuel = static_cast<const openvdb::FloatGrid *>(&base);
+      }
+    }
+    if (const bke::VolumeGridData *data = BKE_volume_grid_find(source, grids::velocity)) {
+      const openvdb::GridBase &base = data->grid(velocity_token);
+      if (base.type() == openvdb::Vec3fGrid::gridType()) {
+        source_velocity = static_cast<const openvdb::Vec3fGrid *>(&base);
+      }
+    }
+
+    openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> density_sampler(
+        source_density);
+    std::optional<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>
+        temperature_sampler;
+    std::optional<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>
+        fuel_sampler;
+    std::optional<openvdb::tools::GridSampler<openvdb::Vec3fGrid, openvdb::tools::BoxSampler>>
+        velocity_sampler;
+    if (source_temperature != nullptr) {
+      temperature_sampler.emplace(*source_temperature);
+    }
+    if (source_fuel != nullptr) {
+      fuel_sampler.emplace(*source_fuel);
+    }
+    if (source_velocity != nullptr) {
+      velocity_sampler.emplace(*source_velocity);
+    }
+
+    const openvdb::CoordBBox source_box = source_density.evalActiveVoxelBoundingBox();
+    const openvdb::Vec3d min_world = source_density.transform().indexToWorld(source_box.min());
+    const openvdb::Vec3d max_world = source_density.transform().indexToWorld(source_box.max());
+    const openvdb::CoordBBox state_box = transform.worldToIndexCellCentered(
+        openvdb::BBoxd(min_world, max_world));
+    const int x0 = std::max(bmin.x(), state_box.min().x());
+    const int y0 = std::max(bmin.y(), state_box.min().y());
+    const int z0 = std::max(bmin.z(), state_box.min().z());
+    const int x1 = std::min(bmax.x(), state_box.max().x());
+    const int y1 = std::min(bmax.y(), state_box.max().y());
+    const int z1 = std::min(bmax.z(), state_box.max().z());
+    for (int k = z0; k <= z1; k++) {
+      for (int j = y0; j <= y1; j++) {
+        for (int i = x0; i <= x1; i++) {
+          const openvdb::Coord coord(i, j, k);
+          const openvdb::Vec3d world = transform.indexToWorld(coord);
+          const float source_value = density_sampler.wsSample(world);
+          if (source_value <= 0.0f) {
+            continue;
+          }
+          const int64_t base = flat(coord) * 7;
+          source_values[base + 0] = std::max(source_values[base + 0], source_value);
+          if (temperature_sampler.has_value()) {
+            const float value = temperature_sampler->wsSample(world);
+            if (value != 0.0f) {
+              float current = source_values[base + 1];
+              source_values[base + 1] = value > 0.0f ? std::max(current, value) :
+                                                       std::min(current, value);
+            }
+          }
+          if (fuel_sampler.has_value()) {
+            const float value = fuel_sampler->wsSample(world);
+            if (value > 0.0f) {
+              source_values[base + 2] = std::max(source_values[base + 2], value);
+            }
+          }
+          if (velocity_sampler.has_value()) {
+            const openvdb::Vec3f incoming = velocity_sampler->wsSample(world);
+            if (incoming.lengthSqr() > 0.0f) {
+              /* Store the source velocity itself; the blend weight is the sampled density and is
+               * applied by `KERNEL_SOURCE_MERGE` every substep, like `add_source_volume` does. */
+              source_values[base + 3] = incoming.x();
+              source_values[base + 4] = incoming.y();
+              source_values[base + 5] = incoming.z();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  ha::IgnisDeviceFrame frame;
+  frame.index_min = int3(int(bmin.x()), int(bmin.y()), int(bmin.z()));
+  frame.dims = int3(int(dim_x), int(dim_y), int(dim_z));
+  frame.voxel_size = voxel_size;
+  frame.delta_time = dt;
+  frame.substeps = substeps;
+  frame.solver_radius = radius;
+  frame.extrapolate = std::max(0, settings.extrapolate);
+  frame.max_voxels = budget;
+  frame.settings = settings;
+  frame.scalars = scalars.as_mutable_span();
+  frame.velocity = velocity.as_mutable_span();
+  frame.pressure = pressure.as_mutable_span();
+  frame.mask = mask.as_mutable_span();
+  frame.current_mask = current_mask.as_mutable_span();
+  frame.carve_mask = carve_mask.as_mutable_span();
+  frame.collider_velocities = Span<float>(collider_velocities.data(), int64_t(collider_velocities.size()));
+  frame.source = source_values.as_mutable_span();
+
+  ha::IgnisDeviceResult device;
+  const bool ran = ha::ignis_device_solve(frame, device);
+  if (!ran) {
+    r_reason = device.reason.empty() ? "device solve failed" : device.reason;
+    return nullptr;
+  }
+
+  /* Dense to sparse. Values below the tree prune thresholds stay inactive, which is what the CPU
+   * path ends up with as well. */
+  State output;
+  output.density = create_float_grid(state.density->transformPtr());
+  output.temperature = create_float_grid(state.density->transformPtr());
+  output.fuel = create_float_grid(state.density->transformPtr());
+  output.flame = create_float_grid(state.density->transformPtr());
+  output.pressure = create_float_grid(state.density->transformPtr());
+  output.velocity = openvdb::Vec3fGrid::create(openvdb::Vec3f(0.0f));
+  output.velocity->setTransform(state.density->transformPtr());
+
+  openvdb::FloatGrid::Accessor density_writer = output.density->getAccessor();
+  openvdb::FloatGrid::Accessor temperature_writer = output.temperature->getAccessor();
+  openvdb::FloatGrid::Accessor fuel_writer = output.fuel->getAccessor();
+  openvdb::FloatGrid::Accessor flame_writer = output.flame->getAccessor();
+  openvdb::FloatGrid::Accessor pressure_writer = output.pressure->getAccessor();
+  openvdb::Vec3fGrid::Accessor velocity_writer = output.velocity->getAccessor();
+  for (int64_t z = 0; z < dim_z; z++) {
+    for (int64_t y = 0; y < dim_y; y++) {
+      for (int64_t x = 0; x < dim_x; x++) {
+        const int64_t i = x + dim_x * (y + dim_y * z);
+        const openvdb::Coord coord(int(bmin.x() + x), int(bmin.y() + y), int(bmin.z() + z));
+        const float density = scalars[i * 4 + 0];
+        const float temperature = scalars[i * 4 + 1];
+        const float fuel = scalars[i * 4 + 2];
+        const float flame = scalars[i * 4 + 3];
+        if (std::abs(density) > 1e-6f) {
+          density_writer.setValue(coord, density);
+        }
+        if (std::abs(temperature) > 1e-6f) {
+          temperature_writer.setValue(coord, temperature);
+        }
+        if (std::abs(fuel) > 1e-6f) {
+          fuel_writer.setValue(coord, fuel);
+        }
+        if (flame > 1e-6f) {
+          flame_writer.setValue(coord, flame);
+        }
+        const float vx = velocity[i * 3 + 0];
+        const float vy = velocity[i * 3 + 1];
+        const float vz = velocity[i * 3 + 2];
+        if (vx * vx + vy * vy + vz * vz > 1e-12f) {
+          velocity_writer.setValue(coord, openvdb::Vec3f(vx, vy, vz));
+        }
+        if (std::abs(pressure[i]) > 1e-9f) {
+          pressure_writer.setValue(coord, pressure[i]);
+        }
+      }
+    }
+  }
+
+  Volume *volume = BKE_id_new_nomain<Volume>(nullptr);
+  write_state(*volume, output);
+
+  r_stats.device = true;
+  r_stats.device_passes = device.passes;
+  r_stats.active_voxels = device.active_voxels;
+  r_stats.substeps_used = substeps;
+  r_stats.pressure_iterations = device.pressure_iterations;
+  r_stats.residual = device.residual;
+  r_stats.divergence_before = device.divergence_before;
+  r_stats.divergence_after = device.divergence_after;
+  r_stats.solid_voxels = solid_voxels;
+  r_stats.domain_removed = device.domain_removed;
+  r_stats.cfl_limited = cfl_limited;
+  r_stats.milliseconds = device.milliseconds;
+  return volume;
+}
+
 Volume *solve_frame(const Volume *previous,
                     const Span<const Volume *> sources,
                     const Span<const Collider> colliders,
                     const Settings &settings,
                     const float delta_time,
-                    Stats &r_stats)
+                    Stats &r_stats,
+                    const int backend_request)
 {
+  r_stats = Stats{};
+
+  /* The device path is opt in through the `HW Accelerate` zone (`Auto` / `Strict`) or the
+   * `BLENDER_IGNIS_GPU=1` test override. `Force CPU` (3) and the outside of a zone (0) stay on the
+   * CPU, which also keeps every old scene bit for bit identical. */
+  const char *gpu_env = std::getenv("BLENDER_IGNIS_GPU");
+  const bool force_gpu = gpu_env != nullptr && std::string(gpu_env) == "1";
+  const bool force_cpu = gpu_env != nullptr && std::string(gpu_env) == "0";
+  const bool device_requested = !force_cpu && (force_gpu || backend_request == 1 ||
+                                               backend_request == 2);
+  if (device_requested) {
+    Stats device_stats;
+    std::string reason;
+    if (Volume *volume = solve_frame_device(previous,
+                                            sources,
+                                            colliders,
+                                            settings,
+                                            delta_time,
+                                            device_stats,
+                                            reason)) {
+      r_stats = device_stats;
+      return volume;
+    }
+    r_stats.device_fallback_reason = reason;
+    if (std::getenv("BLENDER_IGNIS_HA_DEBUG") != nullptr) {
+      fprintf(stderr, "IGNIS_HA fallback: %s\n", reason.c_str());
+      fflush(stderr);
+    }
+  }
+
   r_stats.sources = int(sources.size());
   const auto start = std::chrono::steady_clock::now();
   const float voxel_size = std::max(1e-5f, settings.voxel_size);
@@ -1466,6 +2199,12 @@ Volume *solve_frame(const Volume *previous,
   }
 
   const float dt = std::max(0.0f, delta_time);
+  Array<Collider> collider_data;
+  collider_data.reinitialize(colliders.size());
+  for (const int i : colliders.index_range()) {
+    collider_data[i] = colliders[i];
+  }
+  const MutableSpan<Collider> dynamic_colliders = collider_data.as_mutable_span();
   if (dt <= 0.0f) {
     /* First frame or a paused frame: only show the sources, do not integrate. */
     for (const Volume *source : sources) {
@@ -1475,10 +2214,12 @@ Volume *solve_frame(const Volume *previous,
     state.flame = create_float_grid(state.density->transformPtr());
     filter_flame(state, settings);
     if (!colliders.is_empty()) {
-      const SolidMask solids = build_solid_mask(
-          *state.density->transformPtr(), colliders, solid_region(state, settings));
-      r_stats.solid_voxels = int(solids.count());
-      carve_solids(state, solids);
+      const ColliderMasks masks = build_collider_masks(*state.density->transformPtr(),
+                                                      dynamic_colliders,
+                                                      solid_region(state, settings),
+                                                      0.0f);
+      r_stats.solid_voxels = int(masks.filled.count());
+      carve_solids(state, masks.carve);
     }
     /* Do not mask the seeding / paused frame: it only shows the sources, and a field like `flame`
      * is still empty there. The next simulated frame applies the mask. */
@@ -1514,7 +2255,7 @@ Volume *solve_frame(const Volume *previous,
 
   /* The wall of the colliders is rebuilt once per frame. The region is the smoke of the previous
    * frame grown by the room the smoke can reach, so a collider outside it costs nothing. */
-  SolidMask solids;
+  ColliderMasks collider_masks;
   bool solids_built = colliders.is_empty();
 
   double ms_sources = 0.0;
@@ -1536,9 +2277,12 @@ Volume *solve_frame(const Volume *previous,
     ensure_velocity_topology(state);
     if (!solids_built) {
       ScopedTimer timer(ms_colliders);
-      solids = build_solid_mask(*state.density->transformPtr(), colliders, solid_region(state, settings));
+      collider_masks = build_collider_masks(*state.density->transformPtr(),
+                                            dynamic_colliders,
+                                            solid_region(state, settings),
+                                            dt);
       solids_built = true;
-      r_stats.solid_voxels = int(solids.count());
+      r_stats.solid_voxels = int(collider_masks.filled.count());
     }
     {
       ScopedTimer timer(ms_forces);
@@ -1556,8 +2300,13 @@ Volume *solve_frame(const Volume *previous,
     }
     {
       ScopedTimer timer(ms_projection);
-      project_velocity(state, settings, r_stats, solids);
-      clamp_velocity_at_solids(state, solids);
+      /* The wall velocity has to be in the field before the projection: the divergence it creates
+       * is what pushes the smoke around a moving collider instead of letting the collider slide
+       * through it. It is imposed again after the projection, because that is where the clip has to
+       * survive (the pressure solve does not know about the wall velocity). */
+      clamp_velocity_at_solids(state, collider_masks.current, dynamic_colliders);
+      project_velocity(state, settings, r_stats, collider_masks.filled);
+      clamp_velocity_at_solids(state, collider_masks.current, dynamic_colliders);
     }
     {
       ScopedTimer timer(ms_scalars);
@@ -1582,7 +2331,7 @@ Volume *solve_frame(const Volume *previous,
     {
       ScopedTimer timer(ms_solids);
       limit_and_extrapolate_velocity(state, settings);
-      carve_solids(state, solids);
+      carve_solids(state, collider_masks.carve);
     }
   }
 
@@ -1639,7 +2388,7 @@ Volume *solve_frame(const Volume *previous,
            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                .count());
     printf("IGNIS_DEBUG step: density=%lld velocity=%lld max_v=%.3f div %.4f -> %.4f "
-           "(%.1f%%) substeps=%d pressure=%d residual=%.5f cfl=%d\n",
+           "(%.1f%%) substeps=%d pressure=%d residual=%.5f solids=%d cfl=%d\n",
            (long long)state.density->activeVoxelCount(),
            (long long)velocity_num,
            double(max_velocity),
@@ -1651,6 +2400,7 @@ Volume *solve_frame(const Volume *previous,
            r_stats.substeps_used,
            r_stats.pressure_iterations,
            double(r_stats.residual),
+           r_stats.solid_voxels,
            int(r_stats.cfl_limited));
   }
   r_stats.milliseconds = std::chrono::duration<double, std::milli>(
@@ -1662,11 +2412,12 @@ Volume *solve_frame(const Volume *previous,
 #else /* WITH_OPENVDB */
 
 Volume *solve_frame(const Volume * /*previous*/,
-                    const Volume * /*source*/,
+                    const Span<const Volume *> /*sources*/,
                     const Span<const Collider> /*colliders*/,
                     const Settings & /*settings*/,
                     const float /*delta_time*/,
-                    Stats & /*r_stats*/)
+                    Stats & /*r_stats*/,
+                    const int /*backend_request*/)
 {
   return nullptr;
 }

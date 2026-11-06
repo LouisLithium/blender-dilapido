@@ -28,7 +28,10 @@
 
 #pragma once
 
+#include <string>
+
 #include "BLI_array.hh"
+#include "BLI_math_matrix_types.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
 
@@ -138,22 +141,39 @@ struct Stats {
   bool cfl_limited = false;
   bool resized = false;
   double milliseconds = 0.0;
+  /** The last frame ran on the compute backend (inside an `HW Accelerate` zone). */
+  bool device = false;
+  /** Dispatches the device path issued, for the node badge and debugging. */
+  int device_passes = 0;
+  /** Why the CPU path was used although the solve ran inside an `HW Accelerate` zone. */
+  std::string device_fallback_reason;
 };
 
 /**
- * A collider of the frame: a mesh in world space.
+ * A collider of the frame: a mesh in world space, with optional motion data.
  *
  * The solver rasterizes the surface into a thin solid shell and treats it as a wall: the smoke is
  * removed where it would be inside, the velocity may not point into it and the pressure is zero on
  * it. The mesh is expected to be closed for a volumetric obstacle; an open mesh (a ground plane)
  * works as a thin wall of one voxel.
  *
- * \note `Dilapido Collider` bakes its `Transform` into the geometry, so the mesh arrives here already
- * posed. A collider that moves more than one voxel per frame can be jumped over, because the surface
- * is sampled once per frame (the limitation the PBD solver had before it learned to sweep).
+ * `Dilapido Collider` bakes its `Transform` into the mesh, so `mesh` is the current pose and
+ * `previous_mesh` (from the collider's `previous` bundle) is the pose of the previous frame. When
+ * `sweep` is on, the mask is the union of several poses between the two, which is what stops a
+ * fast collider from jumping over the smoke. `deforming` interpolates the vertices instead of the
+ * object transform. `velocity` is the average motion per second, used to push the smoke out of the
+ * way instead of only deleting it.
  */
 struct Collider {
   const Mesh *mesh = nullptr;
+  const Mesh *previous_mesh = nullptr;
+  float4x4 transform = float4x4::identity();
+  float4x4 previous_transform = float4x4::identity();
+  bool has_previous = false;
+  bool has_previous_transform = false;
+  bool sweep = true;
+  bool deforming = false;
+  float3 velocity = float3(0.0f);
 };
 
 /**
@@ -174,7 +194,8 @@ Volume *solve_frame(const Volume *previous,
                     Span<const Collider> colliders,
                     const Settings &settings,
                     float delta_time,
-                    Stats &r_stats);
+                    Stats &r_stats,
+                    int backend_request = 0);
 
 }  // namespace geometry::ignis
 }  // namespace blender

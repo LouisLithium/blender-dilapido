@@ -69,3 +69,4 @@ c676fe02-8d25-49a1-b672-11aee0918221:Hair/Read:Hair-Read
 f8291c19-ec70-4a53-82d5-40b68a0c3a86:Shading:Shading
 2571be08-e20a-48a8-80c8-26171509f863:Shading/Utilities:Shading-Utilities
 9cd554d5-1d8f-43dd-a2ab-41635557769b:Shading/Utilities/Vector:Shading-Utilities-Vector
+d8a0f6e4-4a3e-4f0b-9c1a-7f2c5e6b8d90:Material/Ignis:Material-Ignis

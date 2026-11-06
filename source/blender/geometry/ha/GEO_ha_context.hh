@@ -107,6 +107,12 @@ HaScopeBackend ha_scope_backend();
 /** True when the current evaluation may use the GPU (i.e. inside a zone that is not `Force CPU`). */
 bool ha_scope_allows_gpu();
 
+/**
+ * Why the last #HaContextGuard on this thread could not be created, or an empty string when it was
+ * valid. Used by the nodes to report an actionable reason instead of the generic "no GPU context".
+ */
+const char *ha_context_error();
+
 /** \} */
 
 /** A storage buffer holding `float` elements (used for interleaved positions: 3 per element). */class HaBuffer {

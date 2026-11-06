@@ -1,0 +1,2639 @@
+/* SPDX-FileCopyrightText: 2026 Blender Authors
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later */
+
+/** \file
+ * \ingroup geo
+ *
+ * Dense device implementation of the Ignis smoke solver. See `GEO_ha_ignis.hh` for the data model:
+ * the caller converts the sparse OpenVDB state to a dense box, this file runs all substeps of the
+ * frame on the compute backend, and the caller converts the result back.
+ *
+ * Every pass is a plain per-voxel kernel with Jacobi semantics (read the previous pass' buffers,
+ * write a different buffer), so the result does not depend on scheduling. The only reductions are
+ * CG dot products, which use one invocation per fixed block (a two stage reduction with a fixed
+ * summation order).
+ */
+
+#include "GEO_ha_ignis.hh"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include "BLI_array.hh"
+#include "BLI_math_vector.hh"
+#include "BLI_span.hh"
+#include "BLI_vector.hh"
+
+#include "GPU_shader.hh"
+#include "GPU_state.hh"
+#include "GPU_storage_buffer.hh"
+
+#include "GEO_ha_context.hh"
+
+namespace blender::geometry::ha {
+
+namespace {
+
+/* -------------------------------------------------------------------- */
+/** \name Parameters
+ * \{ */
+
+/** Layout of the small float parameter buffer every kernel reads. */
+enum IgnisParam : int {
+  P_CELLS = 0,
+  P_DX,
+  P_DY,
+  P_DZ,
+  P_VOXEL,
+  P_DT,
+  P_GRAVITY_X,
+  P_GRAVITY_Y,
+  P_GRAVITY_Z,
+  P_WIND_X,
+  P_WIND_Y,
+  P_WIND_Z,
+  P_BUOYANCY,
+  P_AMBIENT,
+  P_DRAG,
+  P_DAMPING,
+  P_VORTICITY,
+  P_BURN_RATE,
+  P_HEAT_RELEASE,
+  P_SMOKE_PER_BURN,
+  P_COOLING,
+  P_DISSIPATION,
+  P_FLAME_THRESHOLD,
+  P_DOMAIN_FIELD,
+  P_DOMAIN_THRESHOLD,
+  P_USE_BOUNDS,
+  P_BOUNDS_MIN_X,
+  P_BOUNDS_MIN_Y,
+  P_BOUNDS_MIN_Z,
+  P_BOUNDS_MAX_X,
+  P_BOUNDS_MAX_Y,
+  P_BOUNDS_MAX_Z,
+  P_RADIUS,
+  P_EXTRAPOLATE,
+  P_TOLERANCE,
+  P_MAX_ITERATIONS,
+  P_ITERATION,
+  P_RHS_NORM,
+  P_RES_NORM,
+  P_RZ,
+  P_PQ,
+  P_ALPHA,
+  P_BETA,
+  P_CONVERGED,
+  P_PARTIALS,
+  P_ORIGIN_X,
+  P_ORIGIN_Y,
+  P_ORIGIN_Z,
+  P_DILATE_BIT,
+  P_DIV_BEFORE_SUM,
+  P_DIV_AFTER_SUM,
+  P_UNKNOWN_COUNT,
+  P_USE_DOMAIN_MASK,
+  P_COUNT,
+};
+
+const char *GLSL_PRELUDE =
+    "#define HA_SMOKE 1\n"
+    "#define HA_DOMAIN 2\n"
+    "#define HA_UNKNOWN 4\n"
+    "#define HA_SOLID 8\n"
+    "#define HA_FILLED 16\n"
+    "#define HA_KEEP 32\n"
+    "#define HA_BAND 64\n"
+    "#define HA_REMOVED 128\n"
+    "#define HA_CELL_COUNT int(params[0])\n"
+    "#define HA_DX int(params[1])\n"
+    "#define HA_DY int(params[2])\n"
+    "#define HA_DZ int(params[3])\n"
+    "#define HA_VOXEL params[4]\n"
+    "#define HA_DT params[5]\n"
+    "#define HA_GRAVITY vec3(params[6], params[7], params[8])\n"
+    "#define HA_WIND vec3(params[9], params[10], params[11])\n"
+    "#define HA_BUOYANCY params[12]\n"
+    "#define HA_AMBIENT params[13]\n"
+    "#define HA_DRAG params[14]\n"
+    "#define HA_DAMPING params[15]\n"
+    "#define HA_VORTICITY params[16]\n"
+    "#define HA_BURN_RATE params[17]\n"
+    "#define HA_HEAT_RELEASE params[18]\n"
+    "#define HA_SMOKE_PER_BURN params[19]\n"
+    "#define HA_COOLING params[20]\n"
+    "#define HA_DISSIPATION params[21]\n"
+    "#define HA_FLAME_THRESHOLD params[22]\n"
+    "#define HA_DOMAIN_FIELD int(params[23])\n"
+    "#define HA_DOMAIN_THRESHOLD params[24]\n"
+    "#define HA_USE_BOUNDS int(params[25])\n"
+    "#define HA_BOUNDS_MIN vec3(params[26], params[27], params[28])\n"
+    "#define HA_BOUNDS_MAX vec3(params[29], params[30], params[31])\n"
+    "#define HA_RADIUS int(params[32])\n"
+    "#define HA_EXTRAPOLATE int(params[33])\n"
+    "#define HA_TOLERANCE params[34]\n"
+    "#define HA_MAX_ITERATIONS int(params[35])\n"
+    "#define HA_ITERATION int(params[36])\n"
+    "#define HA_RHS_NORM params[37]\n"
+    "#define HA_RES_NORM params[38]\n"
+    "#define HA_RZ params[39]\n"
+    "#define HA_PQ params[40]\n"
+    "#define HA_ALPHA params[41]\n"
+    "#define HA_BETA params[42]\n"
+    "#define HA_CONVERGED int(params[43])\n"
+    "#define HA_PARTIAL_COUNT int(params[44])\n"
+    "#define HA_ORIGIN vec3(params[45], params[46], params[47])\n"
+    "#define HA_DILATE_BIT int(params[48])\n"
+    "#define HA_DIV_BEFORE_SUM params[49]\n"
+    "#define HA_DIV_AFTER_SUM params[50]\n"
+    "#define HA_UNKNOWN_COUNT params[51]\n"
+    "#define HA_USE_DOMAIN_MASK int(params[52])\n"
+    "int ha_flat(ivec3 c) { return c.x + HA_DX * (c.y + HA_DY * c.z); }\n"
+    "void ha_cell(int i, out ivec3 c)\n"
+    "{\n"
+    "  int dx = HA_DX;\n"
+    "  int dy = HA_DY;\n"
+    "  c.x = i % dx;\n"
+    "  i /= dx;\n"
+    "  c.y = i % dy;\n"
+    "  c.z = i / dy;\n"
+    "}\n"
+    "bool ha_inside(ivec3 c)\n"
+    "{\n"
+    "  return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < HA_DX && c.y < HA_DY && c.z < HA_DZ;\n"
+    "}\n"
+    "vec3 ha_world(ivec3 c) { return (HA_ORIGIN + vec3(c)) * HA_VOXEL; }\n";
+
+/** Per pass controls of the advection kernels (a separate buffer, so they never clobber CG state).
+ */
+const char *GLSL_ADVECT_CONTROLS =
+    "#define HA_ADVECT_DIR adv[0]\n"
+    "#define HA_ADVECT_ORDER int(adv[1])\n"
+    "#define HA_LIMITER int(adv[2])\n"
+    "#define HA_COMPONENT int(adv[3])\n"
+    "#define HA_CORRECT_MODE int(adv[4])\n";
+
+HaShaderResource res(const int slot,
+                     const HaShaderQualifier qualifier,
+                     const char *type,
+                     const char *name)
+{
+  HaShaderResource r;
+  r.slot = slot;
+  r.qualifier = qualifier;
+  r.type = type;
+  r.name = name;
+  return r;
+}
+
+#define HA_READ(slot, type, name) res(slot, HaShaderQualifier::Read, type, name)
+#define HA_WRITE(slot, type, name) res(slot, HaShaderQualifier::Write, type, name)
+#define HA_RW(slot, type, name) res(slot, HaShaderQualifier::ReadWrite, type, name)
+
+/** \{ */
+
+/* -------------------------------------------------------------------- */
+/** \name Shared GLSL helpers
+ * \{ */
+
+const char *GLSL_MASK_HELPERS =
+    "int ha_mask_at(ivec3 c) { return ha_inside(c) ? mask[ha_flat(c)] : 0; }\n";
+
+const char *GLSL_MASK_IN_HELPERS =
+    "int ha_mask_in_at(ivec3 c) { return ha_inside(c) ? mask_in[ha_flat(c)] : 0; }\n";
+
+const char *GLSL_SCALAR_HELPERS =
+    "float ha_scalar_at(ivec3 c, int component)\n"
+    "{\n"
+    "  return ha_inside(c) ? scalars[ha_flat(c) * 4 + component] : 0.0;\n"
+    "}\n";
+
+const char *GLSL_VELOCITY_HELPERS =
+    "vec3 ha_velocity(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "}\n"
+    "void ha_velocity_set(ivec3 c, vec3 v)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return; }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  velocity[base + 0] = v.x;\n"
+    "  velocity[base + 1] = v.y;\n"
+    "  velocity[base + 2] = v.z;\n"
+    "}\n"
+    "vec3 ha_velocity_sample(vec3 p)\n"
+    "{\n"
+    "  vec3 pf = floor(p);\n"
+    "  ivec3 i = ivec3(pf);\n"
+    "  vec3 f = p - pf;\n"
+    "  vec3 v000 = ha_velocity(i);\n"
+    "  vec3 v100 = ha_velocity(i + ivec3(1, 0, 0));\n"
+    "  vec3 v010 = ha_velocity(i + ivec3(0, 1, 0));\n"
+    "  vec3 v110 = ha_velocity(i + ivec3(1, 1, 0));\n"
+    "  vec3 v001 = ha_velocity(i + ivec3(0, 0, 1));\n"
+    "  vec3 v101 = ha_velocity(i + ivec3(1, 0, 1));\n"
+    "  vec3 v011 = ha_velocity(i + ivec3(0, 1, 1));\n"
+    "  vec3 v111 = ha_velocity(i + ivec3(1, 1, 1));\n"
+    "  vec3 v00 = mix(v000, v100, f.x);\n"
+    "  vec3 v10 = mix(v010, v110, f.x);\n"
+    "  vec3 v01 = mix(v001, v101, f.x);\n"
+    "  vec3 v11 = mix(v011, v111, f.x);\n"
+    "  return mix(mix(v00, v10, f.y), mix(v01, v11, f.y), f.z);\n"
+    "}\n";
+
+const char *GLSL_ADVECT_VEC3_FIELD =
+    "vec3 ha_field_read(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  return vec3(field_in[base + 0], field_in[base + 1], field_in[base + 2]);\n"
+    "}\n"
+    "void ha_field_write(int i, vec3 v)\n"
+    "{\n"
+    "  field_out[i * 3 + 0] = v.x;\n"
+    "  field_out[i * 3 + 1] = v.y;\n"
+    "  field_out[i * 3 + 2] = v.z;\n"
+    "}\n"
+    "vec3 ha_field_forward(int i)\n"
+    "{\n"
+    "  return vec3(field_out[i * 3 + 0], field_out[i * 3 + 1], field_out[i * 3 + 2]);\n"
+    "}\n";
+
+const char *GLSL_ADVECT_VEC3_AUX =
+    "vec3 ha_field_aux(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  return vec3(field_aux[base + 0], field_aux[base + 1], field_aux[base + 2]);\n"
+    "}\n";
+
+const char *GLSL_ADVECT_SCALAR_FIELD =
+    "float ha_field_read(ivec3 c)\n"
+    "{\n"
+    "  return ha_inside(c) ? field_in[ha_flat(c) * 4 + HA_COMPONENT] : 0.0;\n"
+    "}\n"
+    "void ha_field_write(int i, float v) { field_out[i] = v; }\n"
+    "float ha_field_forward(int i) { return field_out[i]; }\n";
+
+const char *GLSL_ADVECT_SCALAR_AUX =
+    "float ha_field_aux(ivec3 c) { return ha_inside(c) ? field_aux[ha_flat(c)] : 0.0; }\n";
+
+/** The same for a buffer that already has one float per voxel (the intermediate of a scalar pass).
+ */
+const char *GLSL_ADVECT_PLAIN_FIELD =
+    "float ha_field_read(ivec3 c) { return ha_inside(c) ? field_in[ha_flat(c)] : 0.0; }\n"
+    "void ha_field_write(int i, float v) { field_out[i] = v; }\n";
+
+const char *GLSL_ADVECT_SAMPLE_VEC3 =
+    "vec3 ha_sample_field(vec3 p)\n"
+    "{\n"
+    "  vec3 pf = floor(p);\n"
+    "  ivec3 i = ivec3(pf);\n"
+    "  vec3 f = p - pf;\n"
+    "  vec3 v000 = ha_field_read(i);\n"
+    "  vec3 v100 = ha_field_read(i + ivec3(1, 0, 0));\n"
+    "  vec3 v010 = ha_field_read(i + ivec3(0, 1, 0));\n"
+    "  vec3 v110 = ha_field_read(i + ivec3(1, 1, 0));\n"
+    "  vec3 v001 = ha_field_read(i + ivec3(0, 0, 1));\n"
+    "  vec3 v101 = ha_field_read(i + ivec3(1, 0, 1));\n"
+    "  vec3 v011 = ha_field_read(i + ivec3(0, 1, 1));\n"
+    "  vec3 v111 = ha_field_read(i + ivec3(1, 1, 1));\n"
+    "  vec3 v00 = mix(v000, v100, f.x);\n"
+    "  vec3 v10 = mix(v010, v110, f.x);\n"
+    "  vec3 v01 = mix(v001, v101, f.x);\n"
+    "  vec3 v11 = mix(v011, v111, f.x);\n"
+    "  return mix(mix(v00, v10, f.y), mix(v01, v11, f.y), f.z);\n"
+    "}\n";
+
+const char *GLSL_ADVECT_SAMPLE_SCALAR =
+    "float ha_sample_field(vec3 p)\n"
+    "{\n"
+    "  vec3 pf = floor(p);\n"
+    "  ivec3 i = ivec3(pf);\n"
+    "  vec3 f = p - pf;\n"
+    "  float v000 = ha_field_read(i);\n"
+    "  float v100 = ha_field_read(i + ivec3(1, 0, 0));\n"
+    "  float v010 = ha_field_read(i + ivec3(0, 1, 0));\n"
+    "  float v110 = ha_field_read(i + ivec3(1, 1, 0));\n"
+    "  float v001 = ha_field_read(i + ivec3(0, 0, 1));\n"
+    "  float v101 = ha_field_read(i + ivec3(1, 0, 1));\n"
+    "  float v011 = ha_field_read(i + ivec3(0, 1, 1));\n"
+    "  float v111 = ha_field_read(i + ivec3(1, 1, 1));\n"
+    "  float v00 = mix(v000, v100, f.x);\n"
+    "  float v10 = mix(v010, v110, f.x);\n"
+    "  float v01 = mix(v001, v101, f.x);\n"
+    "  float v11 = mix(v011, v111, f.x);\n"
+    "  return mix(mix(v00, v10, f.y), mix(v01, v11, f.y), f.z);\n"
+    "}\n";
+
+/** \{ */
+
+/* -------------------------------------------------------------------- */
+/** \name Kernels
+ * \{ */
+
+const char *KERNEL_SOURCE_MERGE =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  float source_density = source[i * 7 + 0];\n"
+    "  if (source_density <= 0.0) { return; }\n"
+    "  scalars[i * 4 + 0] = max(scalars[i * 4 + 0], source_density);\n"
+    "  float source_temperature = source[i * 7 + 1];\n"
+    "  if (source_temperature != 0.0) {\n"
+    "    float temperature = scalars[i * 4 + 1];\n"
+    "    scalars[i * 4 + 1] = source_temperature > 0.0 ? max(temperature, source_temperature) :\n"
+    "                                                    min(temperature, source_temperature);\n"
+    "  }\n"
+    "  float source_fuel = source[i * 7 + 2];\n"
+    "  if (source_fuel > 0.0) { scalars[i * 4 + 2] = max(scalars[i * 4 + 2], source_fuel); }\n"
+    "  vec3 incoming = vec3(source[i * 7 + 3], source[i * 7 + 4], source[i * 7 + 5]);\n"
+    "  if (dot(incoming, incoming) > 0.0) {\n"
+    "    float weight = clamp(source_density, 0.0, 1.0);\n"
+    "    int base = i * 3;\n"
+    "    vec3 current = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "    vec3 blended = current + (incoming - current) * weight;\n"
+    "    velocity[base + 0] = blended.x;\n"
+    "    velocity[base + 1] = blended.y;\n"
+    "    velocity[base + 2] = blended.z;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_FORCES =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  if (scalars[i * 4 + 0] <= 1e-4) { return; }\n"
+    "  float anomaly = scalars[i * 4 + 1] - HA_AMBIENT;\n"
+    "  int base = i * 3;\n"
+    "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "  if (anomaly != 0.0) { v -= HA_GRAVITY * (HA_BUOYANCY * anomaly * HA_DT); }\n"
+    "  v += HA_WIND * HA_DT;\n"
+    "  if (HA_DRAG > 0.0) { v *= 1.0 / (1.0 + HA_DRAG * HA_DT); }\n"
+    "  v *= 1.0 / (1.0 + HA_DAMPING * HA_DT);\n"
+    "  velocity[base + 0] = v.x;\n"
+    "  velocity[base + 1] = v.y;\n"
+    "  velocity[base + 2] = v.z;\n"
+    "}\n";
+
+const char *KERNEL_VORTICITY_CURL =
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(i, c);\n"
+    "  bool band = ha_scalar_at(c, 0) > 1e-4 || ha_scalar_at(c + ivec3(1, 0, 0), 0) > 1e-4 ||\n"
+    "              ha_scalar_at(c + ivec3(-1, 0, 0), 0) > 1e-4 ||\n"
+    "              ha_scalar_at(c + ivec3(0, 1, 0), 0) > 1e-4 ||\n"
+    "              ha_scalar_at(c + ivec3(0, -1, 0), 0) > 1e-4 ||\n"
+    "              ha_scalar_at(c + ivec3(0, 0, 1), 0) > 1e-4 ||\n"
+    "              ha_scalar_at(c + ivec3(0, 0, -1), 0) > 1e-4;\n"
+    "  if (!band) {\n"
+    "    mask[i] = mask[i] & ~HA_BAND;\n"
+    "    return;\n"
+    "  }\n"
+    "  vec3 dx_p = ha_velocity(c + ivec3(1, 0, 0));\n"
+    "  vec3 dx_m = ha_velocity(c + ivec3(-1, 0, 0));\n"
+    "  vec3 dy_p = ha_velocity(c + ivec3(0, 1, 0));\n"
+    "  vec3 dy_m = ha_velocity(c + ivec3(0, -1, 0));\n"
+    "  vec3 dz_p = ha_velocity(c + ivec3(0, 0, 1));\n"
+    "  vec3 dz_m = ha_velocity(c + ivec3(0, 0, -1));\n"
+    "  vec3 omega = vec3((dy_p.z - dy_m.z) - (dz_p.y - dz_m.y),\n"
+    "                    (dz_p.x - dz_m.x) - (dx_p.z - dx_m.z),\n"
+    "                    (dx_p.y - dx_m.y) - (dy_p.x - dy_m.x)) * (0.5 / HA_VOXEL);\n"
+    "  curl[i * 4 + 0] = omega.x;\n"
+    "  curl[i * 4 + 1] = omega.y;\n"
+    "  curl[i * 4 + 2] = omega.z;\n"
+    "  curl[i * 4 + 3] = length(omega);\n"
+    "  mask[i] = mask[i] | HA_BAND;\n"
+    "}\n";
+
+const char *KERNEL_VORTICITY_APPLY =
+    "float ha_curl_length(ivec3 c) { return ha_inside(c) ? curl[ha_flat(c) * 4 + 3] : 0.0; }\n"
+    "void main()\n"
+    "{\n"
+    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  if ((mask[i] & HA_BAND) == 0) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(i, c);\n"
+    "  vec3 normal = vec3(ha_curl_length(c + ivec3(1, 0, 0)) - ha_curl_length(c + ivec3(-1, 0, "
+    "0)),\n"
+    "                     ha_curl_length(c + ivec3(0, 1, 0)) - ha_curl_length(c + ivec3(0, -1, "
+    "0)),\n"
+    "                     ha_curl_length(c + ivec3(0, 0, 1)) - ha_curl_length(c + ivec3(0, 0, "
+    "-1)));\n"
+    "  float normal_length = length(normal);\n"
+    "  if (normal_length < 1e-8) { return; }\n"
+    "  vec3 value = vec3(curl[i * 4 + 0], curl[i * 4 + 1], curl[i * 4 + 2]);\n"
+    "  vec3 force = cross(normal / normal_length, value) * (HA_VORTICITY * HA_VOXEL * HA_DT);\n"
+    "  int base = i * 3;\n"
+    "  velocity[base + 0] += force.x;\n"
+    "  velocity[base + 1] += force.y;\n"
+    "  velocity[base + 2] += force.z;\n"
+    "}\n";
+
+const char *KERNEL_ADVECT_PASS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  vec3 p = vec3(c);\n"
+    "  float dir = HA_ADVECT_DIR;\n"
+    "  vec3 v = ha_velocity_sample(p) / HA_VOXEL;\n"
+    "  vec3 traced = p + dir * HA_DT * v;\n"
+    "  if (HA_ADVECT_ORDER >= 2) {\n"
+    "    vec3 v_mid = ha_velocity_sample(p + dir * HA_DT * 0.5 * v) / HA_VOXEL;\n"
+    "    traced = p + dir * HA_DT * v_mid;\n"
+    "  }\n"
+    "  ha_field_write(index, ha_sample_field(traced));\n"
+    "}\n";
+
+const char *KERNEL_ADVECT_CORRECT_VEC3 =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  vec3 original = ha_field_read(c);\n"
+    "  vec3 backward = ha_field_aux(c);\n"
+    "  vec3 forward = ha_field_forward(index);\n"
+    "  vec3 value = HA_CORRECT_MODE == 0 ? forward + 0.5 * (original - backward) :\n"
+    "                                      0.5 * (3.0 * original - backward);\n"
+    "  ha_field_write(index, value);\n"
+    "}\n";
+
+const char *KERNEL_ADVECT_CORRECT_SCALAR =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  float original = ha_field_read(c);\n"
+    "  float backward = ha_field_aux(c);\n"
+    "  float forward = ha_field_forward(index);\n"
+    "  float value = HA_CORRECT_MODE == 0 ? forward + 0.5 * (original - backward) :\n"
+    "                                      0.5 * (3.0 * original - backward);\n"
+    "  ha_field_write(index, value);\n"
+    "}\n";
+
+const char *KERNEL_ADVECT_LIMITER_VEC3 =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (HA_LIMITER == 0) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  vec3 traced = vec3(c) - HA_DT * (ha_velocity_sample(vec3(c)) / HA_VOXEL);\n"
+    "  vec3 pf = floor(traced);\n"
+    "  ivec3 i = ivec3(pf);\n"
+    "  vec3 f = traced - pf;\n"
+    "  vec3 v000 = ha_field_read(i);\n"
+    "  vec3 v100 = ha_field_read(i + ivec3(1, 0, 0));\n"
+    "  vec3 v010 = ha_field_read(i + ivec3(0, 1, 0));\n"
+    "  vec3 v110 = ha_field_read(i + ivec3(1, 1, 0));\n"
+    "  vec3 v001 = ha_field_read(i + ivec3(0, 0, 1));\n"
+    "  vec3 v101 = ha_field_read(i + ivec3(1, 0, 1));\n"
+    "  vec3 v011 = ha_field_read(i + ivec3(0, 1, 1));\n"
+    "  vec3 v111 = ha_field_read(i + ivec3(1, 1, 1));\n"
+    "  vec3 value = ha_field_forward(index);\n"
+    "  vec3 vmin = min(min(min(v000, v100), min(v010, v110)),\n"
+    "                  min(min(v001, v101), min(v011, v111)));\n"
+    "  vec3 vmax = max(max(max(v000, v100), max(v010, v110)),\n"
+    "                  max(max(v001, v101), max(v011, v111)));\n"
+    "  if (HA_LIMITER == 1) {\n"
+    "    value = clamp(value, vmin, vmax);\n"
+    "  }\n"
+    "  else if (any(lessThan(value, vmin)) || any(greaterThan(value, vmax))) {\n"
+    "    vec3 a = mix(v000, v100, f.x);\n"
+    "    vec3 b = mix(v010, v110, f.x);\n"
+    "    vec3 cc = mix(v001, v101, f.x);\n"
+    "    vec3 dd = mix(v011, v111, f.x);\n"
+    "    value = mix(mix(a, b, f.y), mix(cc, dd, f.y), f.z);\n"
+    "  }\n"
+    "  ha_field_write(index, value);\n"
+    "}\n";
+
+const char *KERNEL_ADVECT_LIMITER_SCALAR =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (HA_LIMITER == 0) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  vec3 traced = vec3(c) - HA_DT * (ha_velocity_sample(vec3(c)) / HA_VOXEL);\n"
+    "  vec3 pf = floor(traced);\n"
+    "  ivec3 i = ivec3(pf);\n"
+    "  vec3 f = traced - pf;\n"
+    "  float v000 = ha_field_read(i);\n"
+    "  float v100 = ha_field_read(i + ivec3(1, 0, 0));\n"
+    "  float v010 = ha_field_read(i + ivec3(0, 1, 0));\n"
+    "  float v110 = ha_field_read(i + ivec3(1, 1, 0));\n"
+    "  float v001 = ha_field_read(i + ivec3(0, 0, 1));\n"
+    "  float v101 = ha_field_read(i + ivec3(1, 0, 1));\n"
+    "  float v011 = ha_field_read(i + ivec3(0, 1, 1));\n"
+    "  float v111 = ha_field_read(i + ivec3(1, 1, 1));\n"
+    "  float value = ha_field_forward(index);\n"
+    "  float vmin = min(min(min(v000, v100), min(v010, v110)),\n"
+    "                   min(min(v001, v101), min(v011, v111)));\n"
+    "  float vmax = max(max(max(v000, v100), max(v010, v110)),\n"
+    "                   max(max(v001, v101), max(v011, v111)));\n"
+    "  if (HA_LIMITER == 1) {\n"
+    "    value = clamp(value, vmin, vmax);\n"
+    "  }\n"
+    "  else if (value < vmin || value > vmax) {\n"
+    "    float a = mix(v000, v100, f.x);\n"
+    "    float b = mix(v010, v110, f.x);\n"
+    "    float cc = mix(v001, v101, f.x);\n"
+    "    float dd = mix(v011, v111, f.x);\n"
+    "    value = mix(mix(a, b, f.y), mix(cc, dd, f.y), f.z);\n"
+    "  }\n"
+    "  ha_field_write(index, value);\n"
+    "}\n";
+
+const char *KERNEL_COPY_VEC3 =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int base = index * 3;\n"
+    "  field_out[base + 0] = field_in[base + 0];\n"
+    "  field_out[base + 1] = field_in[base + 1];\n"
+    "  field_out[base + 2] = field_in[base + 2];\n"
+    "}\n";
+
+const char *KERNEL_TMP_TO_SCALAR =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  field_out[index * 4 + HA_COMPONENT] = field_in[index];\n"
+    "}\n";
+
+const char *KERNEL_MASK_INIT =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int m = solid[index];\n"
+    "  if (scalars[index * 4 + 0] > 1e-4) { m = m | HA_SMOKE | HA_DOMAIN; }\n"
+    "  mask_out[index] = m;\n"
+    "}\n";
+
+const char *KERNEL_DILATE =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  int bit = 1 << HA_DILATE_BIT;\n"
+    "  int m = mask_in[index];\n"
+    "  if ((m & bit) == 0) {\n"
+    "    if ((ha_mask_in_at(c + ivec3(1, 0, 0)) & bit) != 0 ||\n"
+    "        (ha_mask_in_at(c + ivec3(-1, 0, 0)) & bit) != 0 ||\n"
+    "        (ha_mask_in_at(c + ivec3(0, 1, 0)) & bit) != 0 ||\n"
+    "        (ha_mask_in_at(c + ivec3(0, -1, 0)) & bit) != 0 ||\n"
+    "        (ha_mask_in_at(c + ivec3(0, 0, 1)) & bit) != 0 ||\n"
+    "        (ha_mask_in_at(c + ivec3(0, 0, -1)) & bit) != 0) {\n"
+    "      m = m | bit;\n"
+    "    }\n"
+    "  }\n"
+    "  mask_out[index] = m;\n"
+    "}\n";
+
+const char *KERNEL_UNKNOWN =
+    "bool ha_domain_cell(int value) { return (value & HA_DOMAIN) != 0 && (value & HA_SOLID) == 0; "
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  int m = mask[index];\n"
+    "  bool here = ha_domain_cell(m);\n"
+    "  if (c.x + 1 >= HA_DX || c.y + 1 >= HA_DY || c.z + 1 >= HA_DZ) { here = false; }\n"
+    "  if (here) {\n"
+    "    here = ha_domain_cell(ha_mask_at(c + ivec3(1, 0, 0))) &&\n"
+    "           ha_domain_cell(ha_mask_at(c + ivec3(0, 1, 0))) &&\n"
+    "           ha_domain_cell(ha_mask_at(c + ivec3(0, 0, 1)));\n"
+    "  }\n"
+    "  mask[index] = here ? (m | HA_UNKNOWN) : (m & ~HA_UNKNOWN);\n"
+    "}\n";
+
+const char *KERNEL_RHS =
+    "vec3 ha_vel_at(int mask_value, ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c) || (mask_value & HA_DOMAIN) == 0 || (mask_value & HA_SOLID) != 0) {\n"
+    "    return vec3(0.0);\n"
+    "  }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "}\n"
+    "float ha_divergence(ivec3 c)\n"
+    "{\n"
+    "  vec3 v = ha_vel_at(ha_mask_at(c), c);\n"
+    "  return ((ha_vel_at(ha_mask_at(c + ivec3(1, 0, 0)), c + ivec3(1, 0, 0)).x - v.x) +\n"
+    "          (ha_vel_at(ha_mask_at(c + ivec3(0, 1, 0)), c + ivec3(0, 1, 0)).y - v.y) +\n"
+    "          (ha_vel_at(ha_mask_at(c + ivec3(0, 0, 1)), c + ivec3(0, 0, 1)).z - v.z)) /\n"
+    "         HA_VOXEL;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  if ((mask[index] & HA_UNKNOWN) != 0) {\n"
+    "    rhs[index] = ha_divergence(c) * HA_VOXEL * HA_VOXEL;\n"
+    "  }\n"
+    "  else {\n"
+    "    rhs[index] = 0.0;\n"
+    "  }\n"
+    "  if (index % 64 == 0) {\n"
+    "    float sum = 0.0;\n"
+    "    float count = 0.0;\n"
+    "    int end = min(index + 64, HA_CELL_COUNT);\n"
+    "    for (int j = index; j < end; j++) {\n"
+    "      if ((mask[j] & HA_UNKNOWN) == 0) { continue; }\n"
+    "      ivec3 cj;\n"
+    "      ha_cell(j, cj);\n"
+    "      float divergence = ha_divergence(cj);\n"
+    "      sum += divergence * divergence;\n"
+    "      count += 1.0;\n"
+    "    }\n"
+    "    partial[(index / 64) * 4 + 0] = sum;\n"
+    "    partial[(index / 64) * 4 + 2] = count;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_CG_PRODUCT =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) { product[index] = 0.0; return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  float sum = -6.0 * pressure[index];\n"
+    "  if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(1, 0, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(-1, 0, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(0, 1, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(0, -1, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(0, 0, 1))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += pressure[ha_flat(c + ivec3(0, 0, -1))];\n"
+    "  }\n"
+    "  product[index] = sum;\n"
+    "}\n";
+
+const char *KERNEL_CG_PQ_SUM =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (index % 64 != 0) { return; }\n"
+    "  float pq = 0.0;\n"
+    "  int end = min(index + 64, HA_CELL_COUNT);\n"
+    "  for (int j = index; j < end; j++) { pq += direction[j] * product[j]; }\n"
+    "  partial[(index / 64) * 4 + 0] = pq;\n"
+    "}\n";
+
+const char *KERNEL_CG_INIT =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  float value = (mask[index] & HA_UNKNOWN) != 0 ? rhs[index] - product[index] : 0.0;\n"
+    "  residual[index] = value;\n"
+    "  direction[index] = value / 6.0;\n"
+    "  if (index % 64 == 0) {\n"
+    "    float sum = 0.0;\n"
+    "    int end = min(index + 64, HA_CELL_COUNT);\n"
+    "    for (int j = index; j < end; j++) {\n"
+    "      float r = (mask[j] & HA_UNKNOWN) != 0 ? rhs[j] - product[j] : 0.0;\n"
+    "      sum += r * r;\n"
+    "    }\n"
+    "    partial[(index / 64) * 4 + 1] = sum;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_REDUCE_INIT =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  float div_sum = 0.0;\n"
+    "  float res_sum = 0.0;\n"
+    "  float count = 0.0;\n"
+    "  for (int b = 0; b < HA_PARTIAL_COUNT; b++) {\n"
+    "    div_sum += partial[b * 4 + 0];\n"
+    "    res_sum += partial[b * 4 + 1];\n"
+    "    count += partial[b * 4 + 2];\n"
+    "  }\n"
+    "  params[49] = div_sum;\n"
+    "  params[51] = count;\n"
+    "  params[37] = sqrt(div_sum) * HA_VOXEL * HA_VOXEL;\n"
+    "  params[38] = sqrt(res_sum);\n"
+    "  params[39] = res_sum / 6.0;\n"
+    "  params[36] = 0.0;\n"
+    "  params[43] = (params[37] <= 1e-12 || params[38] <= HA_TOLERANCE * params[37]) ? 1.0 : "
+    "0.0;\n"
+    "}\n";
+
+const char *KERNEL_CG_DIRECTION =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) { return; }\n"
+    "  direction[index] = residual[index] / 6.0 + HA_BETA * direction[index];\n"
+    "}\n";
+
+const char *KERNEL_CG_LAPLACIAN =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) {\n"
+    "    product[index] = 0.0;\n"
+    "    return;\n"
+    "  }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  float sum = -6.0 * direction[index];\n"
+    "  if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(1, 0, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(-1, 0, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(0, 1, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(0, -1, 0))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(0, 0, 1))];\n"
+    "  }\n"
+    "  if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
+    "    sum += direction[ha_flat(c + ivec3(0, 0, -1))];\n"
+    "  }\n"
+    "  product[index] = sum;\n"
+    "}\n";
+
+const char *KERNEL_REDUCE_PQ =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  float pq = 0.0;\n"
+    "  for (int b = 0; b < HA_PARTIAL_COUNT; b++) { pq += partial[b * 4 + 0]; }\n"
+    "  params[40] = pq;\n"
+    "  params[41] = abs(pq) < 1e-30 ? 0.0 : params[39] / pq;\n"
+    "  if (abs(pq) < 1e-30) { params[43] = 1.0; }\n"
+    "}\n";
+
+const char *KERNEL_CG_UPDATE =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) { return; }\n"
+    "  pressure[index] += HA_ALPHA * direction[index];\n"
+    "  residual[index] -= HA_ALPHA * product[index];\n"
+    "}\n";
+
+const char *KERNEL_CG_RESIDUAL_SUM =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (index % 64 != 0) { return; }\n"
+    "  float sum = 0.0;\n"
+    "  int end = min(index + 64, HA_CELL_COUNT);\n"
+    "  for (int j = index; j < end; j++) { sum += residual[j] * residual[j]; }\n"
+    "  partial[(index / 64) * 4 + 1] = sum;\n"
+    "}\n";
+
+const char *KERNEL_REDUCE_RES =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  float res_sum = 0.0;\n"
+    "  for (int b = 0; b < HA_PARTIAL_COUNT; b++) { res_sum += partial[b * 4 + 1]; }\n"
+    "  params[38] = sqrt(res_sum);\n"
+    "  params[36] = params[36] + 1.0;\n"
+    "  if (params[38] <= HA_TOLERANCE * params[37]) { params[43] = 1.0; }\n"
+    "  if (params[43] == 0.0) {\n"
+    "    params[42] = (res_sum / 6.0) / max(params[39], 1e-30);\n"
+    "    params[39] = res_sum / 6.0;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_CG_GRADIENT =
+    "float ha_pressure_at(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return 0.0; }\n"
+    "  int i = ha_flat(c);\n"
+    "  return (mask[i] & HA_UNKNOWN) != 0 ? pressure[i] : 0.0;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int m = mask[index];\n"
+    "  if ((m & HA_DOMAIN) == 0 || (m & HA_SOLID) != 0) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  float p = ha_pressure_at(c);\n"
+    "  vec3 gradient = vec3(p - ha_pressure_at(c + ivec3(-1, 0, 0)),\n"
+    "                       p - ha_pressure_at(c + ivec3(0, -1, 0)),\n"
+    "                       p - ha_pressure_at(c + ivec3(0, 0, -1))) / HA_VOXEL;\n"
+    "  int base = index * 3;\n"
+    "  velocity[base + 0] -= gradient.x;\n"
+    "  velocity[base + 1] -= gradient.y;\n"
+    "  velocity[base + 2] -= gradient.z;\n"
+    "}\n";
+
+const char *KERNEL_DIVERGENCE_AFTER =
+    "vec3 ha_vel_after(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c) || (ha_mask_at(c) & HA_DOMAIN) == 0 ||\n"
+    "      (ha_mask_at(c) & HA_SOLID) != 0) {\n"
+    "    return vec3(0.0);\n"
+    "  }\n"
+    "  int base = ha_flat(c) * 3;\n"
+    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (index % 64 != 0) { return; }\n"
+    "  float sum = 0.0;\n"
+    "  int end = min(index + 64, HA_CELL_COUNT);\n"
+    "  for (int j = index; j < end; j++) {\n"
+    "    if ((mask[j] & HA_UNKNOWN) == 0) { continue; }\n"
+    "    ivec3 cj;\n"
+    "    ha_cell(j, cj);\n"
+    "    vec3 v = ha_vel_after(cj);\n"
+    "    float divergence = ((ha_vel_after(cj + ivec3(1, 0, 0)).x - v.x) +\n"
+    "                        (ha_vel_after(cj + ivec3(0, 1, 0)).y - v.y) +\n"
+    "                        (ha_vel_after(cj + ivec3(0, 0, 1)).z - v.z)) / HA_VOXEL;\n"
+    "    sum += divergence * divergence;\n"
+    "  }\n"
+    "  partial[(index / 64) * 4 + 0] = sum;\n"
+    "}\n";
+
+const char *KERNEL_REDUCE_DIVERGENCE =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  float sum = 0.0;\n"
+    "  for (int b = 0; b < HA_PARTIAL_COUNT; b++) { sum += partial[b * 4 + 0]; }\n"
+    "  params[50] = sum;\n"
+    "}\n";
+
+/* The velocity clamp uses the *current* pose of the colliders, not the swept one: the sweep is what
+ * keeps the smoke out of the path of a fast collider, while the wall velocity of a moving collider
+ * is only meaningful where the collider is right now. The clip is against the wall velocity (a
+ * relative normal velocity) instead of zero, so a wall that moves towards the smoke pushes it while
+ * a wall that moves away lets it slide: imposing the wall velocity unconditionally would drag the
+ * smoke along with a falling collider. The collider id is stored in bits 8..15 of the solid mask
+ * (id + 1), so the wall component can be clamped against that collider's velocity. */
+const char *KERNEL_CLAMP_SOLIDS =
+    "int ha_solid_current_at(ivec3 c)\n"
+    "{\n"
+    "  return ha_inside(c) ? solid_current[ha_flat(c)] : 0;\n"
+    "}\n"
+    "bool ha_collider_velocity(ivec3 c, out float vx, out float vy, out float vz)\n"
+    "{\n"
+    "  vx = 0.0;\n"
+    "  vy = 0.0;\n"
+    "  vz = 0.0;\n"
+    "  if (!ha_inside(c)) { return false; }\n"
+    "  int id = (solid_current[ha_flat(c)] >> 8) & 0xff;\n"
+    "  if (id == 0) { return false; }\n"
+    "  int offset = (id - 1) * 3;\n"
+    "  vx = collider_velocity[offset + 0];\n"
+    "  vy = collider_velocity[offset + 1];\n"
+    "  vz = collider_velocity[offset + 2];\n"
+    "  return (vx * vx + vy * vy + vz * vz) > 0.0;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  int base = index * 3;\n"
+    "  if ((solid_current[index] & HA_SOLID) != 0) {\n"
+    "    velocity[base + 0] = 0.0;\n"
+    "    velocity[base + 1] = 0.0;\n"
+    "    velocity[base + 2] = 0.0;\n"
+    "    return;\n"
+    "  }\n"
+    "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "  float wx, wy, wz;\n"
+    "  if (ha_collider_velocity(c + ivec3(1, 0, 0), wx, wy, wz)) { v.x = min(v.x, wx); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(1, 0, 0)) & HA_SOLID) != 0) { v.x = min(v.x, 0.0); }\n"
+    "  if (ha_collider_velocity(c + ivec3(-1, 0, 0), wx, wy, wz)) { v.x = max(v.x, wx); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(-1, 0, 0)) & HA_SOLID) != 0) { v.x = max(v.x, 0.0); }\n"
+    "  if (ha_collider_velocity(c + ivec3(0, 1, 0), wx, wy, wz)) { v.y = min(v.y, wy); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(0, 1, 0)) & HA_SOLID) != 0) { v.y = min(v.y, 0.0); }\n"
+    "  if (ha_collider_velocity(c + ivec3(0, -1, 0), wx, wy, wz)) { v.y = max(v.y, wy); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(0, -1, 0)) & HA_SOLID) != 0) { v.y = max(v.y, 0.0); }\n"
+    "  if (ha_collider_velocity(c + ivec3(0, 0, 1), wx, wy, wz)) { v.z = min(v.z, wz); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(0, 0, 1)) & HA_SOLID) != 0) { v.z = min(v.z, 0.0); }\n"
+    "  if (ha_collider_velocity(c + ivec3(0, 0, -1), wx, wy, wz)) { v.z = max(v.z, wz); }\n"
+    "  else if ((ha_solid_current_at(c + ivec3(0, 0, -1)) & HA_SOLID) != 0) { v.z = max(v.z, 0.0); }\n"
+    "  velocity[base + 0] = v.x;\n"
+    "  velocity[base + 1] = v.y;\n"
+    "  velocity[base + 2] = v.z;\n"
+    "}\n";
+
+const char *KERNEL_COMBUST =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  float fuel = scalars[index * 4 + 2];\n"
+    "  if (HA_BURN_RATE > 0.0 && fuel > 0.0) {\n"
+    "    float burned = min(fuel, HA_BURN_RATE * HA_DT);\n"
+    "    scalars[index * 4 + 2] = fuel - burned;\n"
+    "    float heat = burned * HA_HEAT_RELEASE;\n"
+    "    scalars[index * 4 + 1] += heat;\n"
+    "    scalars[index * 4 + 0] += burned * HA_SMOKE_PER_BURN;\n"
+    "    if (heat > 0.0) { scalars[index * 4 + 3] = max(scalars[index * 4 + 3], heat / HA_DT); }\n"
+    "  }\n"
+    "  scalars[index * 4 + 0] *= exp(-HA_DISSIPATION * HA_DT);\n"
+    "  scalars[index * 4 + 1] *= exp(-HA_COOLING * HA_DT);\n"
+    "}\n";
+
+const char *KERNEL_CLIP_BOUNDS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (HA_USE_BOUNDS == 0) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  vec3 position = ha_world(c);\n"
+    "  if (position.x < HA_BOUNDS_MIN.x || position.x > HA_BOUNDS_MAX.x ||\n"
+    "      position.y < HA_BOUNDS_MIN.y || position.y > HA_BOUNDS_MAX.y ||\n"
+    "      position.z < HA_BOUNDS_MIN.z || position.z > HA_BOUNDS_MAX.z) {\n"
+    "    scalars[index * 4 + 0] = 0.0;\n"
+    "    scalars[index * 4 + 1] = 0.0;\n"
+    "    scalars[index * 4 + 2] = 0.0;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_MASK_KEEP_INIT =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int m = solid[index];\n"
+    "  if (scalars[index * 4 + 0] > 1e-4) { m = m | HA_SMOKE | HA_KEEP; }\n"
+    "  mask_out[index] = m;\n"
+    "}\n";
+
+const char *KERNEL_EXTRAPOLATE_SETUP =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int m = mask[index];\n"
+    "  int base = index * 3;\n"
+    "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "  if ((m & HA_KEEP) == 0) {\n"
+    "    velocity[base + 0] = 0.0;\n"
+    "    velocity[base + 1] = 0.0;\n"
+    "    velocity[base + 2] = 0.0;\n"
+    "    m = m & ~HA_FILLED;\n"
+    "  }\n"
+    "  else if (dot(v, v) > 1e-12) {\n"
+    "    m = m | HA_FILLED;\n"
+    "  }\n"
+    "  else {\n"
+    "    m = m & ~HA_FILLED;\n"
+    "  }\n"
+    "  mask[index] = m;\n"
+    "}\n";
+
+const char *KERNEL_EXTRAPOLATE_PASS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  int m = mask_in[index];\n"
+    "  int out_mask = m;\n"
+    "  if ((m & HA_KEEP) != 0 && (m & HA_FILLED) == 0) {\n"
+    "    vec3 sum = vec3(0.0);\n"
+    "    int count = 0;\n"
+    "    if ((ha_mask_in_at(c + ivec3(1, 0, 0)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(1, 0, 0));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if ((ha_mask_in_at(c + ivec3(-1, 0, 0)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(-1, 0, 0));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if ((ha_mask_in_at(c + ivec3(0, 1, 0)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(0, 1, 0));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if ((ha_mask_in_at(c + ivec3(0, -1, 0)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(0, -1, 0));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if ((ha_mask_in_at(c + ivec3(0, 0, 1)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(0, 0, 1));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if ((ha_mask_in_at(c + ivec3(0, 0, -1)) & HA_FILLED) != 0) {\n"
+    "      sum += ha_velocity(c + ivec3(0, 0, -1));\n"
+    "      count++;\n"
+    "    }\n"
+    "    if (count > 0) {\n"
+    "      ha_velocity_set(c, sum / float(count));\n"
+    "      out_mask = m | HA_FILLED;\n"
+    "    }\n"
+    "  }\n"
+    "  mask_out[index] = out_mask;\n"
+    "}\n";
+
+const char *KERNEL_CARVE_SOLIDS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((solid_carve[index] & HA_SOLID) == 0) { return; }\n"
+    "  scalars[index * 4 + 0] = 0.0;\n"
+    "  scalars[index * 4 + 1] = 0.0;\n"
+    "  scalars[index * 4 + 2] = 0.0;\n"
+    "  int base = index * 3;\n"
+    "  velocity[base + 0] = 0.0;\n"
+    "  velocity[base + 1] = 0.0;\n"
+    "  velocity[base + 2] = 0.0;\n"
+    "}\n";
+
+const char *KERNEL_FLAME_FILTER =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  scalars[index * 4 + 3] = max(0.0, scalars[index * 4 + 3] - HA_FLAME_THRESHOLD);\n"
+    "}\n";
+
+const char *KERNEL_DOMAIN_MASK =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if (HA_USE_DOMAIN_MASK == 0) { return; }\n"
+    "  if (abs(scalars[index * 4 + 0]) <= 1e-6) { return; }\n"
+    "  float value = 0.0;\n"
+    "  if (HA_DOMAIN_FIELD == 0) { value = scalars[index * 4 + 0]; }\n"
+    "  else if (HA_DOMAIN_FIELD == 1) { value = scalars[index * 4 + 1]; }\n"
+    "  else if (HA_DOMAIN_FIELD == 2) { value = scalars[index * 4 + 2]; }\n"
+    "  else { value = scalars[index * 4 + 3]; }\n"
+    "  if (abs(value) < HA_DOMAIN_THRESHOLD) {\n"
+    "    scalars[index * 4 + 0] = 0.0;\n"
+    "    scalars[index * 4 + 1] = 0.0;\n"
+    "    scalars[index * 4 + 2] = 0.0;\n"
+    "    scalars[index * 4 + 3] = 0.0;\n"
+    "    int base = index * 3;\n"
+    "    velocity[base + 0] = 0.0;\n"
+    "    velocity[base + 1] = 0.0;\n"
+    "    velocity[base + 2] = 0.0;\n"
+    "    pressure[index] = 0.0;\n"
+    "    mask[index] = mask[index] | HA_REMOVED;\n"
+    "  }\n"
+    "}\n";
+
+/** \{ */
+
+/* -------------------------------------------------------------------- */
+/** \name Device solver
+ * \{ */
+
+constexpr int GROUP_SIZE = 64;
+
+double time_now_ms()
+{
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool debug_enabled()
+{
+  const char *value = std::getenv("BLENDER_IGNIS_HA_DEBUG");
+  return value != nullptr && value[0] != '0' && value[0] != '\0';
+}
+
+void debug_log(const char *format, ...)
+{
+  if (!debug_enabled()) {
+    return;
+  }
+  /* stderr survives a crash, stdout is block buffered when piped. */
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fflush(stderr);
+}
+
+class HaIgnisSolver {
+ public:
+  bool solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result);
+  /** Frees the device buffers; call while a #HaContextGuard is still active. */
+  void release();
+
+ private:
+  bool allocate(const int64_t cells, const int64_t blocks, std::string &r_reason);
+  bool bind(const IgnisDeviceFrame &frame, std::string &r_reason);
+  void fill_params(const IgnisDeviceFrame &frame, const float dt, MutableSpan<float> r_params);
+  void write_adv(const float dir,
+                 const float order,
+                 const float limiter,
+                 const float component,
+                 const float correct_mode);
+  bool pass(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int count);
+  void swap_masks();
+
+  bool projection(const int64_t cells, std::string &r_reason);
+  bool advect_velocity(const int64_t cells, std::string &r_reason);
+  bool advect_scalars(const int64_t cells, std::string &r_reason);
+  bool extrapolate(const int64_t cells, std::string &r_reason);
+  bool dilate_mask(const int radius, const int bit_index, std::string &r_reason);
+
+  gpu::Shader *shader(const char *key,
+                      const std::string &source,
+                      Span<const HaShaderResource> resources);
+  bool shaders_valid() const;
+  void create_shaders();
+
+  HaBuffer scalars_;
+  HaBuffer velocity_;
+  HaBuffer velocity_tmp_;
+  HaBuffer velocity_aux_;
+  HaBuffer scalar_tmp_;
+  HaBuffer scalar_aux_;
+  HaBuffer pressure_;
+  HaBuffer rhs_;
+  HaBuffer residual_;
+  HaBuffer direction_;
+  HaBuffer product_;
+  HaBuffer curl_;
+  HaBuffer source_;
+  HaBuffer params_;
+  HaBuffer adv_;
+  HaBuffer partial_;
+  HaBufferInt mask_a_;
+  HaBufferInt mask_b_;
+  HaBufferInt solid_;
+  HaBufferInt solid_current_;
+  HaBufferInt solid_carve_;
+  HaBuffer collider_velocity_;
+
+  HaBufferInt *mask_ = nullptr;
+  HaBufferInt *mask_other_ = nullptr;
+  int64_t cells_ = 0;
+  int64_t blocks_ = 0;
+  int64_t radius_ = 0;
+  ignis::Settings settings_;
+  IgnisDeviceResult *result_ = nullptr;
+
+  /* Shaders, created once per solve call (the backend caches the compiled programs by key). */
+  gpu::Shader *source_merge_ = nullptr;
+  gpu::Shader *forces_ = nullptr;
+  gpu::Shader *vorticity_curl_ = nullptr;
+  gpu::Shader *vorticity_apply_ = nullptr;
+  gpu::Shader *advect_vec3_ = nullptr;
+  gpu::Shader *advect_scalar_ = nullptr;
+  gpu::Shader *advect_scalar_tmp_ = nullptr;
+  gpu::Shader *correct_vec3_ = nullptr;
+  gpu::Shader *correct_scalar_ = nullptr;
+  gpu::Shader *limiter_vec3_ = nullptr;
+  gpu::Shader *limiter_scalar_ = nullptr;
+  gpu::Shader *copy_vec3_ = nullptr;
+  gpu::Shader *tmp_to_scalar_ = nullptr;
+  gpu::Shader *mask_init_ = nullptr;
+  gpu::Shader *mask_keep_init_ = nullptr;
+  gpu::Shader *dilate_ = nullptr;
+  gpu::Shader *unknown_ = nullptr;
+  gpu::Shader *rhs_shader_ = nullptr;
+  gpu::Shader *cg_product_ = nullptr;
+  gpu::Shader *cg_init_ = nullptr;
+  gpu::Shader *reduce_init_ = nullptr;
+  gpu::Shader *cg_direction_ = nullptr;
+  gpu::Shader *cg_laplacian_ = nullptr;
+  gpu::Shader *cg_pq_sum_ = nullptr;
+  gpu::Shader *reduce_pq_ = nullptr;
+  gpu::Shader *cg_update_ = nullptr;
+  gpu::Shader *cg_residual_sum_ = nullptr;
+  gpu::Shader *reduce_res_ = nullptr;
+  gpu::Shader *cg_gradient_ = nullptr;
+  gpu::Shader *divergence_after_ = nullptr;
+  gpu::Shader *reduce_divergence_ = nullptr;
+  gpu::Shader *clamp_solids_ = nullptr;
+  gpu::Shader *combust_ = nullptr;
+  gpu::Shader *clip_bounds_ = nullptr;
+  gpu::Shader *extrapolate_setup_ = nullptr;
+  gpu::Shader *extrapolate_pass_ = nullptr;
+  gpu::Shader *carve_solids_ = nullptr;
+  gpu::Shader *flame_filter_ = nullptr;
+  gpu::Shader *domain_mask_ = nullptr;
+};
+
+gpu::Shader *HaIgnisSolver::shader(const char *key,
+                                   const std::string &source,
+                                   const Span<const HaShaderResource> resources)
+{
+  return ha_shader_get_source(key, source, resources, GROUP_SIZE);
+}
+
+void HaIgnisSolver::create_shaders()
+{
+  if (advect_vec3_ != nullptr) {
+    return;
+  }
+  const std::string common = std::string(GLSL_PRELUDE);
+
+  static const HaShaderResource source_merge_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "scalars[]"),
+      HA_RW(2, "float", "velocity[]"),
+      HA_READ(3, "float", "source[]"),
+  };
+  source_merge_ = shader("ignis|source_merge",
+                         common + KERNEL_SOURCE_MERGE,
+                         Span<const HaShaderResource>(source_merge_res, 4));
+
+  static const HaShaderResource forces_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "scalars[]"),
+      HA_RW(2, "float", "velocity[]"),
+  };
+  forces_ = shader(
+      "ignis|forces", common + KERNEL_FORCES, Span<const HaShaderResource>(forces_res, 3));
+
+  static const HaShaderResource curl_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "scalars[]"),
+      HA_READ(2, "float", "velocity[]"),
+      HA_RW(3, "int", "mask[]"),
+      HA_WRITE(4, "float", "curl[]"),
+  };
+  const std::string curl_source = common + GLSL_SCALAR_HELPERS + GLSL_VELOCITY_HELPERS +
+                                  KERNEL_VORTICITY_CURL;
+  vorticity_curl_ = shader(
+      "ignis|vorticity_curl", curl_source, Span<const HaShaderResource>(curl_res, 5));
+
+  static const HaShaderResource apply_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "velocity[]"),
+      HA_READ(2, "int", "mask[]"),
+      HA_READ(3, "float", "curl[]"),
+  };
+  const std::string apply_source = common + GLSL_MASK_HELPERS + GLSL_VELOCITY_HELPERS +
+                                   KERNEL_VORTICITY_APPLY;
+  vorticity_apply_ = shader(
+      "ignis|vorticity_apply", apply_source, Span<const HaShaderResource>(apply_res, 4));
+
+  /* Advection: the same kernel for the velocity field (3 floats) and the scalar fields (the
+   * interleaved 4 float buffer); `HA_COMPONENT` selects the scalar component at runtime. */
+  {
+    static const HaShaderResource advect_vec3_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_WRITE(3, "float", "field_out[]"),
+        HA_READ(4, "float", "velocity[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_VELOCITY_HELPERS + GLSL_ADVECT_VEC3_FIELD +
+                               GLSL_ADVECT_SAMPLE_VEC3 + KERNEL_ADVECT_PASS;
+    advect_vec3_ = shader(
+        "ignis|advect_vec3", source, Span<const HaShaderResource>(advect_vec3_res, 5));
+  }
+  {
+    static const HaShaderResource advect_scalar_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_WRITE(3, "float", "field_out[]"),
+        HA_READ(4, "float", "velocity[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_VELOCITY_HELPERS + GLSL_ADVECT_SCALAR_FIELD +
+                               GLSL_ADVECT_SAMPLE_SCALAR + KERNEL_ADVECT_PASS;
+    advect_scalar_ = shader(
+        "ignis|advect_scalar", source, Span<const HaShaderResource>(advect_scalar_res, 5));
+  }
+  {
+    static const HaShaderResource advect_scalar_tmp_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_WRITE(3, "float", "field_out[]"),
+        HA_READ(4, "float", "velocity[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_VELOCITY_HELPERS + GLSL_ADVECT_PLAIN_FIELD +
+                               GLSL_ADVECT_SAMPLE_SCALAR + KERNEL_ADVECT_PASS;
+    advect_scalar_tmp_ = shader(
+        "ignis|advect_scalar_tmp", source, Span<const HaShaderResource>(advect_scalar_tmp_res, 5));
+  }
+  {
+    static const HaShaderResource correct_vec3_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_RW(3, "float", "field_out[]"),
+        HA_READ(4, "float", "field_aux[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_ADVECT_VEC3_FIELD + GLSL_ADVECT_VEC3_AUX +
+                               KERNEL_ADVECT_CORRECT_VEC3;
+    correct_vec3_ = shader(
+        "ignis|correct_vec3", source, Span<const HaShaderResource>(correct_vec3_res, 5));
+  }
+  {
+    static const HaShaderResource correct_scalar_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_RW(3, "float", "field_out[]"),
+        HA_READ(4, "float", "field_aux[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_ADVECT_SCALAR_FIELD + GLSL_ADVECT_SCALAR_AUX +
+                               KERNEL_ADVECT_CORRECT_SCALAR;
+    correct_scalar_ = shader(
+        "ignis|correct_scalar", source, Span<const HaShaderResource>(correct_scalar_res, 5));
+  }
+  {
+    static const HaShaderResource limiter_vec3_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_RW(3, "float", "field_out[]"),
+        HA_READ(4, "float", "velocity[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_VELOCITY_HELPERS + GLSL_ADVECT_VEC3_FIELD +
+                               KERNEL_ADVECT_LIMITER_VEC3;
+    limiter_vec3_ = shader(
+        "ignis|limiter_vec3", source, Span<const HaShaderResource>(limiter_vec3_res, 5));
+  }
+  {
+    static const HaShaderResource limiter_scalar_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_RW(3, "float", "field_out[]"),
+        HA_READ(4, "float", "velocity[]"),
+    };
+    const std::string source = std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                               GLSL_VELOCITY_HELPERS + GLSL_ADVECT_SCALAR_FIELD +
+                               KERNEL_ADVECT_LIMITER_SCALAR;
+    limiter_scalar_ = shader(
+        "ignis|limiter_scalar", source, Span<const HaShaderResource>(limiter_scalar_res, 5));
+  }
+  {
+    static const HaShaderResource copy_vec3_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "field_in[]"),
+        HA_WRITE(2, "float", "field_out[]"),
+    };
+    copy_vec3_ = shader("ignis|copy_vec3",
+                        common + KERNEL_COPY_VEC3,
+                        Span<const HaShaderResource>(copy_vec3_res, 3));
+  }
+  {
+    static const HaShaderResource tmp_to_scalar_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "adv[]"),
+        HA_READ(2, "float", "field_in[]"),
+        HA_RW(3, "float", "field_out[]"),
+    };
+    tmp_to_scalar_ = shader("ignis|tmp_to_scalar",
+                            std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
+                                KERNEL_TMP_TO_SCALAR,
+                            Span<const HaShaderResource>(tmp_to_scalar_res, 4));
+  }
+
+  static const HaShaderResource mask_init_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "scalars[]"),
+      HA_READ(2, "int", "solid[]"),
+      HA_WRITE(3, "int", "mask_out[]"),
+  };
+  mask_init_ = shader("ignis|mask_init",
+                      common + KERNEL_MASK_INIT,
+                      Span<const HaShaderResource>(mask_init_res, 4));
+  mask_keep_init_ = shader("ignis|mask_keep_init",
+                           common + KERNEL_MASK_KEEP_INIT,
+                           Span<const HaShaderResource>(mask_init_res, 4));
+
+  static const HaShaderResource dilate_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask_in[]"),
+      HA_WRITE(2, "int", "mask_out[]"),
+  };
+  dilate_ = shader("ignis|dilate",
+                   common + GLSL_MASK_IN_HELPERS + KERNEL_DILATE,
+                   Span<const HaShaderResource>(dilate_res, 3));
+
+  static const HaShaderResource unknown_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "int", "mask[]"),
+  };
+  unknown_ = shader("ignis|unknown",
+                    common + GLSL_MASK_HELPERS + KERNEL_UNKNOWN,
+                    Span<const HaShaderResource>(unknown_res, 2));
+
+  static const HaShaderResource rhs_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "velocity[]"),
+      HA_READ(2, "int", "mask[]"),
+      HA_WRITE(3, "float", "rhs[]"),
+      HA_RW(4, "float", "partial[]"),
+  };
+  rhs_shader_ = shader("ignis|rhs",
+                       common + GLSL_MASK_HELPERS + KERNEL_RHS,
+                       Span<const HaShaderResource>(rhs_res, 5));
+
+  static const HaShaderResource cg_product_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "pressure[]"),
+      HA_READ(2, "int", "mask[]"),
+      HA_WRITE(3, "float", "product[]"),
+  };
+  cg_product_ = shader("ignis|cg_product",
+                       common + GLSL_MASK_HELPERS + KERNEL_CG_PRODUCT,
+                       Span<const HaShaderResource>(cg_product_res, 4));
+
+  static const HaShaderResource cg_init_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "rhs[]"),
+      HA_READ(2, "float", "product[]"),
+      HA_READ(3, "int", "mask[]"),
+      HA_WRITE(4, "float", "residual[]"),
+      HA_WRITE(5, "float", "direction[]"),
+      HA_RW(6, "float", "partial[]"),
+  };
+  cg_init_ = shader(
+      "ignis|cg_init", common + KERNEL_CG_INIT, Span<const HaShaderResource>(cg_init_res, 7));
+
+  static const HaShaderResource reduce_init_res[] = {
+      HA_RW(0, "float", "params[]"),
+      HA_READ(1, "float", "partial[]"),
+  };
+  reduce_init_ = shader("ignis|reduce_init",
+                        common + KERNEL_REDUCE_INIT,
+                        Span<const HaShaderResource>(reduce_init_res, 2));
+
+  static const HaShaderResource cg_direction_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "residual[]"),
+      HA_RW(3, "float", "direction[]"),
+  };
+  cg_direction_ = shader("ignis|cg_direction",
+                         common + KERNEL_CG_DIRECTION,
+                         Span<const HaShaderResource>(cg_direction_res, 4));
+
+  static const HaShaderResource cg_laplacian_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "direction[]"),
+      HA_RW(3, "float", "product[]"),
+      HA_RW(4, "float", "partial[]"),
+  };
+  cg_laplacian_ = shader("ignis|cg_laplacian",
+                         common + GLSL_MASK_HELPERS + KERNEL_CG_LAPLACIAN,
+                         Span<const HaShaderResource>(cg_laplacian_res, 5));
+
+  static const HaShaderResource cg_pq_sum_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "direction[]"),
+      HA_READ(2, "float", "product[]"),
+      HA_RW(3, "float", "partial[]"),
+  };
+  cg_pq_sum_ = shader("ignis|cg_pq_sum",
+                      common + KERNEL_CG_PQ_SUM,
+                      Span<const HaShaderResource>(cg_pq_sum_res, 4));
+
+  static const HaShaderResource reduce_pq_res[] = {
+      HA_RW(0, "float", "params[]"),
+      HA_READ(1, "float", "partial[]"),
+  };
+  reduce_pq_ = shader("ignis|reduce_pq",
+                      common + KERNEL_REDUCE_PQ,
+                      Span<const HaShaderResource>(reduce_pq_res, 2));
+
+  static const HaShaderResource cg_update_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "direction[]"),
+      HA_READ(3, "float", "product[]"),
+      HA_RW(4, "float", "pressure[]"),
+      HA_RW(5, "float", "residual[]"),
+  };
+  cg_update_ = shader("ignis|cg_update",
+                      common + KERNEL_CG_UPDATE,
+                      Span<const HaShaderResource>(cg_update_res, 6));
+
+  static const HaShaderResource cg_residual_sum_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "residual[]"),
+      HA_RW(2, "float", "partial[]"),
+  };
+  cg_residual_sum_ = shader("ignis|cg_residual_sum",
+                            common + KERNEL_CG_RESIDUAL_SUM,
+                            Span<const HaShaderResource>(cg_residual_sum_res, 3));
+
+  static const HaShaderResource reduce_res_res[] = {
+      HA_RW(0, "float", "params[]"),
+      HA_READ(1, "float", "partial[]"),
+  };
+  reduce_res_ = shader("ignis|reduce_res",
+                       common + KERNEL_REDUCE_RES,
+                       Span<const HaShaderResource>(reduce_res_res, 2));
+
+  static const HaShaderResource cg_gradient_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "pressure[]"),
+      HA_RW(3, "float", "velocity[]"),
+  };
+  cg_gradient_ = shader("ignis|cg_gradient",
+                        common + GLSL_MASK_HELPERS + KERNEL_CG_GRADIENT,
+                        Span<const HaShaderResource>(cg_gradient_res, 4));
+
+  static const HaShaderResource divergence_after_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "velocity[]"),
+      HA_RW(3, "float", "partial[]"),
+  };
+  divergence_after_ = shader("ignis|divergence_after",
+                             common + GLSL_MASK_HELPERS + KERNEL_DIVERGENCE_AFTER,
+                             Span<const HaShaderResource>(divergence_after_res, 4));
+
+  static const HaShaderResource reduce_divergence_res[] = {
+      HA_RW(0, "float", "params[]"),
+      HA_READ(1, "float", "partial[]"),
+  };
+  reduce_divergence_ = shader("ignis|reduce_divergence",
+                              common + KERNEL_REDUCE_DIVERGENCE,
+                              Span<const HaShaderResource>(reduce_divergence_res, 2));
+
+  static const HaShaderResource clamp_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "solid_current[]"),
+      HA_READ(2, "float", "collider_velocity[]"),
+      HA_RW(3, "float", "velocity[]"),
+  };
+  clamp_solids_ = shader("ignis|clamp_solids",
+                         common + KERNEL_CLAMP_SOLIDS,
+                         Span<const HaShaderResource>(clamp_res, 4));
+
+  static const HaShaderResource combust_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "scalars[]"),
+  };
+  combust_ = shader(
+      "ignis|combust", common + KERNEL_COMBUST, Span<const HaShaderResource>(combust_res, 2));
+
+  static const HaShaderResource clip_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "scalars[]"),
+  };
+  clip_bounds_ = shader(
+      "ignis|clip_bounds", common + KERNEL_CLIP_BOUNDS, Span<const HaShaderResource>(clip_res, 2));
+
+  static const HaShaderResource extrapolate_setup_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "int", "mask[]"),
+      HA_RW(2, "float", "velocity[]"),
+  };
+  extrapolate_setup_ = shader("ignis|extrapolate_setup",
+                              common + KERNEL_EXTRAPOLATE_SETUP,
+                              Span<const HaShaderResource>(extrapolate_setup_res, 3));
+
+  static const HaShaderResource extrapolate_pass_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask_in[]"),
+      HA_WRITE(2, "int", "mask_out[]"),
+      HA_RW(3, "float", "velocity[]"),
+  };
+  extrapolate_pass_ = shader("ignis|extrapolate_pass",
+                             common + GLSL_MASK_IN_HELPERS + GLSL_VELOCITY_HELPERS +
+                                 KERNEL_EXTRAPOLATE_PASS,
+                             Span<const HaShaderResource>(extrapolate_pass_res, 4));
+
+  static const HaShaderResource carve_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "solid_carve[]"),
+      HA_RW(2, "float", "scalars[]"),
+      HA_RW(3, "float", "velocity[]"),
+  };
+  carve_solids_ = shader("ignis|carve_solids",
+                         common + KERNEL_CARVE_SOLIDS,
+                         Span<const HaShaderResource>(carve_res, 4));
+
+  static const HaShaderResource flame_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "scalars[]"),
+  };
+  flame_filter_ = shader("ignis|flame_filter",
+                         common + KERNEL_FLAME_FILTER,
+                         Span<const HaShaderResource>(flame_res, 2));
+
+  static const HaShaderResource domain_mask_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "scalars[]"),
+      HA_RW(2, "float", "velocity[]"),
+      HA_RW(3, "float", "pressure[]"),
+      HA_RW(4, "int", "mask[]"),
+  };
+  domain_mask_ = shader("ignis|domain_mask",
+                        common + KERNEL_DOMAIN_MASK,
+                        Span<const HaShaderResource>(domain_mask_res, 5));
+}
+
+bool HaIgnisSolver::shaders_valid() const
+{
+  return source_merge_ != nullptr && forces_ != nullptr && vorticity_curl_ != nullptr &&
+         vorticity_apply_ != nullptr && advect_vec3_ != nullptr && advect_scalar_ != nullptr &&
+         advect_scalar_tmp_ != nullptr && correct_vec3_ != nullptr && correct_scalar_ != nullptr &&
+         limiter_vec3_ != nullptr && limiter_scalar_ != nullptr && copy_vec3_ != nullptr &&
+         tmp_to_scalar_ != nullptr && mask_init_ != nullptr && mask_keep_init_ != nullptr &&
+         dilate_ != nullptr && unknown_ != nullptr && rhs_shader_ != nullptr &&
+         cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
+         cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_pq_sum_ != nullptr &&
+         reduce_pq_ != nullptr && cg_update_ != nullptr && cg_residual_sum_ != nullptr &&
+         reduce_res_ != nullptr && cg_gradient_ != nullptr && divergence_after_ != nullptr &&
+         reduce_divergence_ != nullptr && clamp_solids_ != nullptr && combust_ != nullptr &&
+         clip_bounds_ != nullptr && extrapolate_setup_ != nullptr &&
+         extrapolate_pass_ != nullptr && carve_solids_ != nullptr && flame_filter_ != nullptr &&
+         domain_mask_ != nullptr;
+}
+
+void HaIgnisSolver::release()
+{
+  scalars_.free();
+  velocity_.free();
+  velocity_tmp_.free();
+  velocity_aux_.free();
+  scalar_tmp_.free();
+  scalar_aux_.free();
+  pressure_.free();
+  rhs_.free();
+  residual_.free();
+  direction_.free();
+  product_.free();
+  curl_.free();
+  source_.free();
+  params_.free();
+  adv_.free();
+  partial_.free();
+  mask_a_.free();
+  mask_b_.free();
+  solid_.free();
+  solid_current_.free();
+  solid_carve_.free();
+  collider_velocity_.free();
+  mask_ = nullptr;
+  mask_other_ = nullptr;
+}
+
+bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::string &r_reason)
+{
+  if (!scalars_.ensure(cells * 4) || !velocity_.ensure(cells * 3) ||
+      !velocity_tmp_.ensure(cells * 3) || !velocity_aux_.ensure(cells * 3) ||
+      !scalar_tmp_.ensure(cells) || !scalar_aux_.ensure(cells) || !pressure_.ensure(cells) ||
+      !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
+      !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
+      !params_.ensure(P_COUNT) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
+      !mask_a_.ensure(cells) || !mask_b_.ensure(cells) || !solid_.ensure(cells) ||
+      !solid_current_.ensure(cells) || !solid_carve_.ensure(cells) ||
+      !collider_velocity_.ensure(3 * 256))
+  {
+    r_reason = "device allocation failed (out of GPU memory)";
+    return false;
+  }
+  return true;
+}
+
+bool HaIgnisSolver::bind(const IgnisDeviceFrame &frame, std::string &r_reason)
+{
+  scalars_.upload(frame.scalars);
+  velocity_.upload(frame.velocity);
+  pressure_.upload(frame.pressure);
+  source_.upload(frame.source);
+
+  Array<int> solid;
+  solid.reinitialize(int(cells_));
+  Array<int> solid_current;
+  solid_current.reinitialize(int(cells_));
+  Array<int> solid_carve;
+  solid_carve.reinitialize(int(cells_));
+  solid.fill(0);
+  solid_current.fill(0);
+  solid_carve.fill(0);
+  for (int64_t i = 0; i < cells_; i++) {
+    solid[i] = frame.mask[i] & (IGNIS_MASK_SOLID | (0xFF << 8));
+    solid_current[i] = frame.current_mask.is_empty() ?
+                           solid[i] :
+                           (frame.current_mask[i] & (IGNIS_MASK_SOLID | (0xFF << 8)));
+    solid_carve[i] = frame.carve_mask.is_empty() ?
+                         0 :
+                         (frame.carve_mask[i] & (IGNIS_MASK_SOLID | (0xFF << 8)));
+  }
+  solid_.upload(Span<int>(solid.data(), int64_t(solid.size())));
+  solid_current_.upload(Span<int>(solid_current.data(), int64_t(solid_current.size())));
+  solid_carve_.upload(Span<int>(solid_carve.data(), int64_t(solid_carve.size())));
+  if (frame.collider_velocities.is_empty()) {
+    Array<float> zeros(3 * 256, 0.0f);
+    collider_velocity_.upload(zeros.as_span());
+  }
+  else {
+    collider_velocity_.upload(frame.collider_velocities);
+  }
+  mask_a_.upload(Span<int>(solid.data(), int64_t(solid.size())));
+  mask_ = &mask_a_;
+  mask_other_ = &mask_b_;
+  if (!scalars_.is_valid() || !velocity_.is_valid() || !pressure_.is_valid() ||
+      !source_.is_valid() || !solid_.is_valid() || !solid_current_.is_valid() ||
+      !solid_carve_.is_valid() || !collider_velocity_.is_valid() || !mask_->is_valid() ||
+      !mask_other_->is_valid())
+  {
+    r_reason = "device upload failed";
+    return false;
+  }
+  return true;
+}
+
+void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
+                                const float dt,
+                                MutableSpan<float> r_params)
+{
+  r_params.fill(0.0f);
+  const ignis::Settings &s = frame.settings;
+  r_params[P_CELLS] = float(cells_);
+  r_params[P_DX] = float(frame.dims.x);
+  r_params[P_DY] = float(frame.dims.y);
+  r_params[P_DZ] = float(frame.dims.z);
+  r_params[P_VOXEL] = frame.voxel_size;
+  r_params[P_DT] = dt;
+  r_params[P_GRAVITY_X] = s.gravity.x;
+  r_params[P_GRAVITY_Y] = s.gravity.y;
+  r_params[P_GRAVITY_Z] = s.gravity.z;
+  r_params[P_WIND_X] = s.wind.x;
+  r_params[P_WIND_Y] = s.wind.y;
+  r_params[P_WIND_Z] = s.wind.z;
+  r_params[P_BUOYANCY] = s.buoyancy;
+  r_params[P_AMBIENT] = s.ambient_temperature;
+  r_params[P_DRAG] = std::max(0.0f, s.drag);
+  r_params[P_DAMPING] = std::max(0.0f, s.velocity_damping);
+  r_params[P_VORTICITY] = s.vorticity;
+  r_params[P_BURN_RATE] = std::max(0.0f, s.burn_rate);
+  r_params[P_HEAT_RELEASE] = s.heat_release;
+  r_params[P_SMOKE_PER_BURN] = s.smoke_per_burn;
+  r_params[P_COOLING] = std::max(0.0f, s.cooling);
+  r_params[P_DISSIPATION] = std::max(0.0f, s.dissipation);
+  r_params[P_FLAME_THRESHOLD] = std::max(0.0f, s.flame_threshold);
+  r_params[P_DOMAIN_FIELD] = float(int(s.domain_field));
+  r_params[P_DOMAIN_THRESHOLD] = std::max(0.0f, s.domain_threshold);
+  r_params[P_USE_BOUNDS] = s.use_bounds ? 1.0f : 0.0f;
+  r_params[P_BOUNDS_MIN_X] = s.bounds_min.x;
+  r_params[P_BOUNDS_MIN_Y] = s.bounds_min.y;
+  r_params[P_BOUNDS_MIN_Z] = s.bounds_min.z;
+  r_params[P_BOUNDS_MAX_X] = s.bounds_max.x;
+  r_params[P_BOUNDS_MAX_Y] = s.bounds_max.y;
+  r_params[P_BOUNDS_MAX_Z] = s.bounds_max.z;
+  r_params[P_RADIUS] = float(frame.solver_radius);
+  r_params[P_EXTRAPOLATE] = float(frame.extrapolate);
+  r_params[P_TOLERANCE] = std::max(1e-8f, s.tolerance);
+  r_params[P_MAX_ITERATIONS] = float(std::max(1, s.pressure_iterations));
+  r_params[P_PARTIALS] = float(blocks_);
+  r_params[P_ORIGIN_X] = float(frame.index_min.x);
+  r_params[P_ORIGIN_Y] = float(frame.index_min.y);
+  r_params[P_ORIGIN_Z] = float(frame.index_min.z);
+  r_params[P_USE_DOMAIN_MASK] = s.use_domain_mask ? 1.0f : 0.0f;
+}
+
+void HaIgnisSolver::write_adv(const float dir,
+                              const float order,
+                              const float limiter,
+                              const float component,
+                              const float correct_mode)
+{
+  Array<float> values;
+  values.reinitialize(8);
+  values.fill(0.0f);
+  values[0] = dir;
+  values[1] = order;
+  values[2] = limiter;
+  values[3] = component;
+  values[4] = correct_mode;
+  adv_.upload(values.as_span());
+}
+
+bool HaIgnisSolver::pass(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int count)
+{
+  if (shader == nullptr) {
+    return false;
+  }
+  GPU_shader_bind(shader);
+  ha_bind_storage_buffers(buffers);
+  ha_dispatch(shader, count);
+  GPU_memory_barrier(GPU_BARRIER_SHADER_STORAGE);
+  result_->passes++;
+  return true;
+}
+
+void HaIgnisSolver::swap_masks()
+{
+  std::swap(mask_, mask_other_);
+}
+
+bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::string &r_reason)
+{
+  if (radius <= 0) {
+    return true;
+  }
+  Array<float> values;
+  values.reinitialize(P_COUNT);
+  params_.download(values.as_mutable_span());
+  values[P_DILATE_BIT] = float(bit_index);
+  params_.upload(values.as_span());
+  for (int i = 0; i < radius; i++) {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(mask_other_->buf());
+    if (!pass(dilate_, buffers, int(cells_))) {
+      r_reason = "mask dilation pass failed";
+      return false;
+    }
+    swap_masks();
+  }
+  return true;
+}
+
+bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
+{
+  (void)cells;
+  /* Pressure domain: the smoke grown by the solver radius, face connected (same as the CPU
+   * `smoke_tree(state, solver_radius)`), then the cells whose three forward neighbours exist. */
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(scalars_.buf());
+    buffers.append(solid_.buf());
+    buffers.append(mask_other_->buf());
+    if (!pass(mask_init_, buffers, int(cells_))) {
+      r_reason = "pressure domain pass failed";
+      return false;
+    }
+    swap_masks();
+  }
+  if (!dilate_mask(int(radius_), 1 /* HA_DOMAIN */, r_reason)) {
+    return false;
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    if (!pass(unknown_, buffers, int(cells_))) {
+      r_reason = "pressure unknown pass failed";
+      return false;
+    }
+  }
+
+  const int count = int(cells_);
+  /* Right hand side + the divergence norm used by the stats. */
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(velocity_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(rhs_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(rhs_shader_, buffers, count)) {
+      r_reason = "divergence pass failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(pressure_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(product_.buf());
+    if (!pass(cg_product_, buffers, count)) {
+      r_reason = "CG initial product failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(rhs_.buf());
+    buffers.append(product_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(residual_.buf());
+    buffers.append(direction_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(cg_init_, buffers, count)) {
+      r_reason = "CG initialisation failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(reduce_init_, buffers, 1)) {
+      r_reason = "CG initial reduction failed";
+      return false;
+    }
+  }
+
+  Array<float> values;
+  values.reinitialize(P_COUNT);
+  params_.download(values.as_mutable_span());
+  bool converged = values[P_CONVERGED] != 0.0f;
+  int iterations = 0;
+  const int max_iterations = std::max(1, int(values[P_MAX_ITERATIONS]));
+  while (!converged && iterations < max_iterations) {
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(residual_.buf());
+      buffers.append(direction_.buf());
+      if (!pass(cg_direction_, buffers, count)) {
+        r_reason = "CG direction pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(direction_.buf());
+      buffers.append(product_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(cg_laplacian_, buffers, count)) {
+        r_reason = "CG Laplacian pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(direction_.buf());
+      buffers.append(product_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(cg_pq_sum_, buffers, count)) {
+        r_reason = "CG pq reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(reduce_pq_, buffers, 1)) {
+        r_reason = "CG pq reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(direction_.buf());
+      buffers.append(product_.buf());
+      buffers.append(pressure_.buf());
+      buffers.append(residual_.buf());
+      if (!pass(cg_update_, buffers, count)) {
+        r_reason = "CG update pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(residual_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(cg_residual_sum_, buffers, count)) {
+        r_reason = "CG residual reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(reduce_res_, buffers, 1)) {
+        r_reason = "CG residual finalize failed";
+        return false;
+      }
+    }
+    iterations++;
+    /* Checking the convergence every few iterations keeps the number of GPU reads low: each read
+     * waits for the outstanding dispatches. */
+    if ((iterations % 8) == 0 || iterations == max_iterations) {
+      params_.download(values.as_mutable_span());
+      converged = values[P_CONVERGED] != 0.0f;
+    }
+  }
+
+  /* u -= grad p on the whole band, then measure the remaining divergence. */
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(pressure_.buf());
+    buffers.append(velocity_.buf());
+    if (!pass(cg_gradient_, buffers, count)) {
+      r_reason = "CG gradient pass failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(velocity_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(divergence_after_, buffers, count)) {
+      r_reason = "divergence after pass failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(reduce_divergence_, buffers, 1)) {
+      r_reason = "divergence after reduction failed";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
+{
+  const int count = int(cells);
+  const ignis::AdvectionScheme scheme = settings_.advection_scheme;
+  const int limiter = int(settings_.advection_limiter);
+
+  auto advect =
+      [&](gpu::Shader *shader, HaBuffer &field_in, HaBuffer &field_out, HaBuffer &velocity) {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(adv_.buf());
+        buffers.append(field_in.buf());
+        buffers.append(field_out.buf());
+        buffers.append(velocity.buf());
+        return pass(shader, buffers, count);
+      };
+
+  if (scheme == ignis::AdvectionScheme::SemiLagrangian ||
+      scheme == ignis::AdvectionScheme::Midpoint)
+  {
+    const int order = scheme == ignis::AdvectionScheme::Midpoint ? 2 : 1;
+    write_adv(-1, float(order), 0, 0, 0);
+    if (!advect(advect_vec3_, velocity_, velocity_tmp_, velocity_)) {
+      r_reason = "velocity advection failed";
+      return false;
+    }
+  }
+  else if (scheme == ignis::AdvectionScheme::MacCormack) {
+    write_adv(-1, 1, 0, 0, 0);
+    if (!advect(advect_vec3_, velocity_, velocity_tmp_, velocity_)) {
+      r_reason = "velocity advection (forward) failed";
+      return false;
+    }
+    write_adv(1, 1, 0, 0, 0);
+    if (!advect(advect_vec3_, velocity_tmp_, velocity_aux_, velocity_)) {
+      r_reason = "velocity advection (backward) failed";
+      return false;
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(adv_.buf());
+      buffers.append(velocity_.buf());
+      buffers.append(velocity_tmp_.buf());
+      buffers.append(velocity_aux_.buf());
+      write_adv(0, 1, 0, 0, 0);
+      if (!pass(correct_vec3_, buffers, count)) {
+        r_reason = "velocity advection (correction) failed";
+        return false;
+      }
+      write_adv(-1, 1, float(limiter), 0, 0);
+      if (!pass(limiter_vec3_, buffers, count)) {
+        r_reason = "velocity advection (limiter) failed";
+        return false;
+      }
+    }
+  }
+  else {
+    r_reason = "BFECC advection is not implemented on the device";
+    return false;
+  }
+
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(velocity_tmp_.buf());
+    buffers.append(velocity_.buf());
+    if (!pass(copy_vec3_, buffers, count)) {
+      r_reason = "velocity advection copy failed";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
+{
+  const int count = int(cells);
+  const ignis::AdvectionScheme scheme = settings_.advection_scheme;
+  const int limiter = int(settings_.advection_limiter);
+
+  for (int component = 0; component < 3; component++) {
+    write_adv(-1, scheme == ignis::AdvectionScheme::Midpoint ? 2 : 1, 0, float(component), 0);
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(adv_.buf());
+      buffers.append(scalars_.buf());
+      buffers.append(scalar_tmp_.buf());
+      buffers.append(velocity_.buf());
+      if (!pass(advect_scalar_, buffers, count)) {
+        r_reason = "scalar advection failed";
+        return false;
+      }
+    }
+    if (scheme == ignis::AdvectionScheme::MacCormack) {
+      write_adv(1, 1, 0, float(component), 0);
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(adv_.buf());
+        buffers.append(scalar_tmp_.buf());
+        buffers.append(scalar_aux_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(advect_scalar_tmp_, buffers, count)) {
+          r_reason = "scalar advection (backward) failed";
+          return false;
+        }
+      }
+      write_adv(0, 1, 0, float(component), 0);
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(adv_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(scalar_tmp_.buf());
+        buffers.append(scalar_aux_.buf());
+        if (!pass(correct_scalar_, buffers, count)) {
+          r_reason = "scalar advection (correction) failed";
+          return false;
+        }
+      }
+      write_adv(-1, 1, float(limiter), float(component), 0);
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(adv_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(scalar_tmp_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(limiter_scalar_, buffers, count)) {
+          r_reason = "scalar advection (limiter) failed";
+          return false;
+        }
+      }
+    }
+    else if (scheme == ignis::AdvectionScheme::Bfecc) {
+      r_reason = "BFECC advection is not implemented on the device";
+      return false;
+    }
+
+    write_adv(0, 1, 0, float(component), 0);
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(adv_.buf());
+      buffers.append(scalar_tmp_.buf());
+      buffers.append(scalars_.buf());
+      if (!pass(tmp_to_scalar_, buffers, count)) {
+        r_reason = "scalar advection copy failed";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool HaIgnisSolver::extrapolate(const int64_t cells, std::string &r_reason)
+{
+  const int count = int(cells);
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(scalars_.buf());
+    buffers.append(solid_.buf());
+    buffers.append(mask_other_->buf());
+    if (!pass(mask_keep_init_, buffers, count)) {
+      r_reason = "velocity band init failed";
+      return false;
+    }
+    swap_masks();
+  }
+  if (!dilate_mask(int(radius_), 5 /* HA_KEEP */, r_reason)) {
+    return false;
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(velocity_.buf());
+    if (!pass(extrapolate_setup_, buffers, count)) {
+      r_reason = "velocity band setup failed";
+      return false;
+    }
+  }
+  for (int i = 0; i < int(settings_.extrapolate); i++) {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(mask_other_->buf());
+    buffers.append(velocity_.buf());
+    if (!pass(extrapolate_pass_, buffers, count)) {
+      r_reason = "velocity extrapolation failed";
+      return false;
+    }
+    swap_masks();
+  }
+  return true;
+}
+
+bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
+{
+  result_ = &r_result;
+  r_result = IgnisDeviceResult{};
+  result_ = &r_result;
+  settings_ = frame.settings;
+
+  const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
+  if (cells <= 0) {
+    r_result.reason = "empty voxel box";
+    return false;
+  }
+  if (frame.max_voxels > 0 && cells > frame.max_voxels) {
+    r_result.reason = "the simulation is larger than the device voxel budget";
+    return false;
+  }
+  cells_ = cells;
+  blocks_ = (cells + GROUP_SIZE - 1) / GROUP_SIZE;
+  radius_ = frame.solver_radius;
+
+  if (frame.settings.advection_scheme == ignis::AdvectionScheme::Bfecc) {
+    r_result.reason = "BFECC advection is not implemented on the device";
+    return false;
+  }
+
+  const double start = time_now_ms();
+  if (!allocate(cells, blocks_, r_result.reason)) {
+    return false;
+  }
+  create_shaders();
+  if (!shaders_valid()) {
+    r_result.reason = "shader creation failed";
+    return false;
+  }
+  if (!bind(frame, r_result.reason)) {
+    return false;
+  }
+
+  Array<float> host_params;
+  host_params.reinitialize(P_COUNT);
+  host_params.fill(0.0f);
+  const int substeps = frame.delta_time > 0.0f ? std::max(1, frame.substeps) : 0;
+  bool has_source = false;
+  for (const float value : frame.source) {
+    if (value != 0.0f) {
+      has_source = true;
+      break;
+    }
+  }
+
+  if (substeps == 0) {
+    /* First or paused frame: CPU behaviour is "only show the sources, do not integrate". */
+    fill_params(frame, 0.0f, host_params);
+    params_.upload(host_params.as_span());
+    if (has_source) {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(scalars_.buf());
+      buffers.append(velocity_.buf());
+      buffers.append(source_.buf());
+      if (!pass(source_merge_, buffers, int(cells_))) {
+        r_result.reason = "source merge failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(solid_carve_.buf());
+      buffers.append(scalars_.buf());
+      buffers.append(velocity_.buf());
+      if (!pass(carve_solids_, buffers, int(cells_))) {
+        r_result.reason = "solid carve failed";
+        return false;
+      }
+    }
+  }
+  else {
+    const float step_dt = frame.delta_time / float(substeps);
+    for (int substep = 0; substep < substeps; substep++) {
+      fill_params(frame, step_dt, host_params);
+      params_.upload(host_params.as_span());
+
+      if (has_source) {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(velocity_.buf());
+        buffers.append(source_.buf());
+        if (!pass(source_merge_, buffers, int(cells_))) {
+          r_result.reason = "source merge failed";
+          return false;
+        }
+      }
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(forces_, buffers, int(cells_))) {
+          r_result.reason = "force pass failed";
+          return false;
+        }
+      }
+      if (settings_.vorticity > 0.0f) {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(velocity_.buf());
+        buffers.append(mask_->buf());
+        buffers.append(curl_.buf());
+        if (!pass(vorticity_curl_, buffers, int(cells_))) {
+          r_result.reason = "vorticity curl pass failed";
+          return false;
+        }
+        Vector<gpu::StorageBuf *> buffers_apply;
+        buffers_apply.append(params_.buf());
+        buffers_apply.append(velocity_.buf());
+        buffers_apply.append(mask_->buf());
+        buffers_apply.append(curl_.buf());
+        if (!pass(vorticity_apply_, buffers_apply, int(cells_))) {
+          r_result.reason = "vorticity apply pass failed";
+          return false;
+        }
+      }
+      if (!advect_velocity(cells_, r_result.reason)) {
+        return false;
+      }
+      {
+        /* Impose the moving wall before the projection so that its divergence is what pushes the
+         * smoke around the collider, then clip again after the projection. */
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(solid_current_.buf());
+        buffers.append(collider_velocity_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(clamp_solids_, buffers, int(cells_))) {
+          r_result.reason = "solid clamp pass failed";
+          return false;
+        }
+      }
+      if (!projection(cells_, r_result.reason)) {
+        return false;
+      }
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(solid_current_.buf());
+        buffers.append(collider_velocity_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(clamp_solids_, buffers, int(cells_))) {
+          r_result.reason = "solid clamp pass failed";
+          return false;
+        }
+      }
+      if (!advect_scalars(cells_, r_result.reason)) {
+        return false;
+      }
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(scalars_.buf());
+        if (!pass(combust_, buffers, int(cells_))) {
+          r_result.reason = "combustion pass failed";
+          return false;
+        }
+        if (!pass(clip_bounds_, buffers, int(cells_))) {
+          r_result.reason = "bounds pass failed";
+          return false;
+        }
+      }
+      if (!extrapolate(cells_, r_result.reason)) {
+        return false;
+      }
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(solid_carve_.buf());
+        buffers.append(scalars_.buf());
+        buffers.append(velocity_.buf());
+        if (!pass(carve_solids_, buffers, int(cells_))) {
+          r_result.reason = "solid carve failed";
+          return false;
+        }
+      }
+    }
+  }
+
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(scalars_.buf());
+    if (!pass(flame_filter_, buffers, int(cells_))) {
+      r_result.reason = "flame filter failed";
+      return false;
+    }
+  }
+  if (substeps > 0 && settings_.use_domain_mask) {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(scalars_.buf());
+    buffers.append(velocity_.buf());
+    buffers.append(pressure_.buf());
+    buffers.append(mask_->buf());
+    if (!pass(domain_mask_, buffers, int(cells_))) {
+      r_result.reason = "domain mask failed";
+      return false;
+    }
+  }
+
+  scalars_.download(frame.scalars);
+  velocity_.download(frame.velocity);
+  pressure_.download(frame.pressure);
+  Array<int> mask;
+  mask.reinitialize(int(cells_));
+  mask_->download(mask.as_mutable_span());
+  for (int64_t i = 0; i < cells_; i++) {
+    frame.mask[i] = mask[i];
+  }
+  params_.download(host_params.as_mutable_span());
+
+  int active = 0;
+  int solid_count = 0;
+  int removed = 0;
+  for (int64_t i = 0; i < cells_; i++) {
+    if (std::abs(frame.scalars[i * 4 + 0]) > 1e-5f) {
+      active++;
+    }
+    if ((mask[i] & IGNIS_MASK_SOLID) != 0) {
+      solid_count++;
+    }
+    if ((mask[i] & 128) != 0) {
+      removed++;
+    }
+  }
+
+  const float unknown_count = std::max(1.0f, host_params[P_UNKNOWN_COUNT]);
+  r_result.ran = true;
+  r_result.active_voxels = active;
+  r_result.solid_voxels = solid_count;
+  r_result.domain_removed = removed;
+  r_result.pressure_iterations = int(host_params[P_ITERATION] + 0.5f);
+  r_result.residual = host_params[P_RHS_NORM] > 1e-12f ?
+                          host_params[P_RES_NORM] / host_params[P_RHS_NORM] :
+                          0.0f;
+  r_result.divergence_before = std::sqrt(host_params[P_DIV_BEFORE_SUM] / unknown_count);
+  r_result.divergence_after = std::sqrt(host_params[P_DIV_AFTER_SUM] / unknown_count);
+  r_result.milliseconds = time_now_ms() - start;
+
+  if (debug_enabled()) {
+    float max_speed = 0.0f;
+    for (int64_t i = 0; i < cells_; i++) {
+      const float vx = frame.velocity[i * 3 + 0];
+      const float vy = frame.velocity[i * 3 + 1];
+      const float vz = frame.velocity[i * 3 + 2];
+      max_speed = std::max(max_speed, std::sqrt(vx * vx + vy * vy + vz * vz));
+    }
+    debug_log(
+        "IGNIS_HA frame: cells=%lld passes=%d substeps=%d active=%d pressure=%d "
+        "residual=%.5f div %.4f -> %.4f raw(before=%.6g after=%.6g count=%.1f "
+        "rhs_norm=%.6g res_norm=%.6g) max_speed=%.4f ms=%.1f\n",
+        (long long)cells_,
+        r_result.passes,
+        substeps,
+        active,
+        r_result.pressure_iterations,
+        double(r_result.residual),
+        double(r_result.divergence_before),
+        double(r_result.divergence_after),
+        double(host_params[P_DIV_BEFORE_SUM]),
+        double(host_params[P_DIV_AFTER_SUM]),
+        double(host_params[P_UNKNOWN_COUNT]),
+        double(host_params[P_RHS_NORM]),
+        double(host_params[P_RES_NORM]),
+        double(max_speed),
+        r_result.milliseconds);
+  }
+  return true;
+}
+
+/** \{ */
+
+}  // namespace
+
+bool ignis_device_available()
+{
+  const char *value = std::getenv("BLENDER_IGNIS_GPU");
+  if (value != nullptr && value[0] == '0') {
+    return false;
+  }
+  return ha_gpu_available();
+}
+
+bool ignis_device_solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
+{
+  HaContextGuard guard;
+  if (!guard.is_valid()) {
+    const char *error = ha_context_error();
+    r_result.reason = (error != nullptr && error[0] != '\0') ? std::string(error) :
+                                                              std::string("no GPU context");
+    return false;
+  }
+  /* Buffers are freed and reallocated every evaluation, so the binding cache (keyed by buffer
+   * pointer) must not survive into this one. */
+  ha_bindings_invalidate();
+  HaIgnisSolver solver;
+  const bool ok = solver.solve(frame, r_result);
+  solver.release();
+  return ok;
+}
+
+}  // namespace blender::geometry::ha
