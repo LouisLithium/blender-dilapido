@@ -5159,6 +5159,9 @@ class XpbdSolverStep {
         r_contacts.contacts.point_radii.append(contact_radius);
         r_contacts.contacts.positions_on_face.append(contact->nearest_pos);
         r_contacts.contacts.collider_motion.append(motion);
+        /* The device contact table is a fixed layout; the velocity of the surface is not used by the
+         * position or friction kernel, but it has to exist or the upload reads past the end. */
+        r_contacts.contacts.collider_velocities.append(float3(0.0f));
         r_contacts.contacts.face_normals.append(axis);
         r_contacts.contacts.face_margins.append(0.0f);
         r_contacts.contacts.static_frictions.append(static_friction);
@@ -5374,9 +5377,16 @@ class XpbdSolverStep {
                                    positions[verts[1]] * weights.y +
                                    positions[verts[2]] * weights.z;
     }
-    fluid.gpu_fluid.update_coupled(fluid.coupled_positions,
-                                   fluid.coupled_masses,
-                                   fluid.coupled_inv_masses);
+    const bool updated = fluid.gpu_fluid.update_coupled(fluid.coupled_positions,
+                                                       fluid.coupled_masses,
+                                                       fluid.coupled_inv_masses);
+    if (std::getenv("XPBD_GPU_DEBUG") != nullptr) {
+      printf("XPBD_GPU update_coupled host=%d updated=%d error=%s\n",
+             int(fluid.coupled_positions.size()),
+             updated ? 1 : 0,
+             fluid.gpu_fluid.last_error());
+      fflush(stdout);
+    }
   }
 
   /**
@@ -5719,17 +5729,10 @@ class XpbdSolverStep {
     if (!fluid.active) {
       return "not a fluid";
     }
-    if (fluid.has_coupled) {
-      return "coupled with another geometry";
-    }
-    /* The device hard contact with the coupled solids (a distance field of the cloth) is not robust
-     * enough for a dense falling column. Measured on `HWA_test` (132k particles, 5 substeps): the
-     * whole column ends up below the cloth, because the density pressure pushes the bottom of the
-     * column through the field faster than a position projection can push it back, and a side
-     * dependent push then treats the leaked water as a legitimate lower layer. The CPU path holds
-     * the same scene perfectly (0 particles below the cloth) because it solves the compliant
-     * point/triangle contacts together with the density constraint. Correctness first: coupled
-     * fluids stay on the CPU until the device has an equivalent compliant contact. */
+    /* Coupled fluids run on the device with the *compliant* point/triangle contacts of the CPU:
+     * the host gathers them once per substep from the predicted positions and the device solves the
+     * same constraint set (with the same compliance term) together with the density iterations. The
+     * old hard distance-field projection could not hold a dense falling column (M118). */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
      * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
@@ -6146,29 +6149,12 @@ class XpbdSolverStep {
                       (long long)fluid.sdf->voxels_num(),
                       double(fluid.sdf->spacing));
       }
-      /* Distance field of the coupled solids for the hard contact. The density coupling alone is
-       * unilateral and misses fast / under-dense water; this field catches it on the device. */
-      const char *no_coupled_sdf = std::getenv("BLENDER_NO_COUPLED_SDF");
-      const bool coupled_sdf_enabled = no_coupled_sdf == nullptr || StringRef(no_coupled_sdf) != "1";
-      if (fluid.gpu_active && coupled_sdf_enabled) {
-        this->prepare_coupled_sdf(fluid, geo_data);
-      }
-      else {
-        fluid.coupled_sdf_ready = false;
-        fluid.coupled_sdf.reset();
-      }
-      if (fluid.gpu_active && fluid.coupled_sdf_ready) {
-        /* Hold the fluid one support radius away from the sheet and push up to one support radius per
-         * iteration. A thin shell (half a support radius) could not keep a whole falling column out:
-         * the density pressure pushes the bottom of the column in faster than the shell pushes it
-         * back, and the column ends up below the cloth. */
-        fluid.gpu_fluid.bind_coupled_sdf(*fluid.coupled_sdf,
-                                         fluid.support_radius,
-                                         0.5f,
-                                         fluid.support_radius,
-                                         fluid.coupled_sdf_band);
-      }
-      else if (fluid.gpu_active) {
+      /* The coupled solids use the compliant point/triangle contacts (gathered on the host per
+       * substep, solved on the device), not the distance field hard projection: the latter could
+       * not hold a dense falling column (M118). The field code is kept for reference but off. */
+      fluid.coupled_sdf_ready = false;
+      fluid.coupled_sdf.reset();
+      if (fluid.gpu_active) {
         fluid.gpu_fluid.clear_coupled_sdf();
       }
       debug_gpu_log("BLENDER_XPBD_GPU_LOG",
@@ -6208,14 +6194,45 @@ class XpbdSolverStep {
      * then solved on the device like on the CPU. */
     /* With a distance field the device solves the collider contacts itself, so the host does not
      * gather anything and there is no readback per substep. */
-    const bool gathers_contacts = !geo_data.mesh_colliders.is_empty() &&
+    const bool gathers_collider = !geo_data.mesh_colliders.is_empty() &&
                                   !fluid.gpu_fluid.has_sdf();
+    /* The coupled solids (cloth, soft body) use the *compliant* point/triangle contacts of the CPU:
+     * the gather runs on the host and the device solves the same constraint set. A distance field
+     * hard projection could not hold a dense falling column (M118), a compliant contact can. */
+    const bool gathers_coupled = fluid.has_coupled;
+    /* `GeometryRef::prev_positions` is exposed as a read-only span, but the data it points at
+     * (`temp_positions` or the position attribute) is the solver's own mutable buffer. The device
+     * gather needs to write the device's substep-start positions into it. */
+    const Span<float3> prev_span =
+        geometries_.solver_refs[solver_refs_i][chunk.data_key_i].prev_positions;
+    MutableSpan<float3> prev_positions(const_cast<float3 *>(prev_span.data()), prev_span.size());
+    prev_positions = prev_positions.slice(points);
     geometry::ha::HaXpbdFluid::ContactHook hook;
-    if (gathers_contacts) {
+    if (gathers_collider || gathers_coupled) {
       hook = [&]() -> bool {
         fluid.gpu_fluid.download_positions(positions);
+        if (gathers_coupled) {
+          fluid.gpu_fluid.download_prev_positions(prev_positions);
+          this->gather_contacts__coupled_surfaces(
+              chunk_i,
+              this->get_max_search_distance(sub_delta_time_),
+              solver_refs_i,
+              substep,
+              chunks_data_[chunk_i].coupled_face_contacts);
+          const bool uploaded = this->upload_contacts_to_gpu(
+              chunk_i, chunks_data_[chunk_i].coupled_face_contacts.contacts);
+          if (std::getenv("XPBD_GPU_DEBUG") != nullptr) {
+            printf("XPBD_GPU coupled contacts substep=%d count=%d uploaded=%d\n",
+                   substep.current_i,
+                   int(chunks_data_[chunk_i].coupled_face_contacts.contacts.points.size()),
+                   uploaded ? 1 : 0);
+            fflush(stdout);
+          }
+          return uploaded;
+        }
         this->simulate__gather_dynamic_constraints__chunk(substep, chunk_i, solver_refs_i, true);
-        const bool uploaded = this->upload_contacts_to_gpu(chunk_i);
+        const bool uploaded = this->upload_contacts_to_gpu(
+            chunk_i, chunks_data_[chunk_i].external_face_contacts);
         if (std::getenv("XPBD_GPU_DEBUG") != nullptr) {
           printf("XPBD_GPU contacts substep=%d count=%d uploaded=%d\n",
                  substep.current_i,
@@ -6232,6 +6249,21 @@ class XpbdSolverStep {
     this->simulate__update_gpu_coupled(fluid, solver_refs_i);
 
     const bool ok = fluid.gpu_fluid.substep(constraint_iterations_, hook);
+    /* Give the multipliers of the compliant coupled contacts back to the solid vertices, like the
+     * CPU does after every iteration. The device accumulates them over the iterations of the
+     * substep, so one readback per substep applies the whole impulse. */
+    if (ok && gathers_coupled) {
+      CoupledFaceContacts &coupled = chunks_data_[chunk_i].coupled_face_contacts;
+      ExternalFaceContacts &contacts = coupled.contacts;
+      if (!contacts.points.is_empty()) {
+        fluid.gpu_fluid.download_contact_lambdas(contacts.lambdas_normal.as_mutable_span(),
+                                                 contacts.lambdas_friction.as_mutable_span());
+        coupled.applied_lambdas.reinitialize(int(contacts.points.size()));
+        coupled.applied_lambdas.fill(0.0f);
+        this->simulate__coupled_contact_reaction__chunk(
+            chunk_i, geometries_.solver_refs[solver_refs_i]);
+      }
+    }
     /* The reaction of the whole frame (all substeps and iterations) is read back once, at the end
      * of the last substep: a readback per substep costs ~100 ms of Vulkan stall overhead. */
     if (ok && download_result && fluid.gpu_fluid.coupled_count() > 0) {
@@ -6258,7 +6290,7 @@ class XpbdSolverStep {
             solver_refs_i);
       }
     }
-    if (gathers_contacts) {
+    if (gathers_collider) {
       /* Seed the next gather with the multipliers the device ended up with. */
       ExternalFaceContacts &contacts = chunks_data_[chunk_i].external_face_contacts;
       fluid.gpu_fluid.download_contact_lambdas(contacts.lambdas_normal.as_mutable_span(),
@@ -6317,10 +6349,9 @@ class XpbdSolverStep {
   }
 
   /** Hands the contacts of the current substep to the device. */
-  bool upload_contacts_to_gpu(const int chunk_i)
+  bool upload_contacts_to_gpu(const int chunk_i, const ExternalFaceContacts &contacts)
   {
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
-    const ExternalFaceContacts &contacts = chunks_data_[chunk_i].external_face_contacts;
     if (contacts.points.is_empty()) {
       return false;
     }

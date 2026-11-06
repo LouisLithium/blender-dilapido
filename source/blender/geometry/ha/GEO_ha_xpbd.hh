@@ -374,6 +374,12 @@ class HaXpbdFluid {
   /** Copies the current positions to the host without touching the velocities. */
   bool download_positions(const MutableSpan<float3> r_positions);
 
+  /**
+   * Copies the positions at the start of the substep to the host. The host contact gather needs
+   * them to decide which side of a sheet a particle came from, exactly like the CPU path.
+   */
+  bool download_prev_positions(const MutableSpan<float3> r_positions);
+
   /** Copies positions and velocities back to the host. */
   bool download(const MutableSpan<float3> r_positions, const MutableSpan<float3> r_velocities);
 

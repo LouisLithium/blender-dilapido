@@ -2249,6 +2249,28 @@ bool HaXpbdFluid::download_positions(const MutableSpan<float3> r_positions)
   return true;
 }
 
+bool HaXpbdFluid::download_prev_positions(const MutableSpan<float3> r_positions)
+{
+  if (!ready_) {
+    return false;
+  }
+  HaContextGuard guard;
+  if (!guard.is_valid()) {
+    return false;
+  }
+  const int count = std::min<int64_t>(r_positions.size(), particle_count_);
+  if (count <= 0) {
+    return false;
+  }
+  Array<float> host_positions(int64_t(particle_count_) * 3);
+  prev_positions_.download(host_positions);
+  for (const int i : IndexRange(count)) {
+    r_positions[i] = float3(
+        host_positions[i * 3 + 0], host_positions[i * 3 + 1], host_positions[i * 3 + 2]);
+  }
+  return true;
+}
+
 bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
                        const float support_radius,
                        const float delta_time,
