@@ -1914,7 +1914,19 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
      * caches things like the node tree logger (which the node preview uses), so sharing the outer
      * one made the body write into the outer graph's cache. Copying is what the group node and the
      * other zone wrappers do (`GeoNodesUserData group_user_data = user_data;`). */
-    GeoNodesUserData body_user_data = *static_cast<GeoNodesUserData *>(context.user_data);
+    const GeoNodesUserData &outer_user_data = *static_cast<GeoNodesUserData *>(context.user_data);
+    /* The compute context changes when entering the zone. Without this the body would share the
+     * outer context hash, which is also what the viewer/side-effect lookup is keyed by. That made
+     * a viewer link inside/around the zone look up nodes in the wrong context and could leave the
+     * lazy-function executor with a dangling input link (crash on Ctrl+Shift+click). A plain
+     * `NodeComputeContext` is enough: it must not be a `GroupNodeComputeContext`, because that
+     * would add the zone output node to the nested-node path used to find simulation zones. */
+    bke::NodeComputeContext compute_context{
+        outer_user_data.compute_context, output_bnode_.identifier, &btree_};
+    GeoNodesUserData body_user_data = outer_user_data;
+    body_user_data.compute_context = &compute_context;
+    body_user_data.verbose_log = should_log_verbose_in_context(outer_user_data,
+                                                               compute_context.hash());
     /* Tell the nodes inside the zone that they may use the compute backend. The request travels
      * through the evaluation data, because the executor is free to run the body on worker
      * threads. */
