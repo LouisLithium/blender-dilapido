@@ -950,6 +950,11 @@ class XpbdSolverStep {
   double prof_velocity_ = 0.0;
   double prof_final_ = 0.0;
 
+  /* Sum of the length of every reaction offset applied to a solid vertex, per frame. Used by the
+   * `XPBD_REACTION_DEBUG` measurement to compare the CPU and device coupling. */
+  std::atomic<double> debug_reaction_density_{0.0};
+  std::atomic<double> debug_reaction_contact_{0.0};
+
   const float interpolation_begin_;
   const float interpolation_end_;
 
@@ -1125,6 +1130,15 @@ class XpbdSolverStep {
     this->write_back_geometries_to_world();
 
     this->write_back__contacts();
+
+    if (std::getenv("XPBD_REACTION_DEBUG") != nullptr) {
+      printf("XPBD_REACTION density=%.5f contact=%.5f\n",
+             debug_reaction_density_.load(),
+             debug_reaction_contact_.load());
+      fflush(stdout);
+      debug_reaction_density_.store(0.0);
+      debug_reaction_contact_.store(0.0);
+    }
 
     if (profile) {
       ms_writeback = ms_since(phase_start);
@@ -1465,6 +1479,19 @@ class XpbdSolverStep {
                                       0.0f,
                                       1.0f,
                                       geo_data.fluid_coupling);
+        if (std::getenv("XPBD_REACTION_DEBUG") != nullptr) {
+          float coupling_min = 1e30f;
+          float coupling_max = -1e30f;
+          for (const float c : geo_data.fluid_coupling) {
+            coupling_min = std::min(coupling_min, c);
+            coupling_max = std::max(coupling_max, c);
+          }
+          printf("XPBD_REACTION coupling min=%.3f max=%.3f n=%d\n",
+                 double(coupling_min),
+                 double(coupling_max),
+                 int(geo_data.fluid_coupling.size()));
+          fflush(stdout);
+        }
 
         float max_radius = 0.0f;
         for (const float radius : geo_data.fluid_radii) {
@@ -5350,7 +5377,10 @@ class XpbdSolverStep {
           if (weight_sum <= 0.0f) {
             continue;
           }
-          positions[vertex_i] += scratch.correction_sums[vertex_i] / weight_sum;
+          const float3 offset = scratch.correction_sums[vertex_i] / weight_sum;
+          positions[vertex_i] += offset;
+          debug_reaction_density_.fetch_add(double(math::length(offset)),
+                                            std::memory_order_relaxed);
         }
       }
 
@@ -5449,7 +5479,10 @@ class XpbdSolverStep {
         if (weight_sum <= 0.0f) {
           continue;
         }
-        positions[vertex_i] += scratch.correction_sums[vertex_i] / weight_sum;
+        const float3 offset = scratch.correction_sums[vertex_i] / weight_sum;
+        positions[vertex_i] += offset;
+        debug_reaction_density_.fetch_add(double(math::length(offset)),
+                                          std::memory_order_relaxed);
       }
     }
   }
@@ -5581,6 +5614,16 @@ class XpbdSolverStep {
       return;
     }
     const int contacts_num = int(contacts.contacts.points.size());
+    if (std::getenv("XPBD_REACTION_DEBUG") != nullptr) {
+      float max_lambda = 0.0f;
+      for (const float l : contacts.contacts.lambdas_normal) {
+        max_lambda = std::max(max_lambda, std::abs(l));
+      }
+      printf("XPBD_REACTION contact_call n=%d max_lambda=%.6g\n",
+             contacts_num,
+             double(max_lambda));
+      fflush(stdout);
+    }
     if (contacts.applied_lambdas.size() != contacts_num) {
       contacts.applied_lambdas.reinitialize(contacts_num);
       contacts.applied_lambdas.fill(0.0f);
@@ -5629,6 +5672,8 @@ class XpbdSolverStep {
           continue;
         }
         positions[vertex_i] += offset;
+        debug_reaction_contact_.fetch_add(double(math::length(offset)),
+                                          std::memory_order_relaxed);
       }
     }
   }
