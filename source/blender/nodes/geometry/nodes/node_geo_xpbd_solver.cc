@@ -5628,7 +5628,14 @@ class XpbdSolverStep {
       contacts.applied_lambdas.reinitialize(contacts_num);
       contacts.applied_lambdas.fill(0.0f);
     }
-    const float max_correction = 0.1f * chunks_data_[chunk_i].fluid.support_radius;
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    /* Accumulate first, clamp the *summed* offset once per vertex, then apply. A dense contact
+     * patch has dozens of contacts on the same vertex; clamping only each contact (the old
+     * behaviour) let the sum grow with the number of contacts, which is what pushed the cloth
+     * through the water on the device. */
+    for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+      scratch.correction_sums.fill(float3(0.0f));
+    }
     for (const int contact_i : IndexRange(contacts_num)) {
       const float lambda = contacts.contacts.lambdas_normal[contact_i];
       const float delta = lambda - contacts.applied_lambdas[contact_i];
@@ -5638,6 +5645,16 @@ class XpbdSolverStep {
       contacts.applied_lambdas[contact_i] = lambda;
       const int geometry_i = contacts.face_geometry[contact_i];
       if (geometry_i < 0) {
+        continue;
+      }
+      FluidChunkData::CoupledVertexScratch *scratch = nullptr;
+      for (FluidChunkData::CoupledVertexScratch &candidate : fluid.coupled_scratch) {
+        if (candidate.geometry_i == geometry_i) {
+          scratch = &candidate;
+          break;
+        }
+      }
+      if (scratch == nullptr) {
         continue;
       }
       /* The `Coupling` of the fluid particle says how much it should push the surface at all, the
@@ -5651,7 +5668,6 @@ class XpbdSolverStep {
         continue;
       }
       const Span<float> inv_masses = geometries_.data[geometry_i]->inv_masses;
-      const MutableSpan<float3> positions = refs[geometry_i].positions;
       const int3 &verts = contacts.face_vertices[contact_i];
       const float3 &weights = contacts.face_barycentric[contact_i];
       const float3 &normal = contacts.contacts.face_normals[contact_i];
@@ -5661,9 +5677,21 @@ class XpbdSolverStep {
         if (weight <= 0.0f || inv_masses[vertex_i] <= 0.0f) {
           continue;
         }
-        float3 offset = -delta * coupling * inv_masses[vertex_i] * weight * normal;
+        scratch->correction_sums[vertex_i] +=
+            -delta * coupling * inv_masses[vertex_i] * weight * normal;
+      }
+    }
+
+    const float max_correction = 0.1f * fluid.support_radius;
+    for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
+      const MutableSpan<float3> positions = refs[scratch.geometry_i].positions;
+      for (const int vertex_i : scratch.correction_sums.index_range()) {
+        float3 offset = scratch.correction_sums[vertex_i];
+        if (offset.x == 0.0f && offset.y == 0.0f && offset.z == 0.0f) {
+          continue;
+        }
         const float length = math::length(offset);
-        if (length > max_correction) {
+        if (max_correction > 0.0f && length > max_correction) {
           offset *= max_correction / length;
         }
         if (UNLIKELY(
