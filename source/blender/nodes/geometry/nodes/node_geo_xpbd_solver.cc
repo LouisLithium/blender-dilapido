@@ -5384,7 +5384,7 @@ class XpbdSolverStep {
         }
       }
 
-      this->simulate__coupled_contact_reaction__chunk(chunk_i, refs);
+      this->simulate__coupled_contact_reaction__chunk(chunk_i, refs, /*clamp_sum=*/false);
     }
   }
 
@@ -5607,7 +5607,8 @@ class XpbdSolverStep {
    * the constraint iterations of a substep.
    */
   void simulate__coupled_contact_reaction__chunk(const int chunk_i,
-                                                 const Span<xpbd::GeometryRef> refs)
+                                                 const Span<xpbd::GeometryRef> refs,
+                                                 const bool clamp_sum)
   {
     CoupledFaceContacts &contacts = chunks_data_[chunk_i].coupled_face_contacts;
     if (contacts.contacts.points.is_empty()) {
@@ -5629,10 +5630,61 @@ class XpbdSolverStep {
       contacts.applied_lambdas.fill(0.0f);
     }
     FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
-    /* Accumulate first, clamp the *summed* offset once per vertex, then apply. A dense contact
-     * patch has dozens of contacts on the same vertex; clamping only each contact (the old
-     * behaviour) let the sum grow with the number of contacts, which is what pushed the cloth
-     * through the water on the device. */
+    const float max_correction = 0.1f * fluid.support_radius;
+    if (!clamp_sum) {
+      /* CPU path: every contact is an independent impulse, applied directly. This is the reference
+       * behaviour and it holds the water (measured: the CPU leaks if the sum is clamped). */
+      for (const int contact_i : IndexRange(contacts_num)) {
+        const float lambda = contacts.contacts.lambdas_normal[contact_i];
+        const float delta = lambda - contacts.applied_lambdas[contact_i];
+        if (delta == 0.0f) {
+          continue;
+        }
+        contacts.applied_lambdas[contact_i] = lambda;
+        const int geometry_i = contacts.face_geometry[contact_i];
+        if (geometry_i < 0) {
+          continue;
+        }
+        const int point_i = contacts.contacts.points[contact_i];
+        const GeometryData &fluid_data = *geometries_.data[geometries_.chunks[chunk_i].data_key_i];
+        const float coupling = point_i < fluid_data.fluid_coupling.size() ?
+                                   fluid_data.fluid_coupling[point_i] :
+                                   1.0f;
+        if (!(coupling > 0.0f)) {
+          continue;
+        }
+        const Span<float> inv_masses = geometries_.data[geometry_i]->inv_masses;
+        const MutableSpan<float3> positions = refs[geometry_i].positions;
+        const int3 &verts = contacts.face_vertices[contact_i];
+        const float3 &weights = contacts.face_barycentric[contact_i];
+        const float3 &normal = contacts.contacts.face_normals[contact_i];
+        for (const int k : IndexRange(3)) {
+          const int vertex_i = verts[k];
+          const float weight = weights[k];
+          if (weight <= 0.0f || inv_masses[vertex_i] <= 0.0f) {
+            continue;
+          }
+          float3 offset = -delta * coupling * inv_masses[vertex_i] * weight * normal;
+          const float length = math::length(offset);
+          if (length > max_correction) {
+            offset *= max_correction / length;
+          }
+          if (UNLIKELY(
+                  !(std::isfinite(offset.x) && std::isfinite(offset.y) && std::isfinite(offset.z))))
+          {
+            continue;
+          }
+          positions[vertex_i] += offset;
+          debug_reaction_contact_.fetch_add(double(math::length(offset)),
+                                            std::memory_order_relaxed);
+        }
+      }
+      return;
+    }
+
+    /* Device path: accumulate first, clamp the *summed* offset once per vertex, then apply. A dense
+     * contact patch has dozens of contacts on the same vertex; clamping only each contact let the
+     * sum grow with the number of contacts, which pushed the cloth through the water. */
     for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
       scratch.correction_sums.fill(float3(0.0f));
     }
@@ -5657,8 +5709,6 @@ class XpbdSolverStep {
       if (scratch == nullptr) {
         continue;
       }
-      /* The `Coupling` of the fluid particle says how much it should push the surface at all, the
-       * same attribute that drives the density reaction. */
       const int point_i = contacts.contacts.points[contact_i];
       const GeometryData &fluid_data = *geometries_.data[geometries_.chunks[chunk_i].data_key_i];
       const float coupling = point_i < fluid_data.fluid_coupling.size() ?
@@ -5681,8 +5731,6 @@ class XpbdSolverStep {
             -delta * coupling * inv_masses[vertex_i] * weight * normal;
       }
     }
-
-    const float max_correction = 0.1f * fluid.support_radius;
     for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
       const MutableSpan<float3> positions = refs[scratch.geometry_i].positions;
       for (const int vertex_i : scratch.correction_sums.index_range()) {
@@ -6334,7 +6382,7 @@ class XpbdSolverStep {
         coupled.applied_lambdas.reinitialize(int(contacts.points.size()));
         coupled.applied_lambdas.fill(0.0f);
         this->simulate__coupled_contact_reaction__chunk(
-            chunk_i, geometries_.solver_refs[solver_refs_i]);
+            chunk_i, geometries_.solver_refs[solver_refs_i], /*clamp_sum=*/true);
       }
     }
     /* The reaction of the whole frame (all substeps and iterations) is read back once, at the end
