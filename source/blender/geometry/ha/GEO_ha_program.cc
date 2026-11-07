@@ -110,6 +110,9 @@ struct CompileContext {
   /** Domain of the field being compiled: POINT in the position chain, FACE/EDGE/CORNER in an
    * element pass. `Position` and reductions are only available on POINT. */
   bke::AttrDomain domain = bke::AttrDomain::Point;
+  /** POINT attributes written by an earlier `Store` in the chain, with the stored type. A
+   * downstream `Named Attribute` reads the stored version, so a type mismatch has to fail. */
+  Map<std::string, HaType> written_attributes;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
@@ -855,6 +858,14 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
       return &ctx.pool.constant(0.0f);
   }
   const int components = ha_type_components(type);
+
+  if (const HaType *written_type = ctx.written_attributes.lookup_ptr(name)) {
+    if (*written_type != type) {
+      fail(ctx,
+           fmt::format("Named Attribute: '{}' was stored with a different type", name));
+      return &ctx.pool.constant(0.0f);
+    }
+  }
 
   int slot = -1;
   for (const int i : ctx.attributes.index_range()) {
@@ -1715,9 +1726,25 @@ bool compile_store(CompileContext &ctx,
     if (compiled->type != type) {
       return fail(ctx, "Store Named Attribute: the value has an unsupported type");
     }
+    /* The stored value has to be readable by a downstream `Named Attribute`, so it needs an
+     * attribute slot. If the value already read this name, the slot is reused (the runtime binding
+     * switches from the input buffer to the store buffer after this dispatch). */
+    int slot = -1;
+    for (const int i : ctx.attributes.index_range()) {
+      if (ctx.attributes[i].name == name && ctx.attributes[i].type == type) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot < 0) {
+      slot = int(ctx.attributes.size());
+      ctx.attributes.append({name, type, components});
+    }
+    ctx.written_attributes.add_overwrite(name, type);
     r_store.name = name;
     r_store.type = type;
     r_store.components = components;
+    r_store.attribute_slot = slot;
     r_store.glsl_value = ha_emit_glsl_natural(*compiled);
     r_store.glsl_selection = ha_emit_glsl_scalar(*selection);
     r_is_element = false;
@@ -2122,41 +2149,47 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     return fail("the zone output is not connected");
   }
 
-  /* `Store Named Attribute` nodes may sit between the position chain and the zone output. They are
-   * evaluated on the geometry as it leaves the zone, so they all have to come *after* the chain (a
-   * store in the middle would need the positions at that point). */
-  Vector<const bNode *> store_nodes;
-  const bNode *current = zone_output_input.link->fromnode;
-  while (current->is_type("GeometryNodeStoreNamedAttribute"_ustr)) {
-    if (store_nodes.size() >= MAX_STORE_STEPS) {
-      return fail(fmt::format("the zone contains more than {} 'Store Named Attribute' nodes",
-                              MAX_STORE_STEPS));
-    }
-    store_nodes.append(current);
-    if (current->input_sockets().is_empty()) {
-      return fail("'Store Named Attribute' has no geometry input");
-    }
-    const bNodeSocket &geometry_input = current->input_socket(0);
-    if (geometry_input.link == nullptr) {
-      return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
-    }
-    current = geometry_input.link->fromnode;
-  }
-
-  /* Walk back through the chain of `Set Position` nodes until the zone input is reached. The whole
-   * chain is compiled into one program, so it costs one upload and one download no matter how many
-   * nodes it contains. */
-  Vector<const bNode *> chain;
+  /* Walk back from the zone output through the linear chain. `Set Position` / `Transform` nodes
+   * change positions; POINT `Store Named Attribute` nodes can appear anywhere in the chain (their
+   * value sees the positions at that point, and downstream reads see the stored value). FACE / EDGE
+   * / CORNER stores and structural element nodes are collected separately and run after the
+   * chain. */
+  Vector<const bNode *> chain_nodes; /* Reverse order (output -> input). */
   Vector<const bNode *> element_nodes;
   Vector<const bNode *> corner_nodes;
+  int step_count = 0;
+  int store_count = 0;
+  bool at_tail = true;
+  const bNode *current = zone_output_input.link->fromnode;
   while (true) {
     if (current == input_node) {
       break;
     }
-    if (chain.size() >= MAX_CHAIN_STEPS) {
-      return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
-                              MAX_CHAIN_STEPS));
+    if (current->is_type("GeometryNodeStoreNamedAttribute"_ustr)) {
+      if (store_count >= MAX_STORE_STEPS) {
+        return fail(fmt::format("the zone contains more than {} 'Store Named Attribute' nodes",
+                                MAX_STORE_STEPS));
+      }
+      const auto &storage = *static_cast<const NodeGeometryStoreNamedAttribute *>(current->storage);
+      if (bke::AttrDomain(storage.domain) != bke::AttrDomain::Point && !at_tail) {
+        return fail(fmt::format(
+            "node '{}': a non-POINT 'Store Named Attribute' has to be the last node in the zone",
+            current->name));
+      }
+      if (current->input_sockets().is_empty()) {
+        return fail("'Store Named Attribute' has no geometry input");
+      }
+      const bNodeSocket &geometry_input = current->input_socket(0);
+      if (geometry_input.link == nullptr) {
+        return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
+      }
+      chain_nodes.append(current);
+      store_count++;
+      current = geometry_input.link->fromnode;
+      continue;
     }
+
+    at_tail = false;
     /* Nodes that write an attribute on a domain without positions are a pass-through for the
      * geometry; they become their own device pass. */
     if (current->is_type("GeometryNodeSetShadeSmooth"_ustr) ||
@@ -2177,9 +2210,6 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
         return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
       }
       current = geometry_input.link->fromnode;
-      if (current == input_node) {
-        break;
-      }
       continue;
     }
     if (!current->is_type("GeometryNodeSetPosition"_ustr) &&
@@ -2190,17 +2220,18 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     if (current->input_sockets().size() < 4 || current->output_sockets().is_empty()) {
       return fail(fmt::format("'{}' has unexpected sockets", current->name));
     }
-    chain.append(current);
+    if (step_count >= MAX_CHAIN_STEPS) {
+      return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
+                              MAX_CHAIN_STEPS));
+    }
+    chain_nodes.append(current);
+    step_count++;
 
     const bNodeSocket &geometry_input = current->input_socket(0);
     if (geometry_input.link == nullptr) {
       return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
     }
-    const bNode *previous = geometry_input.link->fromnode;
-    if (previous == input_node) {
-      break;
-    }
-    current = previous;
+    current = geometry_input.link->fromnode;
   }
 
   HaExprPool pool;
@@ -2209,17 +2240,39 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
   ctx.zone_input_node = input_node;
   ctx.tree = &tree;
 
-  /* Compile first step -> last step (`chain` is stored last -> first). */
-  for (const int i : chain.index_range()) {
-    const bNode &node = *chain[chain.size() - 1 - i];
+  /* Compile in chain order (`chain_nodes` is stored last -> first). POINT stores are compiled in
+   * place: the compile context remembers the attributes written so far, so a downstream
+   * `Named Attribute` reads the stored version instead of the zone input. */
+  for (const int i : chain_nodes.index_range()) {
+    const bNode &node = *chain_nodes[chain_nodes.size() - 1 - i];
+
+    if (node.is_type("GeometryNodeStoreNamedAttribute"_ustr)) {
+      HaStore store;
+      HaElementStore element_store;
+      bool is_element = false;
+      if (!compile_store(ctx, node, store, element_store, is_element)) {
+        return fail(ctx.reason.empty() ? std::string("the store is not supported") : ctx.reason);
+      }
+      if (is_element) {
+        program->element_stores_.append(std::move(element_store));
+      }
+      else {
+        const int store_index = int(program->stores_.size());
+        program->stores_.append(std::move(store));
+        program->operations_.append({HaChainOperation::Kind::Store, store_index});
+      }
+      continue;
+    }
 
     if (node.is_type("GeometryNodeTransform"_ustr)) {
       const HaExpr *transformed = compile_transform(ctx, node, pool);
       if (transformed == nullptr) {
         return fail(ctx.reason.empty() ? std::string("the transform is not supported") : ctx.reason);
       }
+      const int step_index = int(program->steps_.size());
       program->steps_.append(
           {ha_emit_glsl(*transformed), ha_emit_glsl_scalar(pool.constant(1.0f))});
+      program->operations_.append({HaChainOperation::Kind::Step, step_index});
       continue;
     }
 
@@ -2246,8 +2299,10 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     }
 
     const HaExpr &final_position = pool.add(HaType::Float3, HaOp::Add, {base, offset});
+    const int step_index = int(program->steps_.size());
     program->steps_.append(
         {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
+    program->operations_.append({HaChainOperation::Kind::Step, step_index});
   }
 
   /* Then the FACE/EDGE passes, first -> last (`element_nodes` is stored last -> first). */
@@ -2276,32 +2331,15 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     program->corner_steps_.append(std::move(step));
   }
 
-  /* A zone that only contains element passes still needs one position step: the chain is what
-   * carries the geometry through the device buffers (and the stores read its result), so insert an
-   * identity step instead of falling back. */
+  /* A zone that only contains stores still needs one position step: the chain is what carries the
+   * geometry through the device buffers, and the stores read its result. It runs before the stores,
+   * so they see the zone input positions. */
   if (program->steps_.is_empty()) {
     program->steps_.append({"(position + vec3(0.0))", "1.0"});
-  }
-
-  /* Then the stores, first -> last (`store_nodes` is stored last -> first). */
-  for (const int i : store_nodes.index_range()) {
-    HaStore store;
-    HaElementStore element_store;
-    bool is_element = false;
-    if (!compile_store(ctx,
-                       *store_nodes[store_nodes.size() - 1 - i],
-                       store,
-                       element_store,
-                       is_element))
-    {
-      return fail(ctx.reason.empty() ? std::string("the store is not supported") : ctx.reason);
-    }
-    if (is_element) {
-      program->element_stores_.append(std::move(element_store));
-    }
-    else {
-      program->stores_.append(std::move(store));
-    }
+    HaChainOperation step_operation;
+    step_operation.kind = HaChainOperation::Kind::Step;
+    step_operation.index = 0;
+    program->operations_.insert(0, step_operation);
   }
   return program;
 }
@@ -2520,6 +2558,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
+  /* Current version of every attribute: the zone input upload at first, then a store's output buffer
+   * after that store runs. This is what lets a downstream `Named Attribute` read a value written in
+   * the middle of the chain. */
+  Array<HaBuffer *> current_attribute_buffers(attributes_.size());
+  for (const int i : attributes_.index_range()) {
+    current_attribute_buffers[i] = &attribute_buffers[i];
+  }
+
   /* The generated source does not spell out the attribute buffer types (they are only in the
    * resource list), so the shader key has to include them. Otherwise an int and a float attribute
    * at the same slot would share a cached shader with the wrong declaration. */
@@ -2665,54 +2711,126 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     ha_program_debug("aggregates ready");
   }
 
-  /* The steps: each one reads the previous result and writes the other buffer. Only the last one
-   * has to be finished before the readback, the intermediate dispatches stay queued. */
+  /* The chain: position steps ping-pong between two buffers; POINT stores run at their place in the
+   * chain, reading the current position and writing an attribute buffer that downstream steps bind.
+   * Only the last dispatch is finished before the readback. */
+  Array<HaBuffer> store_buffers(stores_.size());
+  for (const int i : stores_.index_range()) {
+    if (!store_buffers[i].ensure(int64_t(padded_count) * stores_[i].components)) {
+      return false;
+    }
+  }
   double dispatch_ms = 0.0;
-  for (const int i : steps_.index_range()) {
-    const HaProgramStep &step = steps_[i];
-    gpu::Shader *shader = ha_shader_get(
-        step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key,
-        step.glsl_position,
-        step.glsl_selection,
-        Span<const HaShaderResource>(position_resources.data(), int64_t(position_resources.size())));
+  int steps_run = 0;
+  for (const HaChainOperation &operation : operations_) {
+    if (operation.kind == HaChainOperation::Kind::Step) {
+      const HaProgramStep &step = steps_[operation.index];
+      gpu::Shader *shader = ha_shader_get(
+          step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key,
+          step.glsl_position,
+          step.glsl_selection,
+          Span<const HaShaderResource>(position_resources.data(),
+                                       int64_t(position_resources.size())));
+      if (shader == nullptr) {
+        return false;
+      }
+      HaBuffer &src = buffers[steps_run % 2];
+      HaBuffer &dst = buffers[(steps_run + 1) % 2];
+      GPU_shader_bind(shader);
+      GPU_storagebuf_bind(src.buf(), 0);
+      GPU_storagebuf_bind(dst.buf(), 1);
+      GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_bind(current_attribute_buffers[attribute_i]->buf(), 3 + attribute_i);
+      }
+      if (!params_.is_empty()) {
+        GPU_storagebuf_bind(params_buffer.buf(), 15);
+      }
+      ha_dispatch(shader, padded_count);
+      if (!params_.is_empty()) {
+        GPU_storagebuf_unbind(params_buffer.buf());
+      }
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_unbind(current_attribute_buffers[attribute_i]->buf());
+      }
+      GPU_storagebuf_unbind(buffer_aggregate.buf());
+      GPU_storagebuf_unbind(dst.buf());
+      GPU_storagebuf_unbind(src.buf());
+      GPU_shader_unbind();
+      steps_run++;
+      continue;
+    }
+
+    /* A POINT store in the middle of the chain (or at the end). It reads the position buffer that
+     * the preceding step produced and writes the attribute buffer that downstream steps bind. */
+    const int store_i = operation.index;
+    const HaStore &store = stores_[store_i];
+    const bool with_old = !store.glsl_selection.empty();
+    if (ha_program_debug_enabled()) {
+      if (with_old) {
+        fprintf(stderr, "HA program: store '%s' with selection\n", store.name.c_str());
+      }
+      else {
+        fprintf(stderr, "HA program: store '%s'\n", store.name.c_str());
+      }
+    }
+    if (store.attribute_slot < 0 || store.attribute_slot >= attributes_.size()) {
+      return false;
+    }
+    Vector<HaShaderResource> store_resources;
+    store_resources.reserve(attributes_.size());
+    for (const int attribute_i : attributes_.index_range()) {
+      store_resources.append({(with_old ? 4 : 3) + attribute_i,
+                              HaShaderQualifier::Read,
+                              ha_attribute_buffer_glsl(attributes_[attribute_i].type),
+                              attribute_names[attribute_i].c_str()});
+    }
+    gpu::Shader *shader = ha_shader_get_store(
+        "store|" + store.glsl_value + "|" + ha_type_glsl(store.type) +
+            (with_old ? "|sel" : "") + attribute_key,
+        store.glsl_value,
+        store.glsl_selection,
+        with_old,
+        ha_type_glsl(store.type),
+        store.components,
+        Span<const HaShaderResource>(store_resources.data(), int64_t(store_resources.size())));
     if (shader == nullptr) {
       return false;
     }
-    HaBuffer &src = buffers[i % 2];
-    HaBuffer &dst = buffers[(i + 1) % 2];
     GPU_shader_bind(shader);
-    GPU_storagebuf_bind(src.buf(), 0);
-    GPU_storagebuf_bind(dst.buf(), 1);
+    GPU_storagebuf_bind(buffers[steps_run % 2].buf(), 0);
+    GPU_storagebuf_bind(store_buffers[store_i].buf(), 1);
     GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
-    for (const int attribute_i : attributes_.index_range()) {
-      GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+    if (with_old) {
+      GPU_storagebuf_bind(current_attribute_buffers[store.attribute_slot]->buf(), 3);
     }
-    if (!params_.is_empty()) {
-      GPU_storagebuf_bind(params_buffer.buf(), 15);
+    for (const int attribute_i : attributes_.index_range()) {
+      GPU_storagebuf_bind(current_attribute_buffers[attribute_i]->buf(),
+                          (with_old ? 4 : 3) + attribute_i);
     }
     ha_dispatch(shader, padded_count);
-    if (!params_.is_empty()) {
-      GPU_storagebuf_unbind(params_buffer.buf());
-    }
     for (const int attribute_i : attributes_.index_range()) {
-      GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
+      GPU_storagebuf_unbind(current_attribute_buffers[attribute_i]->buf());
+    }
+    if (with_old) {
+      GPU_storagebuf_unbind(current_attribute_buffers[store.attribute_slot]->buf());
     }
     GPU_storagebuf_unbind(buffer_aggregate.buf());
-    GPU_storagebuf_unbind(dst.buf());
-    GPU_storagebuf_unbind(src.buf());
+    GPU_storagebuf_unbind(store_buffers[store_i].buf());
+    GPU_storagebuf_unbind(buffers[steps_run % 2].buf());
     GPU_shader_unbind();
-    if (i + 1 == steps_.size()) {
-      GPU_finish();
-      dispatch_ms = timer.lap();
-    }
+    /* Downstream steps read the stored value. */
+    current_attribute_buffers[store.attribute_slot] = &store_buffers[store_i];
   }
+  GPU_finish();
+  dispatch_ms = timer.lap();
   ha_program_debug("dispatched");
   if (r_elements != nullptr) {
     *r_elements = element_count;
   }
 
   /* After `n` steps the result is in buffer `n % 2`. */
-  const HaBuffer &result = buffers[steps_.size() % 2];
+  const HaBuffer &result = buffers[steps_run % 2];
 
   /* The stores run after the structural element passes, so a store that follows a `Set Shade
    * Smooth` / `Flip Faces` in the graph sees the updated attributes. See below. */
@@ -3039,89 +3157,19 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
-  /* The stores: POINT stores use the final position buffer, element stores run as their own pass.
-   * Both read the result mesh, so they see the structural element passes above. */
-  if (!stores_.is_empty()) {
-    Array<HaBuffer> store_buffers(stores_.size());
-    Array<HaBuffer> store_in_buffers(stores_.size());
-    for (const int i : stores_.index_range()) {
-      const HaStore &store = stores_[i];
-      const bool with_old = !store.glsl_selection.empty();
-      if (ha_program_debug_enabled() && with_old) {
-        fprintf(stderr, "HA program: store '%s' with selection\n", store.name.c_str());
-      }
-      if (!store_buffers[i].ensure(int64_t(padded_count) * store.components)) {
-        return false;
-      }
-      if (with_old) {
-        const HaAttribute attribute{store.name, store.type, store.components};
-        if (!upload_one_attribute(dst_attributes,
-                                  attribute,
-                                  bke::AttrDomain::Point,
-                                  element_count,
-                                  padded_count,
-                                  store_in_buffers[i]))
-        {
-          return false;
-        }
-      }
-
-      Vector<HaShaderResource> store_resources;
-      store_resources.reserve(attributes_.size());
-      for (const int attribute_i : attributes_.index_range()) {
-        store_resources.append({(with_old ? 4 : 3) + attribute_i,
-                                HaShaderQualifier::Read,
-                                ha_attribute_buffer_glsl(attributes_[attribute_i].type),
-                                attribute_names[attribute_i].c_str()});
-      }
-
-      gpu::Shader *shader = ha_shader_get_store(
-          "store|" + store.glsl_value + "|" + ha_type_glsl(store.type) +
-              (with_old ? "|sel" : "") + attribute_key,
-          store.glsl_value,
-          store.glsl_selection,
-          with_old,
-          ha_type_glsl(store.type),
-          store.components,
-          Span<const HaShaderResource>(store_resources.data(), int64_t(store_resources.size())));
-      if (shader == nullptr) {
-        return false;
-      }
-      GPU_shader_bind(shader);
-      GPU_storagebuf_bind(result.buf(), 0);
-      GPU_storagebuf_bind(store_buffers[i].buf(), 1);
-      GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
-      if (with_old) {
-        GPU_storagebuf_bind(store_in_buffers[i].buf(), 3);
-      }
-      for (const int attribute_i : attributes_.index_range()) {
-        GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), (with_old ? 4 : 3) + attribute_i);
-      }
-      ha_dispatch(shader, padded_count);
-      for (const int attribute_i : attributes_.index_range()) {
-        GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
-      }
-      if (with_old) {
-        GPU_storagebuf_unbind(store_in_buffers[i].buf());
-      }
-      GPU_storagebuf_unbind(buffer_aggregate.buf());
-      GPU_storagebuf_unbind(store_buffers[i].buf());
-      GPU_storagebuf_unbind(result.buf());
-      GPU_shader_unbind();
-    }
-    GPU_finish();
-    for (const int i : stores_.index_range()) {
-      const HaStore &store = stores_[i];
-      if (!write_attribute_from_buffer(dst_attributes,
-                                       store.name,
-                                       store.type,
-                                       bke::AttrDomain::Point,
-                                       element_count,
-                                       padded_count,
-                                       store_buffers[i]))
-      {
-        return false;
-      }
+  /* The POINT stores already ran inside the chain; write their result buffers back to the mesh.
+   * Later stores of the same name overwrite earlier ones because they are written in order. */
+  for (const int i : stores_.index_range()) {
+    const HaStore &store = stores_[i];
+    if (!write_attribute_from_buffer(dst_attributes,
+                                     store.name,
+                                     store.type,
+                                     bke::AttrDomain::Point,
+                                     element_count,
+                                     padded_count,
+                                     store_buffers[i]))
+    {
+      return false;
     }
   }
 

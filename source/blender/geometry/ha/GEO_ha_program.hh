@@ -113,6 +113,19 @@ struct HaStore {
   std::string glsl_value;
   /** Scalar expression; empty means "all elements". Greater than zero means "write this one". */
   std::string glsl_selection;
+  /** Slot in the program's attribute list; downstream `Named Attribute` reads bind this slot. */
+  int attribute_slot = -1;
+};
+
+/** One entry of the linear chain: a position step or a (mid-chain / tail) POINT store. */
+struct HaChainOperation {
+  enum class Kind {
+    Step,
+    Store,
+  };
+  Kind kind = Kind::Step;
+  /** Index into #HaZoneProgram::steps_ or #HaZoneProgram::stores_. */
+  int index = 0;
 };
 
 /**
@@ -256,8 +269,10 @@ class HaZoneProgram {
   Vector<HaAttribute> attributes_;
   /** Animated socket defaults, uploaded to `user_params[]` (slot 15). */
   Vector<HaParamSource> params_;
-  /** `Store Named Attribute` nodes, in evaluation order (all after the position chain). */
+  /** `Store Named Attribute` nodes (POINT), in evaluation order. */
   Vector<HaStore> stores_;
+  /** Linear order of the position steps and the POINT stores. */
+  Vector<HaChainOperation> operations_;
   /** `Store Named Attribute` nodes on FACE / EDGE / CORNER, in evaluation order. */
   Vector<HaElementStore> element_stores_;
   /** FACE / EDGE attribute passes (before the stores; they do not touch positions). */
