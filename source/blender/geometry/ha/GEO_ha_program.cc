@@ -107,9 +107,9 @@ struct CompileContext {
   int depth = 0;
   /** Why the compilation stopped, in a form the node UI can show. */
   std::string reason;
-  /** Set while compiling a field for a FACE/EDGE element pass: `Position` and reductions are not
-   * available there, and `Named Attribute` reads that domain instead of POINT. */
-  bool element_domain = false;
+  /** Domain of the field being compiled: POINT in the position chain, FACE/EDGE/CORNER in an
+   * element pass. `Position` and reductions are only available on POINT. */
+  bke::AttrDomain domain = bke::AttrDomain::Point;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
@@ -788,11 +788,48 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
                                       const bNode &node,
                                       const int socket_index)
 {
-  if (socket_index != 0) {
-    /* The `Exists` output would need to know at compile time whether the attribute is there. */
-    fail(ctx, "Named Attribute: the 'Exists' output is not supported");
+  if (node.input_sockets().is_empty()) {
+    fail(ctx, "Named Attribute: missing the name input");
     return &ctx.pool.constant(0.0f);
   }
+  const bNodeSocket &name_socket = node.input_socket(0);
+  if (name_socket.link != nullptr) {
+    fail(ctx, "Named Attribute: the name has to be a constant");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *name_value = static_cast<const bNodeSocketValueString *>(name_socket.default_value);
+  const std::string name = name_value != nullptr ? std::string(name_value->value) : std::string();
+  if (name.empty()) {
+    fail(ctx, "Named Attribute: the name is empty");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  if (socket_index == 1) {
+    /* `Exists`: the value is resolved at evaluation time from the input geometry's attribute
+     * metadata and uploaded through `user_params[]`. */
+    if (!ctx.allow_params) {
+      fail(ctx, "Named Attribute: the 'Exists' output is not supported in this kernel");
+      return &ctx.pool.constant(0.0f);
+    }
+    const int slot = int(ctx.params.size());
+    HaParamSource source;
+    source.type = HaType::Float;
+    source.attribute_exists = true;
+    source.attribute_name = name;
+    source.attribute_domain = int(ctx.domain);
+    ctx.params.append(std::move(source));
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr, "HA program: 'Exists' for attribute '%s'\n", name.c_str());
+    }
+    HaExpr &read = ctx.pool.add(HaType::Float, HaOp::ParamRead);
+    read.param_slot = slot;
+    return &read;
+  }
+  if (socket_index != 0) {
+    fail(ctx, "Named Attribute: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+
   const auto &storage = *static_cast<const NodeGeometryInputNamedAttribute *>(node.storage);
   HaType type;
   switch (storage.data_type) {
@@ -818,21 +855,6 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
       return &ctx.pool.constant(0.0f);
   }
   const int components = ha_type_components(type);
-  if (node.input_sockets().is_empty()) {
-    fail(ctx, "Named Attribute: missing the name input");
-    return &ctx.pool.constant(0.0f);
-  }
-  const bNodeSocket &name_socket = node.input_socket(0);
-  if (name_socket.link != nullptr) {
-    fail(ctx, "Named Attribute: the name has to be a constant");
-    return &ctx.pool.constant(0.0f);
-  }
-  const auto *value = static_cast<const bNodeSocketValueString *>(name_socket.default_value);
-  const std::string name = value != nullptr ? std::string(value->value) : std::string();
-  if (name.empty()) {
-    fail(ctx, "Named Attribute: the name is empty");
-    return &ctx.pool.constant(0.0f);
-  }
 
   int slot = -1;
   for (const int i : ctx.attributes.index_range()) {
@@ -852,12 +874,20 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
 }
 
 /**
- * `GeometryNodeTransform` in the components mode with constant inputs. The matrix is built here (the
- * IR has no matrix type) and emitted as three dot products plus a translation, which is exactly how
- * `math::transform_point` evaluates `mat * vec4(p, 1)`.
+ * `GeometryNodeTransform` in the components mode.
  *
- * The `Matrix` mode and linked component inputs are refused: they would need a uniform (single)
- * value in the expression language, which only knows per-element values.
+ * `Translation`, `Rotation` and `Scale` are **single-value** sockets in Blender, not fields: a
+ * context-dependent field linked to one of them is evaluated to the socket's default value on the
+ * CPU (`SocketValueVariant::extract` -> `evaluate_constant_field`), i.e. `(0, 0, 0)` for a vector.
+ * Per-element transforms therefore do not exist in the node, so a linked input is refused instead
+ * of silently producing a different result on the device.
+ *
+ * Constant inputs are baked into one matrix (exactly how `math::transform_point` evaluates
+ * `mat * vec4(p, 1)`). Driver-animated translation/scale values go through `user_params[]` (P0-06)
+ * so the shader source stays stable; the matrix is rebuilt from those values at runtime. An
+ * animated rotation is refused because the parameter buffer has no rotation slot.
+ *
+ * The `Matrix` mode is refused.
  */
 const HaExpr *compile_transform(CompileContext &ctx, const bNode &node, HaExprPool &pool)
 {
@@ -870,49 +900,112 @@ const HaExpr *compile_transform(CompileContext &ctx, const bNode &node, HaExprPo
     fail(ctx, "Transform Geometry: the matrix mode is not supported");
     return nullptr;
   }
-  for (const int i : {2, 3, 4}) {
-    const bNodeSocket &socket = node.input_socket(i);
-    if (socket.link != nullptr) {
+
+  const bNodeSocket &translation_socket = node.input_socket(2);
+  const bNodeSocket &rotation_socket = node.input_socket(3);
+  const bNodeSocket &scale_socket = node.input_socket(4);
+  for (const bNodeSocket *socket : {&translation_socket, &rotation_socket, &scale_socket}) {
+    if (socket->link != nullptr) {
       fail(ctx,
-           "Transform Geometry: translation, rotation and scale have to be constant values");
-      return nullptr;
-    }
-    if (ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, socket)) {
-      fail(ctx,
-           "Transform Geometry: an animated translation/rotation/scale would rebuild the shader "
-           "every frame");
+           "Transform Geometry: translation, rotation and scale are single values, so a linked "
+           "field is not supported");
       return nullptr;
     }
   }
-  const auto *translation_value = static_cast<const bNodeSocketValueVector *>(
-      node.input_socket(2).default_value);
+
+  const bool translation_animated =
+      ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, translation_socket);
+  const bool rotation_animated =
+      ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, rotation_socket);
+  const bool scale_animated =
+      ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, scale_socket);
+  if (rotation_animated) {
+    fail(ctx, "Transform Geometry: an animated rotation is not supported");
+    return nullptr;
+  }
+
   const auto *rotation_value = static_cast<const bNodeSocketValueRotation *>(
-      node.input_socket(3).default_value);
-  const auto *scale_value = static_cast<const bNodeSocketValueVector *>(
-      node.input_socket(4).default_value);
-  if (translation_value == nullptr || rotation_value == nullptr || scale_value == nullptr) {
+      rotation_socket.default_value);
+  if (rotation_value == nullptr) {
     fail(ctx, "Transform Geometry: missing input values");
     return nullptr;
   }
 
-  const float3 translation(translation_value->value);
-  const float3 scale(scale_value->value);
+  if (!translation_animated && !scale_animated) {
+    const auto *translation_value = static_cast<const bNodeSocketValueVector *>(
+        translation_socket.default_value);
+    const auto *scale_value = static_cast<const bNodeSocketValueVector *>(
+        scale_socket.default_value);
+    if (translation_value == nullptr || scale_value == nullptr) {
+      fail(ctx, "Transform Geometry: missing input values");
+      return nullptr;
+    }
+
+    const float3 translation(translation_value->value);
+    const float3 scale(scale_value->value);
+    const math::Quaternion rotation = math::to_quaternion(
+        math::EulerXYZ(float3(rotation_value->value_euler)));
+    const float4x4 mat = math::from_loc_rot_scale<float4x4>(translation, rotation, scale);
+
+    /* `float4x4` is column major, so row j is `(mat[0][j], mat[1][j], mat[2][j])`. */
+    const HaExpr *base = &pool.add(HaType::Float3, HaOp::Position);
+    const HaExpr *x = &pool.add(
+        HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][0], mat[1][0], mat[2][0]))});
+    const HaExpr *y = &pool.add(
+        HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][1], mat[1][1], mat[2][1]))});
+    const HaExpr *z = &pool.add(
+        HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][2], mat[1][2], mat[2][2]))});
+    const HaExpr *combined = &pool.add(HaType::Float3, HaOp::Combine, {x, y, z});
+    return &pool.add(HaType::Float3,
+                     HaOp::Add,
+                     {combined, &pool.constant(float3(mat[3][0], mat[3][1], mat[3][2]))});
+  }
+
+  /* Animated translation/scale: the values come from `user_params[]`, so the rotation (constant)
+   * is baked into the matrix coefficients and the scale is applied to the columns at runtime. */
+  const HaExpr *translation = compile_input_as(ctx, node, 2, HaType::Float3);
+  const HaExpr *scale = compile_input_as(ctx, node, 4, HaType::Float3);
+  if (!ctx.ok) {
+    return nullptr;
+  }
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Transform Geometry animated path\n");
+  }
+
+  auto split = [&](const HaExpr *value, const HaOp op) {
+    return &pool.add(HaType::Float, op, {value});
+  };
+  auto add = [&](const HaExpr *a, const HaExpr *b) {
+    return &pool.add(HaType::Float, HaOp::Add, {a, b});
+  };
+  auto mul = [&](const HaExpr *a, const HaExpr *b) {
+    return &pool.add(HaType::Float, HaOp::Mul, {a, b});
+  };
+
   const math::Quaternion rotation = math::to_quaternion(
       math::EulerXYZ(float3(rotation_value->value_euler)));
-  const float4x4 mat = math::from_loc_rot_scale<float4x4>(translation, rotation, scale);
+  const float3x3 rot = math::from_rotation<float3x3>(rotation);
 
-  /* `float4x4` is column major, so row j is `(mat[0][j], mat[1][j], mat[2][j])`. */
+  /* `from_rotation` is column major: `rot[i][j]` is column i, row j. */
+  const HaExpr *ssx = split(scale, HaOp::SplitX);
+  const HaExpr *ssy = split(scale, HaOp::SplitY);
+  const HaExpr *ssz = split(scale, HaOp::SplitZ);
+  auto row = [&](const int j) {
+    return &pool.add(HaType::Float3,
+                     HaOp::Combine,
+                     {mul(&pool.constant(rot[0][j]), ssx),
+                      mul(&pool.constant(rot[1][j]), ssy),
+                      mul(&pool.constant(rot[2][j]), ssz)});
+  };
+
   const HaExpr *base = &pool.add(HaType::Float3, HaOp::Position);
-  const HaExpr *x = &pool.add(
-      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][0], mat[1][0], mat[2][0]))});
-  const HaExpr *y = &pool.add(
-      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][1], mat[1][1], mat[2][1]))});
-  const HaExpr *z = &pool.add(
-      HaType::Float, HaOp::Dot, {base, &pool.constant(float3(mat[0][2], mat[1][2], mat[2][2]))});
-  const HaExpr *combined = &pool.add(HaType::Float3, HaOp::Combine, {x, y, z});
-  return &pool.add(HaType::Float3,
-                   HaOp::Add,
-                   {combined, &pool.constant(float3(mat[3][0], mat[3][1], mat[3][2]))});
+  const HaExpr *tx = split(translation, HaOp::SplitX);
+  const HaExpr *ty = split(translation, HaOp::SplitY);
+  const HaExpr *tz = split(translation, HaOp::SplitZ);
+  const HaExpr *x = add(&pool.add(HaType::Float, HaOp::Dot, {base, row(0)}), tx);
+  const HaExpr *y = add(&pool.add(HaType::Float, HaOp::Dot, {base, row(1)}), ty);
+  const HaExpr *z = add(&pool.add(HaType::Float, HaOp::Dot, {base, row(2)}), tz);
+  return &pool.add(HaType::Float3, HaOp::Combine, {x, y, z});
 }
 
 /**
@@ -1252,7 +1345,7 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
-  ctx.element_domain = true;
+  ctx.domain = domain;
 
   /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
   const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
@@ -1307,7 +1400,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
-  ctx.element_domain = true;
+  ctx.domain = bke::AttrDomain::Face;
   const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
   if (!ctx.ok) {
     fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
@@ -1341,7 +1434,7 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
-  ctx.element_domain = true;
+  ctx.domain = bke::AttrDomain::Face;
   /* Inputs: Geometry(0), Selection(1). */
   const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
   if (!ctx.ok) {
@@ -1654,7 +1747,7 @@ bool compile_store(CompileContext &ctx,
   element_ctx.allow_params = false;
   element_ctx.zone_input_node = ctx.zone_input_node;
   element_ctx.tree = ctx.tree;
-  element_ctx.element_domain = true;
+  element_ctx.domain = domain;
   const HaExpr *selection = compile_input_as(element_ctx, node, 1, HaType::Float);
   const HaExpr *compiled = compile_input_as(element_ctx, node, 3, type);
   if (!element_ctx.ok) {
@@ -1727,9 +1820,9 @@ const HaExpr *compile_map_range(CompileContext &ctx, const bNode &node, const in
 
 const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const int socket_index)
 {
-  if (ctx.element_domain) {
+  if (ctx.domain != bke::AttrDomain::Point) {
     /* The reduction reads the POINT position buffer, which an element pass does not bind. */
-    fail(ctx, "Attribute Statistic: not available on FACE/EDGE element domains");
+    fail(ctx, "Attribute Statistic: only available on the POINT domain");
     return &ctx.pool.constant(0.0f);
   }
   /* Outputs: 0 = Mean, 1 = Median, 2 = Sum, 3 = Min, 4 = Max, 5 = Range, 6 = Std Dev, 7 = Variance.
@@ -1814,10 +1907,11 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
 
   const HaExpr *result = nullptr;
   if (node.is_type("GeometryNodeInputPosition"_ustr)) {
-    if (ctx.element_domain) {
-      /* A face does not have a position of its own; Blender would use the face center, which needs
-       * the corner topology. Refusing keeps the device result from silently differing. */
-      fail(ctx, "the 'Position' field is not available on FACE/EDGE element domains");
+    if (ctx.domain != bke::AttrDomain::Point) {
+      /* A face/corner does not have a position of its own; Blender would use the face center or the
+       * corner's vertex, which needs the corner topology. Refusing keeps the device result from
+       * silently differing. */
+      fail(ctx, "the 'Position' field is only available on the POINT domain");
       return &ctx.pool.constant(0.0f);
     }
     result = &ctx.pool.add(HaType::Float3, HaOp::Position);
@@ -2452,6 +2546,15 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     Array<float> host_params(int64_t(params_.size()) * 4, 0.0f);
     for (const int i : params_.index_range()) {
       const HaParamSource &param = params_[i];
+      if (param.attribute_exists) {
+        const bool exists = lookup_meta_data_in_domain(
+                                input_attributes,
+                                param.attribute_name,
+                                bke::AttrDomain(param.attribute_domain))
+                                .has_value();
+        host_params[i * 4] = exists ? 1.0f : 0.0f;
+        continue;
+      }
       const bNode *node = tree != nullptr ?
                               bke::node_find_node_by_name(const_cast<bNodeTree &>(*tree),
                                                           param.node_name) :

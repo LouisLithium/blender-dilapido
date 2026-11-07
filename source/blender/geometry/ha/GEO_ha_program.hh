@@ -89,6 +89,11 @@ struct HaParamSource {
   std::string node_name;
   int socket_index = 0;
   HaType type = HaType::Float;
+  /** True for `Named Attribute > Exists`: the value is 0/1 depending on the input attribute. */
+  bool attribute_exists = false;
+  std::string attribute_name;
+  /** `bke::AttrDomain` as an int, to keep this header free of the attribute header. */
+  int attribute_domain = 0;
 };
 
 /** Element domain of a #HaElementStep / #HaElementStore. */
