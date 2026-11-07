@@ -34,7 +34,12 @@ namespace blender::geometry::ha {
 
 enum class HaType {
   Float,
+  Int,
+  Float2,
   Float3,
+  /** RGBA, the field system's `ColorGeometry4f`. Not the same as `Float4`: the implicit
+   * conversions differ (`float3 -> Color` sets alpha to 1, `float3 -> float4` sets w to 0). */
+  Color,
 };
 
 /** Integer parameter of an op (#HaExpr::param): comparison, interpolation or boolean operation. */
@@ -149,6 +154,20 @@ enum class HaOp {
   /** value, max, min -> float. */
   Wrap,
 
+  /* --- Implicit type conversions (see `blenkernel/intern/type_conversions.cc`) ---------- */
+  /** The result type is the expression's type; the source type is `args[0]->type`. */
+  ConvertToFloat,
+  ConvertToInt,
+  ConvertToFloat2,
+  ConvertToFloat3,
+  ConvertToColor,
+
+  /* --- Integer math (`FunctionNodeIntegerMath`) --------------------------------------- */
+  /** int, int -> int; safe when the divisor is zero (returns 0). */
+  DivideFloor,
+  DivideCeil,
+  DivideRound,
+
   /* --- Vector math --------------------------------------------------------------------- */
   /** vec3, vec3 -> vec3. */
   Cross,
@@ -213,7 +232,9 @@ inline constexpr int HA_PARAM_CLAMP = 1 << 8;
 struct HaExpr {
   HaType type = HaType::Float;
   HaOp op = HaOp::Const;
-  float value[3] = {0.0f, 0.0f, 0.0f};
+  float value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  /** Used by #HaType::Int constants. */
+  int int_value = 0;
   /** Used by #HaOp::AggregateRead. */
   int aggregate_slot = -1;
   /** Used by #HaOp::AttributeRead. */
@@ -229,7 +250,11 @@ class HaExprPool {
   HaExpr &add(HaType type, HaOp op, std::initializer_list<const HaExpr *> args = {});
   HaExpr &add(HaType type, HaOp op, Span<const HaExpr *> args);
   HaExpr &constant(float value);
+  HaExpr &constant(int value);
+  HaExpr &constant(const float2 &value);
   HaExpr &constant(const float3 &value);
+  /** RGBA (the field system's `ColorGeometry4f`). */
+  HaExpr &constant_color(const float4 &value);
 
  private:
   Vector<std::unique_ptr<HaExpr>> exprs_;
@@ -242,7 +267,20 @@ class HaExprPool {
  */
 float3 ha_evaluate(const HaExpr &expr, int index, Span<float> positions);
 
-/** GLSL expression. In scope: `vec3 position` and `int index`. */
+/** Typed result of #ha_evaluate_typed. `f` holds Float/Float2/Float3/Color, `i` holds Int. */
+struct HaValue {
+  HaType type = HaType::Float;
+  float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  int i = 0;
+};
+
+/** The same as #ha_evaluate but without promoting everything to a vector. */
+HaValue ha_evaluate_typed(const HaExpr &expr, int index, Span<float> positions);
+
+/** GLSL expression of the expression's natural type (float/int/vec2/vec3/vec4). */
+std::string ha_emit_glsl_natural(const HaExpr &expr);
+
+/** GLSL expression. In scope: `vec3 position` and `int index`. Always a `vec3`. */
 std::string ha_emit_glsl(const HaExpr &expr);
 
 /** The same for a scalar expression, without the implicit `vec3(...)` promotion. */

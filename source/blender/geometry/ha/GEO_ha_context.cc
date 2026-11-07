@@ -746,6 +746,22 @@ const char *HA_GLSL_HELPERS =
     "vec3 ha_wrap(vec3 v, vec3 mx, vec3 mn) {\n"
     "  return vec3(ha_wrap(v.x, mx.x, mn.x), ha_wrap(v.y, mx.y, mn.y), ha_wrap(v.z, mx.z, mn.z));\n"
     "}\n"
+    /* Integer division variants of `FunctionNodeIntegerMath` (see `multi_function_common.cc`). */
+    "int ha_divide_floor_int(int a, int b) {\n"
+    "  if (b == 0) { return 0; }\n"
+    "  int d = a / b;\n"
+    "  int r = a - d * b;\n"
+    "  return r != 0 ? d - (((a < 0) != (b < 0)) ? 1 : 0) : d;\n"
+    "}\n"
+    "int ha_divide_ceil_int(int a, int b) {\n"
+    "  return b != 0 ? -ha_divide_floor_int(a, -b) : 0;\n"
+    "}\n"
+    "int ha_divide_round_int(int a, int b) {\n"
+    "  if (b == 0) { return 0; }\n"
+    "  int c = abs(b);\n"
+    "  int s = (b > 0) - (b < 0);\n"
+    "  return a >= 0 ? ((2 * a + c) / (2 * c)) * s : -((2 * -a + c) / (2 * c)) * s;\n"
+    "}\n"
     /* White Noise Texture: a port of `BLI_noise.cc` (Jenkins lookup3 over the float bit patterns).
      * Pure integer math, so it is bit identical to the CPU as long as the float <-> uint conversions
      * agree (they do: both round to nearest). */
@@ -3201,10 +3217,10 @@ gpu::Shader *ha_shader_get(const StringRef key,
 
 gpu::Shader *ha_shader_get_store(const StringRef key,
                                  const StringRef glsl_value,
+                                 const char *glsl_type,
                                  const int components,
                                  const Span<const HaShaderResource> extra_resources)
 {
-  const bool vector = components > 1;
   std::string body = std::string(HA_GLSL_HELPERS) +
                      "void main()\n"
                      "{\n"
@@ -3213,21 +3229,30 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
                      "  vec3 position = vec3(position_in[base], position_in[base + 1], "
                      "position_in[base + 2]);\n"
                      "  ";
-  if (vector) {
-    body += "vec3 value = " + std::string(glsl_value) +
-            ";\n"
-            "  store_out[index * 3] = value.x;\n"
-            "  store_out[index * 3 + 1] = value.y;\n"
-            "  store_out[index * 3 + 2] = value.z;\n";
-  }
-  else {
-    body += "store_out[index] = " + std::string(glsl_value) + ";\n";
+  body += glsl_type;
+  body += " value = ";
+  body += glsl_value;
+  body += ";\n";
+  static const char *components_suffix[4] = {".x", ".y", ".z", ".w"};
+  for (int component = 0; component < components; component++) {
+    body += "  store_out[index * ";
+    body += std::to_string(components);
+    body += " + ";
+    body += std::to_string(component);
+    body += "] = value";
+    if (components > 1) {
+      body += components_suffix[component];
+    }
+    body += ";\n";
   }
   body += "}\n";
 
+  /* The store buffer is a flat array of scalars: `int` for an integer attribute, `float` for every
+   * other type (a `vec3` attribute is three consecutive floats). */
+  const bool integer = std::string(glsl_type) == "int";
   Vector<HaShaderResource> resources;
   resources.append({0, HaShaderQualifier::Read, "float", "position_in[]"});
-  resources.append({1, HaShaderQualifier::Write, "float", "store_out[]"});
+  resources.append({1, HaShaderQualifier::Write, integer ? "int" : "float", "store_out[]"});
   resources.append({2, HaShaderQualifier::Read, "float", "aggregate[]"});
   for (const HaShaderResource &resource : extra_resources) {
     resources.append(resource);

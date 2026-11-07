@@ -47,12 +47,37 @@ HaExpr &HaExprPool::constant(const float value)
   return expr;
 }
 
+HaExpr &HaExprPool::constant(const int value)
+{
+  HaExpr &expr = this->add(HaType::Int, HaOp::Const);
+  expr.int_value = value;
+  return expr;
+}
+
+HaExpr &HaExprPool::constant(const float2 &value)
+{
+  HaExpr &expr = this->add(HaType::Float2, HaOp::Const);
+  expr.value[0] = value.x;
+  expr.value[1] = value.y;
+  return expr;
+}
+
 HaExpr &HaExprPool::constant(const float3 &value)
 {
   HaExpr &expr = this->add(HaType::Float3, HaOp::Const);
   expr.value[0] = value.x;
   expr.value[1] = value.y;
   expr.value[2] = value.z;
+  return expr;
+}
+
+HaExpr &HaExprPool::constant_color(const float4 &value)
+{
+  HaExpr &expr = this->add(HaType::Color, HaOp::Const);
+  expr.value[0] = value.x;
+  expr.value[1] = value.y;
+  expr.value[2] = value.z;
+  expr.value[3] = value.w;
   return expr;
 }
 
@@ -255,6 +280,166 @@ float ha_map_range(const int param,
 
 float eval_float(const HaExpr &expr, int index, Span<float> positions);
 float3 eval_vector(const HaExpr &expr, int index, Span<float> positions);
+int eval_int(const HaExpr &expr, int index, Span<float> positions);
+float2 eval_float2(const HaExpr &expr, int index, Span<float> positions);
+float4 eval_color(const HaExpr &expr, int index, Span<float> positions);
+
+/* Integer helpers mirroring `multi_function_common.cc` / `BLI_math_base.hh`. */
+int ha_safe_divide_int(const int a, const int b)
+{
+  return b != 0 ? a / b : 0;
+}
+
+int ha_divide_floor_int(const int a, const int b)
+{
+  if (b == 0) {
+    return 0;
+  }
+  const int d = a / b;
+  const int r = a % b;
+  return r ? d - int((a < 0) ^ (b < 0)) : d;
+}
+
+int ha_divide_ceil_int(const int a, const int b)
+{
+  return b != 0 ? -ha_divide_floor_int(a, -b) : 0;
+}
+
+int ha_divide_round_int(const int a, const int b)
+{
+  /* Derived from `divide_round_i` but safe and correct for negative inputs (see
+   * `multi_function_common.cc`). */
+  if (b == 0) {
+    return 0;
+  }
+  const int c = std::abs(b);
+  const int sign = (b > 0) - (b < 0);
+  return (a >= 0) ? ha_safe_divide_int(2 * a + c, 2 * c) * sign :
+                    -ha_safe_divide_int(2 * -a + c, 2 * c) * sign;
+}
+
+int ha_mod_periodic_int(const int a, const int b)
+{
+  return b != 0 ? ((a % b) + b) % b : 0;
+}
+
+int ha_sign_int(const int a)
+{
+  return (a > 0) - (a < 0);
+}
+
+/* Implicit conversions, copied from `blenkernel/intern/type_conversions.cc`. */
+float ha_to_float(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.type) {
+    case HaType::Int:
+      return float(eval_int(expr, index, positions));
+    case HaType::Float2: {
+      const float2 value = eval_float2(expr, index, positions);
+      return (value.x + value.y) / 2.0f;
+    }
+    case HaType::Float3: {
+      const float3 value = eval_vector(expr, index, positions);
+      return (value.x + value.y + value.z) / 3.0f;
+    }
+    case HaType::Color: {
+      const float4 value = eval_color(expr, index, positions);
+      return (value.x + value.y + value.z + value.w) / 4.0f;
+    }
+    default:
+      return eval_float(expr, index, positions);
+  }
+}
+
+int ha_to_int(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.type) {
+    case HaType::Float:
+      return int(eval_float(expr, index, positions));
+    case HaType::Float2: {
+      const float2 value = eval_float2(expr, index, positions);
+      return int((value.x + value.y) / 2.0f);
+    }
+    case HaType::Float3: {
+      const float3 value = eval_vector(expr, index, positions);
+      return int((value.x + value.y + value.z) / 3.0f);
+    }
+    case HaType::Color: {
+      const float4 value = eval_color(expr, index, positions);
+      return int((value.x + value.y + value.z + value.w) / 4.0f);
+    }
+    default:
+      return eval_int(expr, index, positions);
+  }
+}
+
+float2 ha_to_float2(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.type) {
+    case HaType::Float:
+      return float2(eval_float(expr, index, positions));
+    case HaType::Int: {
+      const float value = float(eval_int(expr, index, positions));
+      return float2(value, value);
+    }
+    case HaType::Float3: {
+      const float3 value = eval_vector(expr, index, positions);
+      return float2(value.x, value.y);
+    }
+    case HaType::Color: {
+      const float4 value = eval_color(expr, index, positions);
+      return float2(value.x, value.y);
+    }
+    default:
+      return eval_float2(expr, index, positions);
+  }
+}
+
+float3 ha_to_float3(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.type) {
+    case HaType::Float:
+      return float3(eval_float(expr, index, positions));
+    case HaType::Int: {
+      const float value = float(eval_int(expr, index, positions));
+      return float3(value, value, value);
+    }
+    case HaType::Float2: {
+      const float2 value = eval_float2(expr, index, positions);
+      return float3(value.x, value.y, 0.0f);
+    }
+    case HaType::Color: {
+      const float4 value = eval_color(expr, index, positions);
+      return float3(value.x, value.y, value.z);
+    }
+    default:
+      return eval_vector(expr, index, positions);
+  }
+}
+
+float4 ha_to_color(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.type) {
+    case HaType::Float: {
+      const float value = eval_float(expr, index, positions);
+      return float4(value, value, value, 1.0f);
+    }
+    case HaType::Int: {
+      const float value = float(eval_int(expr, index, positions));
+      return float4(value, value, value, 1.0f);
+    }
+    case HaType::Float2: {
+      const float2 value = eval_float2(expr, index, positions);
+      return float4(value.x, value.y, 0.0f, 1.0f);
+    }
+    case HaType::Float3: {
+      const float3 value = eval_vector(expr, index, positions);
+      return float4(value.x, value.y, value.z, 1.0f);
+    }
+    default:
+      return eval_color(expr, index, positions);
+  }
+}
 
 /* Arguments of vector ops treat scalar expressions as a uniform vector, matching GLSL's implicit
  * `vec3(x)` promotion that #emit_as_vector() adds on the GPU side. */
@@ -343,6 +528,8 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
   switch (expr.op) {
     case HaOp::Const:
       return expr.value[0];
+    case HaOp::ConvertToFloat:
+      return ha_to_float(*expr.args[0], index, positions);
     case HaOp::Index:
       return float(index);
     case HaOp::AggregateRead:
@@ -463,6 +650,26 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
                           eval_float(*expr.args[0], index, positions),
                           expr.args.size() > 1 ? eval_float(*expr.args[1], index, positions) : 0.0f);
     case HaOp::Compare:
+      if (expr.args[0]->type == HaType::Int) {
+        const int a = eval_int(*expr.args[0], index, positions);
+        const int b = eval_int(*expr.args[1], index, positions);
+        switch (HaParam(expr.param)) {
+          case HaParam::CompareLess:
+            return a < b ? 1.0f : 0.0f;
+          case HaParam::CompareLessEqual:
+            return a <= b ? 1.0f : 0.0f;
+          case HaParam::CompareGreater:
+            return a > b ? 1.0f : 0.0f;
+          case HaParam::CompareGreaterEqual:
+            return a >= b ? 1.0f : 0.0f;
+          case HaParam::CompareEqual:
+            return a == b ? 1.0f : 0.0f;
+          case HaParam::CompareNotEqual:
+            return a != b ? 1.0f : 0.0f;
+          default:
+            return 0.0f;
+        }
+      }
       return ha_compare(expr.param,
                         eval_float(*expr.args[0], index, positions),
                         eval_float(*expr.args[1], index, positions),
@@ -485,9 +692,99 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
   }
 }
 
+int eval_int(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.op) {
+    case HaOp::Const:
+      return expr.int_value;
+    case HaOp::Index:
+      return index;
+    case HaOp::ConvertToInt:
+      return ha_to_int(*expr.args[0], index, positions);
+    case HaOp::AttributeRead:
+    case HaOp::AggregateRead:
+      /* Attribute buffers and reductions are only available on the GPU; the CPU reference for
+       * them is the regular node evaluation (the `Force CPU` path). */
+      return 0;
+    case HaOp::Add:
+      return eval_int(*expr.args[0], index, positions) + eval_int(*expr.args[1], index, positions);
+    case HaOp::Sub:
+      return eval_int(*expr.args[0], index, positions) - eval_int(*expr.args[1], index, positions);
+    case HaOp::Mul:
+      return eval_int(*expr.args[0], index, positions) * eval_int(*expr.args[1], index, positions);
+    case HaOp::Div: {
+      const int b = eval_int(*expr.args[1], index, positions);
+      return b != 0 ? eval_int(*expr.args[0], index, positions) / b : 0;
+    }
+    case HaOp::Modulo: {
+      const int b = eval_int(*expr.args[1], index, positions);
+      return b != 0 ? eval_int(*expr.args[0], index, positions) % b : 0;
+    }
+    case HaOp::FlooredModulo:
+      return ha_mod_periodic_int(eval_int(*expr.args[0], index, positions),
+                                 eval_int(*expr.args[1], index, positions));
+    case HaOp::Min:
+      return math::min(eval_int(*expr.args[0], index, positions),
+                       eval_int(*expr.args[1], index, positions));
+    case HaOp::Max:
+      return math::max(eval_int(*expr.args[0], index, positions),
+                       eval_int(*expr.args[1], index, positions));
+    case HaOp::Abs:
+      return std::abs(eval_int(*expr.args[0], index, positions));
+    case HaOp::Sign:
+      return ha_sign_int(eval_int(*expr.args[0], index, positions));
+    case HaOp::MulAdd:
+      return eval_int(*expr.args[0], index, positions) * eval_int(*expr.args[1], index, positions) +
+             eval_int(*expr.args[2], index, positions);
+    case HaOp::DivideFloor:
+      return ha_divide_floor_int(eval_int(*expr.args[0], index, positions),
+                                 eval_int(*expr.args[1], index, positions));
+    case HaOp::DivideCeil:
+      return ha_divide_ceil_int(eval_int(*expr.args[0], index, positions),
+                                eval_int(*expr.args[1], index, positions));
+    case HaOp::DivideRound:
+      return ha_divide_round_int(eval_int(*expr.args[0], index, positions),
+                                 eval_int(*expr.args[1], index, positions));
+    default:
+      return 0;
+  }
+}
+
+float2 eval_float2(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.op) {
+    case HaOp::Const:
+      return float2(expr.value[0], expr.value[1]);
+    case HaOp::ConvertToFloat2:
+      return ha_to_float2(*expr.args[0], index, positions);
+    case HaOp::AttributeRead:
+    case HaOp::AggregateRead:
+      return float2(0.0f);
+    default:
+      return float2(0.0f);
+  }
+}
+
+float4 eval_color(const HaExpr &expr, int index, Span<float> positions)
+{
+  switch (expr.op) {
+    case HaOp::Const:
+      return float4(expr.value[0], expr.value[1], expr.value[2], expr.value[3]);
+    case HaOp::ConvertToColor:
+      return ha_to_color(*expr.args[0], index, positions);
+    case HaOp::AttributeRead:
+    case HaOp::AggregateRead:
+      return float4(0.0f);
+    default:
+      return float4(0.0f);
+  }
+}
+
 float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
 {
   switch (expr.op) {
+    case HaOp::ConvertToFloat3:
+      return ha_to_float3(*expr.args[0], index, positions);
     case HaOp::Const:
       return float3(expr.value[0], expr.value[1], expr.value[2]);
     case HaOp::Position: {
@@ -643,13 +940,65 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
 
 }  // namespace
 
+HaValue ha_evaluate_typed(const HaExpr &expr, const int index, Span<float> positions)
+{
+  HaValue value;
+  value.type = expr.type;
+  switch (expr.type) {
+    case HaType::Float:
+      value.f[0] = eval_float(expr, index, positions);
+      break;
+    case HaType::Int:
+      value.i = eval_int(expr, index, positions);
+      break;
+    case HaType::Float2: {
+      const float2 result = eval_float2(expr, index, positions);
+      value.f[0] = result.x;
+      value.f[1] = result.y;
+      break;
+    }
+    case HaType::Float3: {
+      const float3 result = eval_vector(expr, index, positions);
+      value.f[0] = result.x;
+      value.f[1] = result.y;
+      value.f[2] = result.z;
+      break;
+    }
+    case HaType::Color: {
+      const float4 result = eval_color(expr, index, positions);
+      value.f[0] = result.x;
+      value.f[1] = result.y;
+      value.f[2] = result.z;
+      value.f[3] = result.w;
+      break;
+    }
+  }
+  return value;
+}
+
 float3 ha_evaluate(const HaExpr &expr, const int index, Span<float> positions)
 {
-  if (expr.type == HaType::Float3) {
-    return eval_vector(expr, index, positions);
+  switch (expr.type) {
+    case HaType::Float: {
+      const float value = eval_float(expr, index, positions);
+      return float3(value, value, value);
+    }
+    case HaType::Int: {
+      const float value = float(eval_int(expr, index, positions));
+      return float3(value, value, value);
+    }
+    case HaType::Float2: {
+      const float2 value = eval_float2(expr, index, positions);
+      return float3(value.x, value.y, 0.0f);
+    }
+    case HaType::Color: {
+      const float4 value = eval_color(expr, index, positions);
+      return float3(value.x, value.y, value.z);
+    }
+    case HaType::Float3:
+      break;
   }
-  const float value = eval_float(expr, index, positions);
-  return float3(value, value, value);
+  return eval_vector(expr, index, positions);
 }
 
 /** \} */
@@ -672,8 +1021,91 @@ std::string format_float(const float value)
   return text;
 }
 
+std::string format_int(const int value)
+{
+  return std::to_string(value);
+}
+
 std::string emit(const HaExpr &expr);
 std::string emit_as_vector(const HaExpr &expr);
+
+/** Emits an explicit implicit-conversion node (see `type_conversions.cc`). */
+std::string emit_conversion(const HaExpr &expr)
+{
+  const HaExpr &arg = *expr.args[0];
+  const std::string value = emit(arg);
+  const std::string a = "(" + value + ")";
+
+  switch (expr.type) {
+    case HaType::Float:
+      switch (arg.type) {
+        case HaType::Int:
+          return "float(" + value + ")";
+        case HaType::Float2:
+          return "(" + a + ".x + " + a + ".y) / 2.0";
+        case HaType::Float3:
+          return "(" + a + ".x + " + a + ".y + " + a + ".z) / 3.0";
+        case HaType::Color:
+          return "(" + a + ".x + " + a + ".y + " + a + ".z + " + a + ".w) / 4.0";
+        default:
+          return value;
+      }
+    case HaType::Int:
+      switch (arg.type) {
+        case HaType::Float:
+          return "int(" + value + ")";
+        case HaType::Float2:
+          return "int((" + a + ".x + " + a + ".y) / 2.0)";
+        case HaType::Float3:
+          return "int((" + a + ".x + " + a + ".y + " + a + ".z) / 3.0)";
+        case HaType::Color:
+          return "int((" + a + ".x + " + a + ".y + " + a + ".z + " + a + ".w) / 4.0)";
+        default:
+          return value;
+      }
+    case HaType::Float2:
+      switch (arg.type) {
+        case HaType::Float:
+          return "vec2(" + value + ")";
+        case HaType::Int:
+          return "vec2(float(" + value + "))";
+        case HaType::Float3:
+        case HaType::Color:
+          return a + ".xy";
+        default:
+          return value;
+      }
+    case HaType::Float3:
+      switch (arg.type) {
+        case HaType::Float:
+          return "vec3(" + value + ")";
+        case HaType::Int:
+          return "vec3(float(" + value + "))";
+        case HaType::Float2:
+          return "vec3(" + a + ".x, " + a + ".y, 0.0)";
+        case HaType::Color:
+          return a + ".xyz";
+        default:
+          return value;
+      }
+    case HaType::Color:
+      switch (arg.type) {
+        case HaType::Float:
+          return "vec4(" + value + ", " + value + ", " + value + ", 1.0)";
+        case HaType::Int: {
+          const std::string channel = "float(" + value + ")";
+          return "vec4(" + channel + ", " + channel + ", " + channel + ", 1.0)";
+        }
+        case HaType::Float2:
+          return "vec4(" + a + ".x, " + a + ".y, 0.0, 1.0)";
+        case HaType::Float3:
+          return "vec4(" + a + ".x, " + a + ".y, " + a + ".z, 1.0)";
+        default:
+          return value;
+      }
+  }
+  return value;
+}
 
 std::string emit_binary(const char *op, const HaExpr &expr)
 {
@@ -744,15 +1176,31 @@ std::string emit(const HaExpr &expr)
 {
   switch (expr.op) {
     case HaOp::Const:
-      if (expr.type == HaType::Float3) {
-        return "vec3(" + format_float(expr.value[0]) + ", " + format_float(expr.value[1]) + ", " +
-               format_float(expr.value[2]) + ")";
+      switch (expr.type) {
+        case HaType::Float:
+          return format_float(expr.value[0]);
+        case HaType::Int:
+          return format_int(expr.int_value);
+        case HaType::Float2:
+          return "vec2(" + format_float(expr.value[0]) + ", " + format_float(expr.value[1]) + ")";
+        case HaType::Float3:
+          return "vec3(" + format_float(expr.value[0]) + ", " + format_float(expr.value[1]) + ", " +
+                 format_float(expr.value[2]) + ")";
+        case HaType::Color:
+          return "vec4(" + format_float(expr.value[0]) + ", " + format_float(expr.value[1]) + ", " +
+                 format_float(expr.value[2]) + ", " + format_float(expr.value[3]) + ")";
       }
-      return format_float(expr.value[0]);
+      return "0.0";
+    case HaOp::ConvertToFloat:
+    case HaOp::ConvertToInt:
+    case HaOp::ConvertToFloat2:
+    case HaOp::ConvertToFloat3:
+    case HaOp::ConvertToColor:
+      return emit_conversion(expr);
     case HaOp::Position:
       return "position";
     case HaOp::Index:
-      return "float(index)";
+      return expr.type == HaType::Int ? "index" : "float(index)";
     case HaOp::Add:
       return emit_binary("+", expr);
     case HaOp::Sub:
@@ -760,6 +1208,11 @@ std::string emit(const HaExpr &expr)
     case HaOp::Mul:
       return emit_binary("*", expr);
     case HaOp::Div:
+      if (expr.type == HaType::Int) {
+        const std::string a = emit(*expr.args[0]);
+        const std::string b = emit(*expr.args[1]);
+        return "((" + b + ") != 0 ? (" + a + ") / (" + b + ") : 0)";
+      }
       return emit_call("ha_safe_divide", *expr.args[0], *expr.args[1], expr.type == HaType::Float3);
     case HaOp::Max:
     case HaOp::Min: {
@@ -819,11 +1272,21 @@ std::string emit(const HaExpr &expr)
       return "aggregate[" + std::to_string(expr.aggregate_slot) + " * 3]";
     case HaOp::AttributeRead: {
       const std::string buffer = "attribute_" + std::to_string(expr.attribute_slot);
-      if (expr.type == HaType::Float3) {
-        return "vec3(" + buffer + "[index * 3], " + buffer + "[index * 3 + 1], " + buffer +
-               "[index * 3 + 2])";
+      switch (expr.type) {
+        case HaType::Float:
+          return buffer + "[index]";
+        case HaType::Int:
+          return buffer + "[index]";
+        case HaType::Float2:
+          return "vec2(" + buffer + "[index * 2], " + buffer + "[index * 2 + 1])";
+        case HaType::Float3:
+          return "vec3(" + buffer + "[index * 3], " + buffer + "[index * 3 + 1], " + buffer +
+                 "[index * 3 + 2])";
+        case HaType::Color:
+          return "vec4(" + buffer + "[index * 4], " + buffer + "[index * 4 + 1], " + buffer +
+                 "[index * 4 + 2], " + buffer + "[index * 4 + 3])";
       }
-      return buffer + "[index]";
+      return "0.0";
     }
 
     /* --- Math node ---------------------------------------------------------------------- */
@@ -869,10 +1332,28 @@ std::string emit(const HaExpr &expr)
     }
     case HaOp::Modulo:
     case HaOp::FlooredModulo:
+      if (expr.type == HaType::Int) {
+        const std::string a = emit(*expr.args[0]);
+        const std::string b = emit(*expr.args[1]);
+        if (expr.op == HaOp::Modulo) {
+          /* `a % b` without the operator: some drivers miscompile it for large negative values. */
+          return "((" + b + ") != 0 ? (" + a + ") - ((" + a + ") / (" + b + ")) * (" + b + ") : 0)";
+        }
+        return "((" + b + ") != 0 ? (" + a + ") - ha_divide_floor_int((" + a + "), (" + b + ")) * (" +
+               b + ") : 0)";
+      }
       return emit_call(expr.op == HaOp::Modulo ? "ha_safe_mod" : "ha_safe_floored_mod",
                        *expr.args[0],
                        *expr.args[1],
                        expr.type == HaType::Float3);
+    case HaOp::DivideFloor:
+    case HaOp::DivideCeil:
+    case HaOp::DivideRound: {
+      const char *fn = expr.op == HaOp::DivideFloor ? "ha_divide_floor_int" :
+                       expr.op == HaOp::DivideCeil  ? "ha_divide_ceil_int" :
+                                                      "ha_divide_round_int";
+      return emit_call(fn, *expr.args[0], *expr.args[1], false);
+    }
     case HaOp::Snap: {
       const bool vec = expr.type == HaType::Float3;
       const std::string b = emit_typed(*expr.args[1], vec);
@@ -983,6 +1464,10 @@ std::string emit(const HaExpr &expr)
       switch (HaParam(expr.param)) {
         case HaParam::CompareEqual:
         case HaParam::CompareNotEqual: {
+          if (expr.args[0]->type == HaType::Int) {
+            const char *int_op = HaParam(expr.param) == HaParam::CompareEqual ? "==" : "!=";
+            return "((" + a + " " + int_op + " " + b + ") ? 1.0 : 0.0)";
+          }
           const std::string epsilon = expr.args.size() > 2 ? emit(*expr.args[2]) : "0.0";
           const char *op = HaParam(expr.param) == HaParam::CompareEqual ? "<=" : ">";
           return "((abs((" + a + ") - (" + b + ")) " + op + " " + epsilon + ") ? 1.0 : 0.0)";
@@ -1136,13 +1621,27 @@ std::string emit(const HaExpr &expr)
 
 std::string emit_as_vector(const HaExpr &expr)
 {
-  if (expr.type == HaType::Float3) {
-    return emit(expr);
+  switch (expr.type) {
+    case HaType::Float3:
+      return emit(expr);
+    case HaType::Float:
+      return "vec3(" + emit(expr) + ")";
+    case HaType::Int:
+      return "vec3(float(" + emit(expr) + "))";
+    case HaType::Float2:
+      return "vec3(" + emit(expr) + ", 0.0)";
+    case HaType::Color:
+      return "(" + emit(expr) + ").xyz";
   }
-  return "vec3(" + emit(expr) + ")";
+  return "vec3(0.0)";
 }
 
 }  // namespace
+
+std::string ha_emit_glsl_natural(const HaExpr &expr)
+{
+  return emit(expr);
+}
 
 std::string ha_emit_glsl(const HaExpr &expr)
 {

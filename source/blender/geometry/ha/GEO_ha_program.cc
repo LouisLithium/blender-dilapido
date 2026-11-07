@@ -169,6 +169,56 @@ float3 read_vector_default(const bNodeSocket &socket)
   return value != nullptr ? float3(value->value) : float3(0.0f);
 }
 
+float4 read_color_default(const bNodeSocket &socket)
+{
+  const auto *value = static_cast<const bNodeSocketValueRGBA *>(socket.default_value);
+  return value != nullptr ? float4(value->value) : float4(0.0f);
+}
+
+int ha_type_components(const HaType type)
+{
+  switch (type) {
+    case HaType::Float:
+    case HaType::Int:
+      return 1;
+    case HaType::Float2:
+      return 2;
+    case HaType::Float3:
+      return 3;
+    case HaType::Color:
+      return 4;
+  }
+  return 1;
+}
+
+const char *ha_type_glsl(const HaType type)
+{
+  switch (type) {
+    case HaType::Float:
+      return "float";
+    case HaType::Int:
+      return "int";
+    case HaType::Float2:
+      return "vec2";
+    case HaType::Float3:
+      return "vec3";
+    case HaType::Color:
+      return "vec4";
+  }
+  return "float";
+}
+
+/**
+ * GLSL type of an attribute *storage* buffer. The GPU module only lets `int*` / `uint*` / `float*`
+ * type names through verbatim (`ShaderCreateInfo::buffer_typename`); everything else gets a
+ * `_host_shared_` suffix. Attribute buffers are therefore flat scalar arrays, and the emitter
+ * indexes them per component (`attribute_0[index * 3 + 2]`).
+ */
+const char *ha_attribute_buffer_glsl(const HaType type)
+{
+  return type == HaType::Int ? "int" : "float";
+}
+
 int read_int_default(const bNodeSocket &socket)
 {
   const auto *value = static_cast<const bNodeSocketValueInt *>(socket.default_value);
@@ -222,6 +272,43 @@ const HaExpr *compile_input(CompileContext &ctx, const bNode &node, const int so
     return &ctx.pool.constant(0.0f);
   }
   return compile_socket(ctx, node.input_socket(socket_index));
+}
+
+/** Inserts the explicit conversion the field system would do implicitly. */
+const HaExpr *coerce(CompileContext &ctx, const HaExpr *value, const HaType expected)
+{
+  if (!ctx.ok || value == nullptr || value->type == expected) {
+    return value;
+  }
+  HaOp op;
+  switch (expected) {
+    case HaType::Float:
+      op = HaOp::ConvertToFloat;
+      break;
+    case HaType::Int:
+      op = HaOp::ConvertToInt;
+      break;
+    case HaType::Float2:
+      op = HaOp::ConvertToFloat2;
+      break;
+    case HaType::Float3:
+      op = HaOp::ConvertToFloat3;
+      break;
+    case HaType::Color:
+      op = HaOp::ConvertToColor;
+      break;
+    default:
+      return value;
+  }
+  return &ctx.pool.add(expected, op, {value});
+}
+
+const HaExpr *compile_input_as(CompileContext &ctx,
+                               const bNode &node,
+                               const int socket_index,
+                               const HaType expected)
+{
+  return coerce(ctx, compile_input(ctx, node, socket_index), expected);
 }
 
 /** One entry of the Math / Vector Math dispatch tables. */
@@ -363,7 +450,7 @@ const HaExpr *compile_math(CompileContext &ctx, const bNode &node)
 
   Vector<const HaExpr *> args;
   for (const int i : IndexRange(info.arg_count)) {
-    args.append(compile_input(ctx, node, i));
+    args.append(compile_input_as(ctx, node, i, HaType::Float));
   }
   HaExpr &result = ctx.pool.add(info.type, info.op, args.as_span());
   /* The `Clamp` checkbox of the Math node clamps the result to 0..1, and the node's own
@@ -375,6 +462,82 @@ const HaExpr *compile_math(CompileContext &ctx, const bNode &node)
   return &result;
 }
 
+/**
+ * `FunctionNodeIntegerMath`. Integer division/modulo are the exact CPU semantics
+ * (`multi_function_common.cc`), including the "divisor is zero" guards. `Power`, `GCD` and `LCM`
+ * are not implemented yet and fall back to the CPU.
+ */
+const HaExpr *compile_integer_math(CompileContext &ctx, const bNode &node)
+{
+  HaOp op;
+  int arg_count = 2;
+  switch (node.custom1) {
+    case NODE_INTEGER_MATH_ADD:
+      op = HaOp::Add;
+      break;
+    case NODE_INTEGER_MATH_SUBTRACT:
+      op = HaOp::Sub;
+      break;
+    case NODE_INTEGER_MATH_MULTIPLY:
+      op = HaOp::Mul;
+      break;
+    case NODE_INTEGER_MATH_DIVIDE:
+      op = HaOp::Div;
+      break;
+    case NODE_INTEGER_MATH_MULTIPLY_ADD:
+      op = HaOp::MulAdd;
+      arg_count = 3;
+      break;
+    case NODE_INTEGER_MATH_FLOORED_MODULO:
+      op = HaOp::FlooredModulo;
+      break;
+    case NODE_INTEGER_MATH_MODULO:
+      op = HaOp::Modulo;
+      break;
+    case NODE_INTEGER_MATH_ABSOLUTE:
+      op = HaOp::Abs;
+      arg_count = 1;
+      break;
+    case NODE_INTEGER_MATH_SIGN:
+      op = HaOp::Sign;
+      arg_count = 1;
+      break;
+    case NODE_INTEGER_MATH_MINIMUM:
+      op = HaOp::Min;
+      break;
+    case NODE_INTEGER_MATH_MAXIMUM:
+      op = HaOp::Max;
+      break;
+    case NODE_INTEGER_MATH_NEGATE:
+      return &ctx.pool.add(
+          HaType::Int,
+          HaOp::Sub,
+          {&ctx.pool.constant(0), compile_input_as(ctx, node, 0, HaType::Int)});
+    case NODE_INTEGER_MATH_DIVIDE_FLOOR:
+      op = HaOp::DivideFloor;
+      break;
+    case NODE_INTEGER_MATH_DIVIDE_CEIL:
+      op = HaOp::DivideCeil;
+      break;
+    case NODE_INTEGER_MATH_DIVIDE_ROUND:
+      op = HaOp::DivideRound;
+      break;
+    default:
+      fail(ctx, "Integer Math: this operation is not supported");
+      return &ctx.pool.constant(0.0f);
+  }
+
+  Vector<const HaExpr *> args;
+  for (const int i : IndexRange(arg_count)) {
+    args.append(compile_input_as(ctx, node, i, HaType::Int));
+  }
+  return &ctx.pool.add(HaType::Int, op, args.as_span());
+}
+
+/**
+ * `ShaderNodeVectorMath` (float3). Scalar inputs are broadcast, exactly like the CPU evaluator's
+ * `eval_arg_as_vector` and the old GLSL `vec3(...)` promotion.
+ */
 const HaExpr *compile_vector_math(CompileContext &ctx, const bNode &node)
 {
   HaOpInfo info{HaOp::Const, 2, HaType::Float3};
@@ -453,23 +616,25 @@ const HaExpr *compile_vector_math(CompileContext &ctx, const bNode &node)
 
   Vector<const HaExpr *> args;
   for (const int i : IndexRange(info.arg_count)) {
-    args.append(compile_input(ctx, node, i));
+    args.append(compile_input_as(ctx, node, i, HaType::Float3));
   }
   if (info.extra_input >= 0) {
-    args.append(compile_input(ctx, node, info.extra_input));
+    args.append(compile_input_as(ctx, node, info.extra_input, HaType::Float));
   }
   return &ctx.pool.add(info.type, info.op, args.as_span());
 }
 
 /**
- * `FunctionNodeCompare`, float only. `EQ`/`NE` use the `Epsilon` input (a plain `<=` on the absolute
- * difference, exactly like the node's own multi-function).
+ * `FunctionNodeCompare` for floats and integers. In the float mode `EQ`/`NE` use the `Epsilon`
+ * input (a plain `<=` on the absolute difference, exactly like the node's own multi-function); the
+ * integer mode compares exactly.
  */
 const HaExpr *compile_compare(CompileContext &ctx, const bNode &node)
 {
   const auto &storage = *static_cast<const NodeFunctionCompare *>(node.storage);
-  if (storage.data_type != SOCK_FLOAT) {
-    fail(ctx, "Compare: only the float mode is supported");
+  const bool is_int = storage.data_type == SOCK_INT;
+  if (!ELEM(storage.data_type, SOCK_FLOAT, SOCK_INT)) {
+    fail(ctx, "Compare: only the float and integer modes are supported");
     return &ctx.pool.constant(0.0f);
   }
   if (storage.mode != NODE_COMPARE_MODE_ELEMENT) {
@@ -502,16 +667,17 @@ const HaExpr *compile_compare(CompileContext &ctx, const bNode &node)
       return &ctx.pool.constant(0.0f);
   }
 
-  const bool with_epsilon = ELEM(param, HaParam::CompareEqual, HaParam::CompareNotEqual);
+  const bool with_epsilon = !is_int && ELEM(param, HaParam::CompareEqual, HaParam::CompareNotEqual);
+  const HaType arg_type = is_int ? HaType::Int : HaType::Float;
   Vector<const HaExpr *> args;
-  args.append(compile_input(ctx, node, 0));
-  args.append(compile_input(ctx, node, 1));
+  args.append(compile_input_as(ctx, node, 0, arg_type));
+  args.append(compile_input_as(ctx, node, 1, arg_type));
   if (with_epsilon) {
     if (node.input_sockets().size() < 3) {
       fail(ctx, "Compare: the Epsilon input is missing");
       return &ctx.pool.constant(0.0f);
     }
-    args.append(compile_input(ctx, node, 2));
+    args.append(compile_input_as(ctx, node, 2, HaType::Float));
   }
   HaExpr &result = ctx.pool.add(HaType::Float, HaOp::Compare, args.as_span());
   result.param = int(param);
@@ -551,7 +717,7 @@ const HaExpr *compile_bool_math(CompileContext &ctx, const bNode &node)
   const int arg_count = param == HaParam::BoolNot ? 1 : 2;
   Vector<const HaExpr *> args;
   for (const int i : IndexRange(arg_count)) {
-    args.append(compile_input(ctx, node, i));
+    args.append(compile_input_as(ctx, node, i, HaType::Float));
   }
   HaExpr &result = ctx.pool.add(HaType::Float, HaOp::BoolMath, args.as_span());
   result.param = int(param);
@@ -598,11 +764,14 @@ const HaExpr *compile_mix(CompileContext &ctx, const bNode &node, const int sock
     return &ctx.pool.constant(0.0f);
   }
 
-  HaExpr &result = ctx.pool.add(HaType(type),
+  const HaType factor_type = type == HaType::Float ? HaType::Float :
+                             (storage.factor_mode == NODE_MIX_MODE_UNIFORM ? HaType::Float :
+                                                                            HaType::Float3);
+  HaExpr &result = ctx.pool.add(type,
                                 HaOp::Mix,
-                                {compile_input(ctx, node, factor_index),
-                                 compile_input(ctx, node, a_index),
-                                 compile_input(ctx, node, b_index)});
+                                {compile_input_as(ctx, node, factor_index, factor_type),
+                                 compile_input_as(ctx, node, a_index, type),
+                                 compile_input_as(ctx, node, b_index, type)});
   if (storage.clamp_factor != 0) {
     result.param |= HA_PARAM_CLAMP;
   }
@@ -620,18 +789,30 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
     return &ctx.pool.constant(0.0f);
   }
   const auto &storage = *static_cast<const NodeGeometryInputNamedAttribute *>(node.storage);
-  int components;
+  HaType type;
   switch (storage.data_type) {
     case CD_PROP_FLOAT:
-      components = 1;
+      type = HaType::Float;
+      break;
+    case CD_PROP_INT32:
+    case CD_PROP_BOOL:
+      /* The IR has no boolean type; booleans are read as 0/1 integers. */
+      type = HaType::Int;
+      break;
+    case CD_PROP_FLOAT2:
+      type = HaType::Float2;
       break;
     case CD_PROP_FLOAT3:
-      components = 3;
+      type = HaType::Float3;
+      break;
+    case CD_PROP_COLOR:
+      type = HaType::Color;
       break;
     default:
-      fail(ctx, "Named Attribute: only the float and vector types are supported");
+      fail(ctx, "Named Attribute: this attribute type is not supported");
       return &ctx.pool.constant(0.0f);
   }
+  const int components = ha_type_components(type);
   if (node.input_sockets().is_empty()) {
     fail(ctx, "Named Attribute: missing the name input");
     return &ctx.pool.constant(0.0f);
@@ -650,18 +831,17 @@ const HaExpr *compile_named_attribute(CompileContext &ctx,
 
   int slot = -1;
   for (const int i : ctx.attributes.index_range()) {
-    if (ctx.attributes[i].name == name && ctx.attributes[i].components == components) {
+    if (ctx.attributes[i].name == name && ctx.attributes[i].type == type) {
       slot = i;
       break;
     }
   }
   if (slot < 0) {
     slot = int(ctx.attributes.size());
-    ctx.attributes.append({name, components});
+    ctx.attributes.append({name, type, components});
   }
 
-  HaExpr &read = ctx.pool.add(components == 1 ? HaType::Float : HaType::Float3,
-                              HaOp::AttributeRead);
+  HaExpr &read = ctx.pool.add(type, HaOp::AttributeRead);
   read.attribute_slot = slot;
   return &read;
 }
@@ -747,7 +927,7 @@ const HaExpr *compile_white_noise(CompileContext &ctx, const bNode &node, const 
   if (dimensions != 1) {
     const bNodeSocket &vector_socket = node.input_socket(0);
     const HaExpr *vector = vector_socket.link != nullptr ?
-                               compile_input(ctx, node, 0) :
+                               compile_input_as(ctx, node, 0, HaType::Float3) :
                                &ctx.pool.add(HaType::Float3, HaOp::Position);
     if (vector->type != HaType::Float3) {
       fail(ctx, "White Noise Texture: the vector input has to be a vector");
@@ -756,7 +936,7 @@ const HaExpr *compile_white_noise(CompileContext &ctx, const bNode &node, const 
     noise.args.append(vector);
   }
   if (dimensions == 1 || dimensions == 4) {
-    const HaExpr *w = compile_input(ctx, node, 1);
+    const HaExpr *w = compile_input_as(ctx, node, 1, HaType::Float);
     if (w->type != HaType::Float) {
       fail(ctx, "White Noise Texture: 'W' has to be a scalar");
       return &ctx.pool.constant(0.0f);
@@ -796,9 +976,9 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
    * Distortion(8). 1D uses `W * Scale`, 3D `Vector * Scale`. */
   HaExpr *position = nullptr;
   const HaExpr *w = &ctx.pool.constant(0.0f);
-  const HaExpr *scale = compile_input(ctx, node, 2);
+  const HaExpr *scale = compile_input_as(ctx, node, 2, HaType::Float);
   if (is_1d) {
-    const HaExpr *w_input = compile_input(ctx, node, 1);
+    const HaExpr *w_input = compile_input_as(ctx, node, 1, HaType::Float);
     if (w_input->type != HaType::Float) {
       fail(ctx, "Noise Texture: 'W' has to be a scalar");
       return &ctx.pool.constant(0.0f);
@@ -807,7 +987,7 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
   }
   else {
     const HaExpr *vector = node.input_socket(0).link != nullptr ?
-                               compile_input(ctx, node, 0) :
+                               compile_input_as(ctx, node, 0, HaType::Float3) :
                                &ctx.pool.add(HaType::Float3, HaOp::Position);
     if (vector->type != HaType::Float3) {
       fail(ctx, "Noise Texture: the vector input has to be a vector");
@@ -816,7 +996,7 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
     position = &ctx.pool.add(HaType::Float3, HaOp::Mul, {vector, scale});
     if (storage.dimensions == 4) {
       /* 4D samples `vec4(vector * scale, w * scale)`. */
-      const HaExpr *w_input = compile_input(ctx, node, 1);
+      const HaExpr *w_input = compile_input_as(ctx, node, 1, HaType::Float);
       if (w_input->type != HaType::Float) {
         fail(ctx, "Noise Texture: 'W' has to be a scalar");
         return &ctx.pool.constant(0.0f);
@@ -826,16 +1006,17 @@ const HaExpr *compile_noise_texture(CompileContext &ctx, const bNode &node, cons
   }
   const HaExpr *detail = &ctx.pool.add(HaType::Float,
                                        HaOp::Clamp,
-                                       {compile_input(ctx, node, 3),
+                                       {compile_input_as(ctx, node, 3, HaType::Float),
                                         &ctx.pool.constant(0.0f),
                                         &ctx.pool.constant(15.0f)});
-  const HaExpr *roughness = &ctx.pool.add(HaType::Float,
-                                          HaOp::Max,
-                                          {compile_input(ctx, node, 4), &ctx.pool.constant(0.0f)});
-  const HaExpr *lacunarity = compile_input(ctx, node, 5);
-  const HaExpr *offset = compile_input(ctx, node, 6);
-  const HaExpr *gain = compile_input(ctx, node, 7);
-  const HaExpr *distortion = compile_input(ctx, node, 8);
+  const HaExpr *roughness = &ctx.pool.add(
+      HaType::Float,
+      HaOp::Max,
+      {compile_input_as(ctx, node, 4, HaType::Float), &ctx.pool.constant(0.0f)});
+  const HaExpr *lacunarity = compile_input_as(ctx, node, 5, HaType::Float);
+  const HaExpr *offset = compile_input_as(ctx, node, 6, HaType::Float);
+  const HaExpr *gain = compile_input_as(ctx, node, 7, HaType::Float);
+  const HaExpr *distortion = compile_input_as(ctx, node, 8, HaType::Float);
   if (!ctx.ok) {
     fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return &ctx.pool.constant(0.0f);
@@ -877,7 +1058,7 @@ const HaExpr *compile_wave_texture(CompileContext &ctx, const bNode &node, const
   /* Inputs: Vector(0), Scale(1), Distortion(2), Detail(3), Detail Scale(4),
    * Detail Roughness(5), Phase Offset(6). */
   const HaExpr *vector = node.input_socket(0).link != nullptr ?
-                             compile_input(ctx, node, 0) :
+                             compile_input_as(ctx, node, 0, HaType::Float3) :
                              &ctx.pool.add(HaType::Float3, HaOp::Position);
   if (vector->type != HaType::Float3) {
     fail(ctx, "Wave Texture: the vector input has to be a vector");
@@ -886,12 +1067,12 @@ const HaExpr *compile_wave_texture(CompileContext &ctx, const bNode &node, const
   HaExpr &wave = ctx.pool.add(HaType::Float,
                               HaOp::WaveTexture,
                               {vector,
-                               compile_input(ctx, node, 1),
-                               compile_input(ctx, node, 2),
-                               compile_input(ctx, node, 3),
-                               compile_input(ctx, node, 4),
-                               compile_input(ctx, node, 5),
-                               compile_input(ctx, node, 6)});
+                               compile_input_as(ctx, node, 1, HaType::Float),
+                               compile_input_as(ctx, node, 2, HaType::Float),
+                               compile_input_as(ctx, node, 3, HaType::Float),
+                               compile_input_as(ctx, node, 4, HaType::Float),
+                               compile_input_as(ctx, node, 5, HaType::Float),
+                               compile_input_as(ctx, node, 6, HaType::Float)});
   if (!ctx.ok) {
     fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return &ctx.pool.constant(0.0f);
@@ -944,7 +1125,7 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
   const HaExpr *vector = &ctx.pool.constant(float3(0.0f));
   if (dimensions != 1) {
     vector = node.input_socket(0).link != nullptr ?
-                 compile_input(ctx, node, 0) :
+                 compile_input_as(ctx, node, 0, HaType::Float3) :
                  &ctx.pool.add(HaType::Float3, HaOp::Position);
     if (vector->type != HaType::Float3) {
       fail(ctx, "Voronoi Texture: the vector input has to be a vector");
@@ -953,19 +1134,20 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
   }
   const HaExpr *w = &ctx.pool.constant(0.0f);
   if (dimensions == 1 || dimensions == 4) {
-    w = compile_input(ctx, node, 1);
+    w = compile_input_as(ctx, node, 1, HaType::Float);
     if (w->type != HaType::Float) {
       fail(ctx, "Voronoi Texture: 'W' has to be a scalar");
       return &ctx.pool.constant(0.0f);
     }
   }
-  const HaExpr *scale = compile_input(ctx, node, 2);
+  const HaExpr *scale = compile_input_as(ctx, node, 2, HaType::Float);
   /* `randomness` is clamped to [0, 1] by the node. */
-  const HaExpr *randomness = &ctx.pool.add(HaType::Float,
-                                           HaOp::Clamp,
-                                           {compile_input(ctx, node, 8),
-                                            &ctx.pool.constant(0.0f),
-                                            &ctx.pool.constant(1.0f)});
+  const HaExpr *randomness = &ctx.pool.add(
+      HaType::Float,
+      HaOp::Clamp,
+      {compile_input_as(ctx, node, 8, HaType::Float),
+       &ctx.pool.constant(0.0f),
+       &ctx.pool.constant(1.0f)});
   if (!ctx.ok) {
     fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return &ctx.pool.constant(0.0f);
@@ -984,21 +1166,24 @@ const HaExpr *compile_voronoi_texture(CompileContext &ctx,
   }
 
   const int metric = storage.distance;
-  const HaExpr *detail = compile_input(ctx, node, 3);
-  const HaExpr *roughness = compile_input(ctx, node, 4);
-  const HaExpr *lacunarity = compile_input(ctx, node, 5);
+  const HaExpr *detail = compile_input_as(ctx, node, 3, HaType::Float);
+  const HaExpr *roughness = compile_input_as(ctx, node, 4, HaType::Float);
+  const HaExpr *lacunarity = compile_input_as(ctx, node, 5, HaType::Float);
   /* `smoothness` is only used by `Smooth F1`, where the node halves it and clamps it to [0, 0.5]. */
   const HaExpr *smoothness = &ctx.pool.constant(0.0f);
   if (feature == 2) {
     const HaExpr *halved = &ctx.pool.add(
-        HaType::Float, HaOp::Div, {compile_input(ctx, node, 6), &ctx.pool.constant(2.0f)});
+        HaType::Float,
+        HaOp::Div,
+        {compile_input_as(ctx, node, 6, HaType::Float), &ctx.pool.constant(2.0f)});
     smoothness = &ctx.pool.add(HaType::Float,
                                HaOp::Clamp,
                                {halved, &ctx.pool.constant(0.0f), &ctx.pool.constant(0.5f)});
   }
   /* The node only reads `Exponent` for `Minkowski` and not in 1D. */
-  const HaExpr *exponent = metric == 3 && dimensions != 1 ? compile_input(ctx, node, 7) :
-                                                            &ctx.pool.constant(0.0f);
+  const HaExpr *exponent = metric == 3 && dimensions != 1 ?
+                               compile_input_as(ctx, node, 7, HaType::Float) :
+                               &ctx.pool.constant(0.0f);
   if (!ctx.ok) {
     fail(ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return &ctx.pool.constant(0.0f);
@@ -1057,8 +1242,8 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   ctx.element_domain = true;
 
   /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
-  const HaExpr *selection = compile_input(ctx, node, 1);
-  const HaExpr *smooth = compile_input(ctx, node, 2);
+  const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
+  const HaExpr *smooth = compile_input_as(ctx, node, 2, HaType::Float);
   if (!ctx.ok) {
     fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return false;
@@ -1109,7 +1294,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
-  const HaExpr *selection = compile_input(ctx, node, 1);
+  const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
   if (!ctx.ok) {
     fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return false;
@@ -1143,7 +1328,7 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
   /* Inputs: Geometry(0), Selection(1). */
-  const HaExpr *selection = compile_input(ctx, node, 1);
+  const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
   if (!ctx.ok) {
     fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     return false;
@@ -1156,10 +1341,164 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   return true;
 }
 
+/** Uploads one attribute buffer. Returns false when the attribute's actual type/domain is not
+ * supported, in which case the caller falls back to the CPU. */
+bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
+                          const HaAttribute &attribute,
+                          const bke::AttrDomain domain,
+                          const int count,
+                          const int padded,
+                          HaBuffer &r_buffer)
+{
+  const int components = attribute.components;
+  const int64_t total = int64_t(padded) * components;
+  const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
+      attribute.name);
+  if (meta.has_value() && meta->domain != domain) {
+    /* Interpolating from another domain is not implemented; the CPU path handles it. */
+    return false;
+  }
+
+  if (attribute.type == HaType::Int) {
+    Array<int> host(total, 0);
+    if (meta.has_value()) {
+      if (meta->data_type == bke::AttrType::Int32) {
+        const bke::AttributeReader<int> reader = src_attributes.lookup<int>(attribute.name,
+                                                                            domain);
+        if (reader) {
+          const VArray<int> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            host[element] = values[element];
+          }
+        }
+      }
+      else if (meta->data_type == bke::AttrType::Bool) {
+        const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(attribute.name,
+                                                                              domain);
+        if (reader) {
+          const VArray<bool> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            host[element] = values[element] ? 1 : 0;
+          }
+        }
+      }
+      else {
+        return false;
+      }
+    }
+    if (!r_buffer.ensure(total)) {
+      return false;
+    }
+    /* The SSBO is raw bytes; the kernel declares this binding as `int[]`. */
+    r_buffer.upload(Span<float>(reinterpret_cast<const float *>(host.data()), total));
+    return true;
+  }
+
+  Array<float> host(total, 0.0f);
+  if (meta.has_value()) {
+    switch (attribute.type) {
+      case HaType::Float: {
+        if (meta->data_type == bke::AttrType::Float) {
+          const bke::AttributeReader<float> reader = src_attributes.lookup<float>(attribute.name,
+                                                                                  domain);
+          if (reader) {
+            const VArray<float> &values = reader.varray;
+            for (const int element : IndexRange(count)) {
+              host[element] = values[element];
+            }
+          }
+        }
+        else if (meta->data_type == bke::AttrType::Int32) {
+          const bke::AttributeReader<int> reader = src_attributes.lookup<int>(attribute.name,
+                                                                              domain);
+          if (reader) {
+            const VArray<int> &values = reader.varray;
+            for (const int element : IndexRange(count)) {
+              host[element] = float(values[element]);
+            }
+          }
+        }
+        else if (meta->data_type == bke::AttrType::Bool) {
+          const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(attribute.name,
+                                                                                domain);
+          if (reader) {
+            const VArray<bool> &values = reader.varray;
+            for (const int element : IndexRange(count)) {
+              host[element] = values[element] ? 1.0f : 0.0f;
+            }
+          }
+        }
+        else {
+          return false;
+        }
+        break;
+      }
+      case HaType::Float2: {
+        if (meta->data_type != bke::AttrType::Float2) {
+          return false;
+        }
+        const bke::AttributeReader<float2> reader = src_attributes.lookup<float2>(attribute.name,
+                                                                                  domain);
+        if (reader) {
+          const VArray<float2> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            const float2 value = values[element];
+            host[element * 2 + 0] = value.x;
+            host[element * 2 + 1] = value.y;
+          }
+        }
+        break;
+      }
+      case HaType::Float3: {
+        if (meta->data_type != bke::AttrType::Float3) {
+          return false;
+        }
+        const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(attribute.name,
+                                                                                  domain);
+        if (reader) {
+          const VArray<float3> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            const float3 value = values[element];
+            host[element * 3 + 0] = value.x;
+            host[element * 3 + 1] = value.y;
+            host[element * 3 + 2] = value.z;
+          }
+        }
+        break;
+      }
+      case HaType::Color: {
+        if (meta->data_type != bke::AttrType::ColorFloat) {
+          return false;
+        }
+        const bke::AttributeReader<ColorGeometry4f> reader =
+            src_attributes.lookup<ColorGeometry4f>(attribute.name, domain);
+        if (reader) {
+          const VArray<ColorGeometry4f> &values = reader.varray;
+          for (const int element : IndexRange(count)) {
+            const ColorGeometry4f value = values[element];
+            host[element * 4 + 0] = value.r;
+            host[element * 4 + 1] = value.g;
+            host[element * 4 + 2] = value.b;
+            host[element * 4 + 3] = value.a;
+          }
+        }
+        break;
+      }
+      case HaType::Int:
+        break;
+    }
+  }
+  if (!r_buffer.ensure(total)) {
+    return false;
+  }
+  r_buffer.upload(host);
+  return true;
+}
+
 /**
- * Uploads the attributes a FACE/EDGE pass reads, from the matching domain of the source mesh.
- * Returns false when an attribute cannot be represented (wrong domain or type), which makes the
- * caller fall back to the CPU.
+ * Uploads the attributes a FACE/EDGE/CORNER pass reads, from the matching domain of the source
+ * mesh. Returns false when an attribute cannot be represented (wrong domain or type), which makes
+ * the caller fall back to the CPU.
  */
 bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
                               const Span<const HaAttribute> attributes,
@@ -1175,79 +1514,15 @@ bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
   r_resources.reserve(attributes.size());
   for (const int attribute_i : attributes.index_range()) {
     const HaAttribute &attribute = attributes[attribute_i];
-    const int64_t total = int64_t(padded) * attribute.components;
-    Array<float> host_attribute(total, 0.0f);
-    const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
-        attribute.name);
-    if (meta.has_value()) {
-      if (meta->domain != domain) {
-        /* Interpolating from another domain is not implemented; the CPU path handles it. */
-        return false;
-      }
-      if (attribute.components == 1) {
-        switch (meta->data_type) {
-          case bke::AttrType::Float: {
-            const bke::AttributeReader<float> reader = src_attributes.lookup<float>(attribute.name,
-                                                                                   domain);
-            if (reader) {
-              const VArray<float> &values = reader.varray;
-              for (const int element : IndexRange(count)) {
-                host_attribute[element] = values[element];
-              }
-            }
-            break;
-          }
-          case bke::AttrType::Int32: {
-            const bke::AttributeReader<int> reader = src_attributes.lookup<int>(attribute.name,
-                                                                               domain);
-            if (reader) {
-              const VArray<int> &values = reader.varray;
-              for (const int element : IndexRange(count)) {
-                host_attribute[element] = float(values[element]);
-              }
-            }
-            break;
-          }
-          case bke::AttrType::Bool: {
-            const bke::AttributeReader<bool> reader = src_attributes.lookup<bool>(attribute.name,
-                                                                                 domain);
-            if (reader) {
-              const VArray<bool> &values = reader.varray;
-              for (const int element : IndexRange(count)) {
-                host_attribute[element] = values[element] ? 1.0f : 0.0f;
-              }
-            }
-            break;
-          }
-          default:
-            return false;
-        }
-      }
-      else {
-        if (meta->data_type != bke::AttrType::Float3) {
-          return false;
-        }
-        const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(attribute.name,
-                                                                                 domain);
-        if (reader) {
-          const VArray<float3> &values = reader.varray;
-          for (const int element : IndexRange(count)) {
-            const float3 value = values[element];
-            host_attribute[element * 3 + 0] = value.x;
-            host_attribute[element * 3 + 1] = value.y;
-            host_attribute[element * 3 + 2] = value.z;
-          }
-        }
-      }
-    }
-    if (!r_buffers[attribute_i].ensure(total)) {
+    if (!upload_one_attribute(
+            src_attributes, attribute, domain, count, padded, r_buffers[attribute_i]))
+    {
       return false;
     }
-    r_buffers[attribute_i].upload(host_attribute);
     r_names.append("attribute_" + std::to_string(attribute_i) + "[]");
     r_resources.append({first_slot + attribute_i,
                         HaShaderQualifier::Read,
-                        attribute.components == 3 ? "vec3" : "float",
+                        ha_attribute_buffer_glsl(attribute.type),
                         r_names.last().c_str()});
   }
   return true;
@@ -1257,17 +1532,27 @@ bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
 bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
 {
   const auto &storage = *static_cast<const NodeGeometryStoreNamedAttribute *>(node.storage);
-  int components;
+  HaType type;
   switch (storage.data_type) {
     case CD_PROP_FLOAT:
-      components = 1;
+      type = HaType::Float;
+      break;
+    case CD_PROP_INT32:
+      type = HaType::Int;
+      break;
+    case CD_PROP_FLOAT2:
+      type = HaType::Float2;
       break;
     case CD_PROP_FLOAT3:
-      components = 3;
+      type = HaType::Float3;
+      break;
+    case CD_PROP_COLOR:
+      type = HaType::Color;
       break;
     default:
-      return fail(ctx, "Store Named Attribute: only the float and vector types are supported");
+      return fail(ctx, "Store Named Attribute: this attribute type is not supported");
   }
+  const int components = ha_type_components(type);
   if (storage.domain != int8_t(bke::AttrDomain::Point)) {
     return fail(ctx, "Store Named Attribute: only the point domain is supported");
   }
@@ -1288,20 +1573,18 @@ bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
     return fail(ctx, "Store Named Attribute: the name is empty");
   }
 
-  const HaExpr *compiled = compile_input(ctx, node, 3);
+  const HaExpr *compiled = compile_input_as(ctx, node, 3, type);
   if (!ctx.ok) {
     return false;
   }
-  if (components == 1 && compiled->type != HaType::Float) {
-    return fail(ctx, "Store Named Attribute: expected a float value");
-  }
-  if (components == 3 && compiled->type != HaType::Float3) {
-    return fail(ctx, "Store Named Attribute: expected a vector value");
+  if (compiled->type != type) {
+    return fail(ctx, "Store Named Attribute: the value has an unsupported type");
   }
 
   r_store.name = name;
+  r_store.type = type;
   r_store.components = components;
-  r_store.glsl_value = components == 1 ? ha_emit_glsl_scalar(*compiled) : ha_emit_glsl(*compiled);
+  r_store.glsl_value = ha_emit_glsl_natural(*compiled);
   return true;
 }
 
@@ -1340,10 +1623,10 @@ const HaExpr *compile_map_range(CompileContext &ctx, const bNode &node, const in
 
   Vector<const HaExpr *> args;
   for (const int i : IndexRange(5)) {
-    args.append(compile_input(ctx, node, base + i));
+    args.append(compile_input_as(ctx, node, base + i, type));
   }
   if (interpolation == HaParam::MapRangeStepped) {
-    args.append(compile_input(ctx, node, base + 5));
+    args.append(compile_input_as(ctx, node, base + 5, type));
   }
   HaExpr &result = ctx.pool.add(type, HaOp::MapRange, args.as_span());
   result.param = int(interpolation);
@@ -1405,7 +1688,7 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
   }
 
   /* `Attribute` is input socket 2. */
-  const HaExpr *value = compile_input(ctx, node, 2);
+  const HaExpr *value = compile_input_as(ctx, node, 2, HaType::Float);
   if (!ctx.ok || value == nullptr || value->type != HaType::Float) {
     if (ctx.ok) {
       fail(ctx, "Attribute Statistic: only scalar attributes are supported");
@@ -1448,18 +1731,21 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
     result = &ctx.pool.add(HaType::Float3, HaOp::Position);
   }
   else if (node.is_type("GeometryNodeInputIndex"_ustr)) {
-    result = &ctx.pool.add(HaType::Float, HaOp::Index);
+    result = &ctx.pool.add(HaType::Int, HaOp::Index);
   }
   else if (node.is_type("ShaderNodeMath"_ustr)) {
     result = compile_math(ctx, node);
+  }
+  else if (node.is_type("FunctionNodeIntegerMath"_ustr)) {
+    result = compile_integer_math(ctx, node);
   }
   else if (node.is_type("ShaderNodeVectorMath"_ustr)) {
     result = compile_vector_math(ctx, node);
   }
   else if (node.is_type("ShaderNodeCombineXYZ"_ustr)) {
-    const HaExpr *x = compile_input(ctx, node, 0);
-    const HaExpr *y = compile_input(ctx, node, 1);
-    const HaExpr *z = compile_input(ctx, node, 2);
+    const HaExpr *x = compile_input_as(ctx, node, 0, HaType::Float);
+    const HaExpr *y = compile_input_as(ctx, node, 1, HaType::Float);
+    const HaExpr *z = compile_input_as(ctx, node, 2, HaType::Float);
     if (x->type != HaType::Float || y->type != HaType::Float || z->type != HaType::Float) {
       /* Blender converts a linked vector into a scalar here (averaging the components); the IR has
        * no such conversion, and emitting it would produce `vec3(vec3, 0, 0)` in GLSL. */
@@ -1474,14 +1760,15 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
     const HaOp op = socket_index == 0 ? HaOp::SplitX :
                     socket_index == 1 ? HaOp::SplitY :
                                         HaOp::SplitZ;
-    result = &ctx.pool.add(HaType::Float, op, {compile_input(ctx, node, 0)});
+    result = &ctx.pool.add(
+        HaType::Float, op, {compile_input_as(ctx, node, 0, HaType::Float3)});
   }
   else if (node.is_type("ShaderNodeClamp"_ustr)) {
     /* `custom1` is the clamp type. Both modes read the `Min`/`Max` sockets: `Range` only swaps them
      * when they are in the wrong order (see `node_shader_clamp.cc`), it does *not* clamp to 0..1. */
-    const HaExpr *value = compile_input(ctx, node, 0);
-    const HaExpr *min_value = compile_input(ctx, node, 1);
-    const HaExpr *max_value = compile_input(ctx, node, 2);
+    const HaExpr *value = compile_input_as(ctx, node, 0, HaType::Float);
+    const HaExpr *min_value = compile_input_as(ctx, node, 1, HaType::Float);
+    const HaExpr *max_value = compile_input_as(ctx, node, 2, HaType::Float);
     if (node.custom1 == NODE_CLAMP_RANGE) {
       result = &ctx.pool.add(HaType::Float,
                              HaOp::Clamp,
@@ -1554,10 +1841,11 @@ const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket)
       case SOCK_FLOAT:
         return &ctx.pool.constant(read_float_default(socket));
       case SOCK_VECTOR:
-      case SOCK_RGBA:
         return &ctx.pool.constant(read_vector_default(socket));
+      case SOCK_RGBA:
+        return &ctx.pool.constant_color(read_color_default(socket));
       case SOCK_INT:
-        return &ctx.pool.constant(float(read_int_default(socket)));
+        return &ctx.pool.constant(read_int_default(socket));
       case SOCK_BOOLEAN:
         return &ctx.pool.constant(read_bool_default(socket) ? 1.0f : 0.0f);
       default:
@@ -1729,10 +2017,10 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
      *   only, so the kernel picks between the old and the new position instead of skipping the
      *   write. */
     const HaExpr *base = node.input_socket(2).link != nullptr ?
-                             compile_input(ctx, node, 2) :
+                             compile_input_as(ctx, node, 2, HaType::Float3) :
                              &pool.add(HaType::Float3, HaOp::Position);
-    const HaExpr *offset = compile_input(ctx, node, 3);
-    const HaExpr *selection = compile_input(ctx, node, 1);
+    const HaExpr *offset = compile_input_as(ctx, node, 3, HaType::Float3);
+    const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
     if (!ctx.ok) {
       return fail(ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
     }
@@ -1894,60 +2182,32 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   attribute_names.reserve(attributes_.size());
   extra_resources.reserve(attributes_.size());
   {
-    const bke::AttributeAccessor &src_attributes = input_attributes;
     for (const int i : attributes_.index_range()) {
       const HaAttribute &attribute = attributes_[i];
-      const int64_t total = int64_t(padded_count) * attribute.components;
-      Array<float> host(total, 0.0f);
-
-      const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
-          attribute.name);
-      if (meta.has_value()) {
-        if (meta->domain != bke::AttrDomain::Point) {
-          /* Interpolating from another domain is not implemented; the CPU path handles it. */
-          return false;
-        }
-        if (attribute.components == 1) {
-          if (!ELEM(meta->data_type, bke::AttrType::Float, bke::AttrType::Int32,
-                    bke::AttrType::Bool))
-          {
-            return false;
-          }
-          const bke::AttributeReader<float> reader = src_attributes.lookup<float>(
-              attribute.name, bke::AttrDomain::Point);
-          if (reader) {
-            const VArray<float> &values = reader.varray;
-            for (const int element : IndexRange(element_count)) {
-              host[element] = values[element];
-            }
-          }
-        }
-        else {
-          if (meta->data_type != bke::AttrType::Float3) {
-            return false;
-          }
-          const bke::AttributeReader<float3> reader = src_attributes.lookup<float3>(
-              attribute.name, bke::AttrDomain::Point);
-          if (reader) {
-            const VArray<float3> &values = reader.varray;
-            for (const int element : IndexRange(element_count)) {
-              const float3 value = values[element];
-              host[element * 3 + 0] = value.x;
-              host[element * 3 + 1] = value.y;
-              host[element * 3 + 2] = value.z;
-            }
-          }
-        }
-      }
-
-      if (!attribute_buffers[i].ensure(total)) {
+      if (!upload_one_attribute(input_attributes,
+                                attribute,
+                                bke::AttrDomain::Point,
+                                element_count,
+                                padded_count,
+                                attribute_buffers[i]))
+      {
         return false;
       }
-      attribute_buffers[i].upload(host);
       attribute_names.append("attribute_" + std::to_string(i) + "[]");
-      extra_resources.append(
-          {3 + i, HaShaderQualifier::Read, "float", attribute_names.last().c_str()});
+      extra_resources.append({3 + i,
+                              HaShaderQualifier::Read,
+                              ha_attribute_buffer_glsl(attribute.type),
+                              attribute_names.last().c_str()});
     }
+  }
+
+  /* The generated source does not spell out the attribute buffer types (they are only in the
+   * resource list), so the shader key has to include them. Otherwise an int and a float attribute
+   * at the same slot would share a cached shader with the wrong declaration. */
+  std::string attribute_key;
+  for (const HaAttribute &attribute : attributes_) {
+    attribute_key += "|";
+    attribute_key += ha_attribute_buffer_glsl(attribute.type);
   }
 
   /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
@@ -2013,12 +2273,11 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   double dispatch_ms = 0.0;
   for (const int i : steps_.index_range()) {
     const HaProgramStep &step = steps_[i];
-    gpu::Shader *shader = ha_shader_get(step.glsl_position + '#' + step.glsl_selection,
-                                        step.glsl_position,
-                                        step.glsl_selection,
-                                        Span<const HaShaderResource>(extra_resources.data(),
-                                                                     int64_t(
-                                                                         extra_resources.size())));
+    gpu::Shader *shader = ha_shader_get(
+        step.glsl_position + '#' + step.glsl_selection + attribute_key,
+        step.glsl_position,
+        step.glsl_selection,
+        Span<const HaShaderResource>(extra_resources.data(), int64_t(extra_resources.size())));
     if (shader == nullptr) {
       return false;
     }
@@ -2059,12 +2318,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     if (!store_buffers[i].ensure(int64_t(padded_count) * store.components)) {
       return false;
     }
-    gpu::Shader *shader = ha_shader_get_store("store|" + store.glsl_value,
-                                             store.glsl_value,
-                                             store.components,
-                                             Span<const HaShaderResource>(extra_resources.data(),
-                                                                          int64_t(
-                                                                              extra_resources.size())));
+    gpu::Shader *shader = ha_shader_get_store("store|" + store.glsl_value + "|" +
+                                                  ha_type_glsl(store.type) + attribute_key,
+                                              store.glsl_value,
+                                              ha_type_glsl(store.type),
+                                              store.components,
+                                              Span<const HaShaderResource>(extra_resources.data(),
+                                                                           int64_t(
+                                                                               extra_resources.size())));
     if (shader == nullptr) {
       return false;
     }
@@ -2131,12 +2392,26 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   if (!stores_.is_empty()) {
     for (const int i : stores_.index_range()) {
       const HaStore &store = stores_[i];
+      if (store.type == HaType::Int) {
+        Array<int> host_store(padded_count);
+        store_buffers[i].download(
+            MutableSpan<float>(reinterpret_cast<float *>(host_store.data()), padded_count));
+        bke::SpanAttributeWriter<int> writer =
+            dst_attributes.lookup_or_add_for_write_span<int>(store.name, bke::AttrDomain::Point);
+        if (!writer) {
+          BKE_id_free(nullptr, dst_id);
+          return false;
+        }
+        writer.span.copy_from(host_store.as_span().take_front(element_count));
+        writer.finish();
+        continue;
+      }
+
       Array<float> host_store(padded_count * store.components);
       store_buffers[i].download(host_store);
-      if (store.components == 1) {
+      if (store.type == HaType::Float) {
         bke::SpanAttributeWriter<float> writer =
-            dst_attributes.lookup_or_add_for_write_span<float>(store.name,
-                                                               bke::AttrDomain::Point);
+            dst_attributes.lookup_or_add_for_write_span<float>(store.name, bke::AttrDomain::Point);
         if (!writer) {
           BKE_id_free(nullptr, dst_id);
           return false;
@@ -2144,16 +2419,43 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         writer.span.copy_from(host_store.as_span().take_front(element_count));
         writer.finish();
       }
-      else {
+      else if (store.type == HaType::Float2) {
+        bke::SpanAttributeWriter<float2> writer =
+            dst_attributes.lookup_or_add_for_write_span<float2>(store.name, bke::AttrDomain::Point);
+        if (!writer) {
+          BKE_id_free(nullptr, dst_id);
+          return false;
+        }
+        for (const int element : IndexRange(element_count)) {
+          writer.span[element] = float2(host_store[element * 2], host_store[element * 2 + 1]);
+        }
+        writer.finish();
+      }
+      else if (store.type == HaType::Float3) {
         bke::SpanAttributeWriter<float3> writer =
-            dst_attributes.lookup_or_add_for_write_span<float3>(store.name,
-                                                                bke::AttrDomain::Point);
+            dst_attributes.lookup_or_add_for_write_span<float3>(store.name, bke::AttrDomain::Point);
         if (!writer) {
           BKE_id_free(nullptr, dst_id);
           return false;
         }
         writer.span.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_store.data()),
                                            element_count));
+        writer.finish();
+      }
+      else {
+        bke::SpanAttributeWriter<ColorGeometry4f> writer =
+            dst_attributes.lookup_or_add_for_write_span<ColorGeometry4f>(store.name,
+                                                                         bke::AttrDomain::Point);
+        if (!writer) {
+          BKE_id_free(nullptr, dst_id);
+          return false;
+        }
+        for (const int element : IndexRange(element_count)) {
+          writer.span[element] = ColorGeometry4f(host_store[element * 4 + 0],
+                                                 host_store[element * 4 + 1],
+                                                 host_store[element * 4 + 2],
+                                                 host_store[element * 4 + 3]);
+        }
         writer.finish();
       }
     }
@@ -2267,9 +2569,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       const std::array<float, 4> element_params_host{float(count), 0.0f, 0.0f, 0.0f};
       element_params.upload(element_params_host);
 
+      std::string step_attribute_key;
+      for (const HaAttribute &attribute : step.attributes) {
+        step_attribute_key += "|";
+        step_attribute_key += ha_attribute_buffer_glsl(attribute.type);
+      }
       gpu::Shader *element_shader = ha_shader_get_element(
           "element|" + value_expression + "|" + step.glsl_selection + "|" +
-              std::to_string(step.components),
+              std::to_string(step.components) + step_attribute_key,
           value_expression,
           step.glsl_selection,
           step.components,

@@ -39,6 +39,8 @@
 #include "BLI_string_ref.hh"
 #include "BLI_vector.hh"
 
+#include "GEO_ha_expr.hh"
+
 namespace blender {
 struct bNodeTree;
 struct Material;
@@ -73,14 +75,16 @@ struct HaProgramStep {
 /** One POINT attribute the program reads, uploaded once per evaluation. */
 struct HaAttribute {
   std::string name;
-  /** 1 for a float attribute, 3 for a vector one. */
+  HaType type = HaType::Float;
+  /** 1 for a float/int attribute, 2/3/4 for a vector one. */
   int components = 1;
 };
 
 /** One `Store Named Attribute` node at the end of the chain (written back after the steps). */
 struct HaStore {
   std::string name;
-  /** 1 for a float attribute, 3 for a vector one. */
+  HaType type = HaType::Float;
+  /** 1 for a float/int attribute, 2/3/4 for a vector one. */
   int components = 1;
   /** GLSL expression, evaluated with `vec3 position` (the *final* position) and `int index`. */
   std::string glsl_value;

@@ -222,12 +222,13 @@ gpu::Shader *ha_shader_get(StringRef key,
 
 /**
  * Compiles a `Store Named Attribute` kernel: writes \a glsl_value (evaluated with `vec3 position`
- * and `int index` in scope) into `store_out[]`, which has \a components floats per element. Used
- * with the *final* position buffer bound as `position_in`, so the value field sees the geometry as
- * it leaves the zone.
+ * and `int index` in scope) into `store_out[]`, which has \a components elements of \a glsl_type
+ * per element. Used with the *final* position buffer bound as `position_in`, so the value field
+ * sees the geometry as it leaves the zone.
  */
 gpu::Shader *ha_shader_get_store(StringRef key,
                                  StringRef glsl_value,
+                                 const char *glsl_type,
                                  int components,
                                  Span<const HaShaderResource> extra_resources = {});
 
