@@ -7610,6 +7610,16 @@ static void def_geo_hw_accelerate_input(BlenderRNA *brna, StructRNA *srna)
                            "nodes with a device implementation (the XPBD fluid solver and the "
                            "position/field chains) leave the CPU");
   RNA_def_property_update(prop, NC_NODE | NA_EDITED, "rna_Node_update");
+
+  prop = RNA_def_property(srna, "vram_limit_mb", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "vram_limit_mb");
+  RNA_def_property_range(prop, 0, 1024 * 1024);
+  RNA_def_property_ui_text(
+      prop,
+      "VRAM Limit",
+      "Device memory this zone may allocate, in megabytes. Zero means unlimited. When the budget "
+      "is exceeded the zone stops dispatching to the device and reports a warning");
+  RNA_def_property_update(prop, NC_NODE | NA_EDITED, "rna_Node_update");
 }
 
 static void def_geo_hw_accelerate_output(BlenderRNA * /*brna*/, StructRNA *srna)
@@ -10760,6 +10770,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeGridToPoints");
   define("GeometryNode", "GeometryNodeGridVoxelize");
   define("GeometryNode", "GeometryNodeDilapidoForce");
+  define("GeometryNode", "GeometryNodeDilapidoFieldRemap");
   define("GeometryNode", "GeometryNodeIgnisSolver");
   define("GeometryNode", "GeometryNodeInitIgnisData");
   define("GeometryNode", "GeometryNodeHWAccelerateInput", def_geo_hw_accelerate_input);

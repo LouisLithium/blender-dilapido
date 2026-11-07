@@ -100,6 +100,33 @@ enum IgnisParam : int {
   P_DIV_AFTER_SUM,
   P_UNKNOWN_COUNT,
   P_USE_DOMAIN_MASK,
+  P_FORCE_TIME,
+  P_DISTURBANCE,
+  P_DISTURBANCE_SCALE,
+  P_DISTURBANCE_SPEED,
+  P_DISTURBANCE_SEED,
+  P_DISTURBANCE_OCTAVES,
+  P_DISTURBANCE_LACUNARITY,
+  P_DISTURBANCE_ROUGHNESS,
+  P_TURBULENCE,
+  P_TURBULENCE_SCALE,
+  P_TURBULENCE_SPEED,
+  P_TURBULENCE_SEED,
+  P_TURBULENCE_OCTAVES,
+  P_TURBULENCE_LACUNARITY,
+  P_TURBULENCE_ROUGHNESS,
+  P_DIST_REMAP_FIELD,
+  P_DIST_REMAP_MODE,
+  P_DIST_REMAP_MIN,
+  P_DIST_REMAP_MAX,
+  P_DIST_REMAP_SOFTNESS,
+  P_DIST_REMAP_SCALE,
+  P_TURB_REMAP_FIELD,
+  P_TURB_REMAP_MODE,
+  P_TURB_REMAP_MIN,
+  P_TURB_REMAP_MAX,
+  P_TURB_REMAP_SOFTNESS,
+  P_TURB_REMAP_SCALE,
   P_COUNT,
 };
 
@@ -155,6 +182,33 @@ const char *GLSL_PRELUDE =
     "#define HA_DIV_AFTER_SUM params[50]\n"
     "#define HA_UNKNOWN_COUNT params[51]\n"
     "#define HA_USE_DOMAIN_MASK int(params[52])\n"
+    "#define HA_FORCE_TIME params[53]\n"
+    "#define HA_DISTURBANCE params[54]\n"
+    "#define HA_DIST_SCALE params[55]\n"
+    "#define HA_DIST_SPEED params[56]\n"
+    "#define HA_DIST_SEED int(params[57])\n"
+    "#define HA_DIST_OCTAVES int(params[58])\n"
+    "#define HA_DIST_LACUNARITY params[59]\n"
+    "#define HA_DIST_ROUGHNESS params[60]\n"
+    "#define HA_TURBULENCE params[61]\n"
+    "#define HA_TURB_SCALE params[62]\n"
+    "#define HA_TURB_SPEED params[63]\n"
+    "#define HA_TURB_SEED int(params[64])\n"
+    "#define HA_TURB_OCTAVES int(params[65])\n"
+    "#define HA_TURB_LACUNARITY params[66]\n"
+    "#define HA_TURB_ROUGHNESS params[67]\n"
+    "#define HA_DIST_REMAP_FIELD int(params[68])\n"
+    "#define HA_DIST_REMAP_MODE int(params[69])\n"
+    "#define HA_DIST_REMAP_MIN params[70]\n"
+    "#define HA_DIST_REMAP_MAX params[71]\n"
+    "#define HA_DIST_REMAP_SOFTNESS params[72]\n"
+    "#define HA_DIST_REMAP_SCALE params[73]\n"
+    "#define HA_TURB_REMAP_FIELD int(params[74])\n"
+    "#define HA_TURB_REMAP_MODE int(params[75])\n"
+    "#define HA_TURB_REMAP_MIN params[76]\n"
+    "#define HA_TURB_REMAP_MAX params[77]\n"
+    "#define HA_TURB_REMAP_SOFTNESS params[78]\n"
+    "#define HA_TURB_REMAP_SCALE params[79]\n"
     "int ha_flat(ivec3 c) { return c.x + HA_DX * (c.y + HA_DY * c.z); }\n"
     "void ha_cell(int i, out ivec3 c)\n"
     "{\n"
@@ -338,6 +392,130 @@ const char *GLSL_ADVECT_SAMPLE_SCALAR =
 /** \{ */
 
 /* -------------------------------------------------------------------- */
+/** \name Procedural force helpers
+ *
+ * A bit-for-bit port of the CPU hash and value noise in `GEO_ignis_solver.cc`. `uint` arithmetic
+ * matches between C++ and GLSL, so the disturbance and turbulence patterns agree on both backends.
+ * \{ */
+
+const char *GLSL_FORCE_HELPERS =
+    "uint ha_force_hash(uint x)\n"
+    "{\n"
+    "  x ^= x >> 16;\n"
+    "  x *= 0x7feb352du;\n"
+    "  x ^= x >> 15;\n"
+    "  x *= 0x846ca68bu;\n"
+    "  x ^= x >> 16;\n"
+    "  return x;\n"
+    "}\n"
+    "float ha_force_channel(uint h, int channel)\n"
+    "{\n"
+    "  uint shift = uint(channel) * 10u;\n"
+    "  return float((h >> shift) & 0x3FFu) * (2.0 / 1023.0) - 1.0;\n"
+    "}\n"
+    "vec3 ha_force_random3(ivec3 c, int seed)\n"
+    "{\n"
+    "  uint h = ha_force_hash(uint(c.x) + ha_force_hash(uint(c.y) + ha_force_hash(uint(c.z) + "
+    "ha_force_hash(uint(seed)))));\n"
+    "  return vec3(ha_force_channel(h, 0), ha_force_channel(h, 1), ha_force_channel(h, 2));\n"
+    "}\n"
+    "float ha_force_fade(float t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }\n"
+    "vec3 ha_force_value_noise(vec3 p, int seed)\n"
+    "{\n"
+    "  vec3 base = floor(p);\n"
+    "  ivec3 c = ivec3(base);\n"
+    "  vec3 f = p - base;\n"
+    "  vec3 u = vec3(ha_force_fade(f.x), ha_force_fade(f.y), ha_force_fade(f.z));\n"
+    "  vec3 n000 = ha_force_random3(c + ivec3(0, 0, 0), seed);\n"
+    "  vec3 n100 = ha_force_random3(c + ivec3(1, 0, 0), seed);\n"
+    "  vec3 n010 = ha_force_random3(c + ivec3(0, 1, 0), seed);\n"
+    "  vec3 n110 = ha_force_random3(c + ivec3(1, 1, 0), seed);\n"
+    "  vec3 n001 = ha_force_random3(c + ivec3(0, 0, 1), seed);\n"
+    "  vec3 n101 = ha_force_random3(c + ivec3(1, 0, 1), seed);\n"
+    "  vec3 n011 = ha_force_random3(c + ivec3(0, 1, 1), seed);\n"
+    "  vec3 n111 = ha_force_random3(c + ivec3(1, 1, 1), seed);\n"
+    "  return mix(mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),\n"
+    "             mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);\n"
+    "}\n"
+    "vec3 ha_force_curl(vec3 p, int seed)\n"
+    "{\n"
+    "  float e = 0.5;\n"
+    "  vec3 v0 = ha_force_value_noise(p, seed);\n"
+    "  vec3 vx = ha_force_value_noise(p + vec3(e, 0.0, 0.0), seed);\n"
+    "  vec3 vy = ha_force_value_noise(p + vec3(0.0, e, 0.0), seed);\n"
+    "  vec3 vz = ha_force_value_noise(p + vec3(0.0, 0.0, e), seed);\n"
+    "  return vec3(((vy.z - v0.z) - (vz.y - v0.y)) / e,\n"
+    "              ((vz.x - v0.x) - (vx.z - v0.z)) / e,\n"
+    "              ((vx.y - v0.y) - (vy.x - v0.x)) / e);\n"
+    "}\n"
+    "float ha_remap_window(float value, int mode, float minv, float maxv, float softness)\n"
+    "{\n"
+    "  if (maxv < minv) { float t = minv; minv = maxv; maxv = t; }\n"
+    "  float range = max(maxv - minv, 1e-6);\n"
+    "  float soft = clamp(softness, 0.0, 1.0) * range;\n"
+    "  float lower = smoothstep(minv, minv + max(soft, 1e-6), value);\n"
+    "  float upper = 1.0 - smoothstep(maxv - max(soft, 1e-6), maxv, value);\n"
+    "  float inside = lower * upper;\n"
+    "  if (mode == 1) { return 1.0 - inside; }\n"
+    "  if (mode == 2) { return lower; }\n"
+    "  if (mode == 3) { return upper; }\n"
+    "  return inside;\n"
+    "}\n"
+    "float ha_remap_field_value(int field, ivec3 c, vec3 velocity_now)\n"
+    "{\n"
+    "  int index = ha_flat(c);\n"
+    "  if (field == 1) { return pressure[index]; }\n"
+    "  if (field == 2) { return scalars[index * 4 + 0]; }\n"
+    "  if (field == 3) { return scalars[index * 4 + 1]; }\n"
+    "  if (field == 4) { return scalars[index * 4 + 2]; }\n"
+    "  if (field == 5) { return scalars[index * 4 + 3]; }\n"
+    "  if (field == 6) { return length(velocity_now); }\n"
+    "  return 1.0;\n"
+    "}\n"
+    "vec3 ha_disturbance(vec3 p)\n"
+    "{\n"
+    "  if (HA_DISTURBANCE == 0.0) { return vec3(0.0); }\n"
+    "  float scale = max(HA_DIST_SCALE, 1e-4);\n"
+    "  vec3 q = p / scale + vec3(HA_FORCE_TIME * HA_DIST_SPEED,\n"
+    "                           HA_FORCE_TIME * HA_DIST_SPEED * 0.73,\n"
+    "                           HA_FORCE_TIME * HA_DIST_SPEED * 0.41);\n"
+    "  float amp = 1.0;\n"
+    "  float total = 0.0;\n"
+    "  vec3 result = vec3(0.0);\n"
+    "  for (int o = 0; o < 8; ++o) {\n"
+    "    if (o >= HA_DIST_OCTAVES) { break; }\n"
+    "    result += ha_force_value_noise(q + vec3(float(o) * 17.3, float(o) * 9.1, "
+    "float(o) * 3.7), HA_DIST_SEED + o * 131) * amp;\n"
+    "    total += amp;\n"
+    "    amp *= HA_DIST_ROUGHNESS;\n"
+    "    q *= HA_DIST_LACUNARITY;\n"
+    "  }\n"
+    "  return result * (HA_DISTURBANCE / max(total, 1e-4));\n"
+    "}\n"
+    "vec3 ha_turbulence(vec3 p)\n"
+    "{\n"
+    "  if (HA_TURBULENCE == 0.0) { return vec3(0.0); }\n"
+    "  float scale = max(HA_TURB_SCALE, 1e-4);\n"
+    "  vec3 q = p / scale + vec3(HA_FORCE_TIME * HA_TURB_SPEED,\n"
+    "                           HA_FORCE_TIME * HA_TURB_SPEED * 0.61,\n"
+    "                           HA_FORCE_TIME * HA_TURB_SPEED * 0.37);\n"
+    "  float amp = 1.0;\n"
+    "  float total = 0.0;\n"
+    "  vec3 result = vec3(0.0);\n"
+    "  for (int o = 0; o < 8; ++o) {\n"
+    "    if (o >= HA_TURB_OCTAVES) { break; }\n"
+    "    result += ha_force_curl(q + vec3(float(o) * 7.1, float(o) * 23.7, "
+    "float(o) * 11.3), HA_TURB_SEED + o * 197) * amp;\n"
+    "    total += amp;\n"
+    "    amp *= HA_TURB_ROUGHNESS;\n"
+    "    q *= HA_TURB_LACUNARITY;\n"
+    "  }\n"
+    "  return result * (HA_TURBULENCE / max(total, 1e-4));\n"
+    "}\n";
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Kernels
  * \{ */
 
@@ -377,9 +555,35 @@ const char *KERNEL_FORCES =
     "  if (scalars[i * 4 + 0] <= 1e-4) { return; }\n"
     "  float anomaly = scalars[i * 4 + 1] - HA_AMBIENT;\n"
     "  int base = i * 3;\n"
+    "  ivec3 c;\n"
+    "  ha_cell(i, c);\n"
     "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
     "  if (anomaly != 0.0) { v -= HA_GRAVITY * (HA_BUOYANCY * anomaly * HA_DT); }\n"
     "  v += HA_WIND * HA_DT;\n"
+    "  vec3 remap_velocity = v;\n"
+    "  float dist_factor = 1.0;\n"
+    "  float turb_factor = 1.0;\n"
+    "  if (HA_DIST_REMAP_FIELD != 0) {\n"
+    "    float fv = ha_remap_field_value(HA_DIST_REMAP_FIELD, c, remap_velocity);\n"
+    "    dist_factor = ha_remap_window(fv, HA_DIST_REMAP_MODE, HA_DIST_REMAP_MIN,\n"
+    "                                  HA_DIST_REMAP_MAX, HA_DIST_REMAP_SOFTNESS) *\n"
+    "                  max(HA_DIST_REMAP_SCALE, 0.0);\n"
+    "  }\n"
+    "  if (HA_TURB_REMAP_FIELD != 0) {\n"
+    "    float fv = ha_remap_field_value(HA_TURB_REMAP_FIELD, c, remap_velocity);\n"
+    "    turb_factor = ha_remap_window(fv, HA_TURB_REMAP_MODE, HA_TURB_REMAP_MIN,\n"
+    "                                  HA_TURB_REMAP_MAX, HA_TURB_REMAP_SOFTNESS) *\n"
+    "                  max(HA_TURB_REMAP_SCALE, 0.0);\n"
+    "  }\n"
+    "  if (HA_DISTURBANCE != 0.0 || HA_TURBULENCE != 0.0) {\n"
+    "    vec3 p = ha_world(c);\n"
+    "    if (HA_DISTURBANCE != 0.0 && dist_factor != 0.0) {\n"
+    "      v += ha_disturbance(p) * (HA_DT * dist_factor);\n"
+    "    }\n"
+    "    if (HA_TURBULENCE != 0.0 && turb_factor != 0.0) {\n"
+    "      v += ha_turbulence(p) * (HA_DT * turb_factor);\n"
+    "    }\n"
+    "  }\n"
     "  if (HA_DRAG > 0.0) { v *= 1.0 / (1.0 + HA_DRAG * HA_DT); }\n"
     "  v *= 1.0 / (1.0 + HA_DAMPING * HA_DT);\n"
     "  velocity[base + 0] = v.x;\n"
@@ -1308,9 +1512,11 @@ void HaIgnisSolver::create_shaders()
       HA_READ(0, "float", "params[]"),
       HA_READ(1, "float", "scalars[]"),
       HA_RW(2, "float", "velocity[]"),
+      HA_READ(3, "float", "pressure[]"),
   };
-  forces_ = shader(
-      "ignis|forces", common + KERNEL_FORCES, Span<const HaShaderResource>(forces_res, 3));
+  forces_ = shader("ignis|forces",
+                   common + GLSL_FORCE_HELPERS + KERNEL_FORCES,
+                   Span<const HaShaderResource>(forces_res, 4));
 
   static const HaShaderResource curl_res[] = {
       HA_READ(0, "float", "params[]"),
@@ -1859,6 +2065,33 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
   r_params[P_ORIGIN_Y] = float(frame.index_min.y);
   r_params[P_ORIGIN_Z] = float(frame.index_min.z);
   r_params[P_USE_DOMAIN_MASK] = s.use_domain_mask ? 1.0f : 0.0f;
+  r_params[P_FORCE_TIME] = s.force_time;
+  r_params[P_DISTURBANCE] = s.disturbance;
+  r_params[P_DISTURBANCE_SCALE] = std::max(1e-4f, s.disturbance_scale);
+  r_params[P_DISTURBANCE_SPEED] = s.disturbance_speed;
+  r_params[P_DISTURBANCE_SEED] = float(s.disturbance_seed);
+  r_params[P_DISTURBANCE_OCTAVES] = float(s.disturbance_octaves);
+  r_params[P_DISTURBANCE_LACUNARITY] = std::max(1.0f, s.disturbance_lacunarity);
+  r_params[P_DISTURBANCE_ROUGHNESS] = std::clamp(s.disturbance_roughness, 0.0f, 1.0f);
+  r_params[P_TURBULENCE] = s.turbulence;
+  r_params[P_TURBULENCE_SCALE] = std::max(1e-4f, s.turbulence_scale);
+  r_params[P_TURBULENCE_SPEED] = s.turbulence_speed;
+  r_params[P_TURBULENCE_SEED] = float(s.turbulence_seed);
+  r_params[P_TURBULENCE_OCTAVES] = float(s.turbulence_octaves);
+  r_params[P_TURBULENCE_LACUNARITY] = std::max(1.0f, s.turbulence_lacunarity);
+  r_params[P_TURBULENCE_ROUGHNESS] = std::clamp(s.turbulence_roughness, 0.0f, 1.0f);
+  r_params[P_DIST_REMAP_FIELD] = float(s.disturbance_remap_field);
+  r_params[P_DIST_REMAP_MODE] = float(s.disturbance_remap_mode);
+  r_params[P_DIST_REMAP_MIN] = s.disturbance_remap_min;
+  r_params[P_DIST_REMAP_MAX] = s.disturbance_remap_max;
+  r_params[P_DIST_REMAP_SOFTNESS] = std::clamp(s.disturbance_remap_softness, 0.0f, 1.0f);
+  r_params[P_DIST_REMAP_SCALE] = std::max(0.0f, s.disturbance_remap_scale);
+  r_params[P_TURB_REMAP_FIELD] = float(s.turbulence_remap_field);
+  r_params[P_TURB_REMAP_MODE] = float(s.turbulence_remap_mode);
+  r_params[P_TURB_REMAP_MIN] = s.turbulence_remap_min;
+  r_params[P_TURB_REMAP_MAX] = s.turbulence_remap_max;
+  r_params[P_TURB_REMAP_SOFTNESS] = std::clamp(s.turbulence_remap_softness, 0.0f, 1.0f);
+  r_params[P_TURB_REMAP_SCALE] = std::max(0.0f, s.turbulence_remap_scale);
 }
 
 void HaIgnisSolver::write_adv(const float dir,
@@ -2337,10 +2570,6 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     r_result.reason = "empty voxel box";
     return false;
   }
-  if (frame.max_voxels > 0 && cells > frame.max_voxels) {
-    r_result.reason = "the simulation is larger than the device voxel budget";
-    return false;
-  }
   cells_ = cells;
   blocks_ = (cells + GROUP_SIZE - 1) / GROUP_SIZE;
   radius_ = frame.solver_radius;
@@ -2424,6 +2653,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(params_.buf());
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
+        buffers.append(pressure_.buf());
         if (!pass(forces_, buffers, int(cells_))) {
           r_result.reason = "force pass failed";
           return false;

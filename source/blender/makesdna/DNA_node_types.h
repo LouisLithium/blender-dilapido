@@ -3564,6 +3564,9 @@ struct NodeGeometryHwAccelerateInput {
   int32_t output_node_id = 0;
   /** #NodeHwAccelerateBackend. */
   int backend = NODE_HW_ACCELERATE_BACKEND_AUTO;
+  /** Device memory budget of this zone in megabytes; 0 means unlimited. */
+  int vram_limit_mb = 0;
+  int _pad = 0;
 };
 
 struct NodeGeometryHwAccelerateOutput {

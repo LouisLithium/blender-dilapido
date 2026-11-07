@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -39,6 +40,9 @@ namespace blender::geometry::ha {
 namespace {
 
 constexpr int LOCAL_GROUP_SIZE = 64;
+
+/** Innermost zone budget of the current evaluation (GPU work is serialized by the context guard). */
+std::atomic<HaMemoryBudget *> g_memory_budget{nullptr};
 
 Map<std::string, gpu::Shader *> &shader_cache()
 {
@@ -416,6 +420,87 @@ const char *ha_context_error()
 /** \} */
 
 /* -------------------------------------------------------------------- */
+/** \name Device memory budget
+ * \{ */
+
+void HaMemoryBudget::set_limit(const int64_t bytes)
+{
+  limit_.store(bytes, std::memory_order_relaxed);
+  exceeded_.store(false, std::memory_order_relaxed);
+}
+
+int64_t HaMemoryBudget::limit() const
+{
+  return limit_.load(std::memory_order_relaxed);
+}
+
+int64_t HaMemoryBudget::used() const
+{
+  return used_.load(std::memory_order_relaxed);
+}
+
+int64_t HaMemoryBudget::peak() const
+{
+  return peak_.load(std::memory_order_relaxed);
+}
+
+bool HaMemoryBudget::exceeded() const
+{
+  return exceeded_.load(std::memory_order_acquire);
+}
+
+bool HaMemoryBudget::reserve(const int64_t bytes)
+{
+  if (bytes <= 0) {
+    return true;
+  }
+  if (exceeded_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  const int64_t limit = limit_.load(std::memory_order_relaxed);
+  const int64_t current = used_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+  int64_t peak = peak_.load(std::memory_order_relaxed);
+  while (current > peak &&
+         !peak_.compare_exchange_weak(peak, current, std::memory_order_relaxed))
+  {
+  }
+  if (limit > 0 && current > limit) {
+    used_.fetch_sub(bytes, std::memory_order_relaxed);
+    exceeded_.store(true, std::memory_order_release);
+    return false;
+  }
+  return true;
+}
+
+void HaMemoryBudget::release(const int64_t bytes)
+{
+  if (bytes <= 0) {
+    return;
+  }
+  const int64_t current = used_.fetch_sub(bytes, std::memory_order_relaxed) - bytes;
+  if (current < 0) {
+    used_.store(0, std::memory_order_relaxed);
+  }
+}
+
+HaMemoryScope::HaMemoryScope(HaMemoryBudget *budget)
+    : previous_(g_memory_budget.exchange(budget, std::memory_order_acq_rel))
+{
+}
+
+HaMemoryScope::~HaMemoryScope()
+{
+  g_memory_budget.store(previous_, std::memory_order_release);
+}
+
+HaMemoryBudget *ha_memory_budget_current()
+{
+  return g_memory_budget.load(std::memory_order_acquire);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Buffers
  * \{ */
 
@@ -431,14 +516,24 @@ HaBuffer::~HaBuffer()
   if (elements <= 0) {
     return false;
   }
-  buf_ = GPU_storagebuf_create_ex(size_t(elements) * sizeof(float),
+  const int64_t bytes = elements * int64_t(sizeof(float));
+  HaMemoryBudget *budget = ha_memory_budget_current();
+  if (budget != nullptr && !budget->reserve(bytes)) {
+    return false;
+  }
+  buf_ = GPU_storagebuf_create_ex(size_t(bytes),
                                   nullptr,
                                   GPU_USAGE_DYNAMIC,
                                   __func__);
   if (buf_ == nullptr) {
+    if (budget != nullptr) {
+      budget->release(bytes);
+    }
     return false;
   }
   elements_ = elements;
+  budget_ = budget;
+  reserved_bytes_ = bytes;
   return true;
 }
 
@@ -487,6 +582,11 @@ void HaBuffer::free()
      * a bind that is actually needed. */
     ha_bindings_invalidate();
   }
+  if (budget_ != nullptr && reserved_bytes_ > 0) {
+    budget_->release(reserved_bytes_);
+  }
+  budget_ = nullptr;
+  reserved_bytes_ = 0;
   elements_ = 0;
 }
 
@@ -504,14 +604,24 @@ bool HaBufferInt::ensure(const int64_t elements)
   if (elements <= 0) {
     return false;
   }
-  buf_ = GPU_storagebuf_create_ex(size_t(elements) * sizeof(int),
+  const int64_t bytes = elements * int64_t(sizeof(int));
+  HaMemoryBudget *budget = ha_memory_budget_current();
+  if (budget != nullptr && !budget->reserve(bytes)) {
+    return false;
+  }
+  buf_ = GPU_storagebuf_create_ex(size_t(bytes),
                                   nullptr,
                                   GPU_USAGE_DYNAMIC,
                                   __func__);
   if (buf_ == nullptr) {
+    if (budget != nullptr) {
+      budget->release(bytes);
+    }
     return false;
   }
   elements_ = elements;
+  budget_ = budget;
+  reserved_bytes_ = bytes;
   return true;
 }
 
@@ -568,6 +678,11 @@ void HaBufferInt::free()
     /* Same as #HaBuffer::free: the address may be reused by a new buffer. */
     ha_bindings_invalidate();
   }
+  if (budget_ != nullptr && reserved_bytes_ > 0) {
+    budget_->release(reserved_bytes_);
+  }
+  budget_ = nullptr;
+  reserved_bytes_ = 0;
   elements_ = 0;
 }
 

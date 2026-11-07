@@ -296,10 +296,89 @@ void append_collider(const Bundle &bundle, Vector<geometry::ignis::Collider> &r_
   r_colliders.append(collider);
 }
 
-/** Adds the acceleration of one `Dilapido Force` bundle. */
-void append_force(const Bundle &bundle, float3 &r_acceleration)
+/** One procedural force component of a `Dilapido Force` bundle. */
+struct NoiseForce {
+  bool configured = false;
+  float strength = 0.0f;
+  float scale = 1.0f;
+  float speed = 1.0f;
+  float lacunarity = 2.0f;
+  float roughness = 0.5f;
+  int seed = 0;
+  int octaves = 1;
+  int remap_field = 0;
+  int remap_mode = 0;
+  float remap_min = 0.0f;
+  float remap_max = 1.0f;
+  float remap_softness = 0.2f;
+  float remap_scale = 1.0f;
+};
+
+/** All forces collected from the effector bundle. */
+struct ForceFields {
+  float3 acceleration = float3(0.0f);
+  NoiseForce disturbance;
+  NoiseForce turbulence;
+  float time = 0.0f;
+};
+
+/** Adds the disturbance component of one `Dilapido Force` bundle. */
+void append_disturbance(const Bundle &bundle, NoiseForce &r_force)
 {
-  r_acceleration += read_vector(bundle, "acceleration", float3(0.0f));
+  const float strength = read_float(bundle, "disturbance", 0.0f);
+  if (strength == 0.0f) {
+    return;
+  }
+  if (!r_force.configured) {
+    r_force.scale = read_float(bundle, "disturbance_scale", 0.5f);
+    r_force.speed = read_float(bundle, "disturbance_speed", 1.0f);
+    r_force.seed = read_int(bundle, "disturbance_seed", 0);
+    r_force.octaves = read_int(bundle, "disturbance_octaves", 2);
+    r_force.lacunarity = read_float(bundle, "disturbance_lacunarity", 2.0f);
+    r_force.roughness = read_float(bundle, "disturbance_roughness", 0.5f);
+    r_force.remap_field = read_int(bundle, "disturbance_remap_field", 0);
+    r_force.remap_mode = read_int(bundle, "disturbance_remap_mode", 0);
+    r_force.remap_min = read_float(bundle, "disturbance_remap_min", 0.0f);
+    r_force.remap_max = read_float(bundle, "disturbance_remap_max", 1.0f);
+    r_force.remap_softness = read_float(bundle, "disturbance_remap_softness", 0.2f);
+    r_force.remap_scale = read_float(bundle, "disturbance_remap_scale", 1.0f);
+    r_force.configured = true;
+  }
+  r_force.strength += strength;
+}
+
+/** Adds the turbulence component of one `Dilapido Force` bundle. */
+void append_turbulence(const Bundle &bundle, NoiseForce &r_force)
+{
+  const float strength = read_float(bundle, "turbulence", 0.0f);
+  if (strength == 0.0f) {
+    return;
+  }
+  if (!r_force.configured) {
+    r_force.scale = read_float(bundle, "turbulence_scale", 0.25f);
+    r_force.speed = read_float(bundle, "turbulence_speed", 1.0f);
+    r_force.seed = read_int(bundle, "turbulence_seed", 0);
+    r_force.octaves = read_int(bundle, "turbulence_octaves", 3);
+    r_force.lacunarity = read_float(bundle, "turbulence_lacunarity", 2.0f);
+    r_force.roughness = read_float(bundle, "turbulence_roughness", 0.5f);
+    r_force.remap_field = read_int(bundle, "turbulence_remap_field", 0);
+    r_force.remap_mode = read_int(bundle, "turbulence_remap_mode", 0);
+    r_force.remap_min = read_float(bundle, "turbulence_remap_min", 0.0f);
+    r_force.remap_max = read_float(bundle, "turbulence_remap_max", 1.0f);
+    r_force.remap_softness = read_float(bundle, "turbulence_remap_softness", 0.2f);
+    r_force.remap_scale = read_float(bundle, "turbulence_remap_scale", 1.0f);
+    r_force.configured = true;
+  }
+  r_force.strength += strength;
+}
+
+/** Adds the wind, disturbance, turbulence and time of one `Dilapido Force` bundle. */
+void append_force(const Bundle &bundle, ForceFields &r_forces)
+{
+  r_forces.acceleration += read_vector(bundle, "acceleration", float3(0.0f));
+  append_disturbance(bundle, r_forces.disturbance);
+  append_turbulence(bundle, r_forces.turbulence);
+  r_forces.time = read_float(bundle, "time", r_forces.time);
 }
 
 /**
@@ -310,7 +389,7 @@ void append_force(const Bundle &bundle, float3 &r_acceleration)
  */
 void gather_effectors(const Bundle &effectors,
                       Vector<geometry::ignis::Collider> &r_colliders,
-                      float3 &r_acceleration)
+                      ForceFields &r_forces)
 {
   auto is_effector = [](const StringRef type) {
     return type == COLLIDER_MESH_TYPE || type == COLLIDER_BOX_TYPE || type == FORCE_TYPE;
@@ -324,7 +403,7 @@ void gather_effectors(const Bundle &effectors,
       append_collider(bundle, r_colliders);
     }
     else if (*type == FORCE_TYPE) {
-      append_force(bundle, r_acceleration);
+      append_force(bundle, r_forces);
     }
   };
 
@@ -430,25 +509,58 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   Vector<geometry::ignis::Collider> colliders;
-  float3 acceleration = float3(0.0f);
+  ForceFields forces;
   if (const BundlePtr *effectors = world_ptr->lookup_ptr<BundlePtr>(*BundleKey::from_str("effectors")))
   {
     if (*effectors) {
-      gather_effectors(**effectors, colliders, acceleration);
+      gather_effectors(**effectors, colliders, forces);
     }
   }
-  /* `Dilapido Force` is a uniform acceleration; the solver adds it to the wind term. */
-  settings.wind += acceleration;
+  /* `Dilapido Force` is a uniform acceleration plus optional procedural noise forces. */
+  settings.wind += forces.acceleration;
+  if (forces.disturbance.configured) {
+    settings.disturbance = forces.disturbance.strength;
+    settings.disturbance_scale = forces.disturbance.scale;
+    settings.disturbance_speed = forces.disturbance.speed;
+    settings.disturbance_seed = forces.disturbance.seed;
+    settings.disturbance_octaves = forces.disturbance.octaves;
+    settings.disturbance_lacunarity = forces.disturbance.lacunarity;
+    settings.disturbance_roughness = forces.disturbance.roughness;
+    settings.disturbance_remap_field = forces.disturbance.remap_field;
+    settings.disturbance_remap_mode = forces.disturbance.remap_mode;
+    settings.disturbance_remap_min = forces.disturbance.remap_min;
+    settings.disturbance_remap_max = forces.disturbance.remap_max;
+    settings.disturbance_remap_softness = forces.disturbance.remap_softness;
+    settings.disturbance_remap_scale = forces.disturbance.remap_scale;
+  }
+  if (forces.turbulence.configured) {
+    settings.turbulence = forces.turbulence.strength;
+    settings.turbulence_scale = forces.turbulence.scale;
+    settings.turbulence_speed = forces.turbulence.speed;
+    settings.turbulence_seed = forces.turbulence.seed;
+    settings.turbulence_octaves = forces.turbulence.octaves;
+    settings.turbulence_lacunarity = forces.turbulence.lacunarity;
+    settings.turbulence_roughness = forces.turbulence.roughness;
+    settings.turbulence_remap_field = forces.turbulence.remap_field;
+    settings.turbulence_remap_mode = forces.turbulence.remap_mode;
+    settings.turbulence_remap_min = forces.turbulence.remap_min;
+    settings.turbulence_remap_max = forces.turbulence.remap_max;
+    settings.turbulence_remap_softness = forces.turbulence.remap_softness;
+    settings.turbulence_remap_scale = forces.turbulence.remap_scale;
+  }
+  settings.force_time = forces.time;
 
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
     printf("IGNIS_DEBUG exec: previous %s, sources %d, colliders %d, acceleration %.2f %.2f %.2f, "
-           "dt %.4f\n",
+           "disturbance %.2f, turbulence %.2f, dt %.4f\n",
            previous != nullptr ? "yes" : "no",
            int(sources.size()),
            int(colliders.size()),
-           double(acceleration.x),
-           double(acceleration.y),
-           double(acceleration.z),
+           double(forces.acceleration.x),
+           double(forces.acceleration.y),
+           double(forces.acceleration.z),
+           double(settings.disturbance),
+           double(settings.turbulence),
            delta_time);
     for (const geometry::ignis::Collider &collider : colliders) {
       printf("IGNIS_DEBUG collider: sweep %d, deforming %d, previous mesh %s, previous "

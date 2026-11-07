@@ -15,6 +15,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+
 #include "BLI_span.hh"
 #include "BLI_string_ref.hh"
 
@@ -115,6 +118,52 @@ const char *ha_context_error();
 
 /** \} */
 
+/* -------------------------------------------------------------------- */
+/** \name Device memory budget
+ *
+ * A `HW Accelerate` zone can carry a VRAM budget. Every `HaBuffer` allocation is charged to the
+ * innermost budget on the current evaluation. Once an allocation would cross the limit the budget
+ * is latched as exceeded and all further allocations fail, so the accelerated nodes stop dispatching
+ * and fall back to the CPU instead of letting the driver run out of memory.
+ *
+ * The GPU work of this module is already serialized by the context guard, so one active budget at a
+ * time is enough. Nested zones save and restore the previous budget.
+ * \{ */
+
+class HaMemoryBudget {
+ public:
+  void set_limit(int64_t bytes);
+  int64_t limit() const;
+  int64_t used() const;
+  int64_t peak() const;
+  bool exceeded() const;
+
+  bool reserve(int64_t bytes);
+  void release(int64_t bytes);
+
+ private:
+  std::atomic<int64_t> limit_{0};
+  std::atomic<int64_t> used_{0};
+  std::atomic<int64_t> peak_{0};
+  std::atomic<bool> exceeded_{false};
+};
+
+class HaMemoryScope {
+ public:
+  explicit HaMemoryScope(HaMemoryBudget *budget);
+  ~HaMemoryScope();
+  HaMemoryScope(const HaMemoryScope &) = delete;
+  HaMemoryScope &operator=(const HaMemoryScope &) = delete;
+
+ private:
+  HaMemoryBudget *previous_ = nullptr;
+};
+
+/** Budget of the innermost zone being evaluated on this thread, null outside of zones. */
+HaMemoryBudget *ha_memory_budget_current();
+
+/** \} */
+
 /** A storage buffer holding `float` elements (used for interleaved positions: 3 per element). */class HaBuffer {
  public:
   HaBuffer() = default;
@@ -147,6 +196,8 @@ const char *ha_context_error();
  private:
   gpu::StorageBuf *buf_ = nullptr;
   int64_t elements_ = 0;
+  HaMemoryBudget *budget_ = nullptr;
+  int64_t reserved_bytes_ = 0;
 };
 
 /**
@@ -186,6 +237,8 @@ class HaBufferInt {
  private:
   gpu::StorageBuf *buf_ = nullptr;
   int64_t elements_ = 0;
+  HaMemoryBudget *budget_ = nullptr;
+  int64_t reserved_bytes_ = 0;
 };
 
 /** Access qualifier of one storage buffer binding, mirrors `gpu::shader::Qualifier`. */

@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "BLI_array.hh"
 #include "BLI_math_base.hh"
@@ -427,6 +429,180 @@ typename GridType::Ptr advect_with_velocity(const GridType &grid,
 /** \name Forces
  * \{ */
 
+/* -------------------------------------------------------------------- */
+/** \name Procedural forces
+ *
+ * The same 32 bit hash and value noise are used by the device kernels, so the CPU and the GPU see
+ * the same disturbance / turbulence pattern. The hash is cheap, integer only and independent of
+ * the thread that evaluates it.
+ * \{ */
+
+uint32_t force_hash_u32(uint32_t x)
+{
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+/** One of three signed random values packed into the 32 bit hash. */
+float force_hash_channel(const uint32_t hash, const int channel)
+{
+  const uint32_t shift = uint32_t(channel) * 10u;
+  return float((hash >> shift) & 0x3FFu) * (2.0f / 1023.0f) - 1.0f;
+}
+
+float3 force_random3(const int3 cell, const int seed)
+{
+  const uint32_t hash = force_hash_u32(
+      uint32_t(cell.x) +
+      force_hash_u32(uint32_t(cell.y) + force_hash_u32(uint32_t(cell.z) +
+                                                       force_hash_u32(uint32_t(seed)))));
+  return float3(force_hash_channel(hash, 0),
+                force_hash_channel(hash, 1),
+                force_hash_channel(hash, 2));
+}
+
+float force_fade(const float t)
+{
+  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float3 force_lerp(const float3 a, const float3 b, const float t)
+{
+  /* Match GLSL `mix()` exactly. */
+  return a * (1.0f - t) + b * t;
+}
+
+float3 force_value_noise(const float3 p, const int seed)
+{
+  const float3 base(std::floor(p.x), std::floor(p.y), std::floor(p.z));
+  const int3 cell(int(base.x), int(base.y), int(base.z));
+  const float3 f = p - base;
+  const float3 u(force_fade(f.x), force_fade(f.y), force_fade(f.z));
+
+  const float3 n000 = force_random3(int3(cell.x, cell.y, cell.z), seed);
+  const float3 n100 = force_random3(int3(cell.x + 1, cell.y, cell.z), seed);
+  const float3 n010 = force_random3(int3(cell.x, cell.y + 1, cell.z), seed);
+  const float3 n110 = force_random3(int3(cell.x + 1, cell.y + 1, cell.z), seed);
+  const float3 n001 = force_random3(int3(cell.x, cell.y, cell.z + 1), seed);
+  const float3 n101 = force_random3(int3(cell.x + 1, cell.y, cell.z + 1), seed);
+  const float3 n011 = force_random3(int3(cell.x, cell.y + 1, cell.z + 1), seed);
+  const float3 n111 = force_random3(int3(cell.x + 1, cell.y + 1, cell.z + 1), seed);
+
+  const float3 n00 = force_lerp(n000, n100, u.x);
+  const float3 n10 = force_lerp(n010, n110, u.x);
+  const float3 n01 = force_lerp(n001, n101, u.x);
+  const float3 n11 = force_lerp(n011, n111, u.x);
+  const float3 n0 = force_lerp(n00, n10, u.y);
+  const float3 n1 = force_lerp(n01, n11, u.y);
+  return force_lerp(n0, n1, u.z);
+}
+
+/** Forward difference curl of the vector value noise (divergence free up to the stencil error). */
+float3 force_curl_noise(const float3 p, const int seed)
+{
+  constexpr float eps = 0.5f;
+  const float3 v0 = force_value_noise(p, seed);
+  const float3 vx = force_value_noise(p + float3(eps, 0.0f, 0.0f), seed);
+  const float3 vy = force_value_noise(p + float3(0.0f, eps, 0.0f), seed);
+  const float3 vz = force_value_noise(p + float3(0.0f, 0.0f, eps), seed);
+  return float3(((vy.z - v0.z) - (vz.y - v0.y)) / eps,
+                ((vz.x - v0.x) - (vx.z - v0.z)) / eps,
+                ((vx.y - v0.y) - (vy.x - v0.x)) / eps);
+}
+
+float3 force_disturbance(const float3 p, const Settings &settings)
+{
+  if (settings.disturbance == 0.0f) {
+    return float3(0.0f);
+  }
+  const float scale = std::max(1e-4f, settings.disturbance_scale);
+  const float3 flow = float3(settings.force_time * settings.disturbance_speed,
+                             settings.force_time * settings.disturbance_speed * 0.73f,
+                             settings.force_time * settings.disturbance_speed * 0.41f);
+  float3 q = p / scale + flow;
+  const int octaves = std::clamp(settings.disturbance_octaves, 1, 8);
+  const float lacunarity = std::max(1.0f, settings.disturbance_lacunarity);
+  const float roughness = std::clamp(settings.disturbance_roughness, 0.0f, 1.0f);
+  float amplitude = 1.0f;
+  float total = 0.0f;
+  float3 result(0.0f);
+  for (int octave = 0; octave < octaves; octave++) {
+    const float3 offset(float(octave) * 17.3f, float(octave) * 9.1f, float(octave) * 3.7f);
+    result += force_value_noise(q + offset, settings.disturbance_seed + octave * 131) * amplitude;
+    total += amplitude;
+    amplitude *= roughness;
+    q *= lacunarity;
+  }
+  return result * (settings.disturbance / std::max(total, 1e-4f));
+}
+
+float3 force_turbulence(const float3 p, const Settings &settings)
+{
+  if (settings.turbulence == 0.0f) {
+    return float3(0.0f);
+  }
+  const float scale = std::max(1e-4f, settings.turbulence_scale);
+  const float3 flow = float3(settings.force_time * settings.turbulence_speed,
+                             settings.force_time * settings.turbulence_speed * 0.61f,
+                             settings.force_time * settings.turbulence_speed * 0.37f);
+  float3 q = p / scale + flow;
+  const int octaves = std::clamp(settings.turbulence_octaves, 1, 8);
+  const float lacunarity = std::max(1.0f, settings.turbulence_lacunarity);
+  const float roughness = std::clamp(settings.turbulence_roughness, 0.0f, 1.0f);
+  float amplitude = 1.0f;
+  float total = 0.0f;
+  float3 result(0.0f);
+  for (int octave = 0; octave < octaves; octave++) {
+    const float3 offset(float(octave) * 7.1f, float(octave) * 23.7f, float(octave) * 11.3f);
+    result += force_curl_noise(q + offset, settings.turbulence_seed + octave * 197) * amplitude;
+    total += amplitude;
+    amplitude *= roughness;
+    q *= lacunarity;
+  }
+  return result * (settings.turbulence / std::max(total, 1e-4f));
+}
+
+/** Smooth window used by the force remap. `softness` is a fraction of the field range. */
+float force_remap_window(const float value,
+                         const int mode,
+                         float min,
+                         float max,
+                         const float softness)
+{
+  if (min > max) {
+    std::swap(min, max);
+  }
+  const float range = std::max(max - min, 1e-6f);
+  const float soft = std::clamp(softness, 0.0f, 1.0f) * range;
+  auto smooth = [](const float edge0, const float edge1, const float x) {
+    if (edge1 <= edge0) {
+      return x < edge0 ? 0.0f : 1.0f;
+    }
+    const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+  };
+  const float lower = smooth(min, min + soft, value);
+  const float upper = 1.0f - smooth(max - soft, max, value);
+  const float inside = lower * upper;
+  switch (mode) {
+    case 1:
+      return 1.0f - inside;
+    case 2:
+      return lower;
+    case 3:
+      return upper;
+    case 0:
+    default:
+      return inside;
+  }
+}
+
+/** \} */
+
 void apply_forces(State &state, const Settings &settings, const float delta_time)
 {
   const float dt = delta_time;
@@ -449,10 +625,46 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
       coords.append(iter.getCoord());
     }
   }
+  auto grid_accessor = [](const openvdb::FloatGrid::Ptr &grid)
+      -> std::optional<openvdb::FloatGrid::ConstAccessor> {
+    if (!grid) {
+      return std::nullopt;
+    }
+    return grid->getConstAccessor();
+  };
+  const std::optional<openvdb::FloatGrid::ConstAccessor> density_accessor =
+      grid_accessor(state.density);
+  const std::optional<openvdb::FloatGrid::ConstAccessor> temperature_accessor =
+      grid_accessor(state.temperature);
+  const std::optional<openvdb::FloatGrid::ConstAccessor> fuel_accessor =
+      grid_accessor(state.fuel);
+  const std::optional<openvdb::FloatGrid::ConstAccessor> flame_accessor =
+      grid_accessor(state.flame);
+  const std::optional<openvdb::FloatGrid::ConstAccessor> pressure_accessor =
+      grid_accessor(state.pressure);
+
+  auto read_field = [&](const int field, const float velocity_length, const Coord &coord) {
+    switch (field) {
+      case 1:
+        return pressure_accessor ? pressure_accessor->getValue(coord) : 0.0f;
+      case 2:
+        return density_accessor ? density_accessor->getValue(coord) : 0.0f;
+      case 3:
+        return temperature_accessor ? temperature_accessor->getValue(coord) : 0.0f;
+      case 4:
+        return fuel_accessor ? fuel_accessor->getValue(coord) : 0.0f;
+      case 5:
+        return flame_accessor ? flame_accessor->getValue(coord) : 0.0f;
+      case 6:
+        return velocity_length;
+      default:
+        return 1.0f;
+    }
+  };
+
   threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
                           [&](const IndexRange range) {
     openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
-    const openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
     for (const int64_t i : range) {
       const Coord &coord = coords[i];
       float3 value = from_vdb(velocity.getValue(coord));
@@ -460,12 +672,53 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
        * on the smoke is its density anomaly. With a temperature relative to the ambient that anomaly
        * is just `T - ambient`, and `buoyancy = 1` means one unit above ambient accelerates the smoke
        * at `g`: positive temperatures rise, negative ones sink, no separate gravity is applied. */
-      const float anomaly = temperature.getValue(coord) - ambient;
+      const float temperature = temperature_accessor ? temperature_accessor->getValue(coord) : 0.0f;
+      const float anomaly = temperature - ambient;
       if (anomaly != 0.0f) {
         /* Opposite to gravity, so a positive anomaly rises and a negative one sinks. */
         value -= settings.gravity * (buoyancy * anomaly * dt);
       }
       value += settings.wind * dt;
+      if (settings.disturbance != 0.0f || settings.turbulence != 0.0f) {
+        const openvdb::Vec3d world = state.velocity->transform().indexToWorld(coord);
+        const float3 position(float(world.x()), float(world.y()), float(world.z()));
+        const float velocity_length = math::length(value);
+
+        auto remap_factor = [&](const int field,
+                                const int mode,
+                                const float min,
+                                const float max,
+                                const float softness,
+                                const float scale) {
+          if (field == 0) {
+            return 1.0f;
+          }
+          if (scale <= 0.0f) {
+            return 0.0f;
+          }
+          const float field_value = read_field(field, velocity_length, coord);
+          return force_remap_window(field_value, mode, min, max, softness) * scale;
+        };
+
+        const float disturbance_factor = remap_factor(settings.disturbance_remap_field,
+                                                      settings.disturbance_remap_mode,
+                                                      settings.disturbance_remap_min,
+                                                      settings.disturbance_remap_max,
+                                                      settings.disturbance_remap_softness,
+                                                      settings.disturbance_remap_scale);
+        const float turbulence_factor = remap_factor(settings.turbulence_remap_field,
+                                                     settings.turbulence_remap_mode,
+                                                     settings.turbulence_remap_min,
+                                                     settings.turbulence_remap_max,
+                                                     settings.turbulence_remap_softness,
+                                                     settings.turbulence_remap_scale);
+        if (disturbance_factor != 0.0f) {
+          value += force_disturbance(position, settings) * (dt * disturbance_factor);
+        }
+        if (turbulence_factor != 0.0f) {
+          value += force_turbulence(position, settings) * (dt * turbulence_factor);
+        }
+      }
       if (drag > 0.0f) {
         value *= 1.0f / (1.0f + drag * dt);
       }
@@ -1811,18 +2064,8 @@ static Volume *solve_frame_device(const Volume *previous,
   const int64_t dim_y = int64_t(bmax.y()) - bmin.y() + 1;
   const int64_t dim_z = int64_t(bmax.z()) - bmin.z() + 1;
   const int64_t cells = dim_x * dim_y * dim_z;
-  int64_t budget = 2097152;
-  if (const char *value = std::getenv("BLENDER_IGNIS_GPU_MAX_VOXELS")) {
-    const int64_t parsed = std::atoll(value);
-    if (parsed > 0) {
-      budget = parsed;
-    }
-  }
-  if (cells > budget) {
-    r_reason = "the simulation needs " + std::to_string(cells) +
-               " voxels, above the device budget of " + std::to_string(budget);
-    return nullptr;
-  }
+  /* No artificial voxel cap: the device allocation either succeeds or reports its own failure
+   * (and the zone VRAM budget can reject it before the driver runs out of memory). */
 
   Array<float> scalars;
   Array<float> velocity;
@@ -2055,7 +2298,6 @@ static Volume *solve_frame_device(const Volume *previous,
   frame.substeps = substeps;
   frame.solver_radius = radius;
   frame.extrapolate = std::max(0, settings.extrapolate);
-  frame.max_voxels = budget;
   frame.settings = settings;
   frame.scalars = scalars.as_mutable_span();
   frame.velocity = velocity.as_mutable_span();

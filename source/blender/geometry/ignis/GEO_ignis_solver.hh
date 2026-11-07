@@ -96,6 +96,36 @@ struct Settings {
   /* Forces and transport. */
   float3 gravity = float3(0.0f, 0.0f, -9.81f);
   float3 wind = float3(0.0f);
+  /** Low frequency procedural force, in m/s². */
+  float disturbance = 0.0f;
+  float disturbance_scale = 0.5f;
+  float disturbance_speed = 1.0f;
+  int disturbance_seed = 0;
+  int disturbance_octaves = 2;
+  float disturbance_lacunarity = 2.0f;
+  float disturbance_roughness = 0.5f;
+  /** Divergence free curl noise force, in m/s². */
+  float turbulence = 0.0f;
+  float turbulence_scale = 0.25f;
+  float turbulence_speed = 1.0f;
+  int turbulence_seed = 0;
+  int turbulence_octaves = 3;
+  float turbulence_lacunarity = 2.0f;
+  float turbulence_roughness = 0.5f;
+  int disturbance_remap_field = 0;
+  int disturbance_remap_mode = 0;
+  float disturbance_remap_min = 0.0f;
+  float disturbance_remap_max = 1.0f;
+  float disturbance_remap_softness = 0.2f;
+  float disturbance_remap_scale = 1.0f;
+  int turbulence_remap_field = 0;
+  int turbulence_remap_mode = 0;
+  float turbulence_remap_min = 0.0f;
+  float turbulence_remap_max = 1.0f;
+  float turbulence_remap_softness = 0.2f;
+  float turbulence_remap_scale = 1.0f;
+  /** Scene time in seconds, so the force patterns move with the animation. */
+  float force_time = 0.0f;
   /** Acceleration per unit of temperature anomaly, in units of gravity. */
   float buoyancy = 1.0f;
   /** The temperature field is measured against this; 0 means the field is the anomaly itself. */

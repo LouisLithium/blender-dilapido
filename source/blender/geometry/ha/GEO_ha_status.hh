@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 struct bNode;
@@ -49,6 +50,11 @@ struct HaNodeStatus {
    * the zone is cheap while a second zone is not. Zero when the node does not report it.
    */
   int steps = 0;
+  /** Device storage buffers charged to this zone during the last evaluation. */
+  int64_t vram_used = 0;
+  int64_t vram_peak = 0;
+  /** Zone budget in bytes; zero means unlimited. */
+  int64_t vram_limit = 0;
 };
 
 /** Publishes the state of the last evaluation of \a node. */

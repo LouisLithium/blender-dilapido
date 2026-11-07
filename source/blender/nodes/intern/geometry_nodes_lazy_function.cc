@@ -29,6 +29,9 @@
 #include "NOD_multi_function.hh"
 #include "NOD_node_declaration.hh"
 
+#include <algorithm>
+#include <cstdint>
+
 #include "BLI_array_utils.hh"
 #include "BLI_bit_group_vector.hh"
 #include "BLI_bit_span_ops.hh"
@@ -1901,14 +1904,20 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     const ScopedNodeTimer node_timer{context, output_bnode_};
 
     const geometry::ha::HaScope scope{this->backend_scope()};
+    geometry::ha::HaMemoryBudget memory_budget;
+    memory_budget.set_limit(this->vram_limit_bytes());
+    const geometry::ha::HaMemoryScope memory_scope{&memory_budget};
 
     std::string fallback_reason;
     int elements = 0;
     if (this->try_execute_on_gpu(params, fallback_reason, elements)) {
-      this->publish_status(geometry::ha::HaNodeState::Device, {}, elements);
+      if (memory_budget.exceeded()) {
+        this->report_memory_limit(context, memory_budget);
+      }
+      this->publish_status(geometry::ha::HaNodeState::Device, {}, elements, &memory_budget);
       return;
     }
-    this->report_fallback(context, fallback_reason);
+    const bool reported_memory = this->report_fallback(context, fallback_reason, &memory_budget);
 
     /* Every nested graph in Blender gets its own user data and local user data: the local one
      * caches things like the node tree logger (which the node preview uses), so sharing the outer
@@ -1948,6 +1957,9 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     lf::RemappedParams remapped_params{
         fn_, params, input_map_, output_map_, multi_threading_enabled_};
     fn_.execute(remapped_params, body_context);
+    if (!reported_memory && memory_budget.exceeded()) {
+      this->report_memory_limit(body_context, memory_budget);
+    }
   }
 
   /**
@@ -2023,7 +2035,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
    */
   void publish_status(const geometry::ha::HaNodeState state,
                       std::string reason,
-                      const int elements) const
+                      const int elements,
+                      const geometry::ha::HaMemoryBudget *memory_budget = nullptr) const
   {
     const bNode *input_node = zone_.input_node();
     if (input_node == nullptr) {
@@ -2038,6 +2051,11 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     }
     else {
       status.reason = std::move(reason);
+    }
+    if (memory_budget != nullptr) {
+      status.vram_used = memory_budget->used();
+      status.vram_peak = memory_budget->peak();
+      status.vram_limit = memory_budget->limit();
     }
     if (getenv("BLENDER_HA_DEBUG") != nullptr) {
       /* The node UI looks the status up with the *displayed* tree and node, so the identity used
@@ -2058,30 +2076,68 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
    * with `Auto` it is information. `Force CPU` is what the user asked for, so nothing is reported.
    * A silent fallback is exactly what made this feature hard to trust (see M88b).
    */
-  void report_fallback(const lf::Context &context, const std::string &reason) const
+  bool report_fallback(const lf::Context &context,
+                       const std::string &reason,
+                       const geometry::ha::HaMemoryBudget *memory_budget) const
   {
     const bNode *input_node = zone_.input_node();
     const geometry::ha::HaScopeBackend backend = this->backend_scope();
+    const bool memory_exceeded = memory_budget != nullptr && memory_budget->exceeded();
     if (backend == geometry::ha::HaScopeBackend::ForceCpu) {
       /* Not a fallback: the user asked for the CPU. Clear the hint so switching the backend does
        * not leave a stale "device" badge behind. */
       if (input_node != nullptr) {
         geometry::ha::ha_status_clear(btree_, *input_node);
       }
-      return;
+      return memory_exceeded;
     }
-    this->publish_status(geometry::ha::HaNodeState::Fallback, reason, 0);
+    std::string full_reason = reason;
+    if (memory_exceeded) {
+      full_reason += fmt::format("; VRAM limit exceeded (peak {} of {} MB)",
+                                 double(memory_budget->peak()) / (1024.0 * 1024.0),
+                                 double(memory_budget->limit()) / (1024.0 * 1024.0));
+    }
+    this->publish_status(geometry::ha::HaNodeState::Fallback, full_reason, 0, memory_budget);
     if (input_node == nullptr) {
-      return;
+      return memory_exceeded;
     }
-    const NodeWarningType type = backend == geometry::ha::HaScopeBackend::Strict ?
+    const NodeWarningType type = memory_exceeded || backend == geometry::ha::HaScopeBackend::Strict ?
                                      NodeWarningType::Warning :
                                      NodeWarningType::Info;
     report_from_lazy_function(
         context,
         *input_node,
         type,
-        fmt::format("HW Accelerate zone: the body is evaluated on the CPU ({})", reason));
+        fmt::format("HW Accelerate zone: the body is evaluated on the CPU ({})", full_reason));
+    return memory_exceeded;
+  }
+
+  /** Reports a budget overrun when the body itself (not the zone program) tried to allocate. */
+  void report_memory_limit(const lf::Context &context,
+                           const geometry::ha::HaMemoryBudget &memory_budget) const
+  {
+    const bNode *input_node = zone_.input_node();
+    if (input_node == nullptr) {
+      return;
+    }
+    report_from_lazy_function(
+        context,
+        *input_node,
+        NodeWarningType::Warning,
+        fmt::format("HW Accelerate zone: VRAM limit exceeded (peak {} of {} MB); stopped dispatching "
+                    "to the device",
+                    double(memory_budget.peak()) / (1024.0 * 1024.0),
+                    double(memory_budget.limit()) / (1024.0 * 1024.0)));
+  }
+
+  int64_t vram_limit_bytes() const
+  {
+    const bNode *input_node = zone_.input_node();
+    if (input_node == nullptr || input_node->storage == nullptr) {
+      return 0;
+    }
+    const auto &data = *static_cast<const NodeGeometryHwAccelerateInput *>(input_node->storage);
+    return int64_t(std::max(0, data.vram_limit_mb)) * 1024 * 1024;
   }
 
   bool try_execute_on_gpu(lf::Params &params, std::string &r_reason, int &r_elements) const

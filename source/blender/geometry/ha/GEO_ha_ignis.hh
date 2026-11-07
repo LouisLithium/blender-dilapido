@@ -72,8 +72,6 @@ struct IgnisDeviceFrame {
   int solver_radius = 6;
   /** Number of extrapolation layers for the velocity band. */
   int extrapolate = 4;
-  /** Device voxel budget; above this the caller should fall back to the CPU. */
-  int64_t max_voxels = 0;
 
   ignis::Settings settings;
 

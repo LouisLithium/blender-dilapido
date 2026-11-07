@@ -39,6 +39,8 @@
 #include "UI_interface_layout.hh"
 #include "UI_resources.hh"
 
+#include "GEO_ha_status.hh"
+
 #include "node_geometry_util.hh"
 
 namespace blender {
@@ -49,6 +51,32 @@ namespace nodes::node_geo_hw_accelerate_cc {
 /** \name Shared
  * \{ */
 
+/** Read only VRAM line for the last evaluation of this zone. */
+static void draw_memory_status(ui::Layout &layout, const bNode &node)
+{
+  geometry::ha::HaNodeStatus status;
+  if (!geometry::ha::ha_status_get(node.owner_tree(), node, status)) {
+    return;
+  }
+  char line[192];
+  if (status.vram_limit > 0) {
+    BLI_snprintf(line,
+                 sizeof(line),
+                 "VRAM: %.1f / %.1f MB (peak %.1f)",
+                 double(status.vram_used) / (1024.0 * 1024.0),
+                 double(status.vram_limit) / (1024.0 * 1024.0),
+                 double(status.vram_peak) / (1024.0 * 1024.0));
+  }
+  else {
+    BLI_snprintf(line,
+                 sizeof(line),
+                 "VRAM: %.1f MB (peak %.1f)",
+                 double(status.vram_used) / (1024.0 * 1024.0),
+                 double(status.vram_peak) / (1024.0 * 1024.0));
+  }
+  layout.label(line, ICON_INFO);
+}
+
 static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *current_node_ptr)
 {
   bNode &node = *static_cast<bNode *>(current_node_ptr->data);
@@ -56,6 +84,8 @@ static void node_layout_ex(ui::Layout &layout, bContext * /*C*/, PointerRNA *cur
     return;
   }
   layout.prop(current_node_ptr, "backend", UI_ITEM_NONE, "", ICON_NONE);
+  layout.prop(current_node_ptr, "vram_limit_mb", UI_ITEM_NONE, "", ICON_NONE);
+  draw_memory_status(layout, node);
 }
 
 /**
@@ -69,6 +99,8 @@ static void node_draw_buttons(ui::Layout &layout, bContext * /*C*/, PointerRNA *
     return;
   }
   layout.prop(ptr, "backend", UI_ITEM_NONE, "", ICON_NONE);
+  layout.prop(ptr, "vram_limit_mb", UI_ITEM_NONE, "", ICON_NONE);
+  draw_memory_status(layout, node);
 }
 
 /** \} */
@@ -93,6 +125,7 @@ static void node_init(bNodeTree * /*tree*/, bNode *node)
   /* Needs to be initialized for the node to work. */
   data->output_node_id = 0;
   data->backend = NODE_HW_ACCELERATE_BACKEND_AUTO;
+  data->vram_limit_mb = 0;
   node->storage = data;
 }
 

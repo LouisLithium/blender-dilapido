@@ -3041,6 +3041,15 @@ static void node_draw_basis(const bContext &C,
           tip += ": " + ha_status.reason;
         }
       }
+      if (ha_status.vram_limit > 0) {
+        tip += fmt::format("\nVRAM: {:.1f} / {:.1f} MB",
+                           double(ha_status.vram_used) / (1024.0 * 1024.0),
+                           double(ha_status.vram_limit) / (1024.0 * 1024.0));
+      }
+      else if (ha_status.vram_used > 0) {
+        tip += fmt::format("\nVRAM: {:.1f} MB",
+                           double(ha_status.vram_used) / (1024.0 * 1024.0));
+      }
       iconofs -= iconbutw;
       block_emboss_set(&block, ui::EmbossType::None);
       ui::Button *but = uiDefIconBut(&block,
