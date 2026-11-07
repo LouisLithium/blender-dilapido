@@ -759,7 +759,7 @@ const char *HA_GLSL_HELPERS =
     "int ha_divide_round_int(int a, int b) {\n"
     "  if (b == 0) { return 0; }\n"
     "  int c = abs(b);\n"
-    "  int s = (b > 0) - (b < 0);\n"
+    "  int s = (b > 0 ? 1 : 0) - (b < 0 ? 1 : 0);\n"
     "  return a >= 0 ? ((2 * a + c) / (2 * c)) * s : -((2 * -a + c) / (2 * c)) * s;\n"
     "}\n"
     /* White Noise Texture: a port of `BLI_noise.cc` (Jenkins lookup3 over the float bit patterns).
