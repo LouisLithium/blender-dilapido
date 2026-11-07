@@ -1341,6 +1341,24 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   return true;
 }
 
+/**
+ * `AttributeAccessor::lookup_meta_data(name)` returns the first attribute with that name, regardless
+ * of its domain. A name can exist on more than one domain (for example a FACE and a CORNER
+ * attribute), so look the domain up explicitly.
+ */
+std::optional<bke::AttributeMetaData> lookup_meta_data_in_domain(
+    const bke::AttributeAccessor &attributes, const StringRef name, const bke::AttrDomain domain)
+{
+  std::optional<bke::AttributeMetaData> result;
+  attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
+    if (iter.name == name && iter.domain == domain) {
+      result.emplace(bke::AttributeMetaData{iter.domain, iter.data_type});
+      iter.stop();
+    }
+  });
+  return result;
+}
+
 /** Uploads one attribute buffer. Returns false when the attribute's actual type/domain is not
  * supported, in which case the caller falls back to the CPU. */
 bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
@@ -1352,8 +1370,8 @@ bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
 {
   const int components = attribute.components;
   const int64_t total = int64_t(padded) * components;
-  const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(
-      attribute.name);
+  const std::optional<bke::AttributeMetaData> meta = lookup_meta_data_in_domain(
+      src_attributes, attribute.name, domain);
   if (meta.has_value() && meta->domain != domain) {
     /* Interpolating from another domain is not implemented; the CPU path handles it. */
     return false;
@@ -1528,8 +1546,16 @@ bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
   return true;
 }
 
-/** `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps. */
-bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
+/**
+ * `GeometryNodeStoreNamedAttribute`: the value field is written back after the position steps and
+ * after the structural element nodes. POINT stores use the position kernel; FACE / EDGE / CORNER
+ * stores become their own element pass.
+ */
+bool compile_store(CompileContext &ctx,
+                   const bNode &node,
+                   HaStore &r_store,
+                   HaElementStore &r_element_store,
+                   bool &r_is_element)
 {
   const auto &storage = *static_cast<const NodeGeometryStoreNamedAttribute *>(node.storage);
   HaType type;
@@ -1553,15 +1579,8 @@ bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
       return fail(ctx, "Store Named Attribute: this attribute type is not supported");
   }
   const int components = ha_type_components(type);
-  if (storage.domain != int8_t(bke::AttrDomain::Point)) {
-    return fail(ctx, "Store Named Attribute: only the point domain is supported");
-  }
   if (node.input_sockets().size() < 4) {
     return fail(ctx, "Store Named Attribute: unexpected sockets");
-  }
-  /* A partial write would have to blend with the previous values, which are not on the device. */
-  if (node.input_socket(1).link != nullptr) {
-    return fail(ctx, "Store Named Attribute: the 'Selection' input is not supported");
   }
   const bNodeSocket &name_socket = node.input_socket(2);
   if (name_socket.link != nullptr) {
@@ -1573,18 +1592,66 @@ bool compile_store(CompileContext &ctx, const bNode &node, HaStore &r_store)
     return fail(ctx, "Store Named Attribute: the name is empty");
   }
 
-  const HaExpr *compiled = compile_input_as(ctx, node, 3, type);
-  if (!ctx.ok) {
-    return false;
-  }
-  if (compiled->type != type) {
-    return fail(ctx, "Store Named Attribute: the value has an unsupported type");
+  const bke::AttrDomain domain = bke::AttrDomain(storage.domain);
+  if (domain == bke::AttrDomain::Point) {
+    const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
+    const HaExpr *compiled = compile_input_as(ctx, node, 3, type);
+    if (!ctx.ok) {
+      return false;
+    }
+    if (compiled->type != type) {
+      return fail(ctx, "Store Named Attribute: the value has an unsupported type");
+    }
+    r_store.name = name;
+    r_store.type = type;
+    r_store.components = components;
+    r_store.glsl_value = ha_emit_glsl_natural(*compiled);
+    r_store.glsl_selection = ha_emit_glsl_scalar(*selection);
+    r_is_element = false;
+    return true;
   }
 
-  r_store.name = name;
-  r_store.type = type;
-  r_store.components = components;
-  r_store.glsl_value = ha_emit_glsl_natural(*compiled);
+  HaElementDomain element_domain;
+  if (domain == bke::AttrDomain::Face) {
+    element_domain = HaElementDomain::Face;
+  }
+  else if (domain == bke::AttrDomain::Edge) {
+    element_domain = HaElementDomain::Edge;
+  }
+  else if (domain == bke::AttrDomain::Corner) {
+    element_domain = HaElementDomain::Corner;
+  }
+  else {
+    return fail(ctx, "Store Named Attribute: only the POINT/FACE/EDGE/CORNER domains are supported");
+  }
+
+  /* Compile the value and the selection on the target domain: `Named Attribute` reads that
+   * domain, and `Position`/`Attribute Statistic` are refused there. */
+  HaExprPool element_pool;
+  Vector<HaAggregate> element_aggregates;
+  CompileContext element_ctx{element_pool, element_aggregates, r_element_store.attributes};
+  element_ctx.zone_input_node = ctx.zone_input_node;
+  element_ctx.tree = ctx.tree;
+  element_ctx.element_domain = true;
+  const HaExpr *selection = compile_input_as(element_ctx, node, 1, HaType::Float);
+  const HaExpr *compiled = compile_input_as(element_ctx, node, 3, type);
+  if (!element_ctx.ok) {
+    return fail(ctx,
+                element_ctx.reason.empty() ? std::string("the field is not supported") :
+                                             element_ctx.reason);
+  }
+  if (selection->type != HaType::Float || compiled->type != type) {
+    return fail(ctx, "Store Named Attribute: the value or selection has an unsupported type");
+  }
+
+  r_element_store.name = name;
+  r_element_store.domain = element_domain;
+  r_element_store.type = type;
+  r_element_store.components = components;
+  r_element_store.glsl_value = ha_emit_glsl_natural(*compiled);
+  r_element_store.glsl_selection = ha_emit_glsl_scalar(*selection);
+  r_element_store.default_value = 0.0f;
+  r_is_element = true;
   return true;
 }
 
@@ -1938,6 +2005,9 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
   Vector<const bNode *> element_nodes;
   Vector<const bNode *> corner_nodes;
   while (true) {
+    if (current == input_node) {
+      break;
+    }
     if (chain.size() >= MAX_CHAIN_STEPS) {
       return fail(fmt::format("the zone contains more than {} 'Set Position' nodes in a row",
                               MAX_CHAIN_STEPS));
@@ -2071,10 +2141,22 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
   /* Then the stores, first -> last (`store_nodes` is stored last -> first). */
   for (const int i : store_nodes.index_range()) {
     HaStore store;
-    if (!compile_store(ctx, *store_nodes[store_nodes.size() - 1 - i], store)) {
+    HaElementStore element_store;
+    bool is_element = false;
+    if (!compile_store(ctx,
+                       *store_nodes[store_nodes.size() - 1 - i],
+                       store,
+                       element_store,
+                       is_element))
+    {
       return fail(ctx.reason.empty() ? std::string("the store is not supported") : ctx.reason);
     }
-    program->stores_.append(std::move(store));
+    if (is_element) {
+      program->element_stores_.append(std::move(element_store));
+    }
+    else {
+      program->stores_.append(std::move(store));
+    }
   }
   return program;
 }
@@ -2101,6 +2183,96 @@ std::string HaZoneProgram::debug_description() const
                           step.glsl_selection);
   }
   return result;
+}
+
+bke::AttrDomain ha_element_domain_to_attr(const HaElementDomain domain)
+{
+  switch (domain) {
+    case HaElementDomain::Face:
+      return bke::AttrDomain::Face;
+    case HaElementDomain::Edge:
+      return bke::AttrDomain::Edge;
+    case HaElementDomain::Corner:
+      return bke::AttrDomain::Corner;
+  }
+  return bke::AttrDomain::Point;
+}
+
+/** Downloads \a buffer and writes it into \a dst as the given attribute type and domain. */
+bool write_attribute_from_buffer(bke::MutableAttributeAccessor &dst,
+                                 const StringRef name,
+                                 const HaType type,
+                                 const bke::AttrDomain domain,
+                                 const int count,
+                                 const int padded,
+                                 const HaBuffer &buffer)
+{
+  if (type == HaType::Int) {
+    Array<int> host(padded);
+    buffer.download(MutableSpan<float>(reinterpret_cast<float *>(host.data()), padded));
+    bke::SpanAttributeWriter<int> writer = dst.lookup_or_add_for_write_span<int>(name, domain);
+    if (!writer) {
+      return false;
+    }
+    writer.span.copy_from(host.as_span().take_front(count));
+    writer.finish();
+    return true;
+  }
+
+  const int components = ha_type_components(type);
+  Array<float> host(int64_t(padded) * components);
+  buffer.download(host);
+  switch (type) {
+    case HaType::Float: {
+      bke::SpanAttributeWriter<float> writer = dst.lookup_or_add_for_write_span<float>(name, domain);
+      if (!writer) {
+        return false;
+      }
+      writer.span.copy_from(host.as_span().take_front(count));
+      writer.finish();
+      break;
+    }
+    case HaType::Float2: {
+      bke::SpanAttributeWriter<float2> writer = dst.lookup_or_add_for_write_span<float2>(name,
+                                                                                         domain);
+      if (!writer) {
+        return false;
+      }
+      for (const int element : IndexRange(count)) {
+        writer.span[element] = float2(host[element * 2], host[element * 2 + 1]);
+      }
+      writer.finish();
+      break;
+    }
+    case HaType::Float3: {
+      bke::SpanAttributeWriter<float3> writer = dst.lookup_or_add_for_write_span<float3>(name,
+                                                                                         domain);
+      if (!writer) {
+        return false;
+      }
+      writer.span.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host.data()), count));
+      writer.finish();
+      break;
+    }
+    case HaType::Color: {
+      bke::SpanAttributeWriter<ColorGeometry4f> writer =
+          dst.lookup_or_add_for_write_span<ColorGeometry4f>(name, domain);
+      if (!writer) {
+        return false;
+      }
+      for (const int element : IndexRange(count)) {
+        writer.span[element] = ColorGeometry4f(host[element * 4 + 0],
+                                               host[element * 4 + 1],
+                                               host[element * 4 + 2],
+                                               host[element * 4 + 3]);
+      }
+      writer.finish();
+      break;
+    }
+    case HaType::Int:
+      break;
+  }
+  return true;
 }
 
 bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
@@ -2137,7 +2309,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   if (element_count <= 0 || steps_.is_empty()) {
     return false;
   }
-  if (src_mesh == nullptr && (!element_steps_.is_empty() || !corner_steps_.is_empty())) {
+  if (src_mesh == nullptr &&
+      (!element_steps_.is_empty() || !element_stores_.is_empty() || !corner_steps_.is_empty())) {
     /* Those passes write FACE / EDGE / CORNER data, which only a mesh has. */
     return false;
   }
@@ -2311,43 +2484,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   /* After `n` steps the result is in buffer `n % 2`. */
   const HaBuffer &result = buffers[steps_.size() % 2];
 
-  /* The stores read the *final* positions, so they run after the chain. */
-  Array<HaBuffer> store_buffers(stores_.size());
-  for (const int i : stores_.index_range()) {
-    const HaStore &store = stores_[i];
-    if (!store_buffers[i].ensure(int64_t(padded_count) * store.components)) {
-      return false;
-    }
-    gpu::Shader *shader = ha_shader_get_store("store|" + store.glsl_value + "|" +
-                                                  ha_type_glsl(store.type) + attribute_key,
-                                              store.glsl_value,
-                                              ha_type_glsl(store.type),
-                                              store.components,
-                                              Span<const HaShaderResource>(extra_resources.data(),
-                                                                           int64_t(
-                                                                               extra_resources.size())));
-    if (shader == nullptr) {
-      return false;
-    }
-    GPU_shader_bind(shader);
-    GPU_storagebuf_bind(result.buf(), 0);
-    GPU_storagebuf_bind(store_buffers[i].buf(), 1);
-    GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
-    for (const int attribute_i : attributes_.index_range()) {
-      GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), 3 + attribute_i);
-    }
-    ha_dispatch(shader, padded_count);
-    for (const int attribute_i : attributes_.index_range()) {
-      GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
-    }
-    GPU_storagebuf_unbind(buffer_aggregate.buf());
-    GPU_storagebuf_unbind(store_buffers[i].buf());
-    GPU_storagebuf_unbind(result.buf());
-    GPU_shader_unbind();
-  }
-  if (!stores_.is_empty()) {
-    GPU_finish();
-  }
+  /* The stores run after the structural element passes, so a store that follows a `Set Shade
+   * Smooth` / `Flip Faces` in the graph sees the updated attributes. See below. */
 
   Array<float> host_output(padded_count * 3);
   result.download(host_output);
@@ -2388,87 +2526,17 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   }
   bke::MutableAttributeAccessor dst_attributes = *dst_attributes_storage;
 
-  /* Write the stored attributes back. */
-  if (!stores_.is_empty()) {
-    for (const int i : stores_.index_range()) {
-      const HaStore &store = stores_[i];
-      if (store.type == HaType::Int) {
-        Array<int> host_store(padded_count);
-        store_buffers[i].download(
-            MutableSpan<float>(reinterpret_cast<float *>(host_store.data()), padded_count));
-        bke::SpanAttributeWriter<int> writer =
-            dst_attributes.lookup_or_add_for_write_span<int>(store.name, bke::AttrDomain::Point);
-        if (!writer) {
-          BKE_id_free(nullptr, dst_id);
-          return false;
-        }
-        writer.span.copy_from(host_store.as_span().take_front(element_count));
-        writer.finish();
-        continue;
-      }
+  /* The stores are written back after the structural element passes (see below). */
 
-      Array<float> host_store(padded_count * store.components);
-      store_buffers[i].download(host_store);
-      if (store.type == HaType::Float) {
-        bke::SpanAttributeWriter<float> writer =
-            dst_attributes.lookup_or_add_for_write_span<float>(store.name, bke::AttrDomain::Point);
-        if (!writer) {
-          BKE_id_free(nullptr, dst_id);
-          return false;
-        }
-        writer.span.copy_from(host_store.as_span().take_front(element_count));
-        writer.finish();
-      }
-      else if (store.type == HaType::Float2) {
-        bke::SpanAttributeWriter<float2> writer =
-            dst_attributes.lookup_or_add_for_write_span<float2>(store.name, bke::AttrDomain::Point);
-        if (!writer) {
-          BKE_id_free(nullptr, dst_id);
-          return false;
-        }
-        for (const int element : IndexRange(element_count)) {
-          writer.span[element] = float2(host_store[element * 2], host_store[element * 2 + 1]);
-        }
-        writer.finish();
-      }
-      else if (store.type == HaType::Float3) {
-        bke::SpanAttributeWriter<float3> writer =
-            dst_attributes.lookup_or_add_for_write_span<float3>(store.name, bke::AttrDomain::Point);
-        if (!writer) {
-          BKE_id_free(nullptr, dst_id);
-          return false;
-        }
-        writer.span.copy_from(Span<float3>(reinterpret_cast<const float3 *>(host_store.data()),
-                                           element_count));
-        writer.finish();
-      }
-      else {
-        bke::SpanAttributeWriter<ColorGeometry4f> writer =
-            dst_attributes.lookup_or_add_for_write_span<ColorGeometry4f>(store.name,
-                                                                         bke::AttrDomain::Point);
-        if (!writer) {
-          BKE_id_free(nullptr, dst_id);
-          return false;
-        }
-        for (const int element : IndexRange(element_count)) {
-          writer.span[element] = ColorGeometry4f(host_store[element * 4 + 0],
-                                                 host_store[element * 4 + 1],
-                                                 host_store[element * 4 + 2],
-                                                 host_store[element * 4 + 3]);
-        }
-        writer.finish();
-      }
-    }
-  }
-
-  /* The FACE / EDGE passes: they do not touch positions, so they run after the chain and the
+  /* The FACE / EDGE passes: they do not touch positions, so they run after the chain and before the
    * stores, writing straight into the result mesh. */
   if (!element_steps_.is_empty()) {
     const bke::AttributeAccessor &src_attributes = input_attributes;
     bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
     for (const HaElementStep &step : element_steps_) {
       const bke::AttrDomain domain = step.domain == HaElementDomain::Face ? bke::AttrDomain::Face :
-                                                                           bke::AttrDomain::Edge;
+                                       step.domain == HaElementDomain::Edge ? bke::AttrDomain::Edge :
+                                                                              bke::AttrDomain::Corner;
       const int count = int(mesh_attributes.domain_size(domain));
       if (count <= 0) {
         continue;
@@ -2480,7 +2548,6 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       if (!element_in.ensure(int64_t(padded) * step.components) ||
           !element_out.ensure(int64_t(padded) * step.components) || !element_params.ensure(4))
       {
-        BKE_id_free(nullptr, mesh);
         return false;
       }
       Array<float> host_in(int64_t(padded) * step.components, 0.0f);
@@ -2562,7 +2629,6 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                                     step_attribute_names,
                                     step_resources,
                                     3)) {
-        BKE_id_free(nullptr, mesh);
         return false;
       }
 
@@ -2582,7 +2648,6 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
           step.components,
           Span<const HaShaderResource>(step_resources.data(), int64_t(step_resources.size())));
       if (element_shader == nullptr) {
-        BKE_id_free(nullptr, mesh);
         return false;
       }
       GPU_shader_bind(element_shader);
@@ -2744,6 +2809,185 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     }
   }
 
+  /* The stores: POINT stores use the final position buffer, element stores run as their own pass.
+   * Both read the result mesh, so they see the structural element passes above. */
+  if (!stores_.is_empty()) {
+    Array<HaBuffer> store_buffers(stores_.size());
+    Array<HaBuffer> store_in_buffers(stores_.size());
+    for (const int i : stores_.index_range()) {
+      const HaStore &store = stores_[i];
+      const bool with_old = !store.glsl_selection.empty();
+      if (ha_program_debug_enabled() && with_old) {
+        fprintf(stderr, "HA program: store '%s' with selection\n", store.name.c_str());
+      }
+      if (!store_buffers[i].ensure(int64_t(padded_count) * store.components)) {
+        return false;
+      }
+      if (with_old) {
+        const HaAttribute attribute{store.name, store.type, store.components};
+        if (!upload_one_attribute(dst_attributes,
+                                  attribute,
+                                  bke::AttrDomain::Point,
+                                  element_count,
+                                  padded_count,
+                                  store_in_buffers[i]))
+        {
+          return false;
+        }
+      }
+
+      Vector<HaShaderResource> store_resources;
+      store_resources.reserve(attributes_.size());
+      for (const int attribute_i : attributes_.index_range()) {
+        store_resources.append({(with_old ? 4 : 3) + attribute_i,
+                                HaShaderQualifier::Read,
+                                ha_attribute_buffer_glsl(attributes_[attribute_i].type),
+                                attribute_names[attribute_i].c_str()});
+      }
+
+      gpu::Shader *shader = ha_shader_get_store(
+          "store|" + store.glsl_value + "|" + ha_type_glsl(store.type) +
+              (with_old ? "|sel" : "") + attribute_key,
+          store.glsl_value,
+          store.glsl_selection,
+          with_old,
+          ha_type_glsl(store.type),
+          store.components,
+          Span<const HaShaderResource>(store_resources.data(), int64_t(store_resources.size())));
+      if (shader == nullptr) {
+        return false;
+      }
+      GPU_shader_bind(shader);
+      GPU_storagebuf_bind(result.buf(), 0);
+      GPU_storagebuf_bind(store_buffers[i].buf(), 1);
+      GPU_storagebuf_bind(buffer_aggregate.buf(), 2);
+      if (with_old) {
+        GPU_storagebuf_bind(store_in_buffers[i].buf(), 3);
+      }
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), (with_old ? 4 : 3) + attribute_i);
+      }
+      ha_dispatch(shader, padded_count);
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
+      }
+      if (with_old) {
+        GPU_storagebuf_unbind(store_in_buffers[i].buf());
+      }
+      GPU_storagebuf_unbind(buffer_aggregate.buf());
+      GPU_storagebuf_unbind(store_buffers[i].buf());
+      GPU_storagebuf_unbind(result.buf());
+      GPU_shader_unbind();
+    }
+    GPU_finish();
+    for (const int i : stores_.index_range()) {
+      const HaStore &store = stores_[i];
+      if (!write_attribute_from_buffer(dst_attributes,
+                                       store.name,
+                                       store.type,
+                                       bke::AttrDomain::Point,
+                                       element_count,
+                                       padded_count,
+                                       store_buffers[i]))
+      {
+        return false;
+      }
+    }
+  }
+
+  if (!element_stores_.is_empty()) {
+    bke::MutableAttributeAccessor mesh_attributes = mesh->attributes_for_write();
+    for (const HaElementStore &store : element_stores_) {
+      const bke::AttrDomain domain = ha_element_domain_to_attr(store.domain);
+      if (ha_program_debug_enabled()) {
+        fprintf(stderr, "HA program: element store '%s'\n", store.name.c_str());
+      }
+      const int count = int(mesh_attributes.domain_size(domain));
+      if (count <= 0) {
+        continue;
+      }
+      const int padded = (count + local_size - 1) / local_size * local_size;
+      HaBuffer element_in;
+      HaBuffer element_out;
+      HaBuffer element_params;
+      if (!element_in.ensure(int64_t(padded) * store.components) ||
+          !element_out.ensure(int64_t(padded) * store.components) || !element_params.ensure(4))
+      {
+        return false;
+      }
+
+      const HaAttribute attribute{store.name, store.type, store.components};
+      if (!upload_one_attribute(mesh_attributes, attribute, domain, count, padded, element_in)) {
+        return false;
+      }
+
+      Array<HaBuffer> step_attribute_buffers(store.attributes.size());
+      Vector<std::string> step_attribute_names;
+      Vector<HaShaderResource> step_resources;
+      if (!upload_domain_attributes(mesh_attributes,
+                                    Span<const HaAttribute>(store.attributes.data(),
+                                                            store.attributes.size()),
+                                    domain,
+                                    count,
+                                    padded,
+                                    step_attribute_buffers,
+                                    step_attribute_names,
+                                    step_resources,
+                                    3))
+      {
+        return false;
+      }
+
+      const std::array<float, 4> params{float(count), 0.0f, 0.0f, 0.0f};
+      element_params.upload(params);
+
+      std::string step_attribute_key;
+      for (const HaAttribute &field_attribute : store.attributes) {
+        step_attribute_key += "|";
+        step_attribute_key += ha_attribute_buffer_glsl(field_attribute.type);
+      }
+      gpu::Shader *shader = ha_shader_get_element_store(
+          "element_store|" + store.glsl_value + "|" + store.glsl_selection + "|" +
+              std::to_string(store.components) + "|" + ha_type_glsl(store.type) +
+              step_attribute_key,
+          store.glsl_value,
+          store.glsl_selection,
+          ha_type_glsl(store.type),
+          store.components,
+          Span<const HaShaderResource>(step_resources.data(), int64_t(step_resources.size())));
+      if (shader == nullptr) {
+        return false;
+      }
+      GPU_shader_bind(shader);
+      GPU_storagebuf_bind(element_in.buf(), 0);
+      GPU_storagebuf_bind(element_out.buf(), 1);
+      GPU_storagebuf_bind(element_params.buf(), 2);
+      for (const int attribute_i : store.attributes.index_range()) {
+        GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+      }
+      ha_dispatch(shader, padded);
+      for (const int attribute_i : store.attributes.index_range()) {
+        GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+      }
+      GPU_storagebuf_unbind(element_params.buf());
+      GPU_storagebuf_unbind(element_out.buf());
+      GPU_storagebuf_unbind(element_in.buf());
+      GPU_shader_unbind();
+      GPU_finish();
+
+      if (!write_attribute_from_buffer(mesh_attributes,
+                                       store.name,
+                                       store.type,
+                                       domain,
+                                       count,
+                                       padded,
+                                       element_out))
+      {
+        return false;
+      }
+    }
+  }
+
   /* The output component was replaced when the copy was made (mesh, point cloud or curves). */
   r_output = std::move(output);
   if (ha_program_debug_enabled()) {
@@ -2756,12 +3000,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
             "HA program: %d elements, %d step(s), %d attribute(s), %d store(s), %d element "
-            "pass(es), %d element attribute(s), %d corner pass(es): upload %.2f ms, "
-            "dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
+            "store(s), %d element pass(es), %d element attribute(s), %d corner pass(es): "
+            "upload %.2f ms, dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
             int(attributes_.size()),
             int(stores_.size()),
+            int(element_stores_.size()),
             int(element_steps_.size()),
             element_attribute_count,
             int(corner_steps_.size()),

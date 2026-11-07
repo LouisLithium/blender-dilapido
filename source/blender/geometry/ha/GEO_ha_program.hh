@@ -80,6 +80,13 @@ struct HaAttribute {
   int components = 1;
 };
 
+/** Element domain of a #HaElementStep / #HaElementStore. */
+enum class HaElementDomain {
+  Face,
+  Edge,
+  Corner,
+};
+
 /** One `Store Named Attribute` node at the end of the chain (written back after the steps). */
 struct HaStore {
   std::string name;
@@ -88,12 +95,28 @@ struct HaStore {
   int components = 1;
   /** GLSL expression, evaluated with `vec3 position` (the *final* position) and `int index`. */
   std::string glsl_value;
+  /** Scalar expression; empty means "all elements". Greater than zero means "write this one". */
+  std::string glsl_selection;
 };
 
-/** Element domain of a #HaElementStep. Only the domains with supported nodes get an entry. */
-enum class HaElementDomain {
-  Face,
-  Edge,
+/**
+ * A `Store Named Attribute` on a domain that is not POINT (FACE / EDGE / CORNER). It is executed as
+ * its own element pass, after the position chain and after the structural element nodes, so the
+ * value field sees the geometry as it leaves the zone.
+ */
+struct HaElementStore {
+  std::string name;
+  HaElementDomain domain = HaElementDomain::Face;
+  HaType type = HaType::Float;
+  int components = 1;
+  /** GLSL expression, evaluated with `int index` (the element index) in scope. */
+  std::string glsl_value;
+  /** Scalar expression; greater than zero means "write this element". */
+  std::string glsl_selection;
+  /** Value the attribute has when it does not exist yet (zero for `Store`). */
+  float default_value = 0.0f;
+  /** Attributes read by this step's fields, bound at slot 3 + index. */
+  Vector<HaAttribute> attributes;
 };
 
 /** Type of the attribute an element pass writes. */
@@ -188,6 +211,12 @@ class HaZoneProgram {
     return int(element_steps_.size());
   }
 
+  /** Number of FACE/EDGE/CORNER `Store Named Attribute` passes. */
+  int element_store_count() const
+  {
+    return int(element_stores_.size());
+  }
+
   /** Number of `Flip Faces` passes. */
   int corner_step_count() const
   {
@@ -204,7 +233,9 @@ class HaZoneProgram {
   Vector<HaAttribute> attributes_;
   /** `Store Named Attribute` nodes, in evaluation order (all after the position chain). */
   Vector<HaStore> stores_;
-  /** FACE / EDGE attribute passes (all after the stores; they do not touch positions). */
+  /** `Store Named Attribute` nodes on FACE / EDGE / CORNER, in evaluation order. */
+  Vector<HaElementStore> element_stores_;
+  /** FACE / EDGE attribute passes (before the stores; they do not touch positions). */
   Vector<HaElementStep> element_steps_;
   /** `Flip Faces` passes (after the element passes; they rewrite the corner topology). */
   Vector<HaCornerStep> corner_steps_;

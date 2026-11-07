@@ -228,9 +228,24 @@ gpu::Shader *ha_shader_get(StringRef key,
  */
 gpu::Shader *ha_shader_get_store(StringRef key,
                                  StringRef glsl_value,
+                                 StringRef glsl_selection,
+                                 bool with_old,
                                  const char *glsl_type,
                                  int components,
                                  Span<const HaShaderResource> extra_resources = {});
+
+/**
+ * Compiles a `Store Named Attribute` kernel for a non-POINT domain. One invocation per element;
+ * `element_in[]` / `element_out[]` are flat scalar arrays (`int` for integer attributes, `float`
+ * otherwise). The value is written for the selected elements and the old value is copied through
+ * otherwise. `params[0]` is the element count.
+ */
+gpu::Shader *ha_shader_get_element_store(StringRef key,
+                                         StringRef glsl_value,
+                                         StringRef glsl_selection,
+                                         const char *glsl_type,
+                                         int components,
+                                         Span<const HaShaderResource> extra_resources = {});
 
 /**
  * Compiles a kernel for an element domain that is not POINT (FACE / EDGE): for every element, if

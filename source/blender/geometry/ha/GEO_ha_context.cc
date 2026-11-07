@@ -3217,6 +3217,8 @@ gpu::Shader *ha_shader_get(const StringRef key,
 
 gpu::Shader *ha_shader_get_store(const StringRef key,
                                  const StringRef glsl_value,
+                                 const StringRef glsl_selection,
+                                 const bool with_old,
                                  const char *glsl_type,
                                  const int components,
                                  const Span<const HaShaderResource> extra_resources)
@@ -3234,6 +3236,11 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
   body += glsl_value;
   body += ";\n";
   static const char *components_suffix[4] = {".x", ".y", ".z", ".w"};
+  if (with_old) {
+    body += "  if ((";
+    body += glsl_selection;
+    body += ") > 0.0) {\n";
+  }
   for (int component = 0; component < components; component++) {
     body += "  store_out[index * ";
     body += std::to_string(components);
@@ -3245,6 +3252,21 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
     }
     body += ";\n";
   }
+  if (with_old) {
+    body += "  }\n  else {\n";
+    for (int component = 0; component < components; component++) {
+      body += "  store_out[index * ";
+      body += std::to_string(components);
+      body += " + ";
+      body += std::to_string(component);
+      body += "] = store_in[index * ";
+      body += std::to_string(components);
+      body += " + ";
+      body += std::to_string(component);
+      body += "];\n";
+    }
+    body += "  }\n";
+  }
   body += "}\n";
 
   /* The store buffer is a flat array of scalars: `int` for an integer attribute, `float` for every
@@ -3254,6 +3276,68 @@ gpu::Shader *ha_shader_get_store(const StringRef key,
   resources.append({0, HaShaderQualifier::Read, "float", "position_in[]"});
   resources.append({1, HaShaderQualifier::Write, integer ? "int" : "float", "store_out[]"});
   resources.append({2, HaShaderQualifier::Read, "float", "aggregate[]"});
+  if (with_old) {
+    resources.append({3, HaShaderQualifier::Read, integer ? "int" : "float", "store_in[]"});
+  }
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
+  return ha_shader_get_source(
+      key,
+      body,
+      Span<const HaShaderResource>(resources.data(), int64_t(resources.size())),
+      LOCAL_GROUP_SIZE);
+}
+
+gpu::Shader *ha_shader_get_element_store(const StringRef key,
+                                         const StringRef glsl_value,
+                                         const StringRef glsl_selection,
+                                         const char *glsl_type,
+                                         const int components,
+                                         const Span<const HaShaderResource> extra_resources)
+{
+  const bool integer = std::string(glsl_type) == "int";
+  const char *buffer_type = integer ? "int" : "float";
+  static const char *components_suffix[4] = {".x", ".y", ".z", ".w"};
+
+  std::string body = std::string(HA_GLSL_HELPERS);
+  body += "void main()\n";
+  body += "{\n";
+  body += "  int index = int(gl_GlobalInvocationID.x);\n";
+  body += "  if (index >= int(params[0])) { return; }\n";
+  body += "  int base = index * ";
+  body += std::to_string(components);
+  body += ";\n  ";
+  body += glsl_type;
+  body += " value = ";
+  body += glsl_value;
+  body += ";\n";
+  body += "  if ((";
+  body += glsl_selection;
+  body += ") > 0.0) {\n";
+  for (int component = 0; component < components; component++) {
+    body += "  element_out[base + ";
+    body += std::to_string(component);
+    body += "] = value";
+    if (components > 1) {
+      body += components_suffix[component];
+    }
+    body += ";\n";
+  }
+  body += "  }\n  else {\n";
+  for (int component = 0; component < components; component++) {
+    body += "  element_out[base + ";
+    body += std::to_string(component);
+    body += "] = element_in[base + ";
+    body += std::to_string(component);
+    body += "];\n";
+  }
+  body += "  }\n}\n";
+
+  Vector<HaShaderResource> resources;
+  resources.append({0, HaShaderQualifier::Read, buffer_type, "element_in[]"});
+  resources.append({1, HaShaderQualifier::Write, buffer_type, "element_out[]"});
+  resources.append({2, HaShaderQualifier::Read, "float", "params[]"});
   for (const HaShaderResource &resource : extra_resources) {
     resources.append(resource);
   }
