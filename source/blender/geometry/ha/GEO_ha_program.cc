@@ -5,6 +5,7 @@
 #include "GEO_ha_program.hh"
 
 #include <algorithm>
+#include <cstring>
 
 #include "BLI_array.hh"
 #include "BLI_map.hh"
@@ -94,6 +95,10 @@ struct CompileContext {
   HaExprPool &pool;
   Vector<HaAggregate> &aggregates;
   Vector<HaAttribute> &attributes;
+  /** Animated socket defaults of the whole program, shared by the element contexts. */
+  Vector<HaParamSource> &params;
+  /** False in kernels that do not bind `user_params[]` (stores, element passes, reductions). */
+  bool allow_params = true;
   /** The zone input node, used to verify that reductions read the zone geometry. */
   const bNode *zone_input_node = nullptr;
   /** The tree, used to reject animated socket values that would change the shader source. */
@@ -866,9 +871,16 @@ const HaExpr *compile_transform(CompileContext &ctx, const bNode &node, HaExprPo
     return nullptr;
   }
   for (const int i : {2, 3, 4}) {
-    if (node.input_socket(i).link != nullptr) {
+    const bNodeSocket &socket = node.input_socket(i);
+    if (socket.link != nullptr) {
       fail(ctx,
            "Transform Geometry: translation, rotation and scale have to be constant values");
+      return nullptr;
+    }
+    if (ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, socket)) {
+      fail(ctx,
+           "Transform Geometry: an animated translation/rotation/scale would rebuild the shader "
+           "every frame");
       return nullptr;
     }
   }
@@ -1236,7 +1248,8 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
    * binds those buffers instead of the POINT ones. */
   HaExprPool element_pool;
   Vector<HaAggregate> element_aggregates;
-  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
+  ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
@@ -1290,7 +1303,8 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
 
   HaExprPool element_pool;
   Vector<HaAggregate> element_aggregates;
-  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
+  ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
@@ -1323,7 +1337,8 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   }
   HaExprPool element_pool;
   Vector<HaAggregate> element_aggregates;
-  CompileContext ctx{element_pool, element_aggregates, r_step.attributes};
+  CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
+  ctx.allow_params = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.element_domain = true;
@@ -1594,8 +1609,13 @@ bool compile_store(CompileContext &ctx,
 
   const bke::AttrDomain domain = bke::AttrDomain(storage.domain);
   if (domain == bke::AttrDomain::Point) {
+    /* The POINT store kernel does not bind `user_params[]` (it already uses slots 0..3 + the
+     * attributes), so an animated constant falls back to the CPU. */
+    const bool old_allow_params = ctx.allow_params;
+    ctx.allow_params = false;
     const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
     const HaExpr *compiled = compile_input_as(ctx, node, 3, type);
+    ctx.allow_params = old_allow_params;
     if (!ctx.ok) {
       return false;
     }
@@ -1629,7 +1649,9 @@ bool compile_store(CompileContext &ctx,
    * domain, and `Position`/`Attribute Statistic` are refused there. */
   HaExprPool element_pool;
   Vector<HaAggregate> element_aggregates;
-  CompileContext element_ctx{element_pool, element_aggregates, r_element_store.attributes};
+  CompileContext element_ctx{
+      element_pool, element_aggregates, r_element_store.attributes, ctx.params};
+  element_ctx.allow_params = false;
   element_ctx.zone_input_node = ctx.zone_input_node;
   element_ctx.tree = ctx.tree;
   element_ctx.element_domain = true;
@@ -1754,8 +1776,11 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
     return &ctx.pool.constant(0.0f);
   }
 
-  /* `Attribute` is input socket 2. */
+  /* `Attribute` is input socket 2. The reduction kernel does not bind `user_params[]`. */
+  const bool old_allow_params = ctx.allow_params;
+  ctx.allow_params = false;
   const HaExpr *value = compile_input_as(ctx, node, 2, HaType::Float);
+  ctx.allow_params = old_allow_params;
   if (!ctx.ok || value == nullptr || value->type != HaType::Float) {
     if (ctx.ok) {
       fail(ctx, "Attribute Statistic: only scalar attributes are supported");
@@ -1897,12 +1922,38 @@ const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket)
   if (socket.link == nullptr) {
     if (ctx.tree != nullptr && socket_value_is_animated(*ctx.tree, socket)) {
       const bNode *node = socket.runtime->owner_node;
-      fail(ctx,
-           fmt::format("node '{}': input '{}' is animated by a driver; the device shader would be "
-                       "rebuilt every frame",
-                       node != nullptr ? node->name : "",
-                       socket.name));
-      return &ctx.pool.constant(0.0f);
+      if (!ctx.allow_params || node == nullptr) {
+        fail(ctx,
+             fmt::format("node '{}': input '{}' is animated by a driver, which is not supported in "
+                         "this kernel",
+                         node != nullptr ? node->name : "",
+                         socket.name));
+        return &ctx.pool.constant(0.0f);
+      }
+      HaType type;
+      switch (socket.type) {
+        case SOCK_FLOAT:
+        case SOCK_BOOLEAN:
+          type = HaType::Float;
+          break;
+        case SOCK_INT:
+          type = HaType::Int;
+          break;
+        case SOCK_VECTOR:
+          type = HaType::Float3;
+          break;
+        case SOCK_RGBA:
+          type = HaType::Color;
+          break;
+        default:
+          fail(ctx, fmt::format("animated input '{}' has an unsupported socket type", socket.name));
+          return &ctx.pool.constant(0.0f);
+      }
+      const int slot = int(ctx.params.size());
+      ctx.params.append({node->name, socket.index(), type});
+      HaExpr &read = ctx.pool.add(type, HaOp::ParamRead);
+      read.param_slot = slot;
+      return &read;
     }
     switch (socket.type) {
       case SOCK_FLOAT:
@@ -2060,7 +2111,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
 
   HaExprPool pool;
   auto program = std::make_unique<HaZoneProgram>();
-  CompileContext ctx{pool, program->aggregates_, program->attributes_};
+  CompileContext ctx{pool, program->aggregates_, program->attributes_, program->params_};
   ctx.zone_input_node = input_node;
   ctx.tree = &tree;
 
@@ -2277,7 +2328,8 @@ bool write_attribute_from_buffer(bke::MutableAttributeAccessor &dst,
 
 bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                              bke::GeometrySet &r_output,
-                             int *r_elements) const
+                             int *r_elements,
+                             const bNodeTree *tree) const
 {
   /* The zone works on every component that has a POINT domain: meshes, point clouds and curves. The
    * FACE / EDGE / CORNER passes only exist on meshes (they are refused below). */
@@ -2383,6 +2435,75 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     attribute_key += ha_attribute_buffer_glsl(attribute.type);
   }
 
+  /* Animated socket defaults: one 4-float slot per parameter, uploaded every evaluation. The
+   * shader source only contains `user_params[slot * 4 + component]`, so a changing value never
+   * rebuilds the shader. Slot 15 is reserved for this buffer; keep the attribute count below 13. */
+  HaBuffer params_buffer;
+  Vector<HaShaderResource> position_resources;
+  position_resources.reserve(extra_resources.size() + 1);
+  for (const HaShaderResource &resource : extra_resources) {
+    position_resources.append(resource);
+  }
+  std::string param_key;
+  if (!params_.is_empty()) {
+    if (attributes_.size() > 12) {
+      return false;
+    }
+    Array<float> host_params(int64_t(params_.size()) * 4, 0.0f);
+    for (const int i : params_.index_range()) {
+      const HaParamSource &param = params_[i];
+      const bNode *node = tree != nullptr ?
+                              bke::node_find_node_by_name(const_cast<bNodeTree &>(*tree),
+                                                          param.node_name) :
+                              nullptr;
+      const bNodeSocket *socket =
+          node != nullptr && param.socket_index >= 0 &&
+                  param.socket_index < node->input_sockets().size() ?
+              &node->input_socket(param.socket_index) :
+              nullptr;
+      if (socket == nullptr) {
+        return false;
+      }
+      switch (param.type) {
+        case HaType::Float:
+          host_params[i * 4] = read_float_default(*socket);
+          break;
+        case HaType::Int: {
+          const int value = read_int_default(*socket);
+          std::memcpy(&host_params[i * 4], &value, sizeof(int));
+          break;
+        }
+        case HaType::Float2: {
+          const float3 value = read_vector_default(*socket);
+          host_params[i * 4] = value.x;
+          host_params[i * 4 + 1] = value.y;
+          break;
+        }
+        case HaType::Float3: {
+          const float3 value = read_vector_default(*socket);
+          host_params[i * 4] = value.x;
+          host_params[i * 4 + 1] = value.y;
+          host_params[i * 4 + 2] = value.z;
+          break;
+        }
+        case HaType::Color: {
+          const float4 value = read_color_default(*socket);
+          host_params[i * 4] = value.x;
+          host_params[i * 4 + 1] = value.y;
+          host_params[i * 4 + 2] = value.z;
+          host_params[i * 4 + 3] = value.w;
+          break;
+        }
+      }
+    }
+    if (!params_buffer.ensure(int64_t(params_.size()) * 4)) {
+      return false;
+    }
+    params_buffer.upload(host_params);
+    position_resources.append({15, HaShaderQualifier::Read, "float", "user_params[]"});
+    param_key = "|params";
+  }
+
   /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
    * geometry (that is what `Attribute Statistic` is wired to). Two passes per aggregate: one
    * invocation per block writes a partial value, then a single invocation folds them. */
@@ -2447,10 +2568,10 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   for (const int i : steps_.index_range()) {
     const HaProgramStep &step = steps_[i];
     gpu::Shader *shader = ha_shader_get(
-        step.glsl_position + '#' + step.glsl_selection + attribute_key,
+        step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key,
         step.glsl_position,
         step.glsl_selection,
-        Span<const HaShaderResource>(extra_resources.data(), int64_t(extra_resources.size())));
+        Span<const HaShaderResource>(position_resources.data(), int64_t(position_resources.size())));
     if (shader == nullptr) {
       return false;
     }
@@ -2463,7 +2584,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     for (const int attribute_i : attributes_.index_range()) {
       GPU_storagebuf_bind(attribute_buffers[attribute_i].buf(), 3 + attribute_i);
     }
+    if (!params_.is_empty()) {
+      GPU_storagebuf_bind(params_buffer.buf(), 15);
+    }
     ha_dispatch(shader, padded_count);
+    if (!params_.is_empty()) {
+      GPU_storagebuf_unbind(params_buffer.buf());
+    }
     for (const int attribute_i : attributes_.index_range()) {
       GPU_storagebuf_unbind(attribute_buffers[attribute_i].buf());
     }
@@ -3000,13 +3127,14 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
      * the whole budget. `dispatches` is what a chain buys: it grows, the two transfers do not. */
     fprintf(stderr,
             "HA program: %d elements, %d step(s), %d attribute(s), %d store(s), %d element "
-            "store(s), %d element pass(es), %d element attribute(s), %d corner pass(es): "
-            "upload %.2f ms, dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
+            "store(s), %d param(s), %d element pass(es), %d element attribute(s), %d corner "
+            "pass(es): upload %.2f ms, dispatch %.2f ms (%d), download %.2f ms, write %.2f ms\n",
             element_count,
             int(steps_.size()),
             int(attributes_.size()),
             int(stores_.size()),
             int(element_stores_.size()),
+            int(params_.size()),
             int(element_steps_.size()),
             element_attribute_count,
             int(corner_steps_.size()),

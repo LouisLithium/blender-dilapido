@@ -80,6 +80,17 @@ struct HaAttribute {
   int components = 1;
 };
 
+/**
+ * One animated socket default (`driver` / action). The value is read from the evaluated node tree
+ * every frame and uploaded to the uniform parameter buffer; it is never inlined into the shader
+ * source, so the shader does not change when only the value changes.
+ */
+struct HaParamSource {
+  std::string node_name;
+  int socket_index = 0;
+  HaType type = HaType::Float;
+};
+
 /** Element domain of a #HaElementStep / #HaElementStore. */
 enum class HaElementDomain {
   Face,
@@ -186,7 +197,8 @@ class HaZoneProgram {
    */
   bool evaluate(const bke::GeometrySet &input,
                 bke::GeometrySet &r_output,
-                int *r_elements = nullptr) const;
+                int *r_elements = nullptr,
+                const bNodeTree *tree = nullptr) const;
 
   int step_count() const
   {
@@ -203,6 +215,12 @@ class HaZoneProgram {
   int store_count() const
   {
     return int(stores_.size());
+  }
+
+  /** Number of animated socket defaults uploaded per evaluation. */
+  int param_count() const
+  {
+    return int(params_.size());
   }
 
   /** Number of FACE/EDGE attribute passes. */
@@ -231,6 +249,8 @@ class HaZoneProgram {
   Vector<HaAggregate> aggregates_;
   /** Attributes read by the program, in binding order (slot 3 + index). */
   Vector<HaAttribute> attributes_;
+  /** Animated socket defaults, uploaded to `user_params[]` (slot 15). */
+  Vector<HaParamSource> params_;
   /** `Store Named Attribute` nodes, in evaluation order (all after the position chain). */
   Vector<HaStore> stores_;
   /** `Store Named Attribute` nodes on FACE / EDGE / CORNER, in evaluation order. */

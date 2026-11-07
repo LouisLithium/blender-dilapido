@@ -116,6 +116,11 @@ enum class HaOp {
    * attribute and three for a vector one.
    */
   AttributeRead,
+  /**
+   * A value from the program's uniform parameter buffer (an animated socket default). The slot is
+   * `param_slot * 4`; the buffer is declared as `user_params[]`.
+   */
+  ParamRead,
 
   /* --- Math node: unary ---------------------------------------------------------------- */
   /** float -> float. Mirrors `math_functions.cc` / `multi_function_common.cc` exactly. */
@@ -239,6 +244,8 @@ struct HaExpr {
   int aggregate_slot = -1;
   /** Used by #HaOp::AttributeRead. */
   int attribute_slot = -1;
+  /** Used by #HaOp::ParamRead. */
+  int param_slot = -1;
   /** Used by the ops that need an operation selector (see #HaParam). */
   int param = 0;
   Vector<const HaExpr *> args;

@@ -536,6 +536,10 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
       /* Reduction results are only available on the GPU; the CPU reference for them is the regular
        * node evaluation (the `Force CPU` path). */
       return 0.0f;
+    case HaOp::ParamRead:
+      /* Animated socket defaults are uploaded for the device; the CPU reference is the node
+       * evaluation. */
+      return 0.0f;
     case HaOp::AttributeRead:
       /* Attribute buffers are only uploaded for the device path; the CPU reference is the node
        * evaluation. */
@@ -703,8 +707,9 @@ int eval_int(const HaExpr &expr, int index, Span<float> positions)
       return ha_to_int(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
     case HaOp::AggregateRead:
-      /* Attribute buffers and reductions are only available on the GPU; the CPU reference for
-       * them is the regular node evaluation (the `Force CPU` path). */
+    case HaOp::ParamRead:
+      /* Attribute buffers, reductions and animated parameters are only available on the GPU; the
+       * CPU reference for them is the regular node evaluation (the `Force CPU` path). */
       return 0;
     case HaOp::Add:
       return eval_int(*expr.args[0], index, positions) + eval_int(*expr.args[1], index, positions);
@@ -759,6 +764,7 @@ float2 eval_float2(const HaExpr &expr, int index, Span<float> positions)
       return ha_to_float2(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
     case HaOp::AggregateRead:
+    case HaOp::ParamRead:
       return float2(0.0f);
     default:
       return float2(0.0f);
@@ -774,6 +780,7 @@ float4 eval_color(const HaExpr &expr, int index, Span<float> positions)
       return ha_to_color(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
     case HaOp::AggregateRead:
+    case HaOp::ParamRead:
       return float4(0.0f);
     default:
       return float4(0.0f);
@@ -785,6 +792,8 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
   switch (expr.op) {
     case HaOp::ConvertToFloat3:
       return ha_to_float3(*expr.args[0], index, positions);
+    case HaOp::ParamRead:
+      return float3(0.0f);
     case HaOp::Const:
       return float3(expr.value[0], expr.value[1], expr.value[2]);
     case HaOp::Position: {
@@ -1285,6 +1294,22 @@ std::string emit(const HaExpr &expr)
         case HaType::Color:
           return "vec4(" + buffer + "[index * 4], " + buffer + "[index * 4 + 1], " + buffer +
                  "[index * 4 + 2], " + buffer + "[index * 4 + 3])";
+      }
+      return "0.0";
+    }
+    case HaOp::ParamRead: {
+      const std::string base = "user_params[" + std::to_string(expr.param_slot * 4);
+      switch (expr.type) {
+        case HaType::Float:
+          return base + "]";
+        case HaType::Int:
+          return "floatBitsToInt(" + base + "])";
+        case HaType::Float2:
+          return "vec2(" + base + "], " + base + " + 1])";
+        case HaType::Float3:
+          return "vec3(" + base + "], " + base + " + 1], " + base + " + 2])";
+        case HaType::Color:
+          return "vec4(" + base + "], " + base + " + 1], " + base + " + 2], " + base + " + 3])";
       }
       return "0.0";
     }

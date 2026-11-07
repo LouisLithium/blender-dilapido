@@ -2140,7 +2140,7 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     }
 
     GeometrySet output_geometry;
-    if (!program_->evaluate(input_geometry, output_geometry, &r_elements)) {
+    if (!program_->evaluate(input_geometry, output_geometry, &r_elements, &btree_)) {
       r_reason = "the input geometry is not supported (a mesh is required)";
       return false;
     }
