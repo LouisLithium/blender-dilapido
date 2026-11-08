@@ -10,9 +10,11 @@
 #include "BLI_array.hh"
 #include "BLI_array_utils.hh"
 #include "BLI_map.hh"
+#include "BLI_sort.hh"
 #include "MEM_guardedalloc.h"
 #include "BLI_math_matrix.hh"
 #include "BLI_math_rotation.hh"
+#include "BLI_math_vector.hh"
 #include "BLI_math_vector_types.hh"
 
 #include "BKE_anim_data.hh"
@@ -26,6 +28,7 @@
 #include "BKE_material.hh"
 #include "BKE_mesh.h"
 #include "BKE_mesh.hh"
+#include "BKE_mesh_tangent.hh"
 #include "BKE_pointcloud.hh"
 #include "BKE_node.hh"
 #include "BKE_node_runtime.hh"
@@ -1684,6 +1687,81 @@ bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
 }
 
 /**
+ * Host-side copy of `calc_uv_tangents_simple` from `node_geo_uv_tangent.cc` (the "Fast" method).
+ * Keeping the exact algorithm here makes the device path produce the same corner tangents as the
+ * CPU node.
+ */
+void ha_calc_uv_tangents_simple(const Span<float3> positions,
+                                const Span<int> corner_verts,
+                                const Span<int3> corner_tris,
+                                const GroupedSpan<int> vert_to_corners_map,
+                                const Span<float2> uvs,
+                                MutableSpan<float3> r_corner_tangents)
+{
+  for (const int tri_i : corner_tris.index_range()) {
+    const int3 &tri = corner_tris[tri_i];
+    const float3 tangent = [&]() {
+      const float3 &p1 = positions[corner_verts[tri[0]]];
+      const float3 &p2 = positions[corner_verts[tri[1]]];
+      const float3 &p3 = positions[corner_verts[tri[2]]];
+      const float2 &uv1 = uvs[tri[0]];
+      const float2 &uv2 = uvs[tri[1]];
+      const float2 &uv3 = uvs[tri[2]];
+      const float x1 = p2.x - p1.x;
+      const float x2 = p3.x - p1.x;
+      const float y1 = p2.y - p1.y;
+      const float y2 = p3.y - p1.y;
+      const float z1 = p2.z - p1.z;
+      const float z2 = p3.z - p1.z;
+      const float s1 = uv2.x - uv1.x;
+      const float s2 = uv3.x - uv1.x;
+      const float t1 = uv2.y - uv1.y;
+      const float t2 = uv3.y - uv1.y;
+      const float r = math::safe_rcp(s1 * t2 - s2 * t1);
+      return float3((t2 * x1 - t1 * x2) * r,
+                    (t2 * y1 - t1 * y2) * r,
+                    (t2 * z1 - t1 * z2) * r);
+    }();
+    r_corner_tangents[tri[0]] = tangent;
+    r_corner_tangents[tri[1]] = tangent;
+    r_corner_tangents[tri[2]] = tangent;
+  }
+
+  struct SharedCorners {
+    float2 uv;
+    Vector<int, 10> corners;
+    float3 tangent_sum = float3(0.0f);
+  };
+  Vector<SharedCorners> shared_corners;
+  for (const int vert : positions.index_range()) {
+    const Span<int> corners = vert_to_corners_map[vert];
+    shared_corners.clear();
+    for (const int corner : corners) {
+      const float2 uv = uvs[corner];
+      const float3 &tri_tangent = r_corner_tangents[corner];
+      bool found = false;
+      for (SharedCorners &shared_corner : shared_corners) {
+        if (math::distance_manhattan(uv, shared_corner.uv) < 0.00001f) {
+          shared_corner.corners.append(corner);
+          shared_corner.tangent_sum += tri_tangent;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        shared_corners.append({uv, {corner}, tri_tangent});
+      }
+    }
+    for (const SharedCorners &shared_corner : shared_corners) {
+      const float3 tangent = math::normalize(shared_corner.tangent_sum);
+      for (const int corner : shared_corner.corners) {
+        r_corner_tangents[corner] = tangent;
+      }
+    }
+  }
+}
+
+/**
  * Uploads a host-computed attribute (`Face Area` / `Normal` / `True Normal`). The values are
  * derived from the **zone input** mesh, so these nodes are only allowed before the first position
  * step (see `CompileContext::position_may_have_changed`).
@@ -1764,6 +1842,94 @@ bool upload_synthetic_attribute(const Mesh &mesh,
       host[i * 3] = value.x;
       host[i * 3 + 1] = value.y;
       host[i * 3 + 2] = value.z;
+    }
+  }
+  else if (attribute.kind == HaAttributeKind::UVTangent) {
+    const bke::AttributeAccessor attributes = mesh.attributes();
+    const int corner_count = int(mesh.corners_num);
+    Array<float2> uvs(corner_count);
+    if (attribute.ref_data_type == CD_PROP_FLOAT2) {
+      const bke::AttributeReader<float2> reader = attributes.lookup<float2>(
+          attribute.ref_name, bke::AttrDomain::Corner);
+      if (!reader) {
+        return false;
+      }
+      const VArray<float2> &values = reader.varray;
+      for (const int i : IndexRange(corner_count)) {
+        uvs[i] = values[i];
+      }
+    }
+    else if (attribute.ref_data_type == CD_PROP_FLOAT3) {
+      const bke::AttributeReader<float3> reader = attributes.lookup<float3>(
+          attribute.ref_name, bke::AttrDomain::Corner);
+      if (!reader) {
+        return false;
+      }
+      const VArray<float3> &values = reader.varray;
+      for (const int i : IndexRange(corner_count)) {
+        uvs[i] = values[i].xy();
+      }
+    }
+    else {
+      return false;
+    }
+
+    Array<float3> corner_tangents(corner_count);
+    if (attribute.ref_method == 1) {
+      ha_calc_uv_tangents_simple(mesh.vert_positions(),
+                                 mesh.corner_verts(),
+                                 mesh.corner_tris(),
+                                 mesh.vert_to_corner_map(),
+                                 uvs,
+                                 corner_tangents);
+    }
+    else {
+      VArray<bool> sharp_faces = VArray<bool>::from_single(false, mesh.faces_num);
+      if (const bke::AttributeReader<bool> reader = attributes.lookup<bool>("sharp_face",
+                                                                           bke::AttrDomain::Face))
+      {
+        sharp_faces = reader.varray;
+      }
+      const Span<float2> uv_span = uvs;
+      const Span<Span<float2>> uv_maps(&uv_span, 1);
+      const VArraySpan<bool> sharp_faces_span = sharp_faces;
+      Array<Array<float4>> mikk_tangents = bke::mesh::calc_uv_tangents(
+          mesh.vert_positions(),
+          mesh.faces(),
+          mesh.corner_verts(),
+          mesh.corner_tris(),
+          mesh.corner_tri_faces(),
+          sharp_faces_span,
+          mesh.vert_normals(),
+          mesh.face_normals(),
+          mesh.corner_normals(),
+          uv_maps);
+      if (mikk_tangents.is_empty()) {
+        return false;
+      }
+      for (const int i : IndexRange(corner_count)) {
+        corner_tangents[i] = mikk_tangents[0][i].xyz();
+      }
+    }
+
+    const VArray<float3> adapted = attributes.adapt_domain<float3>(
+        VArray<float3>::from_container(std::move(corner_tangents)),
+        bke::AttrDomain::Corner,
+        bke::AttrDomain(attribute.domain));
+    if (adapted.size() < count) {
+      return false;
+    }
+    for (const int i : IndexRange(count)) {
+      const float3 value = adapted[i];
+      host[i * 3] = value.x;
+      host[i * 3 + 1] = value.y;
+      host[i * 3 + 2] = value.z;
+    }
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr,
+              "HA program: uploaded UV Tangent (%s, '%s')\n",
+              attribute.ref_method == 1 ? "Fast" : "Exact",
+              attribute.ref_name.c_str());
     }
   }
   else {
@@ -2187,9 +2353,14 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
   bool is_range = false;
   bool is_variance = false;
   bool is_stddev = false;
+  bool is_median = false;
   switch (socket_index) {
     case 0:
       op = HaAggregateOp::Mean;
+      break;
+    case 1:
+      /* `Median`: needs the sorted values, so it is materialized and sorted on the host. */
+      is_median = true;
       break;
     case 2:
       op = HaAggregateOp::Sum;
@@ -2272,6 +2443,21 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
 
   const std::string glsl_value = ha_emit_glsl_natural(*value);
   const int components = ha_type_components(type);
+  if (is_median) {
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr,
+              "HA program: Attribute Statistic (%s median)\n",
+              components == 3 ? "vector" : "float");
+    }
+    HaExpr &read = ctx.pool.add(type, HaOp::AggregateRead);
+    read.aggregate_slot = int(ctx.aggregates.size());
+    HaAggregate aggregate;
+    aggregate.glsl_value = glsl_value;
+    aggregate.components = components;
+    aggregate.median = true;
+    ctx.aggregates.append(std::move(aggregate));
+    return &read;
+  }
   if (is_variance) {
     if (ha_program_debug_enabled()) {
       fprintf(stderr,
@@ -2482,6 +2668,86 @@ const HaExpr *compile_normal(CompileContext &ctx, const bNode &node, const int s
   read.attribute_slot = slot;
   if (ha_program_debug_enabled()) {
     fprintf(stderr, "HA program: %s\n", true_normals ? "True Normal" : "Normal");
+  }
+  return &read;
+}
+
+/**
+ * `GeometryNodeUVTangent`: host-computed corner tangents. The UV input has to come from a
+ * `Named Attribute` node with a constant FLOAT2/FLOAT3 name (the common `Named Attribute("UVMap",
+ * FLOAT2)` setup); the values are read on the host and the tangents are adapted to the current
+ * domain exactly like the CPU `TangentFieldInput`.
+ */
+const HaExpr *compile_uv_tangent(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "UV Tangent: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.position_may_have_changed) {
+    fail(ctx, "UV Tangent: reading it after a position step is not supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (node.input_sockets().size() < 2) {
+    fail(ctx, "UV Tangent: unexpected sockets");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bNodeSocket &uv_socket = node.input_socket(1);
+  if (uv_socket.link == nullptr || uv_socket.link->fromsock->index() != 0 ||
+      !uv_socket.link->fromnode->is_type("GeometryNodeInputNamedAttribute"_ustr))
+  {
+    fail(ctx,
+         "UV Tangent: the UV input has to come from a 'Named Attribute' node with a constant name");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bNode &uv_node = *uv_socket.link->fromnode;
+  const auto &uv_storage = *static_cast<const NodeGeometryInputNamedAttribute *>(uv_node.storage);
+  if (uv_storage.data_type != CD_PROP_FLOAT2 && uv_storage.data_type != CD_PROP_FLOAT3) {
+    fail(ctx, "UV Tangent: the UV attribute has to be FLOAT2 or FLOAT3");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (uv_node.input_sockets().is_empty()) {
+    fail(ctx, "UV Tangent: the UV attribute name is missing");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bNodeSocket &name_socket = uv_node.input_socket(0);
+  if (name_socket.link != nullptr) {
+    fail(ctx, "UV Tangent: the UV attribute name has to be a constant");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *name_value = static_cast<const bNodeSocketValueString *>(name_socket.default_value);
+  const std::string uv_name = name_value != nullptr ? std::string(name_value->value) :
+                                                      std::string();
+  if (uv_name.empty()) {
+    fail(ctx, "UV Tangent: the UV attribute name is empty");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  int method = 0;
+  if (const auto *menu = static_cast<const bNodeSocketValueMenu *>(node.input_socket(0).default_value))
+  {
+    method = menu->value;
+  }
+  if (method != 0 && method != 1) {
+    fail(ctx, "UV Tangent: this method is not supported");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  const std::string name = fmt::format("__ha_uv_tangent_{}_{}", method, uv_name);
+  const int slot = find_or_add_attribute(
+      ctx, name, HaType::Float3, 3, HaAttributeKind::UVTangent, int(ctx.domain));
+  HaAttribute &attribute = ctx.attributes[slot];
+  attribute.ref_name = uv_name;
+  attribute.ref_method = method;
+  attribute.ref_data_type = uv_storage.data_type;
+
+  HaExpr &read = ctx.pool.add(HaType::Float3, HaOp::AttributeRead);
+  read.attribute_slot = slot;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr,
+            "HA program: UV Tangent (%s, UV '%s')\n",
+            method == 1 ? "Fast" : "Exact",
+            uv_name.c_str());
   }
   return &read;
 }
@@ -2980,6 +3246,9 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("GeometryNodeInputNormal"_ustr)) {
     result = compile_normal(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeUVTangent"_ustr)) {
+    result = compile_uv_tangent(ctx, node, socket_index);
   }
   else if (node.is_type("GeometryNodeInputMeshVertexNeighbors"_ustr)) {
     result = compile_vertex_neighbors(ctx, node, socket_index);
@@ -3906,6 +4175,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   if (!buffer_aggregate.ensure(std::max<int64_t>(1, int64_t(aggregate_count) * 3))) {
     return false;
   }
+  Array<float> host_medians(std::max<int64_t>(1, int64_t(aggregate_count) * 3), 0.0f);
+  bool has_median = false;
   if (aggregate_count > 0) {
     const int block_count = (element_count + HA_REDUCE_BLOCK_SIZE - 1) / HA_REDUCE_BLOCK_SIZE;
     HaBuffer buffer_partial;
@@ -3918,6 +4189,87 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       std::string combine;
       std::string identity;
       aggregate_op_strings(aggregate.op, aggregate.components, combine, identity);
+
+      if (aggregate.median) {
+        if (attributes_.size() > 8 || has_lut_) {
+          return false;
+        }
+        HaBuffer buffer_values;
+        if (!buffer_values.ensure(int64_t(padded_count) * 3)) {
+          return false;
+        }
+        Vector<HaShaderResource> median_resources;
+        median_resources.reserve(extra_resources.size() + 1);
+        for (const HaShaderResource &resource : extra_resources) {
+          median_resources.append(
+              {resource.slot + 1, resource.qualifier, resource.type, resource.name});
+        }
+        gpu::Shader *materialize = ha_shader_get_accumulate_stage1(
+            "median|" + aggregate.glsl_value + "|" + std::to_string(aggregate.components) +
+                attribute_key + lut_key,
+            aggregate.glsl_value,
+            aggregate.components,
+            Span<const HaShaderResource>(median_resources.data(),
+                                         int64_t(median_resources.size())));
+        if (materialize == nullptr) {
+          return false;
+        }
+        const std::array<float, 4> params{
+            float(element_count), float(block_count), 0.0f, 0.0f};
+        buffer_params.upload(params);
+        GPU_shader_bind(materialize);
+        GPU_storagebuf_bind(buffers[0].buf(), 0);
+        GPU_storagebuf_bind(buffer_params.buf(), 1);
+        GPU_storagebuf_bind(buffer_values.buf(), 2);
+        GPU_storagebuf_bind(buffer_partial.buf(), 3);
+        for (const int attribute_i : attributes_.index_range()) {
+          GPU_storagebuf_bind(current_attribute_buffers[attribute_i]->buf(), 4 + attribute_i);
+        }
+        ha_dispatch(materialize, block_count);
+        for (const int attribute_i : attributes_.index_range()) {
+          GPU_storagebuf_unbind(current_attribute_buffers[attribute_i]->buf());
+        }
+        GPU_storagebuf_unbind(buffer_partial.buf());
+        GPU_storagebuf_unbind(buffer_values.buf());
+        GPU_storagebuf_unbind(buffer_params.buf());
+        GPU_storagebuf_unbind(buffers[0].buf());
+        GPU_shader_unbind();
+
+        Array<float> host_values(int64_t(padded_count) * 3);
+        buffer_values.download(host_values);
+        const int components = aggregate.components;
+        if (components == 1) {
+          Array<float> sorted(element_count);
+          for (const int i : IndexRange(element_count)) {
+            sorted[i] = host_values[i];
+          }
+          blender::parallel_sort(sorted.begin(), sorted.end());
+          float median = sorted[element_count / 2];
+          if (element_count % 2 == 0 && element_count > 1) {
+            median = (median + sorted[element_count / 2 - 1]) * 0.5f;
+          }
+          host_medians[slot * 3] = median;
+        }
+        else {
+          Array<float> sorted[3];
+          for (const int component : IndexRange(3)) {
+            sorted[component].reinitialize(element_count);
+            for (const int i : IndexRange(element_count)) {
+              sorted[component][i] = host_values[i * 3 + component];
+            }
+            blender::parallel_sort(sorted[component].begin(), sorted[component].end());
+          }
+          for (const int component : IndexRange(3)) {
+            float median = sorted[component][element_count / 2];
+            if (element_count % 2 == 0 && element_count > 1) {
+              median = (median + sorted[component][element_count / 2 - 1]) * 0.5f;
+            }
+            host_medians[slot * 3 + component] = median;
+          }
+        }
+        has_median = true;
+        continue;
+      }
 
       const std::string key_prefix = aggregate.glsl_value + "|" + combine + "|" +
                                      std::to_string(aggregate.components) + "|" + attribute_key +
@@ -3996,6 +4348,19 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       GPU_shader_unbind();
     }
     GPU_finish();
+    if (has_median) {
+      Array<float> host_aggregates(std::max<int64_t>(1, int64_t(aggregate_count) * 3));
+      buffer_aggregate.download(host_aggregates);
+      for (const int slot : aggregates_.index_range()) {
+        if (!aggregates_[slot].median) {
+          continue;
+        }
+        host_aggregates[slot * 3 + 0] = host_medians[slot * 3 + 0];
+        host_aggregates[slot * 3 + 1] = host_medians[slot * 3 + 1];
+        host_aggregates[slot * 3 + 2] = host_medians[slot * 3 + 2];
+      }
+      buffer_aggregate.upload(host_aggregates);
+    }
     ha_program_debug("aggregates ready");
   }
 

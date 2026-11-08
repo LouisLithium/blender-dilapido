@@ -66,6 +66,8 @@ struct HaAggregate {
   int components = 1;
   /** True when the expression reads `aggregate[]` (variance: the mean from a previous pass). */
   bool read_aggregate = false;
+  /** True for `Attribute Statistic > Median`: computed on the host with a sort. */
+  bool median = false;
 };
 
 /** One running-total field (`Accumulate Field`, P1-10). */
@@ -103,6 +105,8 @@ enum class HaAttributeKind {
   /** `Edge Vertices`: the positions of the two endpoint vertices (valid before a position step). */
   EdgeVertex1Position,
   EdgeVertex2Position,
+  /** `UV Tangent`: host-computed CORNER tangents from the referenced UV attribute. */
+  UVTangent,
 };
 
 /** One POINT attribute the program reads, uploaded once per evaluation. */
@@ -114,6 +118,11 @@ struct HaAttribute {
   HaAttributeKind kind = HaAttributeKind::Input;
   /** `bke::AttrDomain` as an int (the domain the values are uploaded in). */
   int domain = 0;
+  /** Extra input for synthetic attributes: the source attribute name (`UV Tangent` UV map). */
+  std::string ref_name;
+  /** `UV Tangent` method (0 = Exact, 1 = Fast) and the source UV data type (CD_PROP_FLOAT2/3). */
+  int ref_method = 0;
+  int ref_data_type = 0;
 };
 
 /**
