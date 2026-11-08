@@ -279,6 +279,8 @@ class HaZoneProgram {
   Vector<HaElementStep> element_steps_;
   /** `Flip Faces` passes (after the element passes; they rewrite the corner topology). */
   Vector<HaCornerStep> corner_steps_;
+  /** True when the program contains an `AttributeGather` (needs `gather_params[]`). */
+  bool has_gather_ = false;
 };
 
 }  // namespace geometry::ha

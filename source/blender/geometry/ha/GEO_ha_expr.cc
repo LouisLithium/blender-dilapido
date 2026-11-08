@@ -541,6 +541,7 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
        * evaluation. */
       return 0.0f;
     case HaOp::AttributeRead:
+    case HaOp::AttributeGather:
       /* Attribute buffers are only uploaded for the device path; the CPU reference is the node
        * evaluation. */
       return 0.0f;
@@ -691,6 +692,17 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::Cosh:
     case HaOp::Tanh:
       return eval_unary_float(expr, index, positions);
+    case HaOp::Select:
+      return eval_float(*expr.args[0], index, positions) > 0.0f ?
+                 eval_float(*expr.args[2], index, positions) :
+                 eval_float(*expr.args[1], index, positions);
+    case HaOp::IndexSelect: {
+      const int i = eval_int(*expr.args[0], index, positions);
+      if (i < 0 || i + 1 >= int(expr.args.size())) {
+        return 0.0f;
+      }
+      return eval_float(*expr.args[1 + i], index, positions);
+    }
     default:
       return eval_binary_float(expr, index, positions);
   }
@@ -706,6 +718,7 @@ int eval_int(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::ConvertToInt:
       return ha_to_int(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
+    case HaOp::AttributeGather:
     case HaOp::AggregateRead:
     case HaOp::ParamRead:
       /* Attribute buffers, reductions and animated parameters are only available on the GPU; the
@@ -750,6 +763,17 @@ int eval_int(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::DivideRound:
       return ha_divide_round_int(eval_int(*expr.args[0], index, positions),
                                  eval_int(*expr.args[1], index, positions));
+    case HaOp::Select:
+      return eval_float(*expr.args[0], index, positions) > 0.0f ?
+                 eval_int(*expr.args[2], index, positions) :
+                 eval_int(*expr.args[1], index, positions);
+    case HaOp::IndexSelect: {
+      const int i = eval_int(*expr.args[0], index, positions);
+      if (i < 0 || i + 1 >= int(expr.args.size())) {
+        return 0;
+      }
+      return eval_int(*expr.args[1 + i], index, positions);
+    }
     default:
       return 0;
   }
@@ -763,9 +787,21 @@ float2 eval_float2(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::ConvertToFloat2:
       return ha_to_float2(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
+    case HaOp::AttributeGather:
     case HaOp::AggregateRead:
     case HaOp::ParamRead:
       return float2(0.0f);
+    case HaOp::Select:
+      return eval_float(*expr.args[0], index, positions) > 0.0f ?
+                 eval_float2(*expr.args[2], index, positions) :
+                 eval_float2(*expr.args[1], index, positions);
+    case HaOp::IndexSelect: {
+      const int i = eval_int(*expr.args[0], index, positions);
+      if (i < 0 || i + 1 >= int(expr.args.size())) {
+        return float2(0.0f);
+      }
+      return eval_float2(*expr.args[1 + i], index, positions);
+    }
     default:
       return float2(0.0f);
   }
@@ -779,9 +815,21 @@ float4 eval_color(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::ConvertToColor:
       return ha_to_color(*expr.args[0], index, positions);
     case HaOp::AttributeRead:
+    case HaOp::AttributeGather:
     case HaOp::AggregateRead:
     case HaOp::ParamRead:
       return float4(0.0f);
+    case HaOp::Select:
+      return eval_float(*expr.args[0], index, positions) > 0.0f ?
+                 eval_color(*expr.args[2], index, positions) :
+                 eval_color(*expr.args[1], index, positions);
+    case HaOp::IndexSelect: {
+      const int i = eval_int(*expr.args[0], index, positions);
+      if (i < 0 || i + 1 >= int(expr.args.size())) {
+        return float4(0.0f);
+      }
+      return eval_color(*expr.args[1 + i], index, positions);
+    }
     default:
       return float4(0.0f);
   }
@@ -792,6 +840,9 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
   switch (expr.op) {
     case HaOp::ConvertToFloat3:
       return ha_to_float3(*expr.args[0], index, positions);
+    case HaOp::AttributeRead:
+    case HaOp::AttributeGather:
+    case HaOp::AggregateRead:
     case HaOp::ParamRead:
       return float3(0.0f);
     case HaOp::Const:
@@ -916,6 +967,17 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
       return float3(ha_wrapf(value.x, max_value.x, min_value.x),
                     ha_wrapf(value.y, max_value.y, min_value.y),
                     ha_wrapf(value.z, max_value.z, min_value.z));
+    }
+    case HaOp::Select:
+      return eval_float(*expr.args[0], index, positions) > 0.0f ?
+                 eval_vector(*expr.args[2], index, positions) :
+                 eval_vector(*expr.args[1], index, positions);
+    case HaOp::IndexSelect: {
+      const int i = eval_int(*expr.args[0], index, positions);
+      if (i < 0 || i + 1 >= int(expr.args.size())) {
+        return float3(0.0f);
+      }
+      return eval_vector(*expr.args[1 + i], index, positions);
     }
     default:
       break;
@@ -1277,6 +1339,37 @@ std::string emit(const HaExpr &expr)
     case HaOp::Clamp:
       return "clamp(" + emit(*expr.args[0]) + ", " + emit(*expr.args[1]) + ", " +
              emit(*expr.args[2]) + ")";
+    case HaOp::Select: {
+      const std::string condition = emit(*expr.args[0]);
+      return "((" + condition + ") > 0.0 ? " + emit(*expr.args[2]) + " : " + emit(*expr.args[1]) +
+             ")";
+    }
+    case HaOp::IndexSelect: {
+      const std::string index = emit(*expr.args[0]);
+      std::string result;
+      switch (expr.type) {
+        case HaType::Float:
+          result = "0.0";
+          break;
+        case HaType::Int:
+          result = "0";
+          break;
+        case HaType::Float2:
+          result = "vec2(0.0)";
+          break;
+        case HaType::Float3:
+          result = "vec3(0.0)";
+          break;
+        case HaType::Color:
+          result = "vec4(0.0)";
+          break;
+      }
+      for (int i = int(expr.args.size()) - 1; i >= 1; i--) {
+        result = "((" + index + ") == " + std::to_string(i - 1) + " ? " + emit(*expr.args[i]) +
+                 " : " + result + ")";
+      }
+      return result;
+    }
     case HaOp::AggregateRead:
       return "aggregate[" + std::to_string(expr.aggregate_slot) + " * 3]";
     case HaOp::AttributeRead: {
@@ -1296,6 +1389,57 @@ std::string emit(const HaExpr &expr)
                  "[index * 4 + 2], " + buffer + "[index * 4 + 3])";
       }
       return "0.0";
+    }
+    case HaOp::AttributeGather: {
+      const std::string buffer = "attribute_" + std::to_string(expr.attribute_slot);
+      const std::string index_expr = emit(*expr.args[0]);
+      const bool clamp_index = (expr.param & 1) != 0;
+      auto read_at = [&](const std::string &at, const int components) -> std::string {
+        switch (components) {
+          case 1:
+            return buffer + "[" + at + "]";
+          case 2:
+            return "vec2(" + buffer + "[" + at + " * 2], " + buffer + "[" + at + " * 2 + 1])";
+          case 3:
+            return "vec3(" + buffer + "[" + at + " * 3], " + buffer + "[" + at + " * 3 + 1], " +
+                   buffer + "[" + at + " * 3 + 2])";
+          case 4:
+            return "vec4(" + buffer + "[" + at + " * 4], " + buffer + "[" + at + " * 4 + 1], " +
+                   buffer + "[" + at + " * 4 + 2], " + buffer + "[" + at + " * 4 + 3])";
+        }
+        return "0.0";
+      };
+      int components = 1;
+      std::string default_value = "0.0";
+      switch (expr.type) {
+        case HaType::Float:
+          components = 1;
+          default_value = "0.0";
+          break;
+        case HaType::Int:
+          components = 1;
+          default_value = "0";
+          break;
+        case HaType::Float2:
+          components = 2;
+          default_value = "vec2(0.0)";
+          break;
+        case HaType::Float3:
+          components = 3;
+          default_value = "vec3(0.0)";
+          break;
+        case HaType::Color:
+          components = 4;
+          default_value = "vec4(0.0)";
+          break;
+      }
+      if (clamp_index) {
+        const std::string at = "clamp(" + index_expr + ", 0, int(gather_params[0]) - 1)";
+        return read_at(at, components);
+      }
+      const std::string at = "(" + index_expr + ")";
+      return "((" + at + " >= 0 && " + at + " < int(gather_params[0])) ? " +
+             read_at(at, components) + " : " + default_value + ")";
     }
     case HaOp::ParamRead: {
       const std::string base = "user_params[" + std::to_string(expr.param_slot * 4);

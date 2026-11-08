@@ -113,6 +113,10 @@ struct CompileContext {
   /** POINT attributes written by an earlier `Store` in the chain, with the stored type. A
    * downstream `Named Attribute` reads the stored version, so a type mismatch has to fail. */
   Map<std::string, HaType> written_attributes;
+  /** `Sample Index` gathers need the element count in `gather_params[]`; only the position kernel
+   * binds that buffer. */
+  bool allow_gather = true;
+  bool has_gather = false;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
@@ -1354,6 +1358,7 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
   ctx.allow_params = false;
+  ctx.allow_gather = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.domain = domain;
@@ -1409,6 +1414,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
   ctx.allow_params = false;
+  ctx.allow_gather = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.domain = bke::AttrDomain::Face;
@@ -1443,6 +1449,7 @@ bool compile_flip_faces(CompileContext &point_ctx, const bNode &node, HaCornerSt
   Vector<HaAggregate> element_aggregates;
   CompileContext ctx{element_pool, element_aggregates, r_step.attributes, point_ctx.params};
   ctx.allow_params = false;
+  ctx.allow_gather = false;
   ctx.zone_input_node = point_ctx.zone_input_node;
   ctx.tree = point_ctx.tree;
   ctx.domain = bke::AttrDomain::Face;
@@ -1714,12 +1721,16 @@ bool compile_store(CompileContext &ctx,
   const bke::AttrDomain domain = bke::AttrDomain(storage.domain);
   if (domain == bke::AttrDomain::Point) {
     /* The POINT store kernel does not bind `user_params[]` (it already uses slots 0..3 + the
-     * attributes), so an animated constant falls back to the CPU. */
+     * attributes), so an animated constant falls back to the CPU. It also does not bind
+     * `gather_params[]`, so `Sample Index` falls back too. */
     const bool old_allow_params = ctx.allow_params;
+    const bool old_allow_gather = ctx.allow_gather;
     ctx.allow_params = false;
+    ctx.allow_gather = false;
     const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
     const HaExpr *compiled = compile_input_as(ctx, node, 3, type);
     ctx.allow_params = old_allow_params;
+    ctx.allow_gather = old_allow_gather;
     if (!ctx.ok) {
       return false;
     }
@@ -1772,6 +1783,7 @@ bool compile_store(CompileContext &ctx,
   CompileContext element_ctx{
       element_pool, element_aggregates, r_element_store.attributes, ctx.params};
   element_ctx.allow_params = false;
+  element_ctx.allow_gather = false;
   element_ctx.zone_input_node = ctx.zone_input_node;
   element_ctx.tree = ctx.tree;
   element_ctx.domain = domain;
@@ -1896,11 +1908,15 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
     return &ctx.pool.constant(0.0f);
   }
 
-  /* `Attribute` is input socket 2. The reduction kernel does not bind `user_params[]`. */
+  /* `Attribute` is input socket 2. The reduction kernel does not bind `user_params[]` or
+   * `gather_params[]`. */
   const bool old_allow_params = ctx.allow_params;
+  const bool old_allow_gather = ctx.allow_gather;
   ctx.allow_params = false;
+  ctx.allow_gather = false;
   const HaExpr *value = compile_input_as(ctx, node, 2, HaType::Float);
   ctx.allow_params = old_allow_params;
+  ctx.allow_gather = old_allow_gather;
   if (!ctx.ok || value == nullptr || value->type != HaType::Float) {
     if (ctx.ok) {
       fail(ctx, "Attribute Statistic: only scalar attributes are supported");
@@ -1914,6 +1930,189 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
    * vector here (`ha_emit_glsl` would wrap a scalar in `vec3(...)`, which does not compile). */
   ctx.aggregates.append({ha_emit_glsl_scalar(*value), op});
   return &read;
+}
+
+/**
+ * `GeometryNodeSampleIndex`: gather a same-domain attribute at an arbitrary element index.
+ *
+ * Only a `Named Attribute` value (or a constant) is supported: a general field would have to be
+ * evaluated at the sampled index, which the per-element kernel cannot do without a second pass.
+ * The node's `domain` has to match the domain currently being compiled, and the geometry has to
+ * be the zone input.
+ */
+const HaExpr *compile_sample_index(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Sample Index: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *storage = static_cast<const NodeGeometrySampleIndex *>(node.storage);
+  if (storage == nullptr) {
+    fail(ctx, "Sample Index: missing storage");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (!ctx.allow_gather) {
+    fail(ctx, "Sample Index: not supported in this kernel");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (bke::AttrDomain(storage->domain) != ctx.domain) {
+    fail(ctx, "Sample Index: the node domain has to match the current field domain");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (node.input_sockets().size() < 3) {
+    fail(ctx, "Sample Index: unexpected sockets");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bNodeSocket &geometry_input = node.input_socket(0);
+  if (geometry_input.link == nullptr || geometry_input.link->fromnode != ctx.zone_input_node) {
+    fail(ctx, "Sample Index: the geometry has to come from the zone input");
+    return &ctx.pool.constant(0.0f);
+  }
+
+  HaType type;
+  switch (eCustomDataType(storage->data_type)) {
+    case CD_PROP_FLOAT:
+      type = HaType::Float;
+      break;
+    case CD_PROP_INT32:
+    case CD_PROP_BOOL:
+      type = HaType::Int;
+      break;
+    case CD_PROP_FLOAT2:
+      type = HaType::Float2;
+      break;
+    case CD_PROP_FLOAT3:
+      type = HaType::Float3;
+      break;
+    case CD_PROP_COLOR:
+      type = HaType::Color;
+      break;
+    default:
+      fail(ctx, "Sample Index: this data type is not supported");
+      return &ctx.pool.constant(0.0f);
+  }
+
+  const HaExpr *value = compile_input_as(ctx, node, 1, type);
+  const HaExpr *index = compile_input_as(ctx, node, 2, HaType::Int);
+  if (!ctx.ok) {
+    return &ctx.pool.constant(0.0f);
+  }
+  if (value->op == HaOp::Const) {
+    /* Sampling a constant is the constant. */
+    return value;
+  }
+  if (value->op != HaOp::AttributeRead) {
+    fail(ctx, "Sample Index: the value has to be a Named Attribute");
+    return &ctx.pool.constant(0.0f);
+  }
+  HaExpr &gather = ctx.pool.add(type, HaOp::AttributeGather, {index});
+  gather.attribute_slot = value->attribute_slot;
+  gather.param = storage->clamp != 0 ? 1 : 0;
+  ctx.has_gather = true;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Sample Index (clamp=%d)\n", int(storage->clamp));
+  }
+  return &gather;
+}
+
+/**
+ * `GeometryNodeSwitch` for field values. Only the value types the IR has are supported; the
+ * `GEOMETRY` / `MATRIX` / ... branches are structural and fall back.
+ */
+const HaExpr *compile_switch(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Switch: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *storage = static_cast<const NodeSwitch *>(node.storage);
+  if (storage == nullptr) {
+    fail(ctx, "Switch: missing storage");
+    return &ctx.pool.constant(0.0f);
+  }
+  HaType type;
+  switch (storage->input_type) {
+    case SOCK_FLOAT:
+    case SOCK_BOOLEAN:
+      type = HaType::Float;
+      break;
+    case SOCK_INT:
+      type = HaType::Int;
+      break;
+    case SOCK_VECTOR:
+      type = HaType::Float3;
+      break;
+    case SOCK_RGBA:
+      type = HaType::Color;
+      break;
+    default:
+      fail(ctx, "Switch: only float, integer, boolean, vector and color values are supported");
+      return &ctx.pool.constant(0.0f);
+  }
+  const HaExpr *condition = compile_input_as(ctx, node, 0, HaType::Float);
+  const HaExpr *false_value = compile_input_as(ctx, node, 1, type);
+  const HaExpr *true_value = compile_input_as(ctx, node, 2, type);
+  if (!ctx.ok) {
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Switch\n");
+  }
+  return &ctx.pool.add(type, HaOp::Select, {condition, false_value, true_value});
+}
+
+/** `GeometryNodeIndexSwitch` for field values. Out-of-range indices use the type's default. */
+const HaExpr *compile_index_switch(CompileContext &ctx,
+                                   const bNode &node,
+                                   const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Index Switch: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *storage = static_cast<const NodeIndexSwitch *>(node.storage);
+  if (storage == nullptr) {
+    fail(ctx, "Index Switch: missing storage");
+    return &ctx.pool.constant(0.0f);
+  }
+  HaType type;
+  switch (storage->data_type) {
+    case SOCK_FLOAT:
+    case SOCK_BOOLEAN:
+      type = HaType::Float;
+      break;
+    case SOCK_INT:
+      type = HaType::Int;
+      break;
+    case SOCK_VECTOR:
+      type = HaType::Float3;
+      break;
+    case SOCK_RGBA:
+      type = HaType::Color;
+      break;
+    default:
+      fail(ctx,
+           "Index Switch: only float, integer, boolean, vector and color values are supported");
+      return &ctx.pool.constant(0.0f);
+  }
+  const int item_count = storage->items_num;
+  if (item_count <= 0 || 1 + item_count > int(node.input_sockets().size())) {
+    fail(ctx, "Index Switch: no items");
+    return &ctx.pool.constant(0.0f);
+  }
+  Vector<const HaExpr *> args;
+  args.reserve(item_count + 1);
+  args.append(compile_input_as(ctx, node, 0, HaType::Int));
+  for (const int i : IndexRange(item_count)) {
+    args.append(compile_input_as(ctx, node, 1 + i, type));
+  }
+  if (!ctx.ok) {
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Index Switch (%d items)\n", item_count);
+  }
+  return &ctx.pool.add(type, HaOp::IndexSelect, args.as_span());
 }
 
 const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int socket_index)
@@ -2011,6 +2210,15 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("ShaderNodeMapRange"_ustr)) {
     result = compile_map_range(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeSwitch"_ustr)) {
+    result = compile_switch(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeSampleIndex"_ustr)) {
+    result = compile_sample_index(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeIndexSwitch"_ustr)) {
+    result = compile_index_switch(ctx, node, socket_index);
   }
   else if (node.is_type("GeometryNodeInputNamedAttribute"_ustr)) {
     result = compile_named_attribute(ctx, node, socket_index);
@@ -2341,6 +2549,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     step_operation.index = 0;
     program->operations_.insert(0, step_operation);
   }
+  program->has_gather_ = ctx.has_gather;
   return program;
 }
 
@@ -2579,6 +2788,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
    * shader source only contains `user_params[slot * 4 + component]`, so a changing value never
    * rebuilds the shader. Slot 15 is reserved for this buffer; keep the attribute count below 13. */
   HaBuffer params_buffer;
+  HaBuffer gather_buffer;
   Vector<HaShaderResource> position_resources;
   position_resources.reserve(extra_resources.size() + 1);
   for (const HaShaderResource &resource : extra_resources) {
@@ -2651,6 +2861,23 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     params_buffer.upload(host_params);
     position_resources.append({15, HaShaderQualifier::Read, "float", "user_params[]"});
     param_key = "|params";
+  }
+
+  /* `Sample Index` gathers need the element count for the clamp / range check. Slot 14 is used,
+   * so at most 11 attributes can be bound together with a gather. */
+  std::string gather_key;
+  if (has_gather_) {
+    if (attributes_.size() > 11) {
+      return false;
+    }
+    if (!gather_buffer.ensure(1)) {
+      return false;
+    }
+    Array<float> host_gather(1);
+    host_gather[0] = float(element_count);
+    gather_buffer.upload(host_gather);
+    position_resources.append({14, HaShaderQualifier::Read, "float", "gather_params[]"});
+    gather_key = "|gather";
   }
 
   /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
@@ -2726,7 +2953,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     if (operation.kind == HaChainOperation::Kind::Step) {
       const HaProgramStep &step = steps_[operation.index];
       gpu::Shader *shader = ha_shader_get(
-          step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key,
+          step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key + gather_key,
           step.glsl_position,
           step.glsl_selection,
           Span<const HaShaderResource>(position_resources.data(),
@@ -2746,7 +2973,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       if (!params_.is_empty()) {
         GPU_storagebuf_bind(params_buffer.buf(), 15);
       }
+      if (has_gather_) {
+        GPU_storagebuf_bind(gather_buffer.buf(), 14);
+      }
       ha_dispatch(shader, padded_count);
+      if (has_gather_) {
+        GPU_storagebuf_unbind(gather_buffer.buf());
+      }
       if (!params_.is_empty()) {
         GPU_storagebuf_unbind(params_buffer.buf());
       }

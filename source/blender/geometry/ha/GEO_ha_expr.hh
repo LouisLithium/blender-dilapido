@@ -117,6 +117,12 @@ enum class HaOp {
    */
   AttributeRead,
   /**
+   * The same attribute read at an arbitrary element index (`Sample Index`). `args[0]` is the
+   * index; `attribute_slot` is the attribute; `param` bit 0 = clamp the index. The element count
+   * is uploaded in `gather_params[0]`.
+   */
+  AttributeGather,
+  /**
    * A value from the program's uniform parameter buffer (an animated socket default). The slot is
    * `param_slot * 4`; the buffer is declared as `user_params[]`.
    */
@@ -158,6 +164,12 @@ enum class HaOp {
   SmoothMax,
   /** value, max, min -> float. */
   Wrap,
+  /** condition, false_value, true_value -> value (`GeometryNodeSwitch`). The condition is a
+   * float; greater than zero selects `true_value`. */
+  Select,
+  /** index (int), item 0 .. item N-1 -> value (`GeometryNodeIndexSwitch`). Out-of-range indices
+   * produce the type's default value, exactly like the CPU multi-function. */
+  IndexSelect,
 
   /* --- Implicit type conversions (see `blenkernel/intern/type_conversions.cc`) ---------- */
   /** The result type is the expression's type; the source type is `args[0]->type`. */
