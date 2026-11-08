@@ -17,9 +17,11 @@
 #include "BKE_geometry_set.hh"
 #include "BKE_attribute.hh"
 #include "BKE_curves.hh"
+#include "BKE_geometry_fields.hh"
 #include "BKE_lib_id.hh"
 #include "BKE_material.hh"
 #include "BKE_mesh.h"
+#include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
 #include "BKE_node.hh"
 #include "BKE_node_runtime.hh"
@@ -117,6 +119,9 @@ struct CompileContext {
    * binds that buffer. */
   bool allow_gather = true;
   bool has_gather = false;
+  /** True after the first `Set Position` / `Transform` step: `Normal` and `Face Area` would have to
+   * be recomputed from the new positions, which the host upload cannot do. */
+  bool position_may_have_changed = false;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
 };
 
@@ -1640,11 +1645,62 @@ bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
 }
 
 /**
+ * Uploads a host-computed attribute (`Face Area` / `Normal` / `True Normal`). The values are
+ * derived from the **zone input** mesh, so these nodes are only allowed before the first position
+ * step (see `CompileContext::position_may_have_changed`).
+ */
+bool upload_synthetic_attribute(const Mesh &mesh,
+                                const HaAttribute &attribute,
+                                const int count,
+                                const int padded,
+                                HaBuffer &r_buffer)
+{
+  const bke::AttrDomain domain = bke::AttrDomain(attribute.domain);
+  const int components = attribute.components;
+  const int64_t total = int64_t(padded) * components;
+  Array<float> host(total, 0.0f);
+  if (attribute.kind == HaAttributeKind::FaceArea) {
+    const Span<float3> positions = mesh.vert_positions();
+    const OffsetIndices faces = mesh.faces();
+    const Span<int> corner_verts = mesh.corner_verts();
+    auto area_fn = [positions, faces, corner_verts](const int i) -> float {
+      return bke::mesh::face_area_calc(positions, corner_verts.slice(faces[i]));
+    };
+    const VArray<float> areas = mesh.attributes().adapt_domain<float>(
+        VArray<float>::from_func(faces.size(), area_fn), bke::AttrDomain::Face, domain);
+    if (areas.size() < count) {
+      return false;
+    }
+    for (const int i : IndexRange(count)) {
+      host[i] = areas[i];
+    }
+  }
+  else {
+    const bool true_normals = attribute.kind == HaAttributeKind::TrueNormal;
+    const VArray<float3> normals = bke::mesh_normals_varray(
+        mesh, IndexMask(count), domain, false, true_normals);
+    if (normals.size() < count) {
+      return false;
+    }
+    for (const int i : IndexRange(count)) {
+      const float3 value = normals[i];
+      host[i * 3] = value.x;
+      host[i * 3 + 1] = value.y;
+      host[i * 3 + 2] = value.z;
+    }
+  }
+  if (!r_buffer.ensure(total)) {
+    return false;
+  }
+  r_buffer.upload(host);
+  return true;
+}
+
+/**
  * Uploads the attributes a FACE/EDGE/CORNER pass reads, from the matching domain of the source
  * mesh. Returns false when an attribute cannot be represented (wrong domain or type), which makes
  * the caller fall back to the CPU.
- */
-bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
+ */bool upload_domain_attributes(const bke::AttributeAccessor &src_attributes,
                               const Span<const HaAttribute> attributes,
                               const bke::AttrDomain domain,
                               const int count,
@@ -1932,6 +1988,86 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
   return &read;
 }
 
+/** Finds or adds a program attribute and returns its binding slot. */
+int find_or_add_attribute(CompileContext &ctx,
+                          const std::string &name,
+                          const HaType type,
+                          const int components,
+                          const HaAttributeKind kind,
+                          const int domain)
+{
+  for (const int i : ctx.attributes.index_range()) {
+    if (ctx.attributes[i].name == name) {
+      return i;
+    }
+  }
+  const int slot = int(ctx.attributes.size());
+  HaAttribute attribute;
+  attribute.name = name;
+  attribute.type = type;
+  attribute.components = components;
+  attribute.kind = kind;
+  attribute.domain = domain;
+  ctx.attributes.append(std::move(attribute));
+  return slot;
+}
+
+/** `GeometryNodeInputMeshFaceArea`: the host computes the face areas and adapts them to POINT. */
+const HaExpr *compile_face_area(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Face Area: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.domain != bke::AttrDomain::Point) {
+    fail(ctx, "Face Area: only available on the POINT domain");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.position_may_have_changed) {
+    fail(ctx, "Face Area: reading it after a position step is not supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const int slot = find_or_add_attribute(
+      ctx, "__ha_face_area", HaType::Float, 1, HaAttributeKind::FaceArea, int(ctx.domain));
+  HaExpr &read = ctx.pool.add(HaType::Float, HaOp::AttributeRead);
+  read.attribute_slot = slot;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Face Area\n");
+  }
+  return &read;
+}
+
+/** `GeometryNodeInputNormal`: host-computed vertex normals (Normal / True Normal). */
+const HaExpr *compile_normal(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0 && socket_index != 1) {
+    fail(ctx, "Normal: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.domain != bke::AttrDomain::Point) {
+    fail(ctx, "Normal: only available on the POINT domain");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.position_may_have_changed) {
+    fail(ctx, "Normal: reading it after a position step is not supported");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bool true_normals = socket_index == 1;
+  const int slot = find_or_add_attribute(ctx,
+                                         true_normals ? "__ha_true_normal" : "__ha_normal",
+                                         HaType::Float3,
+                                         3,
+                                         true_normals ? HaAttributeKind::TrueNormal :
+                                                        HaAttributeKind::Normal,
+                                         int(ctx.domain));
+  HaExpr &read = ctx.pool.add(HaType::Float3, HaOp::AttributeRead);
+  read.attribute_slot = slot;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: %s\n", true_normals ? "True Normal" : "Normal");
+  }
+  return &read;
+}
+
 /**
  * `GeometryNodeSampleIndex`: gather a same-domain attribute at an arbitrary element index.
  *
@@ -2214,6 +2350,12 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   else if (node.is_type("GeometryNodeSwitch"_ustr)) {
     result = compile_switch(ctx, node, socket_index);
   }
+  else if (node.is_type("GeometryNodeInputMeshFaceArea"_ustr)) {
+    result = compile_face_area(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeInputNormal"_ustr)) {
+    result = compile_normal(ctx, node, socket_index);
+  }
   else if (node.is_type("GeometryNodeSampleIndex"_ustr)) {
     result = compile_sample_index(ctx, node, socket_index);
   }
@@ -2481,6 +2623,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
       program->steps_.append(
           {ha_emit_glsl(*transformed), ha_emit_glsl_scalar(pool.constant(1.0f))});
       program->operations_.append({HaChainOperation::Kind::Step, step_index});
+      ctx.position_may_have_changed = true;
       continue;
     }
 
@@ -2511,6 +2654,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     program->steps_.append(
         {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
     program->operations_.append({HaChainOperation::Kind::Step, step_index});
+    ctx.position_may_have_changed = true;
   }
 
   /* Then the FACE/EDGE passes, first -> last (`element_nodes` is stored last -> first). */
@@ -2750,13 +2894,23 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
   {
     for (const int i : attributes_.index_range()) {
       const HaAttribute &attribute = attributes_[i];
-      if (!upload_one_attribute(input_attributes,
-                                attribute,
-                                bke::AttrDomain::Point,
-                                element_count,
-                                padded_count,
-                                attribute_buffers[i]))
-      {
+      bool uploaded;
+      if (attribute.kind == HaAttributeKind::Input) {
+        uploaded = upload_one_attribute(input_attributes,
+                                        attribute,
+                                        bke::AttrDomain::Point,
+                                        element_count,
+                                        padded_count,
+                                        attribute_buffers[i]);
+      }
+      else {
+        if (src_mesh == nullptr) {
+          return false;
+        }
+        uploaded = upload_synthetic_attribute(
+            *src_mesh, attribute, element_count, padded_count, attribute_buffers[i]);
+      }
+      if (!uploaded) {
         return false;
       }
       attribute_names.append("attribute_" + std::to_string(i) + "[]");

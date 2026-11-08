@@ -72,12 +72,24 @@ struct HaProgramStep {
   std::string glsl_selection;
 };
 
+/** Where a #HaAttribute's values come from. `Input` reads the zone input geometry; the others are
+ * computed by the host from the mesh (P1-04 / P1-05). */
+enum class HaAttributeKind {
+  Input,
+  FaceArea,
+  Normal,
+  TrueNormal,
+};
+
 /** One POINT attribute the program reads, uploaded once per evaluation. */
 struct HaAttribute {
   std::string name;
   HaType type = HaType::Float;
   /** 1 for a float/int attribute, 2/3/4 for a vector one. */
   int components = 1;
+  HaAttributeKind kind = HaAttributeKind::Input;
+  /** `bke::AttrDomain` as an int (the domain the values are uploaded in). */
+  int domain = 0;
 };
 
 /**
