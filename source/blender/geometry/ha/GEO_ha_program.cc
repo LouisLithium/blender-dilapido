@@ -107,6 +107,11 @@ constexpr int MAX_CAPTURE_STEPS = 8;
 struct HaCapturedSocket {
   int slot = -1;
   HaType type = HaType::Float;
+  /** Non-POINT capture: the index into #HaZoneProgram::element_captures_ (and its buffers). */
+  bool element = false;
+  int domain = 0;
+  int buffer_index = -1;
+  std::string name;
 };
 
 struct CompileContext {
@@ -150,8 +155,10 @@ struct CompileContext {
    * be recomputed from the new positions, which the host upload cannot do. */
   bool position_may_have_changed = false;
   Map<const bNodeSocket *, const HaExpr *> compiled_outputs;
-  /** Captured `Capture Attribute` outputs (socket -> internal attribute slot). */
-  Map<const bNodeSocket *, HaCapturedSocket> captured_sockets;
+  /** Captured `Capture Attribute` outputs (socket -> internal attribute slot). Element contexts
+   * point this at the chain context's map so they can resolve a capture node's output. */
+  Map<const bNodeSocket *, HaCapturedSocket> captured_sockets_storage;
+  Map<const bNodeSocket *, HaCapturedSocket> *captured_sockets = &captured_sockets_storage;
 };
 
 const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket);
@@ -1398,6 +1405,7 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   ctx.tree = point_ctx.tree;
   ctx.domain = domain;
   ctx.position_may_have_changed = point_ctx.position_may_have_changed;
+  ctx.captured_sockets = &point_ctx.captured_sockets_storage;
 
   /* Inputs: Geometry(0), Selection(1), Shade Smooth(2). */
   const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
@@ -1457,6 +1465,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
   ctx.tree = point_ctx.tree;
   ctx.domain = bke::AttrDomain::Face;
   ctx.position_may_have_changed = point_ctx.position_may_have_changed;
+  ctx.captured_sockets = &point_ctx.captured_sockets_storage;
   const HaExpr *selection = compile_input_as(ctx, node, 1, HaType::Float);
   if (!ctx.ok) {
     fail(point_ctx, ctx.reason.empty() ? std::string("the field is not supported") : ctx.reason);
@@ -1964,22 +1973,40 @@ bool upload_synthetic_attribute(const Mesh &mesh,
                               const int count,
                               const int padded,
                               Array<HaBuffer> &r_buffers,
+                              Vector<HaBuffer *> &r_binding,
+                              const Span<HaBuffer *const> capture_buffers,
                               Vector<std::string> &r_names,
                               Vector<HaShaderResource> &r_resources,
                               const int first_slot)
 {
   r_names.reserve(attributes.size());
   r_resources.reserve(attributes.size());
+  r_binding.reserve(attributes.size());
   for (const int attribute_i : attributes.index_range()) {
     const HaAttribute &attribute = attributes[attribute_i];
-    const bool uploaded = attribute.kind == HaAttributeKind::Input ?
-                              upload_one_attribute(
-                                  src_attributes, attribute, domain, count, padded, r_buffers[attribute_i]) :
-                              src_mesh != nullptr &&
-                                  upload_synthetic_attribute(
-                                      *src_mesh, attribute, count, padded, r_buffers[attribute_i]);
-    if (!uploaded) {
-      return false;
+    if (attribute.kind == HaAttributeKind::Captured) {
+      if (attribute.ref_index < 0 || attribute.ref_index >= int(capture_buffers.size()) ||
+          capture_buffers[attribute.ref_index] == nullptr)
+      {
+        return false;
+      }
+      r_binding.append(capture_buffers[attribute.ref_index]);
+    }
+    else {
+      const bool uploaded = attribute.kind == HaAttributeKind::Input ?
+                                upload_one_attribute(src_attributes,
+                                                     attribute,
+                                                     domain,
+                                                     count,
+                                                     padded,
+                                                     r_buffers[attribute_i]) :
+                                src_mesh != nullptr &&
+                                    upload_synthetic_attribute(
+                                        *src_mesh, attribute, count, padded, r_buffers[attribute_i]);
+      if (!uploaded) {
+        return false;
+      }
+      r_binding.append(&r_buffers[attribute_i]);
     }
     r_names.append("attribute_" + std::to_string(attribute_i) + "[]");
     r_resources.append({first_slot + attribute_i,
@@ -2030,28 +2057,129 @@ const char *ha_type_default_glsl(const HaType type)
 }
 
 /**
- * `GeometryNodeCaptureAttribute` (P1-11): a pass-through chain node. Its items are snapshotted into
- * internal attribute buffers with ordinary store kernels at this exact point of the chain, and a
- * downstream field reads them through `HaOp::AttributeRead`.
- *
- * Only the POINT domain is supported: the chain carries a single POINT attribute layout. A non
- * constant selection is folded into the stored value (`selection > 0 ? value : default`), which is
- * what `try_capture_fields_on_geometry` does for the unselected elements.
+ * `GeometryNodeCaptureAttribute` (P1-11 / P2-09): a pass-through chain node. POINT items are
+ * snapshotted by ordinary store kernels at this exact point of the chain; FACE / EDGE / CORNER
+ * items are snapshotted before the element passes (the capture has to be upstream of every element
+ * node and no position step / POINT store may have run yet, so it sees the zone input geometry).
+ * A downstream field reads the result through `HaOp::AttributeRead`.
  */
 bool compile_capture(CompileContext &ctx,
                      const bNode &node,
                      const int capture_index,
+                     const int downstream_element_nodes,
+                     const int total_element_nodes,
                      Vector<HaStore> &r_stores,
-                     HaCapture &r_capture)
+                     Vector<HaElementCapture> &r_element_captures,
+                     HaCapture &r_capture,
+                     bool &r_is_element)
 {
   const auto &storage = *static_cast<const NodeGeometryAttributeCapture *>(node.storage);
-  if (bke::AttrDomain(storage.domain) != bke::AttrDomain::Point) {
-    return fail(ctx, "Capture Attribute: only the POINT domain is supported");
-  }
+  const bke::AttrDomain domain = bke::AttrDomain(storage.domain);
+  r_is_element = false;
   if (node.input_sockets().size() < 2 ||
       node.input_sockets().size() < 2 + storage.capture_items_num)
   {
     return fail(ctx, "Capture Attribute: unexpected sockets");
+  }
+
+  if (domain != bke::AttrDomain::Point) {
+    if (!ELEM(domain, bke::AttrDomain::Face, bke::AttrDomain::Edge, bke::AttrDomain::Corner)) {
+      return fail(ctx, "Capture Attribute: this domain is not supported");
+    }
+    if (ctx.position_may_have_changed || !ctx.written_attributes.is_empty()) {
+      return fail(ctx,
+                  "Capture Attribute: a non-POINT capture has to come before any position step or "
+                  "POINT store");
+    }
+    if (downstream_element_nodes != total_element_nodes) {
+      return fail(ctx,
+                  "Capture Attribute: a non-POINT capture has to be upstream of all element nodes");
+    }
+
+    const HaElementDomain element_domain = domain == bke::AttrDomain::Face ?
+                                               HaElementDomain::Face :
+                                               domain == bke::AttrDomain::Edge ?
+                                               HaElementDomain::Edge :
+                                               HaElementDomain::Corner;
+
+    const auto add_item = [&](const bNodeSocket &socket, const int item, const bool selection_item) {
+      HaType type = HaType::Float;
+      if (!selection_item && !ha_type_from_socket(socket, &type)) {
+        return fail(ctx, "Capture Attribute: this item type is not supported");
+      }
+
+      HaElementCapture capture;
+      capture.name = selection_item ? fmt::format("__ha_capture_{}_selection", capture_index) :
+                                      fmt::format("__ha_capture_{}_{}", capture_index, item);
+      capture.domain = element_domain;
+      capture.type = type;
+      capture.components = ha_type_components(type);
+
+      HaExprPool element_pool;
+      Vector<HaAggregate> element_aggregates;
+      CompileContext ectx{element_pool, element_aggregates, capture.attributes, ctx.params};
+      ectx.allow_params = false;
+      ectx.allow_gather = false;
+      ectx.allow_accumulation = false;
+      ectx.allow_element_aggregate = false;
+      ectx.zone_input_node = ctx.zone_input_node;
+      ectx.tree = ctx.tree;
+      ectx.domain = domain;
+      ectx.position_may_have_changed = ctx.position_may_have_changed;
+      ectx.captured_sockets = &ctx.captured_sockets_storage;
+
+      const HaExpr *selection = compile_input_as(ectx, node, 1, HaType::Float);
+      const HaExpr *value = selection_item ? selection :
+                                             compile_input_as(ectx, node, 2 + item, type);
+      if (!ectx.ok) {
+        return fail(ctx,
+                    ectx.reason.empty() ? std::string("the capture field is not supported") :
+                                          ectx.reason);
+      }
+      if (selection->type != HaType::Float || value->type != type) {
+        return fail(ctx, "Capture Attribute: this item type is not supported");
+      }
+      const bool selection_is_full = selection->op == HaOp::Const && selection->value[0] != 0.0f;
+      const std::string selection_glsl = ha_emit_glsl_scalar(*selection);
+      capture.glsl_value = ha_emit_glsl_natural(*value);
+      if (!selection_item && !selection_is_full) {
+        capture.glsl_value = "((" + selection_glsl + ") > 0.0 ? " + capture.glsl_value + " : " +
+                             ha_type_default_glsl(type) + ")";
+      }
+      capture.default_value = 0.0f;
+      const int buffer_index = int(r_element_captures.size());
+      r_element_captures.append(std::move(capture));
+      HaCapturedSocket captured;
+      captured.slot = -1;
+      captured.type = type;
+      captured.element = true;
+      captured.domain = int(domain);
+      captured.buffer_index = buffer_index;
+      captured.name = r_element_captures.last().name;
+      ctx.captured_sockets->add_overwrite(&socket, std::move(captured));
+      return true;
+    };
+
+    for (const int item : IndexRange(storage.capture_items_num)) {
+      if (!add_item(node.output_socket(2 + item), item, false)) {
+        return false;
+      }
+    }
+    if (node.output_socket(1).link != nullptr) {
+      if (!add_item(node.output_socket(1), -1, true)) {
+        return false;
+      }
+    }
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr,
+              "HA program: Capture Attribute (element %s, %d item(s))\n",
+              domain == bke::AttrDomain::Face ? "FACE" :
+              domain == bke::AttrDomain::Edge ? "EDGE" :
+                                                "CORNER",
+              int(storage.capture_items_num));
+    }
+    r_is_element = true;
+    return true;
   }
 
   const int first_store = int(r_stores.size());
@@ -2120,7 +2248,7 @@ bool compile_capture(CompileContext &ctx,
       return false;
     }
     const HaStore &store = r_stores.last();
-    ctx.captured_sockets.add_overwrite(&socket, HaCapturedSocket{store.attribute_slot, store.type});
+    ctx.captured_sockets->add_overwrite(&socket, HaCapturedSocket{store.attribute_slot, store.type});
   }
 
   /* The node also has a `Selection` field output. Capture it only when something reads it. */
@@ -2135,7 +2263,7 @@ bool compile_capture(CompileContext &ctx,
     store.attribute_slot = slot;
     ctx.attributes.append({store.name, HaType::Float, 1});
     r_stores.append(std::move(store));
-    ctx.captured_sockets.add_overwrite(&socket, HaCapturedSocket{slot, HaType::Float});
+    ctx.captured_sockets->add_overwrite(&socket, HaCapturedSocket{slot, HaType::Float});
   }
 
   r_capture.store_offset = first_store;
@@ -2268,6 +2396,7 @@ bool compile_store(CompileContext &ctx,
   element_ctx.tree = ctx.tree;
   element_ctx.domain = domain;
   element_ctx.position_may_have_changed = ctx.position_may_have_changed;
+  element_ctx.captured_sockets = &ctx.captured_sockets_storage;
   const HaExpr *selection = compile_input_as(element_ctx, node, 1, HaType::Float);
   const HaExpr *compiled = compile_input_as(element_ctx, node, 3, type);
   if (!element_ctx.ok) {
@@ -3146,10 +3275,41 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
 
   const HaExpr *result = nullptr;
   if (node.is_type("GeometryNodeCaptureAttribute"_ustr)) {
-    if (const HaCapturedSocket *captured = ctx.captured_sockets.lookup_ptr(&socket)) {
-      HaExpr &read = ctx.pool.add(captured->type, HaOp::AttributeRead);
-      read.attribute_slot = captured->slot;
-      result = &read;
+    if (const HaCapturedSocket *captured = ctx.captured_sockets->lookup_ptr(&socket)) {
+      if (!captured->element) {
+        HaExpr &read = ctx.pool.add(captured->type, HaOp::AttributeRead);
+        read.attribute_slot = captured->slot;
+        result = &read;
+      }
+      else {
+        if (ctx.domain == bke::AttrDomain::Point || int(ctx.domain) != captured->domain) {
+          fail(ctx, "Capture Attribute: an element-domain capture can only be read in the same domain");
+          result = &ctx.pool.constant(0.0f);
+        }
+        else {
+          int slot = -1;
+          for (const int i : ctx.attributes.index_range()) {
+            if (ctx.attributes[i].name == captured->name) {
+              slot = i;
+              break;
+            }
+          }
+          if (slot < 0) {
+            slot = int(ctx.attributes.size());
+            HaAttribute attribute;
+            attribute.name = captured->name;
+            attribute.type = captured->type;
+            attribute.components = ha_type_components(captured->type);
+            attribute.kind = HaAttributeKind::Captured;
+            attribute.domain = captured->domain;
+            attribute.ref_index = captured->buffer_index;
+            ctx.attributes.append(std::move(attribute));
+          }
+          HaExpr &read = ctx.pool.add(captured->type, HaOp::AttributeRead);
+          read.attribute_slot = slot;
+          result = &read;
+        }
+      }
     }
     else {
       fail(ctx, "Capture Attribute: only the captured field outputs are supported");
@@ -3420,6 +3580,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
   int step_count = 0;
   int store_count = 0;
   int capture_count = 0;
+  Map<const bNode *, int> capture_downstream_elements;
   bool at_tail = true;
   const bNode *current = zone_output_input.link->fromnode;
   while (true) {
@@ -3466,6 +3627,8 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
         return fail(fmt::format("node '{}': the geometry input is not connected", current->name));
       }
       chain_nodes.append(current);
+      capture_downstream_elements.add_overwrite(
+          current, int(element_nodes.size() + corner_nodes.size()));
       capture_count++;
       current = geometry_input.link->fromnode;
       continue;
@@ -3524,6 +3687,7 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
   /* Compile in chain order (`chain_nodes` is stored last -> first). POINT stores are compiled in
    * place: the compile context remembers the attributes written so far, so a downstream
    * `Named Attribute` reads the stored version instead of the zone input. */
+  int capture_compile_index = 0;
   for (const int i : chain_nodes.index_range()) {
     const bNode &node = *chain_nodes[chain_nodes.size() - 1 - i];
 
@@ -3547,10 +3711,23 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
 
     if (node.is_type("GeometryNodeCaptureAttribute"_ustr)) {
       HaCapture capture;
-      if (!compile_capture(
-              ctx, node, int(program->captures_.size()), program->capture_stores_, capture))
+      bool is_element = false;
+      const int downstream = capture_downstream_elements.lookup_default(
+          &node, int(element_nodes.size() + corner_nodes.size()));
+      if (!compile_capture(ctx,
+                           node,
+                           capture_compile_index++,
+                           downstream,
+                           int(element_nodes.size() + corner_nodes.size()),
+                           program->capture_stores_,
+                           program->element_captures_,
+                           capture,
+                           is_element))
       {
         return fail(ctx.reason.empty() ? std::string("the capture is not supported") : ctx.reason);
+      }
+      if (is_element) {
+        continue;
       }
       const int capture_index = int(program->captures_.size());
       program->captures_.append(capture);
@@ -3599,6 +3776,12 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
         {ha_emit_glsl(final_position), ha_emit_glsl_scalar(*selection)});
     program->operations_.append({HaChainOperation::Kind::Step, step_index});
     ctx.position_may_have_changed = true;
+  }
+
+  /* A non-POINT capture is materialized from the zone input geometry, so it cannot coexist with a
+   * position step (the element passes would otherwise see moved positions). */
+  if (!program->element_captures_.is_empty() && step_count > 0) {
+    return fail("Capture Attribute: a non-POINT capture is not supported together with a position step");
   }
 
   /* Then the FACE/EDGE passes, first -> last (`element_nodes` is stored last -> first). */
@@ -4657,6 +4840,93 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     return true;
   };
 
+  /* Non-POINT `Capture Attribute` items: the compiler only accepts them before every element node
+   * and before any position step / POINT store, so they can be materialized from the zone input
+   * geometry here. The resulting buffers are bound as `Captured` attributes by the element passes
+   * and stores below. */
+  Array<HaBuffer> element_capture_buffers(int64_t(element_captures_.size()));
+  Array<HaBuffer *> element_capture_buffer_ptrs(int64_t(element_captures_.size()));
+  for (const int i : element_captures_.index_range()) {
+    element_capture_buffer_ptrs[i] = nullptr;
+  }
+  for (const int capture_i : element_captures_.index_range()) {
+    const HaElementCapture &capture = element_captures_[capture_i];
+    const bke::AttrDomain domain = ha_element_domain_to_attr(capture.domain);
+    const int count = int(src_mesh->attributes().domain_size(domain));
+    if (count <= 0) {
+      return false;
+    }
+    const int padded = (count + local_size - 1) / local_size * local_size;
+    HaBuffer &out = element_capture_buffers[capture_i];
+    HaBuffer element_in;
+    HaBuffer element_params;
+    if (!out.ensure(int64_t(padded) * capture.components) ||
+        !element_in.ensure(int64_t(padded) * capture.components) || !element_params.ensure(4))
+    {
+      return false;
+    }
+    Array<float> zeros(int64_t(padded) * capture.components, 0.0f);
+    element_in.upload(zeros);
+    const std::array<float, 4> params{float(count), 0.0f, 0.0f, 0.0f};
+    element_params.upload(params);
+
+    Array<HaBuffer> capture_attribute_buffers(capture.attributes.size());
+    Vector<HaBuffer *> capture_attribute_bindings;
+    Vector<std::string> capture_attribute_names;
+    Vector<HaShaderResource> capture_resources;
+    if (!upload_domain_attributes(
+            src_mesh->attributes(),
+            src_mesh,
+            Span<const HaAttribute>(capture.attributes.data(), capture.attributes.size()),
+            domain,
+            count,
+            padded,
+            capture_attribute_buffers,
+            capture_attribute_bindings,
+            Span<HaBuffer *const>(element_capture_buffer_ptrs.data(), capture_i),
+            capture_attribute_names,
+            capture_resources,
+            3))
+    {
+      return false;
+    }
+    std::string capture_attribute_key;
+    for (const HaAttribute &attribute : capture.attributes) {
+      capture_attribute_key += "|";
+      capture_attribute_key += ha_attribute_buffer_glsl(attribute.type);
+    }
+    gpu::Shader *capture_shader = ha_shader_get_element_store(
+        "ecapture|" + capture.glsl_value + "|" + std::to_string(capture.components) + "|" +
+            ha_type_glsl(capture.type) + capture_attribute_key,
+        capture.glsl_value,
+        "1.0",
+        ha_type_glsl(capture.type),
+        capture.components,
+        Span<const HaShaderResource>(capture_resources.data(), int64_t(capture_resources.size())));
+    if (capture_shader == nullptr) {
+      return false;
+    }
+    GPU_shader_bind(capture_shader);
+    GPU_storagebuf_bind(element_in.buf(), 0);
+    GPU_storagebuf_bind(out.buf(), 1);
+    GPU_storagebuf_bind(element_params.buf(), 2);
+    for (const int attribute_i : capture.attributes.index_range()) {
+      GPU_storagebuf_bind(capture_attribute_bindings[attribute_i]->buf(), 3 + attribute_i);
+    }
+    ha_dispatch(capture_shader, padded);
+    for (const int attribute_i : capture.attributes.index_range()) {
+      GPU_storagebuf_unbind(capture_attribute_bindings[attribute_i]->buf());
+    }
+    GPU_storagebuf_unbind(element_params.buf());
+    GPU_storagebuf_unbind(out.buf());
+    GPU_storagebuf_unbind(element_in.buf());
+    GPU_shader_unbind();
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr, "HA program: element capture '%s'\n", capture.name.c_str());
+    }
+    element_capture_buffer_ptrs[capture_i] = &out;
+  }
+
   /* The FACE / EDGE passes: they do not touch positions, so they run after the chain and before the
    * stores, writing straight into the result mesh. */
   if (!element_steps_.is_empty()) {
@@ -4746,6 +5016,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
 
       /* The attributes this step's fields read, taken from the same domain of the source mesh. */
       Array<HaBuffer> step_attribute_buffers(step.attributes.size());
+      Vector<HaBuffer *> step_attribute_bindings;
       Vector<std::string> step_attribute_names;
       Vector<HaShaderResource> step_resources;
       if (!upload_domain_attributes(src_attributes,
@@ -4756,6 +5027,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                                     count,
                                     padded,
                                     step_attribute_buffers,
+                                    step_attribute_bindings,
+                                    Span<HaBuffer *const>(element_capture_buffer_ptrs.data(),
+                                                          element_capture_buffer_ptrs.size()),
                                     step_attribute_names,
                                     step_resources,
                                     3)) {
@@ -4773,6 +5047,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       HaBuffer element_aggregate;
       if (step.uses_position_gather && step.attributes.size() > 8) {
         return false;
+      }
+      if (!step.aggregates.is_empty()) {
+        for (const HaAttribute &attribute : step.attributes) {
+          if (attribute.kind == HaAttributeKind::Captured) {
+            return false;
+          }
+        }
       }
       if (!prepare_element_aggregates(
               step.aggregates,
@@ -4812,7 +5093,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       GPU_storagebuf_bind(element_out.buf(), 1);
       GPU_storagebuf_bind(element_params.buf(), 2);
       for (const int attribute_i : step.attributes.index_range()) {
-        GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+        GPU_storagebuf_bind(step_attribute_bindings[attribute_i]->buf(), 3 + attribute_i);
       }
       if (step.uses_position_gather) {
         GPU_storagebuf_bind(result.buf(), 11);
@@ -4828,7 +5109,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         GPU_storagebuf_unbind(result.buf());
       }
       for (const int attribute_i : step.attributes.index_range()) {
-        GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+        GPU_storagebuf_unbind(step_attribute_bindings[attribute_i]->buf());
       }
       GPU_storagebuf_unbind(element_params.buf());
       GPU_storagebuf_unbind(element_out.buf());
@@ -4919,6 +5200,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         corner_params_buffer.upload(corner_params);
 
         Array<HaBuffer> step_attribute_buffers(step.attributes.size());
+        Vector<HaBuffer *> step_attribute_bindings;
         Vector<std::string> step_attribute_names;
         Vector<HaShaderResource> step_resources;
         if (!upload_domain_attributes(src_attributes,
@@ -4929,6 +5211,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                                       face_count,
                                       padded_faces,
                                       step_attribute_buffers,
+                                      step_attribute_bindings,
+                                      Span<HaBuffer *const>(),
                                       step_attribute_names,
                                       step_resources,
                                       6))
@@ -4953,11 +5237,11 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         GPU_storagebuf_bind(face_offsets_buffer.buf(), 4);
         GPU_storagebuf_bind(corner_params_buffer.buf(), 5);
         for (const int attribute_i : step.attributes.index_range()) {
-          GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 6 + attribute_i);
+          GPU_storagebuf_bind(step_attribute_bindings[attribute_i]->buf(), 6 + attribute_i);
         }
         ha_dispatch(corner_shader, padded_faces);
         for (const int attribute_i : step.attributes.index_range()) {
-          GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+          GPU_storagebuf_unbind(step_attribute_bindings[attribute_i]->buf());
         }
         GPU_storagebuf_unbind(corner_params_buffer.buf());
         GPU_storagebuf_unbind(face_offsets_buffer.buf());
@@ -5022,6 +5306,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       }
 
       Array<HaBuffer> step_attribute_buffers(store.attributes.size());
+      Vector<HaBuffer *> step_attribute_bindings;
       Vector<std::string> step_attribute_names;
       Vector<HaShaderResource> step_resources;
       if (!upload_domain_attributes(mesh_attributes,
@@ -5032,6 +5317,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
                                     count,
                                     padded,
                                     step_attribute_buffers,
+                                    step_attribute_bindings,
+                                    Span<HaBuffer *const>(element_capture_buffer_ptrs.data(),
+                                                          element_capture_buffer_ptrs.size()),
                                     step_attribute_names,
                                     step_resources,
                                     3))
@@ -5050,6 +5338,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       HaBuffer element_aggregate;
       if (store.uses_position_gather && store.attributes.size() > 8) {
         return false;
+      }
+      if (!store.aggregates.is_empty()) {
+        for (const HaAttribute &attribute : store.attributes) {
+          if (attribute.kind == HaAttributeKind::Captured) {
+            return false;
+          }
+        }
       }
       if (!prepare_element_aggregates(
               store.aggregates,
@@ -5090,7 +5385,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       GPU_storagebuf_bind(element_out.buf(), 1);
       GPU_storagebuf_bind(element_params.buf(), 2);
       for (const int attribute_i : store.attributes.index_range()) {
-        GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
+        GPU_storagebuf_bind(step_attribute_bindings[attribute_i]->buf(), 3 + attribute_i);
       }
       if (store.uses_position_gather) {
         GPU_storagebuf_bind(result.buf(), 11);
@@ -5106,7 +5401,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         GPU_storagebuf_unbind(result.buf());
       }
       for (const int attribute_i : store.attributes.index_range()) {
-        GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
+        GPU_storagebuf_unbind(step_attribute_bindings[attribute_i]->buf());
       }
       GPU_storagebuf_unbind(element_params.buf());
       GPU_storagebuf_unbind(element_out.buf());

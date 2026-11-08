@@ -107,6 +107,8 @@ enum class HaAttributeKind {
   EdgeVertex2Position,
   /** `UV Tangent`: host-computed CORNER tangents from the referenced UV attribute. */
   UVTangent,
+  /** A non-POINT `Capture Attribute` snapshot, read from a program capture buffer. */
+  Captured,
 };
 
 /** One POINT attribute the program reads, uploaded once per evaluation. */
@@ -123,6 +125,8 @@ struct HaAttribute {
   /** `UV Tangent` method (0 = Exact, 1 = Fast) and the source UV data type (CD_PROP_FLOAT2/3). */
   int ref_method = 0;
   int ref_data_type = 0;
+  /** Index into the program's capture buffers for #HaAttributeKind::Captured. */
+  int ref_index = -1;
 };
 
 /**
@@ -213,6 +217,23 @@ struct HaElementStore {
 enum class HaElementType {
   Bool,
   Int,
+};
+
+/**
+ * A `Capture Attribute` item on FACE / EDGE / CORNER (P2-09). The value is evaluated once into
+ * #HaZoneProgram::element_capture_buffers_ before the element passes; downstream element fields
+ * read it through #HaAttributeKind::Captured.
+ */
+struct HaElementCapture {
+  /** Internal attribute name, used only for debug / deduplication. */
+  std::string name;
+  HaElementDomain domain = HaElementDomain::Face;
+  HaType type = HaType::Float;
+  int components = 1;
+  /** Value expression (`selection > 0 ? value : default` is already folded in). */
+  std::string glsl_value;
+  float default_value = 0.0f;
+  Vector<HaAttribute> attributes;
 };
 
 /**
@@ -355,6 +376,8 @@ class HaZoneProgram {
   Vector<HaStore> capture_stores_;
   /** `Capture Attribute` nodes, in chain order. */
   Vector<HaCapture> captures_;
+  /** Non-POINT capture items, evaluated before the element passes. */
+  Vector<HaElementCapture> element_captures_;
   /** Linear order of the position steps and the POINT stores. */
   Vector<HaChainOperation> operations_;
   /** `Store Named Attribute` nodes on FACE / EDGE / CORNER, in evaluation order. */
