@@ -34,7 +34,7 @@ inline constexpr int HA_REDUCE_BLOCK_SIZE = 1024;
 /** The GPU backend is initialized and usable. Never initializes it on its own. */
 bool ha_gpu_available();
 
-/** Human readable backend name for debug output, e.g. "OPENGL / Intel(R) UHD Graphics". */
+/** Human readable backend name for debug output, e.g. "OPENGL / <GPU name>". */
 const char *ha_gpu_backend_name();
 
 /**

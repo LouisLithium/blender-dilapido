@@ -5855,9 +5855,9 @@ class XpbdSolverStep {
      * same constraint set (with the same compliance term) together with the density iterations. The
      * old hard distance-field projection could not hold a dense falling column (M118). */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
-     * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on an
-     * Intel UHD: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the zone made
-     * nothing faster and the fixed cost was visible. */
+     * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on
+     * earlier hardware: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the
+     * zone made nothing faster and the fixed cost was visible. Re-measure on the target GPU. */
     if (int(geometries_.chunks[chunk_i].points_range.size()) < this->device_min_particles()) {
       r_soft = true;
       return "below the device particle threshold";
