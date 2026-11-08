@@ -230,6 +230,13 @@ const char *GLSL_PRELUDE =
     "{\n"
     "  return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < HA_DX && c.y < HA_DY && c.z < HA_DZ;\n"
     "}\n"
+    /* Cell addressing. The dense build is the one below: a cell is its flat index, a neighbour is
+     * `ha_at(c + offset)`. The brick sparse build (doc/ignis-brick-sparse.md) replaces the bodies of
+     * `ha_at`, `ha_cell` and the value of `HA_CELL_COUNT` (the pool size) with the brick pool; the
+     * kernels must not index a field with `ha_flat` directly, so that swap does not touch them. The
+     * one thing the kernels do need then is to drop invocations whose coordinate falls into the
+     * padding of a partial brick (`!ha_inside(c)`). */
+    "int ha_at(ivec3 c) { return ha_inside(c) ? ha_flat(c) : -1; }\n"
     "vec3 ha_world(ivec3 c) { return (HA_ORIGIN + vec3(c)) * HA_VOXEL; }\n";
 
 /** Per pass controls of the advection kernels (a separate buffer, so they never clobber CG state).
@@ -265,28 +272,31 @@ HaShaderResource res(const int slot,
  * \{ */
 
 const char *GLSL_MASK_HELPERS =
-    "int ha_mask_at(ivec3 c) { return ha_inside(c) ? mask[ha_flat(c)] : 0; }\n";
+    "int ha_mask_at(ivec3 c) { int i = ha_at(c); return i < 0 ? 0 : mask[i]; }\n";
 
 const char *GLSL_MASK_IN_HELPERS =
-    "int ha_mask_in_at(ivec3 c) { return ha_inside(c) ? mask_in[ha_flat(c)] : 0; }\n";
+    "int ha_mask_in_at(ivec3 c) { int i = ha_at(c); return i < 0 ? 0 : mask_in[i]; }\n";
 
 const char *GLSL_SCALAR_HELPERS =
     "float ha_scalar_at(ivec3 c, int component)\n"
     "{\n"
-    "  return ha_inside(c) ? scalars[ha_flat(c) * 4 + component] : 0.0;\n"
+    "  int i = ha_at(c);\n"
+    "  return i < 0 ? 0.0 : scalars[i * 4 + component];\n"
     "}\n";
 
 const char *GLSL_VELOCITY_HELPERS =
     "vec3 ha_velocity(ivec3 c)\n"
     "{\n"
-    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int i = ha_at(c);\n"
+    "  if (i < 0) { return vec3(0.0); }\n"
+    "  int base = i * 3;\n"
     "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
     "}\n"
     "void ha_velocity_set(ivec3 c, vec3 v)\n"
     "{\n"
-    "  if (!ha_inside(c)) { return; }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int i = ha_at(c);\n"
+    "  if (i < 0) { return; }\n"
+    "  int base = i * 3;\n"
     "  velocity[base + 0] = v.x;\n"
     "  velocity[base + 1] = v.y;\n"
     "  velocity[base + 2] = v.z;\n"
@@ -314,8 +324,9 @@ const char *GLSL_VELOCITY_HELPERS =
 const char *GLSL_ADVECT_VEC3_FIELD =
     "vec3 ha_field_read(ivec3 c)\n"
     "{\n"
-    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int i = ha_at(c);\n"
+    "  if (i < 0) { return vec3(0.0); }\n"
+    "  int base = i * 3;\n"
     "  return vec3(field_in[base + 0], field_in[base + 1], field_in[base + 2]);\n"
     "}\n"
     "void ha_field_write(int i, vec3 v)\n"
@@ -332,26 +343,28 @@ const char *GLSL_ADVECT_VEC3_FIELD =
 const char *GLSL_ADVECT_VEC3_AUX =
     "vec3 ha_field_aux(ivec3 c)\n"
     "{\n"
-    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int i = ha_at(c);\n"
+    "  if (i < 0) { return vec3(0.0); }\n"
+    "  int base = i * 3;\n"
     "  return vec3(field_aux[base + 0], field_aux[base + 1], field_aux[base + 2]);\n"
     "}\n";
 
 const char *GLSL_ADVECT_SCALAR_FIELD =
     "float ha_field_read(ivec3 c)\n"
     "{\n"
-    "  return ha_inside(c) ? field_in[ha_flat(c) * 4 + HA_COMPONENT] : 0.0;\n"
+    "  int i = ha_at(c);\n"
+    "  return i < 0 ? 0.0 : field_in[i * 4 + HA_COMPONENT];\n"
     "}\n"
     "void ha_field_write(int i, float v) { field_out[i] = v; }\n"
     "float ha_field_forward(int i) { return field_out[i]; }\n";
 
 const char *GLSL_ADVECT_SCALAR_AUX =
-    "float ha_field_aux(ivec3 c) { return ha_inside(c) ? field_aux[ha_flat(c)] : 0.0; }\n";
+    "float ha_field_aux(ivec3 c) { int i = ha_at(c); return i < 0 ? 0.0 : field_aux[i]; }\n";
 
 /** The same for a buffer that already has one float per voxel (the intermediate of a scalar pass).
  */
 const char *GLSL_ADVECT_PLAIN_FIELD =
-    "float ha_field_read(ivec3 c) { return ha_inside(c) ? field_in[ha_flat(c)] : 0.0; }\n"
+    "float ha_field_read(ivec3 c) { int i = ha_at(c); return i < 0 ? 0.0 : field_in[i]; }\n"
     "void ha_field_write(int i, float v) { field_out[i] = v; }\n";
 
 const char *GLSL_ADVECT_SAMPLE_VEC3 =
@@ -470,7 +483,8 @@ const char *GLSL_FORCE_HELPERS =
     "}\n"
     "float ha_remap_field_value(int field, ivec3 c, vec3 velocity_now)\n"
     "{\n"
-    "  int index = ha_flat(c);\n"
+    "  int index = ha_at(c);\n"
+    "  if (index < 0) { return 0.0; }\n"
     "  if (field == 1) { return pressure[index]; }\n"
     "  if (field == 2) { return scalars[index * 4 + 0]; }\n"
     "  if (field == 3) { return scalars[index * 4 + 1]; }\n"
@@ -632,7 +646,7 @@ const char *KERNEL_VORTICITY_CURL =
     "}\n";
 
 const char *KERNEL_VORTICITY_APPLY =
-    "float ha_curl_length(ivec3 c) { return ha_inside(c) ? curl[ha_flat(c) * 4 + 3] : 0.0; }\n"
+    "float ha_curl_length(ivec3 c) { int i = ha_at(c); return i < 0 ? 0.0 : curl[i * 4 + 3]; }\n"
     "void main()\n"
     "{\n"
     "  int i = int(gl_GlobalInvocationID.x);\n"
@@ -901,8 +915,8 @@ const char *KERNEL_RESTRICT_COARSE =
     "    for (int dy = 0; dy < 2; dy++) {\n"
     "      for (int dx = 0; dx < 2; dx++) {\n"
     "        ivec3 f = 2 * c + ivec3(dx, dy, dz);\n"
-    "        if (!ha_inside(f)) { continue; }\n"
-    "        int i = ha_flat(f);\n"
+    "        int i = ha_at(f);\n"
+    "        if (i < 0) { continue; }\n"
     "        if ((mask_in[i] & HA_UNKNOWN) != 0) {\n"
     "          m = HA_UNKNOWN;\n"
     "          sum += rhs_in[i];\n"
@@ -943,7 +957,7 @@ const char *KERNEL_RHS =
     "  if (!ha_inside(c) || (mask_value & HA_DOMAIN) == 0 || (mask_value & HA_SOLID) != 0) {\n"
     "    return vec3(0.0);\n"
     "  }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int base = ha_at(c) * 3;\n"
     "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
     "}\n"
     "float ha_divergence(ivec3 c)\n"
@@ -992,24 +1006,19 @@ const char *KERNEL_CG_PRODUCT =
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
     "  float sum = -6.0 * pressure[index];\n"
-    "  if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(1, 0, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(-1, 0, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(0, 1, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(0, -1, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(0, 0, 1))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += pressure[ha_flat(c + ivec3(0, 0, -1))];\n"
-    "  }\n"
+    "  int n;\n"
+    "  n = ha_at(c + ivec3(1, 0, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
+    "  n = ha_at(c + ivec3(-1, 0, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 1, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
+    "  n = ha_at(c + ivec3(0, -1, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 0, 1));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 0, -1));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure[n]; }\n"
     "  product[index] = sum;\n"
     "}\n";
 
@@ -1083,24 +1092,19 @@ const char *KERNEL_CG_LAPLACIAN =
     "      ivec3 c;\n"
     "      ha_cell(index, c);\n"
     "      float sum = -6.0 * direction[index];\n"
-    "      if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(1, 0, 0))];\n"
-    "      }\n"
-    "      if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(-1, 0, 0))];\n"
-    "      }\n"
-    "      if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(0, 1, 0))];\n"
-    "      }\n"
-    "      if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(0, -1, 0))];\n"
-    "      }\n"
-    "      if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(0, 0, 1))];\n"
-    "      }\n"
-    "      if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
-    "        sum += direction[ha_flat(c + ivec3(0, 0, -1))];\n"
-    "      }\n"
+    "      int n;\n"
+    "      n = ha_at(c + ivec3(1, 0, 0));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
+    "      n = ha_at(c + ivec3(-1, 0, 0));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
+    "      n = ha_at(c + ivec3(0, 1, 0));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
+    "      n = ha_at(c + ivec3(0, -1, 0));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
+    "      n = ha_at(c + ivec3(0, 0, 1));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
+    "      n = ha_at(c + ivec3(0, 0, -1));\n"
+    "      if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += direction[n]; }\n"
     "      product[index] = sum;\n"
     "      pq = direction[index] * sum;\n"
     "    }\n"
@@ -1169,8 +1173,8 @@ const char *KERNEL_REDUCE_RES =
 const char *KERNEL_CG_GRADIENT =
     "float ha_pressure_at(ivec3 c)\n"
     "{\n"
-    "  if (!ha_inside(c)) { return 0.0; }\n"
-    "  int i = ha_flat(c);\n"
+    "  int i = ha_at(c);\n"
+    "  if (i < 0) { return 0.0; }\n"
     "  return (mask[i] & HA_UNKNOWN) != 0 ? pressure[i] : 0.0;\n"
     "}\n"
     "void main()\n"
@@ -1198,7 +1202,7 @@ const char *KERNEL_DIVERGENCE_AFTER =
     "      (ha_mask_at(c) & HA_SOLID) != 0) {\n"
     "    return vec3(0.0);\n"
     "  }\n"
-    "  int base = ha_flat(c) * 3;\n"
+    "  int base = ha_at(c) * 3;\n"
     "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
     "}\n"
     "void main()\n"
@@ -1240,7 +1244,8 @@ const char *KERNEL_REDUCE_DIVERGENCE =
 const char *KERNEL_CLAMP_SOLIDS =
     "int ha_solid_current_at(ivec3 c)\n"
     "{\n"
-    "  return ha_inside(c) ? solid_current[ha_flat(c)] : 0;\n"
+    "  int i = ha_at(c);\n"
+    "  return i < 0 ? 0 : solid_current[i];\n"
     "}\n"
     "bool ha_collider_velocity(ivec3 c, out float vx, out float vy, out float vz)\n"
     "{\n"
@@ -1248,7 +1253,7 @@ const char *KERNEL_CLAMP_SOLIDS =
     "  vy = 0.0;\n"
     "  vz = 0.0;\n"
     "  if (!ha_inside(c)) { return false; }\n"
-    "  int id = (solid_current[ha_flat(c)] >> 8) & 0xff;\n"
+    "  int id = (solid_current[ha_at(c)] >> 8) & 0xff;\n"
     "  if (id == 0) { return false; }\n"
     "  int offset = (id - 1) * 3;\n"
     "  vx = collider_velocity[offset + 0];\n"
@@ -1457,6 +1462,9 @@ const char *KERNEL_DOMAIN_MASK =
  * \{ */
 
 constexpr int GROUP_SIZE = 64;
+
+/** Host side brick grid self test, defined at the end of this file (doc/ignis-brick-sparse.md). */
+static void ignis_bricks_selftest(const IgnisDeviceFrame &frame);
 
 double time_now_ms()
 {
@@ -2934,6 +2942,11 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   if (!bind(frame, r_result.reason)) {
     return false;
   }
+  if (const char *env = std::getenv("BLENDER_IGNIS_BRICK_SELFTEST")) {
+    if (env[0] != '0') {
+      ignis_bricks_selftest(frame);
+    }
+  }
 
   Array<float> host_params;
   host_params.reinitialize(P_COUNT);
@@ -3182,6 +3195,370 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
 }
 
 /** \{ */
+
+/* -------------------------------------------------------------------- */
+/** \name Brick grid (host side)
+ *
+ * Stage 2 of `doc/ignis-brick-sparse.md`. Builds the 4^3 brick list of the dense box, the brick
+ * coordinate map and the six face neighbours of every brick. Nothing on the device uses it yet: the
+ * self test (`BLENDER_IGNIS_BRICK_SELFTEST=1`) scatters the dense fields into the pool and back and
+ * compares them bit for bit, so the builder can be trusted before the kernels are switched over.
+ * \{ */
+
+constexpr int IGNIS_BRICK_EDGE = 4;
+constexpr int IGNIS_BRICK_CELLS = IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE;
+
+struct IgnisBrickGrid {
+  int3 dims = int3(0);
+  int3 brick_dims = int3(0);
+  int tile_count = 0;
+  int brick_count = 0;
+  /** Brick origin in voxels, sorted by (z, y, x) so the slot order is deterministic. */
+  Vector<int3> coords;
+  /** Brick coordinate -> slot, or -1. Indexed by `x + bx * (y + by * z)`. */
+  Vector<int> slot_map;
+  /** `slot * 6 + axis * 2 + (negative ? 1 : 0)`: the face neighbour's slot, or -1. */
+  Vector<int> neighbor;
+  int64_t pool_cells = 0;
+};
+
+/** True when the voxel carries anything the solve may read: a mask bit or a non zero field. */
+static bool brick_voxel_is_wanted(const IgnisDeviceFrame &frame, const int64_t index)
+{
+  if (frame.mask[index] != 0) {
+    return true;
+  }
+  if (!frame.current_mask.is_empty() && frame.current_mask[index] != 0) {
+    return true;
+  }
+  if (!frame.carve_mask.is_empty() && frame.carve_mask[index] != 0) {
+    return true;
+  }
+  for (int k = 0; k < 4; k++) {
+    if (frame.scalars[index * 4 + k] != 0.0f) {
+      return true;
+    }
+  }
+  for (int k = 0; k < 3; k++) {
+    if (frame.velocity[index * 3 + k] != 0.0f) {
+      return true;
+    }
+  }
+  if (frame.pressure[index] != 0.0f) {
+    return true;
+  }
+  for (int k = 0; k < 7; k++) {
+    if (frame.source[index * 7 + k] != 0.0f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static IgnisBrickGrid ignis_bricks_build(const IgnisDeviceFrame &frame)
+{
+  IgnisBrickGrid bricks;
+  bricks.dims = frame.dims;
+  bricks.brick_dims = int3((frame.dims.x + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE,
+                           (frame.dims.y + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE,
+                           (frame.dims.z + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE);
+  const int bx = bricks.brick_dims.x;
+  const int by = bricks.brick_dims.y;
+  const int bz = bricks.brick_dims.z;
+  if (bx <= 0 || by <= 0 || bz <= 0) {
+    return bricks;
+  }
+  bricks.tile_count = bx * by * bz;
+  bricks.slot_map.reinitialize(bricks.tile_count);
+  bricks.slot_map.fill(-1);
+
+  Array<int> active;
+  active.reinitialize(bricks.tile_count);
+  active.fill(0);
+  const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
+  for (int64_t i = 0; i < cells; i++) {
+    if (!brick_voxel_is_wanted(frame, i)) {
+      continue;
+    }
+    const int x = int(i % frame.dims.x);
+    const int y = int((i / frame.dims.x) % frame.dims.y);
+    const int z = int(i / (int64_t(frame.dims.x) * frame.dims.y));
+    active[(x / IGNIS_BRICK_EDGE) + bx * ((y / IGNIS_BRICK_EDGE) +
+                                          by * (z / IGNIS_BRICK_EDGE))] = 1;
+  }
+
+  /* Deterministic slot order: z, then y, then x. */
+  for (int z = 0; z < bz; z++) {
+    for (int y = 0; y < by; y++) {
+      for (int x = 0; x < bx; x++) {
+        const int tile = x + bx * (y + by * z);
+        if (!active[tile]) {
+          continue;
+        }
+        bricks.slot_map[tile] = int(bricks.coords.size());
+        bricks.coords.append(
+            int3(x * IGNIS_BRICK_EDGE, y * IGNIS_BRICK_EDGE, z * IGNIS_BRICK_EDGE));
+      }
+    }
+  }
+  bricks.brick_count = int(bricks.coords.size());
+  bricks.pool_cells = int64_t(bricks.brick_count) * IGNIS_BRICK_CELLS;
+
+  bricks.neighbor.reinitialize(bricks.brick_count * 6);
+  bricks.neighbor.fill(-1);
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    const int3 origin = bricks.coords[slot];
+    const int ox = origin.x / IGNIS_BRICK_EDGE;
+    const int oy = origin.y / IGNIS_BRICK_EDGE;
+    const int oz = origin.z / IGNIS_BRICK_EDGE;
+    for (int axis = 0; axis < 3; axis++) {
+      for (int sign = 0; sign < 2; sign++) {
+        int nx = ox, ny = oy, nz = oz;
+        if (axis == 0) {
+          nx += sign == 0 ? 1 : -1;
+        }
+        else if (axis == 1) {
+          ny += sign == 0 ? 1 : -1;
+        }
+        else {
+          nz += sign == 0 ? 1 : -1;
+        }
+        int value = -1;
+        if (nx >= 0 && ny >= 0 && nz >= 0 && nx < bx && ny < by && nz < bz) {
+          value = bricks.slot_map[nx + bx * (ny + by * nz)];
+        }
+        bricks.neighbor[slot * 6 + axis * 2 + sign] = value;
+      }
+    }
+  }
+  return bricks;
+}
+
+/** Copies a dense field (one value per voxel, `stride` floats per voxel) into the brick pool. */
+static void bricks_scatter_float(const IgnisBrickGrid &bricks,
+                                 const Span<const float> src,
+                                 const int stride,
+                                 const MutableSpan<float> dst)
+{
+  dst.fill(0.0f);
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    const int3 origin = bricks.coords[slot];
+    for (int lz = 0; lz < IGNIS_BRICK_EDGE; lz++) {
+      for (int ly = 0; ly < IGNIS_BRICK_EDGE; ly++) {
+        for (int lx = 0; lx < IGNIS_BRICK_EDGE; lx++) {
+          const int x = origin.x + lx;
+          const int y = origin.y + ly;
+          const int z = origin.z + lz;
+          if (x >= bricks.dims.x || y >= bricks.dims.y || z >= bricks.dims.z) {
+            continue;
+          }
+          const int64_t dense = int64_t(x) + int64_t(bricks.dims.x) *
+                                                  (int64_t(y) + int64_t(bricks.dims.y) * z);
+          const int64_t pool = int64_t(slot) * IGNIS_BRICK_CELLS +
+                               lx + IGNIS_BRICK_EDGE * (ly + IGNIS_BRICK_EDGE * lz);
+          for (int k = 0; k < stride; k++) {
+            dst[pool * stride + k] = src[dense * stride + k];
+          }
+        }
+      }
+    }
+  }
+}
+
+static void bricks_gather_float(const IgnisBrickGrid &bricks,
+                                const Span<const float> src,
+                                const int stride,
+                                const MutableSpan<float> dst)
+{
+  dst.fill(0.0f);
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    const int3 origin = bricks.coords[slot];
+    for (int lz = 0; lz < IGNIS_BRICK_EDGE; lz++) {
+      for (int ly = 0; ly < IGNIS_BRICK_EDGE; ly++) {
+        for (int lx = 0; lx < IGNIS_BRICK_EDGE; lx++) {
+          const int x = origin.x + lx;
+          const int y = origin.y + ly;
+          const int z = origin.z + lz;
+          if (x >= bricks.dims.x || y >= bricks.dims.y || z >= bricks.dims.z) {
+            continue;
+          }
+          const int64_t dense = int64_t(x) + int64_t(bricks.dims.x) *
+                                                  (int64_t(y) + int64_t(bricks.dims.y) * z);
+          const int64_t pool = int64_t(slot) * IGNIS_BRICK_CELLS +
+                               lx + IGNIS_BRICK_EDGE * (ly + IGNIS_BRICK_EDGE * lz);
+          for (int k = 0; k < stride; k++) {
+            dst[dense * stride + k] = src[pool * stride + k];
+          }
+        }
+      }
+    }
+  }
+}
+
+static void bricks_scatter_int(const IgnisBrickGrid &bricks,
+                               const Span<const int> src,
+                               const MutableSpan<int> dst)
+{
+  dst.fill(0);
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    const int3 origin = bricks.coords[slot];
+    for (int lz = 0; lz < IGNIS_BRICK_EDGE; lz++) {
+      for (int ly = 0; ly < IGNIS_BRICK_EDGE; ly++) {
+        for (int lx = 0; lx < IGNIS_BRICK_EDGE; lx++) {
+          const int x = origin.x + lx;
+          const int y = origin.y + ly;
+          const int z = origin.z + lz;
+          if (x >= bricks.dims.x || y >= bricks.dims.y || z >= bricks.dims.z) {
+            continue;
+          }
+          const int64_t dense = int64_t(x) + int64_t(bricks.dims.x) *
+                                                  (int64_t(y) + int64_t(bricks.dims.y) * z);
+          const int64_t pool = int64_t(slot) * IGNIS_BRICK_CELLS +
+                               lx + IGNIS_BRICK_EDGE * (ly + IGNIS_BRICK_EDGE * lz);
+          dst[pool] = src[dense];
+        }
+      }
+    }
+  }
+}
+
+static void bricks_gather_int(const IgnisBrickGrid &bricks,
+                              const Span<const int> src,
+                              const MutableSpan<int> dst)
+{
+  dst.fill(0);
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    const int3 origin = bricks.coords[slot];
+    for (int lz = 0; lz < IGNIS_BRICK_EDGE; lz++) {
+      for (int ly = 0; ly < IGNIS_BRICK_EDGE; ly++) {
+        for (int lx = 0; lx < IGNIS_BRICK_EDGE; lx++) {
+          const int x = origin.x + lx;
+          const int y = origin.y + ly;
+          const int z = origin.z + lz;
+          if (x >= bricks.dims.x || y >= bricks.dims.y || z >= bricks.dims.z) {
+            continue;
+          }
+          const int64_t dense = int64_t(x) + int64_t(bricks.dims.x) *
+                                                  (int64_t(y) + int64_t(bricks.dims.y) * z);
+          const int64_t pool = int64_t(slot) * IGNIS_BRICK_CELLS +
+                               lx + IGNIS_BRICK_EDGE * (ly + IGNIS_BRICK_EDGE * lz);
+          dst[dense] = src[pool];
+        }
+      }
+    }
+  }
+}
+
+/** Builds the brick grid, round trips every field through the pool and reports the counts. */
+static void ignis_bricks_selftest(const IgnisDeviceFrame &frame)
+{
+  const IgnisBrickGrid bricks = ignis_bricks_build(frame);
+  const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
+  const int64_t pool = bricks.pool_cells;
+
+  Array<float> pool_scalars;
+  Array<float> pool_velocity;
+  Array<float> pool_pressure;
+  Array<int> pool_mask;
+  pool_scalars.reinitialize(int(pool * 4));
+  pool_velocity.reinitialize(int(pool * 3));
+  pool_pressure.reinitialize(int(pool));
+  pool_mask.reinitialize(int(pool));
+  bricks_scatter_float(bricks,
+                       Span<const float>(frame.scalars.data(), frame.scalars.size()),
+                       4,
+                       pool_scalars.as_mutable_span());
+  bricks_scatter_float(bricks,
+                       Span<const float>(frame.velocity.data(), frame.velocity.size()),
+                       3,
+                       pool_velocity.as_mutable_span());
+  bricks_scatter_float(bricks,
+                       Span<const float>(frame.pressure.data(), frame.pressure.size()),
+                       1,
+                       pool_pressure.as_mutable_span());
+  bricks_scatter_int(bricks,
+                     Span<const int>(frame.mask.data(), frame.mask.size()),
+                     pool_mask.as_mutable_span());
+
+  Array<float> back_scalars;
+  Array<float> back_velocity;
+  Array<float> back_pressure;
+  Array<int> back_mask;
+  back_scalars.reinitialize(int(cells * 4));
+  back_velocity.reinitialize(int(cells * 3));
+  back_pressure.reinitialize(int(cells));
+  back_mask.reinitialize(int(cells));
+  bricks_gather_float(bricks,
+                      Span<const float>(pool_scalars.data(), pool_scalars.size()),
+                      4,
+                      back_scalars.as_mutable_span());
+  bricks_gather_float(bricks,
+                      Span<const float>(pool_velocity.data(), pool_velocity.size()),
+                      3,
+                      back_velocity.as_mutable_span());
+  bricks_gather_float(bricks,
+                      Span<const float>(pool_pressure.data(), pool_pressure.size()),
+                      1,
+                      back_pressure.as_mutable_span());
+  bricks_gather_int(
+      bricks, Span<const int>(pool_mask.data(), pool_mask.size()), back_mask.as_mutable_span());
+
+  const bool ok =
+      std::memcmp(back_scalars.data(), frame.scalars.data(), size_t(cells * 4) * sizeof(float)) == 0 &&
+      std::memcmp(back_velocity.data(), frame.velocity.data(), size_t(cells * 3) * sizeof(float)) == 0 &&
+      std::memcmp(back_pressure.data(), frame.pressure.data(), size_t(cells) * sizeof(float)) == 0 &&
+      std::memcmp(back_mask.data(), frame.mask.data(), size_t(cells) * sizeof(int)) == 0;
+
+  /* How many bricks carry smoke / the velocity band, which is what the passes will dispatch. */
+  int smoke_bricks = 0;
+  int band_bricks = 0;
+  for (int slot = 0; slot < bricks.brick_count; slot++) {
+    bool smoke = false;
+    bool band = false;
+    const int3 origin = bricks.coords[slot];
+    for (int lz = 0; lz < IGNIS_BRICK_EDGE; lz++) {
+      for (int ly = 0; ly < IGNIS_BRICK_EDGE; ly++) {
+        for (int lx = 0; lx < IGNIS_BRICK_EDGE; lx++) {
+          const int x = origin.x + lx;
+          const int y = origin.y + ly;
+          const int z = origin.z + lz;
+          if (x >= bricks.dims.x || y >= bricks.dims.y || z >= bricks.dims.z) {
+            continue;
+          }
+          const int64_t dense = int64_t(x) + int64_t(bricks.dims.x) *
+                                                  (int64_t(y) + int64_t(bricks.dims.y) * z);
+          if (std::abs(frame.scalars[dense * 4 + 0]) > 1e-4f) {
+            smoke = true;
+          }
+          if (std::abs(frame.velocity[dense * 3 + 0]) > 1e-6f ||
+              std::abs(frame.velocity[dense * 3 + 1]) > 1e-6f ||
+              std::abs(frame.velocity[dense * 3 + 2]) > 1e-6f)
+          {
+            band = true;
+          }
+        }
+      }
+    }
+    smoke_bricks += smoke ? 1 : 0;
+    band_bricks += band ? 1 : 0;
+  }
+
+  printf("IGNIS_BRICKS: cells=%lld bricks=%d/%d (%.1f%%) smoke=%d band=%d "
+         "pool=%lld (%.2fx cells) fields=%s\n",
+         (long long)cells,
+         bricks.brick_count,
+         bricks.tile_count,
+         bricks.tile_count > 0 ?
+             100.0 * double(bricks.brick_count) / double(bricks.tile_count) :
+             0.0,
+         smoke_bricks,
+         band_bricks,
+         (long long)pool,
+         cells > 0 ? double(pool) / double(cells) : 0.0,
+         ok ? "ok" : "MISMATCH");
+}
+
+/** \} */
 
 }  // namespace
 
