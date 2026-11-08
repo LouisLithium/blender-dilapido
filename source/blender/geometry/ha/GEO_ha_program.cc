@@ -1943,7 +1943,8 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
   }
   /* Outputs: 0 = Mean, 1 = Median, 2 = Sum, 3 = Min, 4 = Max, 5 = Range, 6 = Std Dev, 7 = Variance.
    * Only reductions that the backend can do in one pass are supported. */
-  HaAggregateOp op;
+  HaAggregateOp op = HaAggregateOp::Sum;
+  bool is_range = false;
   switch (socket_index) {
     case 0:
       op = HaAggregateOp::Mean;
@@ -1956,6 +1957,11 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
       break;
     case 4:
       op = HaAggregateOp::Max;
+      break;
+    case 5:
+      /* `Range` = Max - Min: two aggregates over the same value. */
+      op = HaAggregateOp::Min;
+      is_range = true;
       break;
     default:
       fail(ctx, "Attribute Statistic: this output is not supported");
@@ -2013,9 +2019,21 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
     return &ctx.pool.constant(0.0f);
   }
 
+  const std::string glsl_value = ha_emit_glsl_natural(*value);
+  const int components = ha_type_components(type);
+  if (is_range) {
+    HaExpr &min_read = ctx.pool.add(type, HaOp::AggregateRead);
+    min_read.aggregate_slot = int(ctx.aggregates.size());
+    ctx.aggregates.append({glsl_value, HaAggregateOp::Min, components});
+    HaExpr &max_read = ctx.pool.add(type, HaOp::AggregateRead);
+    max_read.aggregate_slot = int(ctx.aggregates.size());
+    ctx.aggregates.append({glsl_value, HaAggregateOp::Max, components});
+    return &ctx.pool.add(type, HaOp::Sub, {&max_read, &min_read});
+  }
+
   HaExpr &read = ctx.pool.add(type, HaOp::AggregateRead);
   read.aggregate_slot = int(ctx.aggregates.size());
-  ctx.aggregates.append({ha_emit_glsl_natural(*value), op, ha_type_components(type)});
+  ctx.aggregates.append({glsl_value, op, components});
   return &read;
 }
 
