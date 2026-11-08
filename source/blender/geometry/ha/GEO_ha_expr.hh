@@ -127,6 +127,11 @@ enum class HaOp {
    * `param_slot * 4`; the buffer is declared as `user_params[]`.
    */
   ParamRead,
+  /**
+   * A running total of a value field (`Accumulate Field`). #HaExpr::aggregate_slot indexes the
+   * program's accumulation list; the buffer is `accumulation[]`, three floats per slot.
+   */
+  AccumulateRead,
 
   /* --- Math node: unary ---------------------------------------------------------------- */
   /** float -> float. Mirrors `math_functions.cc` / `multi_function_common.cc` exactly. */

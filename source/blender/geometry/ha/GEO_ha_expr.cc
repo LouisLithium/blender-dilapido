@@ -536,6 +536,9 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
       /* Reduction results are only available on the GPU; the CPU reference for them is the regular
        * node evaluation (the `Force CPU` path). */
       return 0.0f;
+    case HaOp::AccumulateRead:
+      /* Same as `AggregateRead`: an `Accumulate Field` output is GPU-only. */
+      return 0.0f;
     case HaOp::ParamRead:
       /* Animated socket defaults are uploaded for the device; the CPU reference is the node
        * evaluation. */
@@ -724,6 +727,7 @@ int eval_int(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::AttributeRead:
     case HaOp::AttributeGather:
     case HaOp::AggregateRead:
+    case HaOp::AccumulateRead:
     case HaOp::ParamRead:
       /* Attribute buffers, reductions and animated parameters are only available on the GPU; the
        * CPU reference for them is the regular node evaluation (the `Force CPU` path). */
@@ -793,6 +797,7 @@ float2 eval_float2(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::AttributeRead:
     case HaOp::AttributeGather:
     case HaOp::AggregateRead:
+    case HaOp::AccumulateRead:
     case HaOp::ParamRead:
       return float2(0.0f);
     case HaOp::Select:
@@ -821,6 +826,7 @@ float4 eval_color(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::AttributeRead:
     case HaOp::AttributeGather:
     case HaOp::AggregateRead:
+    case HaOp::AccumulateRead:
     case HaOp::ParamRead:
       return float4(0.0f);
     case HaOp::ColorRamp:
@@ -849,6 +855,7 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::AttributeRead:
     case HaOp::AttributeGather:
     case HaOp::AggregateRead:
+    case HaOp::AccumulateRead:
     case HaOp::ParamRead:
       return float3(0.0f);
     case HaOp::Const:
@@ -1392,6 +1399,15 @@ std::string emit(const HaExpr &expr)
                std::to_string(expr.aggregate_slot * 3 + 2) + "])";
       }
       return "aggregate[" + std::to_string(expr.aggregate_slot) + " * 3]";
+    case HaOp::AccumulateRead: {
+      const std::string base = std::to_string(expr.aggregate_slot * 3);
+      if (expr.type == HaType::Float3) {
+        return "vec3(accumulation[" + base + "], accumulation[" +
+               std::to_string(expr.aggregate_slot * 3 + 1) + "], accumulation[" +
+               std::to_string(expr.aggregate_slot * 3 + 2) + "])";
+      }
+      return "accumulation[" + base + "]";
+    }
     case HaOp::AttributeRead: {
       const std::string buffer = "attribute_" + std::to_string(expr.attribute_slot);
       switch (expr.type) {

@@ -64,6 +64,17 @@ struct HaAggregate {
   HaAggregateOp op = HaAggregateOp::Sum;
   /** 1 for a float reduction, 3 for a vector one. */
   int components = 1;
+  /** True when the expression reads `aggregate[]` (variance: the mean from a previous pass). */
+  bool read_aggregate = false;
+};
+
+/** One running-total field (`Accumulate Field`, P1-10). */
+struct HaAccumulation {
+  /** GLSL expression of the accumulated value (component count from #type). */
+  std::string glsl_value;
+  HaType type = HaType::Float;
+  /** 0 = leading (inclusive), 1 = trailing (exclusive), 2 = total. */
+  int mode = 0;
 };
 
 /** One geometry modifying node of the chain: where every element ends up, and which ones move. */
@@ -83,6 +94,12 @@ enum class HaAttributeKind {
   TrueNormal,
   VertexCount,
   VertexFaceCount,
+  /** `Edge Vertices`: the two endpoint vertex indices of every edge (P1-08). */
+  EdgeVertex1Index,
+  EdgeVertex2Index,
+  /** `Edge Vertices`: the positions of the two endpoint vertices (valid before a position step). */
+  EdgeVertex1Position,
+  EdgeVertex2Position,
 };
 
 /** One POINT attribute the program reads, uploaded once per evaluation. */
@@ -133,15 +150,27 @@ struct HaStore {
   int attribute_slot = -1;
 };
 
-/** One entry of the linear chain: a position step or a (mid-chain / tail) POINT store. */
+/** One entry of the linear chain: a position step, a POINT store, or a `Capture Attribute` node. */
 struct HaChainOperation {
   enum class Kind {
     Step,
     Store,
+    Capture,
   };
   Kind kind = Kind::Step;
-  /** Index into #HaZoneProgram::steps_ or #HaZoneProgram::stores_. */
+  /** Index into #HaZoneProgram::steps_ / #HaZoneProgram::stores_ / #HaZoneProgram::captures_. */
   int index = 0;
+};
+
+/**
+ * `Capture Attribute` (P1-11): a pass-through node that snapshots fields at its point in the chain.
+ * The captured values are written to internal attribute buffers by ordinary store kernels; a
+ * downstream node reads them through `HaOp::AttributeRead`, exactly like the zone input attributes.
+ */
+struct HaCapture {
+  /** Range into #HaZoneProgram::capture_stores_. */
+  int store_offset = 0;
+  int store_count = 0;
 };
 
 /**
@@ -162,6 +191,8 @@ struct HaElementStore {
   float default_value = 0.0f;
   /** Attributes read by this step's fields, bound at slot 3 + index. */
   Vector<HaAttribute> attributes;
+  /** Reductions over this element domain (`Attribute Statistic` inside the value field). */
+  Vector<HaAggregate> aggregates;
 };
 
 /** Type of the attribute an element pass writes. */
@@ -201,6 +232,8 @@ struct HaElementStep {
   float default_value = 0.0f;
   /** Attributes read by this step's fields, bound at slot 3 + index (same layout as POINT). */
   Vector<HaAttribute> attributes;
+  /** Reductions over this element domain (`Attribute Statistic` inside the fields). */
+  Vector<HaAggregate> aggregates;
 };
 
 /** One `Flip Faces` node: reverses the winding of the selected faces (CORNER domain). */
@@ -275,18 +308,37 @@ class HaZoneProgram {
     return int(corner_steps_.size());
   }
 
+  /** Number of `Capture Attribute` nodes. */
+  int capture_count() const
+  {
+    return int(captures_.size());
+  }
+
+  /** Number of `Accumulate Field` outputs. */
+  int accumulation_count() const
+  {
+    return int(accumulations_.size());
+  }
+
   /** Human readable form of the compiled chain, for the debug log. */
   std::string debug_description() const;
 
  private:
   Vector<HaProgramStep> steps_;
   Vector<HaAggregate> aggregates_;
+  /** Running totals for `Accumulate Field`, uploaded to `accumulation[]` (slot 12). */
+  Vector<HaAccumulation> accumulations_;
+  bool has_accumulation_ = false;
   /** Attributes read by the program, in binding order (slot 3 + index). */
   Vector<HaAttribute> attributes_;
   /** Animated socket defaults, uploaded to `user_params[]` (slot 15). */
   Vector<HaParamSource> params_;
   /** `Store Named Attribute` nodes (POINT), in evaluation order. */
   Vector<HaStore> stores_;
+  /** Internal stores of the `Capture Attribute` nodes; downstream reads bind these. */
+  Vector<HaStore> capture_stores_;
+  /** `Capture Attribute` nodes, in chain order. */
+  Vector<HaCapture> captures_;
   /** Linear order of the position steps and the POINT stores. */
   Vector<HaChainOperation> operations_;
   /** `Store Named Attribute` nodes on FACE / EDGE / CORNER, in evaluation order. */

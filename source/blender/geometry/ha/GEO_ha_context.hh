@@ -353,6 +353,41 @@ gpu::Shader *ha_shader_get_reduce_stage1(StringRef key,
 gpu::Shader *ha_shader_get_reduce_stage2(
     StringRef key, StringRef combine, StringRef identity, int components, bool divide_by_count);
 
+/**
+ * First reduction pass for an element domain without positions (FACE / EDGE / CORNER). Like
+ * #ha_shader_get_reduce_stage1, but the value expression only has `int index` in scope; the element
+ * attributes are bound from \a first_slot upwards.
+ */
+gpu::Shader *ha_shader_get_reduce_stage1_elements(
+    StringRef key,
+    StringRef glsl_value_expr,
+    StringRef combine,
+    StringRef identity,
+    int components,
+    int first_slot,
+    Span<const HaShaderResource> extra_resources = {});
+
+/**
+ * `Accumulate Field` (P1-10). Three passes over a value field:
+ *
+ * 1. #ha_shader_get_accumulate_stage1: one invocation per block; evaluates the value, writes it to
+ *    `values[]` and the block sum to `block_sums[]`.
+ * 2. #ha_shader_get_accumulate_scan: one invocation; exclusive prefix of the block sums into
+ *    `block_prefix[]`, plus the total in `total[]`.
+ * 3. #ha_shader_get_accumulate_final: one invocation per block; writes the leading (inclusive),
+ *    trailing (exclusive) or total output into `output[]`.
+ *
+ * The scans are serial inside a block / in the single scan invocation, so the result does not
+ * depend on the thread count. Only float and vector values are supported.
+ */
+gpu::Shader *ha_shader_get_accumulate_stage1(StringRef key,
+                                             StringRef glsl_value_expr,
+                                             int components,
+                                             Span<const HaShaderResource> extra_resources = {});
+gpu::Shader *ha_shader_get_accumulate_scan(StringRef key, int components);
+/** \param mode 0 = leading, 1 = trailing, 2 = total. */
+gpu::Shader *ha_shader_get_accumulate_final(StringRef key, int components, int mode);
+
 /** Dispatches `ceil(element_count / 64)` work groups. */
 void ha_dispatch(gpu::Shader *shader, int element_count);
 
