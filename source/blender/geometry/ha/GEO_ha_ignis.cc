@@ -134,6 +134,9 @@ enum IgnisParam : int {
   P_COUNT,
 };
 
+/** `HA_BRICK_BASE` in `GLSL_PRELUDE` must match, the brick pool is appended after the params. */
+static_assert(P_COUNT == 83, "update HA_BRICK_BASE in GLSL_PRELUDE when adding a parameter");
+
 const char *GLSL_PRELUDE =
     "#define HA_SMOKE 1\n"
     "#define HA_DOMAIN 2\n"
@@ -216,27 +219,97 @@ const char *GLSL_PRELUDE =
     "#define HA_COARSE_DX int(params[80])\n"
     "#define HA_COARSE_DY int(params[81])\n"
     "#define HA_COARSE_DZ int(params[82])\n"
+    /* Brick pool (doc/ignis-brick-sparse.md). The layout is appended to the param buffer so every
+     * kernel already has it bound; `HA_BRICK_BASE` must stay equal to `P_COUNT` on the C++ side. */
+    "#define HA_BRICK_BASE 83\n"
+    "#define HA_BRICK_SPARSE int(params[HA_BRICK_BASE + 0])\n"
+    "#define HA_BRICK_TILES int(params[HA_BRICK_BASE + 1])\n"
+    "#define HA_BRICK_DX int(params[HA_BRICK_BASE + 2])\n"
+    "#define HA_BRICK_DY int(params[HA_BRICK_BASE + 3])\n"
+    "#define HA_BRICK_DZ int(params[HA_BRICK_BASE + 4])\n"
+    "#define HA_BRICK_SLOTS (HA_BRICK_BASE + 8)\n"
+    "#define HA_BRICK_COORDS (HA_BRICK_BASE + 8 + HA_BRICK_TILES)\n"
+    "#define HA_BRICK_COUNT int(params[HA_BRICK_BASE + 6])\n"
+    "#define HA_LIST_MODE int(params[HA_BRICK_BASE + 5])\n"
+    "#define HA_BRICK_NEIGHBORS (HA_BRICK_COORDS + 3 * HA_BRICK_COUNT)\n"
     "int ha_flat(ivec3 c) { return c.x + HA_DX * (c.y + HA_DY * c.z); }\n"
     "void ha_cell(int i, out ivec3 c)\n"
     "{\n"
-    "  int dx = HA_DX;\n"
-    "  int dy = HA_DY;\n"
-    "  c.x = i % dx;\n"
-    "  i /= dx;\n"
-    "  c.y = i % dy;\n"
-    "  c.z = i / dy;\n"
+    "  if (HA_BRICK_SPARSE == 0) {\n"
+    "    int dx = HA_DX;\n"
+    "    int dy = HA_DY;\n"
+    "    c.x = i % dx;\n"
+    "    i /= dx;\n"
+    "    c.y = i % dy;\n"
+    "    c.z = i / dy;\n"
+    "    return;\n"
+    "  }\n"
+    "  int slot = i >> 6;\n"
+    "  int local = i & 63;\n"
+    "  int base = HA_BRICK_COORDS + slot * 3;\n"
+    "  c = ivec3(int(params[base + 0]) + (local & 3),\n"
+    "            int(params[base + 1]) + ((local >> 2) & 3),\n"
+    "            int(params[base + 2]) + ((local >> 4) & 3));\n"
     "}\n"
     "bool ha_inside(ivec3 c)\n"
     "{\n"
     "  return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < HA_DX && c.y < HA_DY && c.z < HA_DZ;\n"
     "}\n"
-    /* Cell addressing. The dense build is the one below: a cell is its flat index, a neighbour is
-     * `ha_at(c + offset)`. The brick sparse build (doc/ignis-brick-sparse.md) replaces the bodies of
-     * `ha_at`, `ha_cell` and the value of `HA_CELL_COUNT` (the pool size) with the brick pool; the
-     * kernels must not index a field with `ha_flat` directly, so that swap does not touch them. The
-     * one thing the kernels do need then is to drop invocations whose coordinate falls into the
-     * padding of a partial brick (`!ha_inside(c)`). */
-    "int ha_at(ivec3 c) { return ha_inside(c) ? ha_flat(c) : -1; }\n"
+    /* Cell addressing. Dense: a cell is its flat index. Sparse: the cell lives in a 4^3 brick of the
+     * pool, `slot * 64 + local`. Either way a neighbour is `ha_at(c + offset)`, and the kernels never
+     * index a field with `ha_flat` directly, so both builds share every kernel.
+     *
+     * `ha_at` is on every stencil edge, so the 27 bricks around the current one are cached in shared
+     * memory (`ha_init_neighbors`): the tile map lookup then costs a shared read instead of a
+     * dependent global load. Coordinates outside that neighbourhood (advection backtraces) fall back
+     * to the global map. Every kernel that reaches a `ha_at` has to call `ha_init_neighbors` first. */
+    "shared int ha_nb_slots[27];\n"
+    "shared ivec3 ha_nb_center;\n"
+    "void ha_init_neighbors(int index)\n"
+    "{\n"
+    "  if (HA_BRICK_SPARSE == 0) { return; }\n"
+    "  ivec3 cc;\n"
+    "  ha_cell(index, cc);\n"
+    "  ivec3 t = ivec3(cc.x >> 2, cc.y >> 2, cc.z >> 2);\n"
+    "  int local = int(gl_LocalInvocationIndex);\n"
+    "  if (local == 0) { ha_nb_center = t; }\n"
+    "  if (local < 27) {\n"
+    "    ivec3 d = ivec3(local % 3, (local / 3) % 3, local / 9) - ivec3(1);\n"
+    "    ivec3 nt = t + d;\n"
+    "    int slot = -1;\n"
+    "    if (nt.x >= 0 && nt.y >= 0 && nt.z >= 0 && nt.x < HA_BRICK_DX && nt.y < HA_BRICK_DY &&\n"
+    "        nt.z < HA_BRICK_DZ) {\n"
+    "      slot = int(params[HA_BRICK_SLOTS + nt.x + HA_BRICK_DX * (nt.y + HA_BRICK_DY * nt.z)]);\n"
+    "    }\n"
+    "    ha_nb_slots[local] = slot;\n"
+    "  }\n"
+    "  barrier();\n"
+    "}\n"
+    "int ha_at(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return -1; }\n"
+    "  if (HA_BRICK_SPARSE == 0) { return ha_flat(c); }\n"
+    "  ivec3 t = ivec3(c.x >> 2, c.y >> 2, c.z >> 2);\n"
+    "  ivec3 d = t - ha_nb_center;\n"
+    "  int slot;\n"
+    "  if (d.x >= -1 && d.x <= 1 && d.y >= -1 && d.y <= 1 && d.z >= -1 && d.z <= 1) {\n"
+    "    slot = ha_nb_slots[(d.x + 1) + 3 * ((d.y + 1) + 3 * (d.z + 1))];\n"
+    "  }\n"
+    "  else {\n"
+    "    slot = int(params[HA_BRICK_SLOTS + t.x + HA_BRICK_DX * (t.y + HA_BRICK_DY * t.z)]);\n"
+    "  }\n"
+    "  if (slot < 0) { return -1; }\n"
+    "  int local = (c.x & 3) + 4 * ((c.y & 3) + 4 * (c.z & 3));\n"
+    "  return slot * 64 + local;\n"
+    "}\n"
+    "int ha_at_global(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return -1; }\n"
+    "  if (HA_BRICK_SPARSE == 0) { return ha_flat(c); }\n"
+    "  int slot = int(params[HA_BRICK_SLOTS + (c.x >> 2) + HA_BRICK_DX * ((c.y >> 2) + HA_BRICK_DY * (c.z >> 2))]);\n"
+    "  if (slot < 0) { return -1; }\n"
+    "  return slot * 64 + ((c.x & 3) + 4 * ((c.y & 3) + 4 * (c.z & 3)));\n"
+    "}\n"
     "vec3 ha_world(ivec3 c) { return (HA_ORIGIN + vec3(c)) * HA_VOXEL; }\n";
 
 /** Per pass controls of the advection kernels (a separate buffer, so they never clobber CG state).
@@ -573,11 +646,13 @@ const char *KERNEL_FORCES =
     "{\n"
     "  int i = int(gl_GlobalInvocationID.x);\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(i);\n"
     "  if (scalars[i * 4 + 0] <= 1e-4) { return; }\n"
     "  float anomaly = scalars[i * 4 + 1] - HA_AMBIENT;\n"
     "  int base = i * 3;\n"
     "  ivec3 c;\n"
     "  ha_cell(i, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
     "  if (anomaly != 0.0) { v -= HA_GRAVITY * (HA_BUOYANCY * anomaly * HA_DT); }\n"
     "  v += HA_WIND * HA_DT;\n"
@@ -617,8 +692,10 @@ const char *KERNEL_VORTICITY_CURL =
     "{\n"
     "  int i = int(gl_GlobalInvocationID.x);\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(i);\n"
     "  ivec3 c;\n"
     "  ha_cell(i, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  bool band = ha_scalar_at(c, 0) > 1e-4 || ha_scalar_at(c + ivec3(1, 0, 0), 0) > 1e-4 ||\n"
     "              ha_scalar_at(c + ivec3(-1, 0, 0), 0) > 1e-4 ||\n"
     "              ha_scalar_at(c + ivec3(0, 1, 0), 0) > 1e-4 ||\n"
@@ -651,9 +728,11 @@ const char *KERNEL_VORTICITY_APPLY =
     "{\n"
     "  int i = int(gl_GlobalInvocationID.x);\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(i);\n"
     "  if ((mask[i] & HA_BAND) == 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(i, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 normal = vec3(ha_curl_length(c + ivec3(1, 0, 0)) - ha_curl_length(c + ivec3(-1, 0, "
     "0)),\n"
     "                     ha_curl_length(c + ivec3(0, 1, 0)) - ha_curl_length(c + ivec3(0, -1, "
@@ -675,8 +754,10 @@ const char *KERNEL_ADVECT_PASS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 p = vec3(c);\n"
     "  float dir = HA_ADVECT_DIR;\n"
     "  vec3 v = ha_velocity_sample(p) / HA_VOXEL;\n"
@@ -693,8 +774,10 @@ const char *KERNEL_ADVECT_CORRECT_VEC3 =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 original = ha_field_read(c);\n"
     "  vec3 backward = ha_field_aux(c);\n"
     "  vec3 forward = ha_field_forward(index);\n"
@@ -708,8 +791,10 @@ const char *KERNEL_ADVECT_CORRECT_SCALAR =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  float original = ha_field_read(c);\n"
     "  float backward = ha_field_aux(c);\n"
     "  float forward = ha_field_forward(index);\n"
@@ -723,9 +808,11 @@ const char *KERNEL_ADVECT_LIMITER_VEC3 =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if (HA_LIMITER == 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 traced = vec3(c) - HA_DT * (ha_velocity_sample(vec3(c)) / HA_VOXEL);\n"
     "  vec3 pf = floor(traced);\n"
     "  ivec3 i = ivec3(pf);\n"
@@ -761,9 +848,11 @@ const char *KERNEL_ADVECT_LIMITER_SCALAR =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if (HA_LIMITER == 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 traced = vec3(c) - HA_DT * (ha_velocity_sample(vec3(c)) / HA_VOXEL);\n"
     "  vec3 pf = floor(traced);\n"
     "  ivec3 i = ivec3(pf);\n"
@@ -799,6 +888,7 @@ const char *KERNEL_COPY_VEC3 =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int base = index * 3;\n"
     "  field_out[base + 0] = field_in[base + 0];\n"
     "  field_out[base + 1] = field_in[base + 1];\n"
@@ -810,6 +900,7 @@ const char *KERNEL_TMP_TO_SCALAR =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  field_out[index * 4 + HA_COMPONENT] = field_in[index];\n"
     "}\n";
 
@@ -821,6 +912,7 @@ const char *KERNEL_PACK_SCALARS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int src = index * 4;\n"
     "  int dst = index * 3;\n"
     "  packed[dst + 0] = scalars[src + 0];\n"
@@ -833,6 +925,7 @@ const char *KERNEL_UNPACK_SCALARS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int src = index * 3;\n"
     "  int dst = index * 4;\n"
     "  scalars[dst + 0] = packed[src + 0];\n"
@@ -845,6 +938,7 @@ const char *KERNEL_MASK_INIT =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int m = solid[index];\n"
     "  if (scalars[index * 4 + 0] > 1e-4) { m = m | HA_SMOKE | HA_DOMAIN; }\n"
     "  mask_out[index] = m;\n"
@@ -855,8 +949,10 @@ const char *KERNEL_DILATE =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  int bit = 1 << HA_DILATE_BIT;\n"
     "  int m = mask_in[index];\n"
     "  if ((m & bit) == 0) {\n"
@@ -879,8 +975,10 @@ const char *KERNEL_UNKNOWN =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  int m = mask[index];\n"
     "  bool here = ha_domain_cell(m);\n"
     "  if (c.x + 1 >= HA_DX || c.y + 1 >= HA_DY || c.z + 1 >= HA_DZ) { here = false; }\n"
@@ -915,7 +1013,7 @@ const char *KERNEL_RESTRICT_COARSE =
     "    for (int dy = 0; dy < 2; dy++) {\n"
     "      for (int dx = 0; dx < 2; dx++) {\n"
     "        ivec3 f = 2 * c + ivec3(dx, dy, dz);\n"
-    "        int i = ha_at(f);\n"
+    "        int i = ha_at_global(f);\n"
     "        if (i < 0) { continue; }\n"
     "        if ((mask_in[i] & HA_UNKNOWN) != 0) {\n"
     "          m = HA_UNKNOWN;\n"
@@ -933,6 +1031,7 @@ const char *KERNEL_ZERO_FIELD =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  field[index] = 0.0;\n"
     "}\n";
 
@@ -941,14 +1040,63 @@ const char *KERNEL_PROLONG_COARSE =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  if ((mask[index] & HA_UNKNOWN) == 0) {\n"
     "    pressure[index] = 0.0;\n"
     "    return;\n"
     "  }\n"
     "  int ci = (c.x / 2) + HA_COARSE_DX * ((c.y / 2) + HA_COARSE_DY * (c.z / 2));\n"
     "  pressure[index] = coarse_pressure[ci];\n"
+    "}\n";
+
+/* Per projection brick lists: `KERNEL_BRICK_FLAG` marks the bricks that contain a cell of the given
+ * mask bit (UNKNOWN here), `KERNEL_BRICK_COMPACT` builds the list in slot order (deterministic) and
+ * zeroes the reduction slots of the bricks that are not in it, so the `reduce_*` kernels can keep
+ * summing over all bricks. */
+const char *KERNEL_BRICK_FLAG =
+    "void main()\n"
+    "{\n"
+    "  int brick = int(gl_GlobalInvocationID.x);\n"
+    "  if (brick >= HA_BRICK_COUNT) { return; }\n"
+    "  int base = brick * 64;\n"
+    "  int has = 0;\n"
+    "  for (int i = 0; i < 64; i++) {\n"
+    "    if ((mask[base + i] & HA_UNKNOWN) != 0) { has = 1; break; }\n"
+    "  }\n"
+    "  flag[brick] = has;\n"
+    "}\n";
+
+const char *KERNEL_BRICK_COMPACT =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  int count = 0;\n"
+    "  for (int brick = 0; brick < HA_BRICK_COUNT; brick++) {\n"
+    "    if (flag[brick] != 0) {\n"
+    "      brick_list[count] = brick;\n"
+    "      count++;\n"
+    "    }\n"
+    "    else {\n"
+    "      partial[brick * 4 + 0] = 0.0;\n"
+    "      partial[brick * 4 + 1] = 0.0;\n"
+    "      partial[brick * 4 + 2] = 0.0;\n"
+    "      partial[brick * 4 + 3] = 0.0;\n"
+    "    }\n"
+    "  }\n"
+    "  count_out[0] = count;\n"
+    "}\n";
+
+/** Index of the cell this invocation handles: from the brick list when the CG runs list mode. */
+const char *GLSL_CG_LIST =
+    "int ha_cg_index()\n"
+    "{\n"
+    "  if (HA_LIST_MODE != 0) {\n"
+    "    return int(brick_list[gl_WorkGroupID.x]) * 64 + int(gl_LocalInvocationIndex);\n"
+    "  }\n"
+    "  return int(gl_GlobalInvocationID.x);\n"
     "}\n";
 
 const char *KERNEL_RHS =
@@ -972,8 +1120,10 @@ const char *KERNEL_RHS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  if ((mask[index] & HA_UNKNOWN) != 0) {\n"
     "    rhs[index] = ha_divergence(c) * HA_VOXEL * HA_VOXEL;\n"
     "  }\n"
@@ -1000,11 +1150,12 @@ const char *KERNEL_RHS =
 const char *KERNEL_CG_PRODUCT =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_cg_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  if ((mask[index] & HA_UNKNOWN) == 0) { product[index] = 0.0; return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  float sum = -6.0 * pressure[index];\n"
     "  int n;\n"
     "  n = ha_at(c + ivec3(1, 0, 0));\n"
@@ -1025,7 +1176,7 @@ const char *KERNEL_CG_PRODUCT =
 const char *KERNEL_CG_INIT =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_cg_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  float value = (mask[index] & HA_UNKNOWN) != 0 ? rhs[index] - product[index] : 0.0;\n"
     "  residual[index] = value;\n"
@@ -1066,7 +1217,7 @@ const char *KERNEL_REDUCE_INIT =
 const char *KERNEL_CG_DIRECTION =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_cg_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  if ((mask[index] & HA_UNKNOWN) == 0) { return; }\n"
     "  direction[index] = residual[index] / 6.0 + HA_BETA * direction[index];\n"
@@ -1081,8 +1232,9 @@ const char *KERNEL_CG_LAPLACIAN =
     "shared float ha_block_pq[64];\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_cg_index();\n"
     "  int local = int(gl_LocalInvocationIndex);\n"
+    "  ha_init_neighbors(index);\n"
     "  float pq = 0.0;\n"
     "  if (index < HA_CELL_COUNT) {\n"
     "    if ((mask[index] & HA_UNKNOWN) == 0) {\n"
@@ -1091,6 +1243,7 @@ const char *KERNEL_CG_LAPLACIAN =
     "    else {\n"
     "      ivec3 c;\n"
     "      ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "      float sum = -6.0 * direction[index];\n"
     "      int n;\n"
     "      n = ha_at(c + ivec3(1, 0, 0));\n"
@@ -1116,7 +1269,7 @@ const char *KERNEL_CG_LAPLACIAN =
     "    barrier();\n"
     "  }\n"
     "  if (local == 0) {\n"
-    "    partial[int(gl_WorkGroupID.x) * 4 + 0] = ha_block_pq[0];\n"
+    "    partial[(index >> 6) * 4 + 0] = ha_block_pq[0];\n"
     "  }\n"
     "}\n";
 
@@ -1135,7 +1288,7 @@ const char *KERNEL_CG_UPDATE =
     "shared float ha_block_rr[64];\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_cg_index();\n"
     "  int local = int(gl_LocalInvocationIndex);\n"
     "  float rr = 0.0;\n"
     "  if (index < HA_CELL_COUNT && (mask[index] & HA_UNKNOWN) != 0) {\n"
@@ -1151,7 +1304,7 @@ const char *KERNEL_CG_UPDATE =
     "    barrier();\n"
     "  }\n"
     "  if (local == 0) {\n"
-    "    partial[int(gl_WorkGroupID.x) * 4 + 1] = ha_block_rr[0];\n"
+    "    partial[(index >> 6) * 4 + 1] = ha_block_rr[0];\n"
     "  }\n"
     "}\n";
 
@@ -1181,10 +1334,12 @@ const char *KERNEL_CG_GRADIENT =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int m = mask[index];\n"
     "  if ((m & HA_DOMAIN) == 0 || (m & HA_SOLID) != 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  float p = ha_pressure_at(c);\n"
     "  vec3 gradient = vec3(p - ha_pressure_at(c + ivec3(-1, 0, 0)),\n"
     "                       p - ha_pressure_at(c + ivec3(0, -1, 0)),\n"
@@ -1209,6 +1364,7 @@ const char *KERNEL_DIVERGENCE_AFTER =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if (index % 64 != 0) { return; }\n"
     "  float sum = 0.0;\n"
     "  int end = min(index + 64, HA_CELL_COUNT);\n"
@@ -1265,8 +1421,10 @@ const char *KERNEL_CLAMP_SOLIDS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  int base = index * 3;\n"
     "  if ((solid_current[index] & HA_SOLID) != 0) {\n"
     "    velocity[base + 0] = 0.0;\n"
@@ -1298,6 +1456,7 @@ const char *KERNEL_COMBUST =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  float fuel = scalars[index * 4 + 2];\n"
     "  if (HA_BURN_RATE > 0.0 && fuel > 0.0) {\n"
     "    float burned = min(fuel, HA_BURN_RATE * HA_DT);\n"
@@ -1316,9 +1475,11 @@ const char *KERNEL_CLIP_BOUNDS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if (HA_USE_BOUNDS == 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  vec3 position = ha_world(c);\n"
     "  if (position.x < HA_BOUNDS_MIN.x || position.x > HA_BOUNDS_MAX.x ||\n"
     "      position.y < HA_BOUNDS_MIN.y || position.y > HA_BOUNDS_MAX.y ||\n"
@@ -1334,6 +1495,7 @@ const char *KERNEL_MASK_KEEP_INIT =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int m = solid[index];\n"
     "  if (scalars[index * 4 + 0] > 1e-4) { m = m | HA_SMOKE | HA_KEEP; }\n"
     "  mask_out[index] = m;\n"
@@ -1344,6 +1506,7 @@ const char *KERNEL_EXTRAPOLATE_SETUP =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  int m = mask[index];\n"
     "  int base = index * 3;\n"
     "  vec3 v = vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
@@ -1367,8 +1530,10 @@ const char *KERNEL_EXTRAPOLATE_PASS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
+    "  if (!ha_inside(c)) { return; }\n"
     "  int m = mask_in[index];\n"
     "  int out_mask = m;\n"
     "  if ((m & HA_KEEP) != 0 && (m & HA_FILLED) == 0) {\n"
@@ -1411,6 +1576,7 @@ const char *KERNEL_CARVE_SOLIDS =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if ((solid_carve[index] & HA_SOLID) == 0) { return; }\n"
     "  scalars[index * 4 + 0] = 0.0;\n"
     "  scalars[index * 4 + 1] = 0.0;\n"
@@ -1426,6 +1592,7 @@ const char *KERNEL_FLAME_FILTER =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  scalars[index * 4 + 3] = max(0.0, scalars[index * 4 + 3] - HA_FLAME_THRESHOLD);\n"
     "}\n";
 
@@ -1434,6 +1601,7 @@ const char *KERNEL_DOMAIN_MASK =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
     "  if (HA_USE_DOMAIN_MASK == 0) { return; }\n"
     "  if (abs(scalars[index * 4 + 0]) <= 1e-6) { return; }\n"
     "  float value = 0.0;\n"
@@ -1458,13 +1626,59 @@ const char *KERNEL_DOMAIN_MASK =
 /** \{ */
 
 /* -------------------------------------------------------------------- */
+/** \name Brick grid (host side)
+ *
+ * The 4^3 brick pool of `doc/ignis-brick-sparse.md`, built on the host from the dense frame. The
+ * device sees it through the param buffer appended after `P_COUNT` (tile -> slot map and brick
+ * origins), so the kernels need no extra storage buffer.
+ * \{ */
+
+constexpr int IGNIS_BRICK_EDGE = 4;
+constexpr int IGNIS_BRICK_CELLS = IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE;
+
+struct IgnisBrickGrid {
+  int3 dims = int3(0);
+  int3 brick_dims = int3(0);
+  int tile_count = 0;
+  int brick_count = 0;
+  /** Brick origin in voxels, sorted by (z, y, x) so the slot order is deterministic. */
+  Vector<int3> coords;
+  /** Brick coordinate -> slot, or -1. Indexed by `x + bx * (y + by * z)`. */
+  Vector<int> slot_map;
+  /** `slot * 6 + axis * 2 + (negative ? 1 : 0)`: the face neighbour's slot, or -1. */
+  Vector<int> neighbor;
+  int64_t pool_cells = 0;
+};
+
+static IgnisBrickGrid ignis_bricks_build(const IgnisDeviceFrame &frame,
+                                         const int margin_voxels,
+                                         const bool force_dense);
+static void bricks_scatter_float(const IgnisBrickGrid &bricks,
+                                 Span<const float> src,
+                                 int stride,
+                                 MutableSpan<float> dst);
+static void bricks_gather_float(const IgnisBrickGrid &bricks,
+                                Span<const float> src,
+                                int stride,
+                                MutableSpan<float> dst);
+static void bricks_scatter_int(const IgnisBrickGrid &bricks,
+                               Span<const int> src,
+                               MutableSpan<int> dst);
+static void bricks_gather_int(const IgnisBrickGrid &bricks,
+                              Span<const int> src,
+                              MutableSpan<int> dst);
+/** Host side brick grid self test, defined at the end of this file. */
+static void ignis_bricks_selftest(const IgnisDeviceFrame &frame,
+                                  const int margin_voxels,
+                                  const bool force_dense);
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Device solver
  * \{ */
 
 constexpr int GROUP_SIZE = 64;
-
-/** Host side brick grid self test, defined at the end of this file (doc/ignis-brick-sparse.md). */
-static void ignis_bricks_selftest(const IgnisDeviceFrame &frame);
 
 double time_now_ms()
 {
@@ -1550,6 +1764,9 @@ class HaIgnisSolver {
   HaBuffer coarse_product_;
   HaBuffer coarse_partial_;
   HaBufferInt coarse_mask_;
+  HaBufferInt brick_flags_;
+  HaBufferInt brick_list_;
+  HaBufferInt brick_list_count_;
   HaBufferInt mask_a_;
   HaBufferInt mask_b_;
   HaBufferInt solid_;
@@ -1561,6 +1778,18 @@ class HaIgnisSolver {
   HaBufferInt *mask_other_ = nullptr;
   int64_t cells_ = 0;
   int64_t blocks_ = 0;
+  /** Brick pool of the current frame (`doc/ignis-brick-sparse.md`). The parameter buffer gets the
+   * brick map and coordinates appended after `P_COUNT`. */
+  IgnisBrickGrid bricks_;
+  int64_t pool_cells_ = 0;
+  int64_t pool_blocks_ = 0;
+  int brick_block_ = 0;
+  /** Host copy of the param buffer of the current frame, including the brick block appended after
+   * `P_COUNT`. Every `params_` upload has to come from this array: uploading a `P_COUNT` sized span
+   * pads the rest with zeros and would clear the brick addressing (`dilate_mask` did exactly that). */
+  Array<float> params_host_;
+  /** Dispatch the fine CG over the bricks that contain an unknown cell instead of the whole pool. */
+  bool cg_list_ = true;
   int64_t coarse_cells_ = 0;
   int64_t coarse_blocks_ = 0;
   int coarse_iterations_ = 12;
@@ -1597,6 +1826,8 @@ class HaIgnisSolver {
   gpu::Shader *zero_field_ = nullptr;
   gpu::Shader *rhs_shader_ = nullptr;
   gpu::Shader *cg_product_ = nullptr;
+  gpu::Shader *brick_flag_ = nullptr;
+  gpu::Shader *brick_compact_ = nullptr;
   gpu::Shader *cg_init_ = nullptr;
   gpu::Shader *reduce_init_ = nullptr;
   gpu::Shader *cg_direction_ = nullptr;
@@ -1887,15 +2118,36 @@ void HaIgnisSolver::create_shaders()
                        common + GLSL_MASK_HELPERS + KERNEL_RHS,
                        Span<const HaShaderResource>(rhs_res, 5));
 
+  static const HaShaderResource brick_flag_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_WRITE(2, "int", "flag[]"),
+  };
+  brick_flag_ = shader("ignis|brick_flag",
+                       common + KERNEL_BRICK_FLAG,
+                       Span<const HaShaderResource>(brick_flag_res, 3));
+
+  static const HaShaderResource brick_compact_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "flag[]"),
+      HA_WRITE(2, "int", "brick_list[]"),
+      HA_RW(3, "float", "partial[]"),
+      HA_WRITE(4, "int", "count_out[]"),
+  };
+  brick_compact_ = shader("ignis|brick_compact",
+                          common + KERNEL_BRICK_COMPACT,
+                          Span<const HaShaderResource>(brick_compact_res, 5));
+
   static const HaShaderResource cg_product_res[] = {
       HA_READ(0, "float", "params[]"),
       HA_READ(1, "float", "pressure[]"),
       HA_READ(2, "int", "mask[]"),
       HA_WRITE(3, "float", "product[]"),
+      HA_READ(4, "int", "brick_list[]"),
   };
   cg_product_ = shader("ignis|cg_product",
-                       common + GLSL_MASK_HELPERS + KERNEL_CG_PRODUCT,
-                       Span<const HaShaderResource>(cg_product_res, 4));
+                       common + GLSL_MASK_HELPERS + GLSL_CG_LIST + KERNEL_CG_PRODUCT,
+                       Span<const HaShaderResource>(cg_product_res, 5));
 
   static const HaShaderResource cg_init_res[] = {
       HA_READ(0, "float", "params[]"),
@@ -1905,9 +2157,12 @@ void HaIgnisSolver::create_shaders()
       HA_WRITE(4, "float", "residual[]"),
       HA_WRITE(5, "float", "direction[]"),
       HA_RW(6, "float", "partial[]"),
+      HA_READ(7, "int", "brick_list[]"),
   };
   cg_init_ = shader(
-      "ignis|cg_init", common + KERNEL_CG_INIT, Span<const HaShaderResource>(cg_init_res, 7));
+      "ignis|cg_init",
+      common + GLSL_CG_LIST + KERNEL_CG_INIT,
+      Span<const HaShaderResource>(cg_init_res, 8));
 
   static const HaShaderResource reduce_init_res[] = {
       HA_RW(0, "float", "params[]"),
@@ -1922,10 +2177,11 @@ void HaIgnisSolver::create_shaders()
       HA_READ(1, "int", "mask[]"),
       HA_READ(2, "float", "residual[]"),
       HA_RW(3, "float", "direction[]"),
+      HA_READ(4, "int", "brick_list[]"),
   };
   cg_direction_ = shader("ignis|cg_direction",
-                         common + KERNEL_CG_DIRECTION,
-                         Span<const HaShaderResource>(cg_direction_res, 4));
+                         common + GLSL_CG_LIST + KERNEL_CG_DIRECTION,
+                         Span<const HaShaderResource>(cg_direction_res, 5));
 
   static const HaShaderResource cg_laplacian_res[] = {
       HA_READ(0, "float", "params[]"),
@@ -1933,10 +2189,11 @@ void HaIgnisSolver::create_shaders()
       HA_READ(2, "float", "direction[]"),
       HA_RW(3, "float", "product[]"),
       HA_RW(4, "float", "partial[]"),
+      HA_READ(5, "int", "brick_list[]"),
   };
   cg_laplacian_ = shader("ignis|cg_laplacian",
-                         common + GLSL_MASK_HELPERS + KERNEL_CG_LAPLACIAN,
-                         Span<const HaShaderResource>(cg_laplacian_res, 5));
+                         common + GLSL_MASK_HELPERS + GLSL_CG_LIST + KERNEL_CG_LAPLACIAN,
+                         Span<const HaShaderResource>(cg_laplacian_res, 6));
 
   static const HaShaderResource reduce_pq_res[] = {
       HA_RW(0, "float", "params[]"),
@@ -1954,10 +2211,11 @@ void HaIgnisSolver::create_shaders()
       HA_RW(4, "float", "pressure[]"),
       HA_RW(5, "float", "residual[]"),
       HA_RW(6, "float", "partial[]"),
+      HA_READ(7, "int", "brick_list[]"),
   };
   cg_update_ = shader("ignis|cg_update",
-                      common + KERNEL_CG_UPDATE,
-                      Span<const HaShaderResource>(cg_update_res, 7));
+                      common + GLSL_CG_LIST + KERNEL_CG_UPDATE,
+                      Span<const HaShaderResource>(cg_update_res, 8));
 
   static const HaShaderResource reduce_res_res[] = {
       HA_RW(0, "float", "params[]"),
@@ -2081,6 +2339,7 @@ bool HaIgnisSolver::shaders_valid() const
           coarse_restrict_ != nullptr && coarse_prolong_ != nullptr &&
           zero_field_ != nullptr &&
          cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
+          brick_flag_ != nullptr && brick_compact_ != nullptr &&
          cg_direction_ != nullptr && cg_laplacian_ != nullptr &&
          reduce_pq_ != nullptr && cg_update_ != nullptr &&
          reduce_res_ != nullptr && cg_gradient_ != nullptr && divergence_after_ != nullptr &&
@@ -2117,6 +2376,9 @@ void HaIgnisSolver::release()
   coarse_product_.free();
   coarse_partial_.free();
   coarse_mask_.free();
+  brick_flags_.free();
+  brick_list_.free();
+  brick_list_count_.free();
   mask_a_.free();
   mask_b_.free();
   solid_.free();
@@ -2135,12 +2397,15 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
       !scalar_pack_.ensure(cells * 3) || !pressure_.ensure(cells) ||
       !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
       !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
-      !params_.ensure(P_COUNT) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
-      !coarse_params_.ensure(P_COUNT) || !coarse_pressure_.ensure(coarse_cells_) ||
+      !params_.ensure(P_COUNT + brick_block_) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
+      !coarse_params_.ensure(P_COUNT + 8) || !coarse_pressure_.ensure(coarse_cells_) ||
       !coarse_rhs_.ensure(coarse_cells_) || !coarse_residual_.ensure(coarse_cells_) ||
       !coarse_direction_.ensure(coarse_cells_) || !coarse_product_.ensure(coarse_cells_) ||
       !coarse_partial_.ensure(std::max<int64_t>(1, coarse_blocks_) * 4) ||
       !coarse_mask_.ensure(coarse_cells_) ||
+      !brick_flags_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !brick_list_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !brick_list_count_.ensure(1) ||
       !mask_a_.ensure(cells) || !mask_b_.ensure(cells) || !solid_.ensure(cells) ||
       !solid_current_.ensure(cells) || !solid_carve_.ensure(cells) ||
       !collider_velocity_.ensure(3 * 256))
@@ -2153,10 +2418,35 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
 
 bool HaIgnisSolver::bind(const IgnisDeviceFrame &frame, std::string &r_reason)
 {
-  scalars_.upload(frame.scalars);
-  velocity_.upload(frame.velocity);
-  pressure_.upload(frame.pressure);
-  source_.upload(frame.source);
+  /* Scatter the dense frame into the brick pool, then upload. */
+  Array<float> pool_scalars;
+  Array<float> pool_velocity;
+  Array<float> pool_pressure;
+  Array<float> pool_source;
+  pool_scalars.reinitialize(int(pool_cells_ * 4));
+  pool_velocity.reinitialize(int(pool_cells_ * 3));
+  pool_pressure.reinitialize(int(pool_cells_));
+  pool_source.reinitialize(int(pool_cells_ * 7));
+  bricks_scatter_float(bricks_,
+                       Span<const float>(frame.scalars.data(), frame.scalars.size()),
+                       4,
+                       pool_scalars.as_mutable_span());
+  bricks_scatter_float(bricks_,
+                       Span<const float>(frame.velocity.data(), frame.velocity.size()),
+                       3,
+                       pool_velocity.as_mutable_span());
+  bricks_scatter_float(bricks_,
+                       Span<const float>(frame.pressure.data(), frame.pressure.size()),
+                       1,
+                       pool_pressure.as_mutable_span());
+  bricks_scatter_float(bricks_,
+                       Span<const float>(frame.source.data(), frame.source.size()),
+                       7,
+                       pool_source.as_mutable_span());
+  scalars_.upload(pool_scalars.as_span());
+  velocity_.upload(pool_velocity.as_span());
+  pressure_.upload(pool_pressure.as_span());
+  source_.upload(pool_source.as_span());
 
   Array<int> solid;
   solid.reinitialize(int(cells_));
@@ -2176,9 +2466,22 @@ bool HaIgnisSolver::bind(const IgnisDeviceFrame &frame, std::string &r_reason)
                          0 :
                          (frame.carve_mask[i] & (IGNIS_MASK_SOLID | (0xFF << 8)));
   }
-  solid_.upload(Span<int>(solid.data(), int64_t(solid.size())));
-  solid_current_.upload(Span<int>(solid_current.data(), int64_t(solid_current.size())));
-  solid_carve_.upload(Span<int>(solid_carve.data(), int64_t(solid_carve.size())));
+  Array<int> pool_solid;
+  Array<int> pool_solid_current;
+  Array<int> pool_solid_carve;
+  pool_solid.reinitialize(int(pool_cells_));
+  pool_solid_current.reinitialize(int(pool_cells_));
+  pool_solid_carve.reinitialize(int(pool_cells_));  bricks_scatter_int(
+      bricks_, Span<const int>(solid.data(), solid.size()), pool_solid.as_mutable_span());
+  bricks_scatter_int(bricks_,
+                     Span<const int>(solid_current.data(), solid_current.size()),
+                     pool_solid_current.as_mutable_span());
+  bricks_scatter_int(bricks_,
+                     Span<const int>(solid_carve.data(), solid_carve.size()),
+                     pool_solid_carve.as_mutable_span());
+  solid_.upload(pool_solid.as_span());
+  solid_current_.upload(pool_solid_current.as_span());
+  solid_carve_.upload(pool_solid_carve.as_span());
   if (frame.collider_velocities.is_empty()) {
     Array<float> zeros(3 * 256, 0.0f);
     collider_velocity_.upload(zeros.as_span());
@@ -2186,9 +2489,46 @@ bool HaIgnisSolver::bind(const IgnisDeviceFrame &frame, std::string &r_reason)
   else {
     collider_velocity_.upload(frame.collider_velocities);
   }
-  mask_a_.upload(Span<int>(solid.data(), int64_t(solid.size())));
+  mask_a_.upload(pool_solid.as_span());
   mask_ = &mask_a_;
   mask_other_ = &mask_b_;
+  if (debug_enabled()) {
+    int64_t smoke_dense = 0;
+    int64_t smoke_pool = 0;
+    int64_t src_dense = 0;
+    int64_t src_pool = 0;
+    int64_t vel_dense = 0;
+    int64_t vel_pool = 0;
+    int64_t solid_dense = 0;
+    int64_t solid_pool = 0;
+    for (int64_t i = 0; i < cells_; i++) {
+      smoke_dense += frame.scalars[i * 4 + 0] > 1e-4f ? 1 : 0;
+      src_dense += frame.source[i * 7 + 0] > 1e-4f ? 1 : 0;
+      solid_dense += solid[i] != 0 ? 1 : 0;
+      vel_dense += (frame.velocity[i * 3 + 0] != 0.0f || frame.velocity[i * 3 + 1] != 0.0f ||
+                    frame.velocity[i * 3 + 2] != 0.0f) ?
+                       1 :
+                       0;
+    }
+    for (int64_t i = 0; i < pool_cells_; i++) {
+      smoke_pool += pool_scalars[i * 4 + 0] > 1e-4f ? 1 : 0;
+      src_pool += pool_source[i * 7 + 0] > 1e-4f ? 1 : 0;
+      solid_pool += pool_solid[i] != 0 ? 1 : 0;
+      vel_pool += (pool_velocity[i * 3 + 0] != 0.0f || pool_velocity[i * 3 + 1] != 0.0f ||
+                   pool_velocity[i * 3 + 2] != 0.0f) ?
+                      1 :
+                      0;
+    }
+    debug_log("IGNIS_HA bind: smoke %lld/%lld source %lld/%lld velocity %lld/%lld solid %lld/%lld\n",
+              (long long)smoke_dense,
+              (long long)smoke_pool,
+              (long long)src_dense,
+              (long long)src_pool,
+              (long long)vel_dense,
+              (long long)vel_pool,
+              (long long)solid_dense,
+              (long long)solid_pool);
+  }
   if (!scalars_.is_valid() || !velocity_.is_valid() || !pressure_.is_valid() ||
       !source_.is_valid() || !solid_.is_valid() || !solid_current_.is_valid() ||
       !solid_carve_.is_valid() || !collider_velocity_.is_valid() || !mask_->is_valid() ||
@@ -2204,9 +2544,9 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
                                 const float dt,
                                 MutableSpan<float> r_params)
 {
-  r_params.fill(0.0f);
+  r_params.take_front(P_COUNT).fill(0.0f);
   const ignis::Settings &s = frame.settings;
-  r_params[P_CELLS] = float(cells_);
+  r_params[P_CELLS] = float(pool_cells_);
   r_params[P_DX] = float(frame.dims.x);
   r_params[P_DY] = float(frame.dims.y);
   r_params[P_DZ] = float(frame.dims.z);
@@ -2282,8 +2622,11 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
 void HaIgnisSolver::upload_coarse_params(const Span<const float> fine_params)
 {
   Array<float> params;
-  params.reinitialize(P_COUNT);
-  std::copy(fine_params.begin(), fine_params.end(), params.begin());
+  params.reinitialize(P_COUNT + 8);
+  params.fill(0.0f);
+  std::copy(fine_params.begin(), fine_params.begin() + P_COUNT, params.begin());
+  /* The coarse grid is a dense box of its own, so it keeps the dense cell addressing. */
+  params[P_COUNT + 0] = 0.0f;
   params[P_CELLS] = float(coarse_cells_);
   params[P_DX] = float(coarse_dims_.x);
   params[P_DY] = float(coarse_dims_.y);
@@ -2342,8 +2685,11 @@ bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::stri
   if (radius <= 0) {
     return true;
   }
+  /* Keep the device side params (the CG writes its statistics there): read the whole buffer, change
+   * only the dilation bit and upload it back. It has to be the full size, otherwise the brick
+   * addressing block appended after `P_COUNT` is cleared. */
   Array<float> values;
-  values.reinitialize(P_COUNT);
+  values.reinitialize(int(params_host_.size()));
   params_.download(values.as_mutable_span());
   values[P_DILATE_BIT] = float(bit_index);
   params_.upload(values.as_span());
@@ -2352,7 +2698,7 @@ bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::stri
     buffers.append(params_.buf());
     buffers.append(mask_->buf());
     buffers.append(mask_other_->buf());
-    if (!pass(dilate_, buffers, int(cells_))) {
+    if (!pass(dilate_, buffers, int(pool_cells_))) {
       r_reason = "mask dilation pass failed";
       return false;
     }
@@ -2430,6 +2776,7 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
       buffers.append(coarse_mask_.buf());
       buffers.append(coarse_residual_.buf());
       buffers.append(coarse_direction_.buf());
+      buffers.append(brick_list_.buf());
       if (!pass(cg_direction_, buffers, coarse_count)) {
         r_reason = "coarse CG direction pass failed";
         return false;
@@ -2442,6 +2789,7 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
       buffers.append(coarse_direction_.buf());
       buffers.append(coarse_product_.buf());
       buffers.append(coarse_partial_.buf());
+      buffers.append(brick_list_.buf());
       if (!pass(cg_laplacian_, buffers, coarse_count)) {
         r_reason = "coarse CG Laplacian pass failed";
         return false;
@@ -2465,6 +2813,7 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
       buffers.append(coarse_pressure_.buf());
       buffers.append(coarse_residual_.buf());
       buffers.append(coarse_partial_.buf());
+      buffers.append(brick_list_.buf());
       if (!pass(cg_update_, buffers, coarse_count)) {
         r_reason = "coarse CG update pass failed";
         return false;
@@ -2486,7 +2835,7 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
     buffers.append(mask_->buf());
     buffers.append(coarse_pressure_.buf());
     buffers.append(pressure_.buf());
-    if (!pass(coarse_prolong_, buffers, int(cells_))) {
+    if (!pass(coarse_prolong_, buffers, int(pool_cells_))) {
       r_reason = "coarse prolongation failed";
       return false;
     }
@@ -2505,7 +2854,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(scalars_.buf());
     buffers.append(solid_.buf());
     buffers.append(mask_other_->buf());
-    if (!pass(mask_init_, buffers, int(cells_))) {
+    if (!pass(mask_init_, buffers, int(pool_cells_))) {
       r_reason = "pressure domain pass failed";
       return false;
     }
@@ -2518,13 +2867,47 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
     buffers.append(mask_->buf());
-    if (!pass(unknown_, buffers, int(cells_))) {
+    if (!pass(unknown_, buffers, int(pool_cells_))) {
       r_reason = "pressure unknown pass failed";
       return false;
     }
   }
 
-  const int count = int(cells_);
+  const int count = int(pool_cells_);
+  /* Brick list of the pressure unknowns: the CG only has to visit the bricks that contain an
+   * unknown cell (about a fifth of the pool here), not the whole dense box. The list is built on
+   * the device in slot order (deterministic) and its length is read back once per projection. */
+  int cg_count = count;
+  if (cg_list_) {
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(brick_flags_.buf());
+      if (!pass(brick_flag_, buffers, int(bricks_.brick_count))) {
+        r_reason = "brick flag pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(brick_flags_.buf());
+      buffers.append(brick_list_.buf());
+      buffers.append(partial_.buf());
+      buffers.append(brick_list_count_.buf());
+      if (!pass(brick_compact_, buffers, 1)) {
+        r_reason = "brick list pass failed";
+        return false;
+      }
+    }
+    int list_count = 0;
+    brick_list_count_.download(MutableSpan<int>(&list_count, 1));
+    list_count = std::clamp(list_count, 0, int(bricks_.brick_count));
+    cg_count = list_count * IGNIS_BRICK_CELLS;
+    params_host_[P_COUNT + 5] = 1.0f;
+    params_.upload(params_host_.as_span());
+  }
   /* Right hand side + the divergence norm used by the stats. */
   {
     Vector<gpu::StorageBuf *> buffers;
@@ -2547,7 +2930,8 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(pressure_.buf());
     buffers.append(mask_->buf());
     buffers.append(product_.buf());
-    if (!pass(cg_product_, buffers, count)) {
+    buffers.append(brick_list_.buf());
+    if (!pass(cg_product_, buffers, cg_count)) {
       r_reason = "CG initial product failed";
       return false;
     }
@@ -2561,7 +2945,8 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(residual_.buf());
     buffers.append(direction_.buf());
     buffers.append(partial_.buf());
-    if (!pass(cg_init_, buffers, count)) {
+    buffers.append(brick_list_.buf());
+    if (!pass(cg_init_, buffers, cg_count)) {
       r_reason = "CG initialisation failed";
       return false;
     }
@@ -2579,6 +2964,11 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
   Array<float> values;
   values.reinitialize(P_COUNT);
   params_.download(values.as_mutable_span());
+  if (debug_enabled()) {
+    debug_log("IGNIS_HA proj: unknown=%.0f rhs=%.5f\n",
+              double(values[P_UNKNOWN_COUNT]),
+              double(values[P_RHS_NORM]));
+  }
   bool converged = values[P_CONVERGED] != 0.0f;
   int iterations = 0;
   const int max_iterations = std::max(1, int(values[P_MAX_ITERATIONS]));
@@ -2589,7 +2979,8 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       buffers.append(mask_->buf());
       buffers.append(residual_.buf());
       buffers.append(direction_.buf());
-      if (!pass(cg_direction_, buffers, count)) {
+      buffers.append(brick_list_.buf());
+      if (!pass(cg_direction_, buffers, cg_count)) {
         r_reason = "CG direction pass failed";
         return false;
       }
@@ -2602,7 +2993,8 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       buffers.append(direction_.buf());
       buffers.append(product_.buf());
       buffers.append(partial_.buf());
-      if (!pass(cg_laplacian_, buffers, count)) {
+      buffers.append(brick_list_.buf());
+      if (!pass(cg_laplacian_, buffers, cg_count)) {
         r_reason = "CG Laplacian pass failed";
         return false;
       }
@@ -2626,7 +3018,8 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       buffers.append(pressure_.buf());
       buffers.append(residual_.buf());
       buffers.append(partial_.buf());
-      if (!pass(cg_update_, buffers, count)) {
+      buffers.append(brick_list_.buf());
+      if (!pass(cg_update_, buffers, cg_count)) {
         r_reason = "CG update pass failed";
         return false;
       }
@@ -2902,8 +3295,37 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     return false;
   }
   cells_ = cells;
-  blocks_ = (cells + GROUP_SIZE - 1) / GROUP_SIZE;
   radius_ = frame.solver_radius;
+  /* Brick pool (doc/ignis-brick-sparse.md): the content plus the same voxel margin the dense box
+   * gives the solver, grown in brick units. The content bricks are measured to be ~10-16% of the
+   * box, so the pool is a few times smaller than the dense box. */
+  const int margin = std::min(64,
+                              int(radius_) + 2 +
+                                  int(std::ceil(std::max(1.0f, frame.settings.cfl))) *
+                                      std::max(1, frame.substeps) +
+                                  2);
+  bool force_dense = false;
+  if (const char *env = std::getenv("BLENDER_IGNIS_DENSE")) {
+    force_dense = env[0] != '0';
+  }
+  bricks_ = ignis_bricks_build(frame, margin, force_dense);
+  if (bricks_.brick_count <= 0) {
+    r_result.reason = "the brick grid is empty";
+    return false;
+  }
+  pool_cells_ = bricks_.pool_cells;
+  pool_blocks_ = bricks_.brick_count;
+  blocks_ = pool_blocks_;
+  brick_block_ = 8 + bricks_.tile_count + bricks_.brick_count * 9;
+  if (debug_enabled()) {
+    debug_log("IGNIS_HA bricks: cells=%lld bricks=%d/%d pool=%lld (%.2fx) margin=%d\n",
+              (long long)cells_,
+              bricks_.brick_count,
+              bricks_.tile_count,
+              (long long)pool_cells_,
+              cells_ > 0 ? double(pool_cells_) / double(cells_) : 0.0,
+              margin);
+  }
   coarse_dims_ = int3((frame.dims.x + 1) / 2, (frame.dims.y + 1) / 2, (frame.dims.z + 1) / 2);
   coarse_cells_ = int64_t(coarse_dims_.x) * int64_t(coarse_dims_.y) * int64_t(coarse_dims_.z);
   coarse_blocks_ = (coarse_cells_ + GROUP_SIZE - 1) / GROUP_SIZE;
@@ -2924,6 +3346,12 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   if (const char *env = std::getenv("BLENDER_IGNIS_CG_CHECK")) {
     cg_check_interval_ = std::clamp(std::atoi(env), 1, 64);
   }
+  cg_list_ = true;
+  if (const char *env = std::getenv("BLENDER_IGNIS_NO_CG_LIST")) {
+    if (env[0] != '0') {
+      cg_list_ = false;
+    }
+  }
 
   if (frame.settings.advection_scheme == ignis::AdvectionScheme::Bfecc) {
     r_result.reason = "BFECC advection is not implemented on the device";
@@ -2931,7 +3359,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   }
 
   const double start = time_now_ms();
-  if (!allocate(cells, blocks_, r_result.reason)) {
+  if (!allocate(pool_cells_, pool_blocks_, r_result.reason)) {
     return false;
   }
   create_shaders();
@@ -2939,18 +3367,52 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     r_result.reason = "shader creation failed";
     return false;
   }
+  if (debug_enabled()) {
+    int64_t smoke_in = 0;
+    for (int64_t i = 0; i < cells_; i++) {
+      if (frame.scalars[i * 4 + 0] > 1e-4f) {
+        smoke_in++;
+      }
+    }
+    debug_log("IGNIS_HA input: smoke=%lld\n", (long long)smoke_in);
+  }
   if (!bind(frame, r_result.reason)) {
     return false;
   }
   if (const char *env = std::getenv("BLENDER_IGNIS_BRICK_SELFTEST")) {
     if (env[0] != '0') {
-      ignis_bricks_selftest(frame);
+      ignis_bricks_selftest(frame, margin, force_dense);
     }
   }
 
-  Array<float> host_params;
-  host_params.reinitialize(P_COUNT);
-  host_params.fill(0.0f);
+  params_host_.reinitialize(P_COUNT + brick_block_);
+  params_host_.fill(0.0f);
+  /* Brick addressing block appended to the param buffer (see `GLSL_PRELUDE`). */
+  {
+    params_host_[P_COUNT + 0] = 1.0f; /* sparse */
+    params_host_[P_COUNT + 1] = float(bricks_.tile_count);
+    params_host_[P_COUNT + 2] = float(bricks_.brick_dims.x);
+    params_host_[P_COUNT + 3] = float(bricks_.brick_dims.y);
+    params_host_[P_COUNT + 4] = float(bricks_.brick_dims.z);
+    params_host_[P_COUNT + 5] = 0.0f; /* list mode: off until `projection` builds the list */
+    params_host_[P_COUNT + 6] = float(bricks_.brick_count);
+    for (int tile = 0; tile < bricks_.tile_count; tile++) {
+      params_host_[P_COUNT + 8 + tile] = float(bricks_.slot_map[tile]);
+    }
+    for (int slot = 0; slot < bricks_.brick_count; slot++) {
+      const int base = P_COUNT + 8 + bricks_.tile_count + slot * 3;
+      params_host_[base + 0] = float(bricks_.coords[slot].x);
+      params_host_[base + 1] = float(bricks_.coords[slot].y);
+      params_host_[base + 2] = float(bricks_.coords[slot].z);
+    }
+    /* Six face neighbours per brick, cached in shared memory by `ha_init_neighbors`. */
+    const int nb_base = P_COUNT + 8 + bricks_.tile_count + bricks_.brick_count * 3;
+    for (int slot = 0; slot < bricks_.brick_count; slot++) {
+      for (int i = 0; i < 6; i++) {
+        params_host_[nb_base + slot * 6 + i] = float(bricks_.neighbor[slot * 6 + i]);
+      }
+    }
+  }
   const int substeps = frame.delta_time > 0.0f ? std::max(1, frame.substeps) : 0;
   bool has_source = false;
   for (const float value : frame.source) {
@@ -2962,15 +3424,15 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
 
   if (substeps == 0) {
     /* First or paused frame: CPU behaviour is "only show the sources, do not integrate". */
-    fill_params(frame, 0.0f, host_params);
-    params_.upload(host_params.as_span());
+    fill_params(frame, 0.0f, params_host_);
+    params_.upload(params_host_.as_span());
     if (has_source) {
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(scalars_.buf());
       buffers.append(velocity_.buf());
       buffers.append(source_.buf());
-      if (!pass(source_merge_, buffers, int(cells_))) {
+      if (!pass(source_merge_, buffers, int(pool_cells_))) {
         r_result.reason = "source merge failed";
         return false;
       }
@@ -2981,7 +3443,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
       buffers.append(solid_carve_.buf());
       buffers.append(scalars_.buf());
       buffers.append(velocity_.buf());
-      if (!pass(carve_solids_, buffers, int(cells_))) {
+      if (!pass(carve_solids_, buffers, int(pool_cells_))) {
         r_result.reason = "solid carve failed";
         return false;
       }
@@ -2990,9 +3452,9 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   else {
     const float step_dt = frame.delta_time / float(substeps);
     for (int substep = 0; substep < substeps; substep++) {
-      fill_params(frame, step_dt, host_params);
-      params_.upload(host_params.as_span());
-      upload_coarse_params(Span<const float>(host_params.data(), host_params.size()));
+      fill_params(frame, step_dt, params_host_);
+      params_.upload(params_host_.as_span());
+      upload_coarse_params(Span<const float>(params_host_.data(), params_host_.size()));
 
       if (has_source) {
         Vector<gpu::StorageBuf *> buffers;
@@ -3000,7 +3462,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
         buffers.append(source_.buf());
-        if (!pass(source_merge_, buffers, int(cells_))) {
+        if (!pass(source_merge_, buffers, int(pool_cells_))) {
           r_result.reason = "source merge failed";
           return false;
         }
@@ -3011,7 +3473,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
         buffers.append(pressure_.buf());
-        if (!pass(forces_, buffers, int(cells_))) {
+        if (!pass(forces_, buffers, int(pool_cells_))) {
           r_result.reason = "force pass failed";
           return false;
         }
@@ -3023,7 +3485,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(velocity_.buf());
         buffers.append(mask_->buf());
         buffers.append(curl_.buf());
-        if (!pass(vorticity_curl_, buffers, int(cells_))) {
+        if (!pass(vorticity_curl_, buffers, int(pool_cells_))) {
           r_result.reason = "vorticity curl pass failed";
           return false;
         }
@@ -3032,12 +3494,12 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers_apply.append(velocity_.buf());
         buffers_apply.append(mask_->buf());
         buffers_apply.append(curl_.buf());
-        if (!pass(vorticity_apply_, buffers_apply, int(cells_))) {
+        if (!pass(vorticity_apply_, buffers_apply, int(pool_cells_))) {
           r_result.reason = "vorticity apply pass failed";
           return false;
         }
       }
-      if (!advect_velocity(cells_, r_result.reason)) {
+      if (!advect_velocity(pool_cells_, r_result.reason)) {
         return false;
       }
       {
@@ -3048,12 +3510,12 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(solid_current_.buf());
         buffers.append(collider_velocity_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(clamp_solids_, buffers, int(cells_))) {
+        if (!pass(clamp_solids_, buffers, int(pool_cells_))) {
           r_result.reason = "solid clamp pass failed";
           return false;
         }
       }
-      if (!projection(cells_, r_result.reason)) {
+      if (!projection(pool_cells_, r_result.reason)) {
         return false;
       }
       {
@@ -3062,28 +3524,28 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(solid_current_.buf());
         buffers.append(collider_velocity_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(clamp_solids_, buffers, int(cells_))) {
+        if (!pass(clamp_solids_, buffers, int(pool_cells_))) {
           r_result.reason = "solid clamp pass failed";
           return false;
         }
       }
-      if (!advect_scalars(cells_, r_result.reason)) {
+      if (!advect_scalars(pool_cells_, r_result.reason)) {
         return false;
       }
       {
         Vector<gpu::StorageBuf *> buffers;
         buffers.append(params_.buf());
         buffers.append(scalars_.buf());
-        if (!pass(combust_, buffers, int(cells_))) {
+        if (!pass(combust_, buffers, int(pool_cells_))) {
           r_result.reason = "combustion pass failed";
           return false;
         }
-        if (!pass(clip_bounds_, buffers, int(cells_))) {
+        if (!pass(clip_bounds_, buffers, int(pool_cells_))) {
           r_result.reason = "bounds pass failed";
           return false;
         }
       }
-      if (!extrapolate(cells_, r_result.reason)) {
+      if (!extrapolate(pool_cells_, r_result.reason)) {
         return false;
       }
       {
@@ -3092,7 +3554,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(solid_carve_.buf());
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(carve_solids_, buffers, int(cells_))) {
+        if (!pass(carve_solids_, buffers, int(pool_cells_))) {
           r_result.reason = "solid carve failed";
           return false;
         }
@@ -3104,7 +3566,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
     buffers.append(scalars_.buf());
-    if (!pass(flame_filter_, buffers, int(cells_))) {
+    if (!pass(flame_filter_, buffers, int(pool_cells_))) {
       r_result.reason = "flame filter failed";
       return false;
     }
@@ -3116,22 +3578,46 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     buffers.append(velocity_.buf());
     buffers.append(pressure_.buf());
     buffers.append(mask_->buf());
-    if (!pass(domain_mask_, buffers, int(cells_))) {
+    if (!pass(domain_mask_, buffers, int(pool_cells_))) {
       r_result.reason = "domain mask failed";
       return false;
     }
   }
 
-  scalars_.download(frame.scalars);
-  velocity_.download(frame.velocity);
-  pressure_.download(frame.pressure);
+  {
+    Array<float> pool;
+    pool.reinitialize(int(pool_cells_ * 4));
+    scalars_.download(pool.as_mutable_span());
+    bricks_gather_float(
+        bricks_, Span<const float>(pool.data(), pool.size()), 4, frame.scalars);
+  }
+  {
+    Array<float> pool;
+    pool.reinitialize(int(pool_cells_ * 3));
+    velocity_.download(pool.as_mutable_span());
+    bricks_gather_float(
+        bricks_, Span<const float>(pool.data(), pool.size()), 3, frame.velocity);
+  }
+  {
+    Array<float> pool;
+    pool.reinitialize(int(pool_cells_));
+    pressure_.download(pool.as_mutable_span());
+    bricks_gather_float(
+        bricks_, Span<const float>(pool.data(), pool.size()), 1, frame.pressure);
+  }
   Array<int> mask;
   mask.reinitialize(int(cells_));
-  mask_->download(mask.as_mutable_span());
+  {
+    Array<int> pool_mask;
+    pool_mask.reinitialize(int(pool_cells_));
+    mask_->download(pool_mask.as_mutable_span());
+    bricks_gather_int(
+        bricks_, Span<const int>(pool_mask.data(), pool_mask.size()), mask.as_mutable_span());
+  }
   for (int64_t i = 0; i < cells_; i++) {
     frame.mask[i] = mask[i];
   }
-  params_.download(host_params.as_mutable_span());
+  params_.download(params_host_.as_mutable_span());
 
   int active = 0;
   int solid_count = 0;
@@ -3148,18 +3634,18 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     }
   }
 
-  const float unknown_count = std::max(1.0f, host_params[P_UNKNOWN_COUNT]);
+  const float unknown_count = std::max(1.0f, params_host_[P_UNKNOWN_COUNT]);
   r_result.ran = true;
   r_result.active_voxels = active;
   r_result.solid_voxels = solid_count;
   r_result.domain_removed = removed;
-  r_result.pressure_iterations = int(host_params[P_ITERATION] + 0.5f);
-  r_result.pressure_iteration_budget = int(host_params[P_MAX_ITERATIONS] + 0.5f);
-  r_result.residual = host_params[P_RHS_NORM] > 1e-12f ?
-                          host_params[P_RES_NORM] / host_params[P_RHS_NORM] :
+  r_result.pressure_iterations = int(params_host_[P_ITERATION] + 0.5f);
+  r_result.pressure_iteration_budget = int(params_host_[P_MAX_ITERATIONS] + 0.5f);
+  r_result.residual = params_host_[P_RHS_NORM] > 1e-12f ?
+                          params_host_[P_RES_NORM] / params_host_[P_RHS_NORM] :
                           0.0f;
-  r_result.divergence_before = std::sqrt(host_params[P_DIV_BEFORE_SUM] / unknown_count);
-  r_result.divergence_after = std::sqrt(host_params[P_DIV_AFTER_SUM] / unknown_count);
+  r_result.divergence_before = std::sqrt(params_host_[P_DIV_BEFORE_SUM] / unknown_count);
+  r_result.divergence_after = std::sqrt(params_host_[P_DIV_AFTER_SUM] / unknown_count);
   r_result.milliseconds = time_now_ms() - start;
 
   if (debug_enabled()) {
@@ -3179,15 +3665,15 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         substeps,
         active,
         r_result.pressure_iterations,
-        int(host_params[P_MAX_ITERATIONS] + 0.5f),
+        int(params_host_[P_MAX_ITERATIONS] + 0.5f),
         double(r_result.residual),
         double(r_result.divergence_before),
         double(r_result.divergence_after),
-        double(host_params[P_DIV_BEFORE_SUM]),
-        double(host_params[P_DIV_AFTER_SUM]),
-        double(host_params[P_UNKNOWN_COUNT]),
-        double(host_params[P_RHS_NORM]),
-        double(host_params[P_RES_NORM]),
+        double(params_host_[P_DIV_BEFORE_SUM]),
+        double(params_host_[P_DIV_AFTER_SUM]),
+        double(params_host_[P_UNKNOWN_COUNT]),
+        double(params_host_[P_RHS_NORM]),
+        double(params_host_[P_RES_NORM]),
         double(max_speed),
         r_result.milliseconds);
   }
@@ -3197,30 +3683,14 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
 /** \{ */
 
 /* -------------------------------------------------------------------- */
-/** \name Brick grid (host side)
+/** \name Brick grid (host side) implementations
  *
- * Stage 2 of `doc/ignis-brick-sparse.md`. Builds the 4^3 brick list of the dense box, the brick
- * coordinate map and the six face neighbours of every brick. Nothing on the device uses it yet: the
- * self test (`BLENDER_IGNIS_BRICK_SELFTEST=1`) scatters the dense fields into the pool and back and
- * compares them bit for bit, so the builder can be trusted before the kernels are switched over.
+ * See the declarations above the device solver. The builder marks every 4^3 brick that carries
+ * anything the solve may read, grows the set by the same voxel margin the dense box uses, and sorts
+ * the bricks by (z, y, x) so the slot order (and therefore every reduction order) is deterministic.
+ * `BLENDER_IGNIS_BRICK_SELFTEST=1` round trips the dense fields through the pool and compares them
+ * bit for bit.
  * \{ */
-
-constexpr int IGNIS_BRICK_EDGE = 4;
-constexpr int IGNIS_BRICK_CELLS = IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE;
-
-struct IgnisBrickGrid {
-  int3 dims = int3(0);
-  int3 brick_dims = int3(0);
-  int tile_count = 0;
-  int brick_count = 0;
-  /** Brick origin in voxels, sorted by (z, y, x) so the slot order is deterministic. */
-  Vector<int3> coords;
-  /** Brick coordinate -> slot, or -1. Indexed by `x + bx * (y + by * z)`. */
-  Vector<int> slot_map;
-  /** `slot * 6 + axis * 2 + (negative ? 1 : 0)`: the face neighbour's slot, or -1. */
-  Vector<int> neighbor;
-  int64_t pool_cells = 0;
-};
 
 /** True when the voxel carries anything the solve may read: a mask bit or a non zero field. */
 static bool brick_voxel_is_wanted(const IgnisDeviceFrame &frame, const int64_t index)
@@ -3255,7 +3725,9 @@ static bool brick_voxel_is_wanted(const IgnisDeviceFrame &frame, const int64_t i
   return false;
 }
 
-static IgnisBrickGrid ignis_bricks_build(const IgnisDeviceFrame &frame)
+static IgnisBrickGrid ignis_bricks_build(const IgnisDeviceFrame &frame,
+                                         const int margin_voxels,
+                                         const bool force_dense)
 {
   IgnisBrickGrid bricks;
   bricks.dims = frame.dims;
@@ -3276,15 +3748,55 @@ static IgnisBrickGrid ignis_bricks_build(const IgnisDeviceFrame &frame)
   active.reinitialize(bricks.tile_count);
   active.fill(0);
   const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
-  for (int64_t i = 0; i < cells; i++) {
-    if (!brick_voxel_is_wanted(frame, i)) {
-      continue;
+  if (force_dense) {
+    active.fill(1);
+  }
+  else {
+    for (int64_t i = 0; i < cells; i++) {
+      if (!brick_voxel_is_wanted(frame, i)) {
+        continue;
+      }
+      const int x = int(i % frame.dims.x);
+      const int y = int((i / frame.dims.x) % frame.dims.y);
+      const int z = int(i / (int64_t(frame.dims.x) * frame.dims.y));
+      active[(x / IGNIS_BRICK_EDGE) + bx * ((y / IGNIS_BRICK_EDGE) +
+                                            by * (z / IGNIS_BRICK_EDGE))] = 1;
     }
-    const int x = int(i % frame.dims.x);
-    const int y = int((i / frame.dims.x) % frame.dims.y);
-    const int z = int(i / (int64_t(frame.dims.x) * frame.dims.y));
-    active[(x / IGNIS_BRICK_EDGE) + bx * ((y / IGNIS_BRICK_EDGE) +
-                                          by * (z / IGNIS_BRICK_EDGE))] = 1;
+    /* The dense box gives the solver `margin_voxels` of empty room around the content (a plume has
+     * to move and the pressure domain grows). The pool needs the same room, so grow the brick set by
+     * `ceil(margin / 4)` bricks in every direction. Without it the flow would be clipped at the
+     * content boundary. */
+    const int margin_tiles = (margin_voxels + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE;
+    Array<int> grown;
+    for (int layer = 0; layer < margin_tiles; layer++) {
+      grown.reinitialize(bricks.tile_count);
+      grown.fill(0);
+      for (int z = 0; z < bz; z++) {
+        for (int y = 0; y < by; y++) {
+          for (int x = 0; x < bx; x++) {
+            const int tile = x + bx * (y + by * z);
+            if (active[tile] != 0) {
+              grown[tile] = 1;
+              continue;
+            }
+            bool near = false;
+            for (int dz = -1; dz <= 1 && !near; dz++) {
+              for (int dy = -1; dy <= 1 && !near; dy++) {
+                for (int dx = -1; dx <= 1 && !near; dx++) {
+                  const int nx = x + dx, ny = y + dy, nz = z + dz;
+                  if (nx < 0 || ny < 0 || nz < 0 || nx >= bx || ny >= by || nz >= bz) {
+                    continue;
+                  }
+                  near = active[nx + bx * (ny + by * nz)] != 0;
+                }
+              }
+            }
+            grown[tile] = near ? 1 : 0;
+          }
+        }
+      }
+      active = grown;
+    }
   }
 
   /* Deterministic slot order: z, then y, then x. */
@@ -3450,9 +3962,12 @@ static void bricks_gather_int(const IgnisBrickGrid &bricks,
 }
 
 /** Builds the brick grid, round trips every field through the pool and reports the counts. */
-static void ignis_bricks_selftest(const IgnisDeviceFrame &frame)
+static void ignis_bricks_selftest(const IgnisDeviceFrame &frame,
+                                  const int margin_voxels,
+                                  const bool force_dense)
 {
-  const IgnisBrickGrid bricks = ignis_bricks_build(frame);
+  const IgnisBrickGrid content = ignis_bricks_build(frame, 0, force_dense);
+  const IgnisBrickGrid bricks = ignis_bricks_build(frame, margin_voxels, force_dense);
   const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
   const int64_t pool = bricks.pool_cells;
 
@@ -3543,18 +4058,20 @@ static void ignis_bricks_selftest(const IgnisDeviceFrame &frame)
     band_bricks += band ? 1 : 0;
   }
 
-  printf("IGNIS_BRICKS: cells=%lld bricks=%d/%d (%.1f%%) smoke=%d band=%d "
-         "pool=%lld (%.2fx cells) fields=%s\n",
+  printf("IGNIS_BRICKS: cells=%lld bricks=%d/%d (%.1f%%) content=%d margin=%d "
+         "pool=%lld (%.2fx cells) smoke=%d band=%d fields=%s\n",
          (long long)cells,
          bricks.brick_count,
          bricks.tile_count,
          bricks.tile_count > 0 ?
              100.0 * double(bricks.brick_count) / double(bricks.tile_count) :
              0.0,
-         smoke_bricks,
-         band_bricks,
+         content.brick_count,
+         margin_voxels,
          (long long)pool,
          cells > 0 ? double(pool) / double(cells) : 0.0,
+         smoke_bricks,
+         band_bricks,
          ok ? "ok" : "MISMATCH");
 }
 
