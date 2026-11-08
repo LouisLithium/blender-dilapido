@@ -1535,11 +1535,16 @@ bool upload_one_attribute(const bke::AttributeAccessor &src_attributes,
 {
   const int components = attribute.components;
   const int64_t total = int64_t(padded) * components;
-  const std::optional<bke::AttributeMetaData> meta = lookup_meta_data_in_domain(
-      src_attributes, attribute.name, domain);
-  if (meta.has_value() && meta->domain != domain) {
-    /* Interpolating from another domain is not implemented; the CPU path handles it. */
-    return false;
+  /* `lookup(name, domain)` interpolates the attribute to the requested domain exactly like the CPU's
+   * `AttributeFieldInput` (`attributes.lookup(name, context.domain())`). The metadata lookup is only
+   * used to know whether the attribute exists at all and which type it has. */
+  const std::optional<bke::AttributeMetaData> meta = src_attributes.lookup_meta_data(attribute.name);
+  if (meta.has_value() && meta->domain != domain && ha_program_debug_enabled()) {
+    fprintf(stderr,
+            "HA program: attribute '%s' adapted from domain %d to %d\n",
+            attribute.name.c_str(),
+            int(meta->domain),
+            int(domain));
   }
 
   if (attribute.type == HaType::Int) {
