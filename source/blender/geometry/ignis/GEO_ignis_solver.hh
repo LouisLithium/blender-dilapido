@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <string>
 
 #include "BLI_array.hh"
@@ -150,14 +152,44 @@ struct Settings {
 
   /* Projection. */
   int pressure_iterations = 40;
+  /** Derive the pressure CG budget from the box resolution and #tolerance instead of treating
+   * #pressure_iterations as a hard cap. Off by default so hand built worlds keep the behaviour they
+   * had; the `Ignis Dynamics` asset turns it on. */
+  bool adaptive_pressure_iterations = false;
   float tolerance = 1e-3f;
   int threads = 1;
 };
+
+/**
+ * Iteration budget of the pressure CG.
+ *
+ * The iteration count of CG grows with the linear resolution of the pressure box (and with
+ * `log(1 / tolerance)`); a fixed number is therefore either too low for a large box (the solve is
+ * cut off before it converges) or wasted work for a small one. With
+ * #Settings::adaptive_pressure_iterations this is derived from the box dimensions and the tolerance,
+ * using the same constants for the sparse CPU solve and the dense device solve (a ~60^3 box at 1e-4
+ * needs roughly 55-60 iterations, which is what the fit reproduces). #Settings::pressure_iterations
+ * stays a cost hint: the adaptive budget is between 8 and four times it.
+ */
+inline int pressure_iteration_budget(const Settings &settings, const int3 &dims)
+{
+  const int fixed = std::max(1, settings.pressure_iterations);
+  if (!settings.adaptive_pressure_iterations) {
+    return fixed;
+  }
+  const int resolution = std::max({dims.x, dims.y, dims.z});
+  const float tolerance = std::max(1e-8f, settings.tolerance);
+  const double scale = std::log(1.0 / double(tolerance)) / std::log(1.0e4);
+  const int budget = int(std::ceil(double(resolution) * scale));
+  return std::clamp(budget, 8, std::max(8, 4 * fixed));
+}
 
 struct Stats {
   int active_voxels = 0;
   int substeps_used = 0;
   int pressure_iterations = 0;
+  /** Iteration budget of the pressure solve (#Settings::pressure_iterations, or the adaptive one). */
+  int pressure_iteration_budget = 0;
   float residual = 0.0f;
   /** L2 norm of the velocity divergence before and after the projection, in 1/s. */
   float divergence_before = 0.0f;

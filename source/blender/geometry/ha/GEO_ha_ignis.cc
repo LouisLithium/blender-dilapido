@@ -1013,18 +1013,6 @@ const char *KERNEL_CG_PRODUCT =
     "  product[index] = sum;\n"
     "}\n";
 
-const char *KERNEL_CG_PQ_SUM =
-    "void main()\n"
-    "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  if (index % 64 != 0) { return; }\n"
-    "  float pq = 0.0;\n"
-    "  int end = min(index + 64, HA_CELL_COUNT);\n"
-    "  for (int j = index; j < end; j++) { pq += direction[j] * product[j]; }\n"
-    "  partial[(index / 64) * 4 + 0] = pq;\n"
-    "}\n";
-
 const char *KERNEL_CG_INIT =
     "void main()\n"
     "{\n"
@@ -1075,37 +1063,57 @@ const char *KERNEL_CG_DIRECTION =
     "  direction[index] = residual[index] / 6.0 + HA_BETA * direction[index];\n"
     "}\n";
 
+/* The Laplacian pass also reduces `direction * product` per 64 cell work group (a shared memory
+ * tree, fixed order, so it stays deterministic). That replaces the separate pq pass with a few
+ * shared memory adds and one global write per group. `gl_LocalInvocationIndex` and the shared array
+ * are sized by the dispatch group size (#LOCAL_GROUP_SIZE = 64), and every invocation reaches the
+ * barriers, including the ones past the last voxel. */
 const char *KERNEL_CG_LAPLACIAN =
+    "shared float ha_block_pq[64];\n"
     "void main()\n"
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  if ((mask[index] & HA_UNKNOWN) == 0) {\n"
-    "    product[index] = 0.0;\n"
-    "    return;\n"
+    "  int local = int(gl_LocalInvocationIndex);\n"
+    "  float pq = 0.0;\n"
+    "  if (index < HA_CELL_COUNT) {\n"
+    "    if ((mask[index] & HA_UNKNOWN) == 0) {\n"
+    "      product[index] = 0.0;\n"
+    "    }\n"
+    "    else {\n"
+    "      ivec3 c;\n"
+    "      ha_cell(index, c);\n"
+    "      float sum = -6.0 * direction[index];\n"
+    "      if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(1, 0, 0))];\n"
+    "      }\n"
+    "      if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(-1, 0, 0))];\n"
+    "      }\n"
+    "      if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(0, 1, 0))];\n"
+    "      }\n"
+    "      if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(0, -1, 0))];\n"
+    "      }\n"
+    "      if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(0, 0, 1))];\n"
+    "      }\n"
+    "      if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
+    "        sum += direction[ha_flat(c + ivec3(0, 0, -1))];\n"
+    "      }\n"
+    "      product[index] = sum;\n"
+    "      pq = direction[index] * sum;\n"
+    "    }\n"
     "  }\n"
-    "  ivec3 c;\n"
-    "  ha_cell(index, c);\n"
-    "  float sum = -6.0 * direction[index];\n"
-    "  if ((ha_mask_at(c + ivec3(1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(1, 0, 0))];\n"
+    "  ha_block_pq[local] = pq;\n"
+    "  barrier();\n"
+    "  for (int stride = 32; stride > 0; stride >>= 1) {\n"
+    "    if (local < stride) { ha_block_pq[local] += ha_block_pq[local + stride]; }\n"
+    "    barrier();\n"
     "  }\n"
-    "  if ((ha_mask_at(c + ivec3(-1, 0, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(-1, 0, 0))];\n"
+    "  if (local == 0) {\n"
+    "    partial[int(gl_WorkGroupID.x) * 4 + 0] = ha_block_pq[0];\n"
     "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(0, 1, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, -1, 0)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(0, -1, 0))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 0, 1)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(0, 0, 1))];\n"
-    "  }\n"
-    "  if ((ha_mask_at(c + ivec3(0, 0, -1)) & HA_UNKNOWN) != 0) {\n"
-    "    sum += direction[ha_flat(c + ivec3(0, 0, -1))];\n"
-    "  }\n"
-    "  product[index] = sum;\n"
     "}\n";
 
 const char *KERNEL_REDUCE_PQ =
@@ -1120,25 +1128,27 @@ const char *KERNEL_REDUCE_PQ =
     "}\n";
 
 const char *KERNEL_CG_UPDATE =
+    "shared float ha_block_rr[64];\n"
     "void main()\n"
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  if ((mask[index] & HA_UNKNOWN) == 0) { return; }\n"
-    "  pressure[index] += HA_ALPHA * direction[index];\n"
-    "  residual[index] -= HA_ALPHA * product[index];\n"
-    "}\n";
-
-const char *KERNEL_CG_RESIDUAL_SUM =
-    "void main()\n"
-    "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  if (index % 64 != 0) { return; }\n"
-    "  float sum = 0.0;\n"
-    "  int end = min(index + 64, HA_CELL_COUNT);\n"
-    "  for (int j = index; j < end; j++) { sum += residual[j] * residual[j]; }\n"
-    "  partial[(index / 64) * 4 + 1] = sum;\n"
+    "  int local = int(gl_LocalInvocationIndex);\n"
+    "  float rr = 0.0;\n"
+    "  if (index < HA_CELL_COUNT && (mask[index] & HA_UNKNOWN) != 0) {\n"
+    "    pressure[index] += HA_ALPHA * direction[index];\n"
+    "    float value = residual[index] - HA_ALPHA * product[index];\n"
+    "    residual[index] = value;\n"
+    "    rr = value * value;\n"
+    "  }\n"
+    "  ha_block_rr[local] = rr;\n"
+    "  barrier();\n"
+    "  for (int stride = 32; stride > 0; stride >>= 1) {\n"
+    "    if (local < stride) { ha_block_rr[local] += ha_block_rr[local + stride]; }\n"
+    "    barrier();\n"
+    "  }\n"
+    "  if (local == 0) {\n"
+    "    partial[int(gl_WorkGroupID.x) * 4 + 1] = ha_block_rr[0];\n"
+    "  }\n"
     "}\n";
 
 const char *KERNEL_REDUCE_RES =
@@ -1583,10 +1593,8 @@ class HaIgnisSolver {
   gpu::Shader *reduce_init_ = nullptr;
   gpu::Shader *cg_direction_ = nullptr;
   gpu::Shader *cg_laplacian_ = nullptr;
-  gpu::Shader *cg_pq_sum_ = nullptr;
   gpu::Shader *reduce_pq_ = nullptr;
   gpu::Shader *cg_update_ = nullptr;
-  gpu::Shader *cg_residual_sum_ = nullptr;
   gpu::Shader *reduce_res_ = nullptr;
   gpu::Shader *cg_gradient_ = nullptr;
   gpu::Shader *divergence_after_ = nullptr;
@@ -1922,16 +1930,6 @@ void HaIgnisSolver::create_shaders()
                          common + GLSL_MASK_HELPERS + KERNEL_CG_LAPLACIAN,
                          Span<const HaShaderResource>(cg_laplacian_res, 5));
 
-  static const HaShaderResource cg_pq_sum_res[] = {
-      HA_READ(0, "float", "params[]"),
-      HA_READ(1, "float", "direction[]"),
-      HA_READ(2, "float", "product[]"),
-      HA_RW(3, "float", "partial[]"),
-  };
-  cg_pq_sum_ = shader("ignis|cg_pq_sum",
-                      common + KERNEL_CG_PQ_SUM,
-                      Span<const HaShaderResource>(cg_pq_sum_res, 4));
-
   static const HaShaderResource reduce_pq_res[] = {
       HA_RW(0, "float", "params[]"),
       HA_READ(1, "float", "partial[]"),
@@ -1947,19 +1945,11 @@ void HaIgnisSolver::create_shaders()
       HA_READ(3, "float", "product[]"),
       HA_RW(4, "float", "pressure[]"),
       HA_RW(5, "float", "residual[]"),
+      HA_RW(6, "float", "partial[]"),
   };
   cg_update_ = shader("ignis|cg_update",
                       common + KERNEL_CG_UPDATE,
-                      Span<const HaShaderResource>(cg_update_res, 6));
-
-  static const HaShaderResource cg_residual_sum_res[] = {
-      HA_READ(0, "float", "params[]"),
-      HA_READ(1, "float", "residual[]"),
-      HA_RW(2, "float", "partial[]"),
-  };
-  cg_residual_sum_ = shader("ignis|cg_residual_sum",
-                            common + KERNEL_CG_RESIDUAL_SUM,
-                            Span<const HaShaderResource>(cg_residual_sum_res, 3));
+                      Span<const HaShaderResource>(cg_update_res, 7));
 
   static const HaShaderResource reduce_res_res[] = {
       HA_RW(0, "float", "params[]"),
@@ -2083,8 +2073,8 @@ bool HaIgnisSolver::shaders_valid() const
           coarse_restrict_ != nullptr && coarse_prolong_ != nullptr &&
           zero_field_ != nullptr &&
          cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
-         cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_pq_sum_ != nullptr &&
-         reduce_pq_ != nullptr && cg_update_ != nullptr && cg_residual_sum_ != nullptr &&
+         cg_direction_ != nullptr && cg_laplacian_ != nullptr &&
+         reduce_pq_ != nullptr && cg_update_ != nullptr &&
          reduce_res_ != nullptr && cg_gradient_ != nullptr && divergence_after_ != nullptr &&
          reduce_divergence_ != nullptr && clamp_solids_ != nullptr && combust_ != nullptr &&
          clip_bounds_ != nullptr && extrapolate_setup_ != nullptr &&
@@ -2243,7 +2233,7 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
   r_params[P_RADIUS] = float(frame.solver_radius);
   r_params[P_EXTRAPOLATE] = float(frame.extrapolate);
   r_params[P_TOLERANCE] = std::max(1e-8f, s.tolerance);
-  r_params[P_MAX_ITERATIONS] = float(std::max(1, s.pressure_iterations));
+  r_params[P_MAX_ITERATIONS] = float(pressure_iteration_budget(s, frame.dims));
   r_params[P_PARTIALS] = float(blocks_);
   r_params[P_ORIGIN_X] = float(frame.index_min.x);
   r_params[P_ORIGIN_Y] = float(frame.index_min.y);
@@ -2452,17 +2442,6 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
     {
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(coarse_params_.buf());
-      buffers.append(coarse_direction_.buf());
-      buffers.append(coarse_product_.buf());
-      buffers.append(coarse_partial_.buf());
-      if (!pass(cg_pq_sum_, buffers, coarse_count)) {
-        r_reason = "coarse CG pq reduction failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
       buffers.append(coarse_partial_.buf());
       if (!pass(reduce_pq_, buffers, 1)) {
         r_reason = "coarse CG pq reduction failed";
@@ -2477,18 +2456,9 @@ bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_r
       buffers.append(coarse_product_.buf());
       buffers.append(coarse_pressure_.buf());
       buffers.append(coarse_residual_.buf());
+      buffers.append(coarse_partial_.buf());
       if (!pass(cg_update_, buffers, coarse_count)) {
         r_reason = "coarse CG update pass failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_residual_.buf());
-      buffers.append(coarse_partial_.buf());
-      if (!pass(cg_residual_sum_, buffers, coarse_count)) {
-        r_reason = "coarse CG residual reduction failed";
         return false;
       }
     }
@@ -2617,6 +2587,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       }
     }
     {
+      /* Laplacian + the pq block reduction (shared memory, one dispatch). */
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(mask_->buf());
@@ -2631,17 +2602,6 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     {
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
-      buffers.append(direction_.buf());
-      buffers.append(product_.buf());
-      buffers.append(partial_.buf());
-      if (!pass(cg_pq_sum_, buffers, count)) {
-        r_reason = "CG pq reduction failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(params_.buf());
       buffers.append(partial_.buf());
       if (!pass(reduce_pq_, buffers, 1)) {
         r_reason = "CG pq reduction failed";
@@ -2649,6 +2609,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       }
     }
     {
+      /* Update + the residual block reduction (shared memory, one dispatch). */
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(mask_->buf());
@@ -2656,18 +2617,9 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       buffers.append(product_.buf());
       buffers.append(pressure_.buf());
       buffers.append(residual_.buf());
+      buffers.append(partial_.buf());
       if (!pass(cg_update_, buffers, count)) {
         r_reason = "CG update pass failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(params_.buf());
-      buffers.append(residual_.buf());
-      buffers.append(partial_.buf());
-      if (!pass(cg_residual_sum_, buffers, count)) {
-        r_reason = "CG residual reduction failed";
         return false;
       }
     }
@@ -3189,6 +3141,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   r_result.solid_voxels = solid_count;
   r_result.domain_removed = removed;
   r_result.pressure_iterations = int(host_params[P_ITERATION] + 0.5f);
+  r_result.pressure_iteration_budget = int(host_params[P_MAX_ITERATIONS] + 0.5f);
   r_result.residual = host_params[P_RHS_NORM] > 1e-12f ?
                           host_params[P_RES_NORM] / host_params[P_RHS_NORM] :
                           0.0f;
@@ -3206,13 +3159,14 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     }
     debug_log(
         "IGNIS_HA frame: cells=%lld passes=%d substeps=%d active=%d pressure=%d "
-        "residual=%.5f div %.4f -> %.4f raw(before=%.6g after=%.6g count=%.1f "
+        "budget=%d residual=%.5f div %.4f -> %.4f raw(before=%.6g after=%.6g count=%.1f "
         "rhs_norm=%.6g res_norm=%.6g) max_speed=%.4f ms=%.1f\n",
         (long long)cells_,
         r_result.passes,
         substeps,
         active,
         r_result.pressure_iterations,
+        int(host_params[P_MAX_ITERATIONS] + 0.5f),
         double(r_result.residual),
         double(r_result.divergence_before),
         double(r_result.divergence_after),

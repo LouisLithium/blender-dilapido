@@ -99,6 +99,8 @@ struct IgnisDeviceResult {
   int passes = 0;
   int active_voxels = 0;
   int pressure_iterations = 0;
+  /** Iteration budget that was available to the pressure solve (adaptive or fixed). */
+  int pressure_iteration_budget = 0;
   float residual = 0.0f;
   float divergence_before = 0.0f;
   float divergence_after = 0.0f;

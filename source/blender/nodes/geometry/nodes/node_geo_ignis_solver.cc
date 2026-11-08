@@ -101,6 +101,7 @@ const FlatBundleTypePtr &IgnisSettingsBundle::get_bundle_type()
     b.add<decl::Float>("smoke_per_burn"_ustr).min(0.0f);
     b.add<decl::Float>("flame_threshold"_ustr).min(0.0f);
     b.add<decl::Int>("pressure_iterations"_ustr).min(1);
+    b.add<decl::Bool>("adaptive_pressure_iterations"_ustr);
     b.add<decl::Float>("tolerance"_ustr).min(0.0f);
     const FlatBundleTypePtr bundle_type = b.build();
     BundleTypeRegistry::register_type(bundle_type);
@@ -244,6 +245,8 @@ geometry::ignis::Settings read_settings(const Bundle &world)
   settings.smoke_per_burn = read_float(s, "smoke_per_burn", settings.smoke_per_burn);
   settings.flame_threshold = read_float(s, "flame_threshold", settings.flame_threshold);
   settings.pressure_iterations = read_int(s, "pressure_iterations", settings.pressure_iterations);
+  settings.adaptive_pressure_iterations = read_bool(
+      s, "adaptive_pressure_iterations", settings.adaptive_pressure_iterations);
   /* A loose default on purpose: 0.04 % of the velocity scale is four orders below the smoke's own
    * numerical diffusion, and a tighter solve costs a third of the frame. */
   settings.tolerance = std::max(read_float(s, "tolerance", settings.tolerance), 0.0f);
@@ -433,6 +436,7 @@ BundlePtr stats_to_bundle(const Stats &stats)
   bundle.add(*BundleKey::from_str("sources"), stats.sources);
   bundle.add(*BundleKey::from_str("substeps"), stats.substeps_used);
   bundle.add(*BundleKey::from_str("pressure_iterations"), stats.pressure_iterations);
+  bundle.add(*BundleKey::from_str("pressure_iteration_budget"), stats.pressure_iteration_budget);
   bundle.add(*BundleKey::from_str("residual"), stats.residual);
   bundle.add(*BundleKey::from_str("divergence_before"), float(stats.divergence_before));
   bundle.add(*BundleKey::from_str("divergence_after"), float(stats.divergence_after));

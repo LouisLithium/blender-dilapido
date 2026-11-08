@@ -1556,8 +1556,10 @@ void project_velocity(State &state,
   });
   int iterations = 0;
   double residual_norm = std::sqrt(dot(residual, residual));
+  const int max_iterations = pressure_iteration_budget(
+      settings, int3(int(dims.x()), int(dims.y()), int(dims.z())));
+  r_stats.pressure_iteration_budget = max_iterations;
   if (rhs_norm > 1e-12 && residual_norm > 0.0) {
-    const int max_iterations = std::max(1, settings.pressure_iterations);
     const double tolerance = std::max(1e-8f, settings.tolerance);
     threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
       for (const int i : range) {
@@ -2458,6 +2460,7 @@ static Volume *solve_frame_device(const Volume *previous,
   r_stats.active_voxels = device.active_voxels;
   r_stats.substeps_used = substeps;
   r_stats.pressure_iterations = device.pressure_iterations;
+  r_stats.pressure_iteration_budget = device.pressure_iteration_budget;
   r_stats.residual = device.residual;
   r_stats.divergence_before = device.divergence_before;
   r_stats.divergence_after = device.divergence_after;
@@ -2719,7 +2722,7 @@ Volume *solve_frame(const Volume *previous,
            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                .count());
     printf("IGNIS_DEBUG step: density=%lld velocity=%lld max_v=%.3f div %.4f -> %.4f "
-           "(%.1f%%) substeps=%d pressure=%d residual=%.5f solids=%d cfl=%d\n",
+           "(%.1f%%) substeps=%d pressure=%d budget=%d residual=%.5f solids=%d cfl=%d\n",
            (long long)state.density->activeVoxelCount(),
            (long long)velocity_num,
            double(max_velocity),
@@ -2730,6 +2733,7 @@ Volume *solve_frame(const Volume *previous,
                0.0,
            r_stats.substeps_used,
            r_stats.pressure_iterations,
+           r_stats.pressure_iteration_budget,
            double(r_stats.residual),
            r_stats.solid_voxels,
            int(r_stats.cfl_limited));
