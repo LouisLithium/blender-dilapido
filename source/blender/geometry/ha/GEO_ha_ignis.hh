@@ -24,8 +24,8 @@
  *
  * The kernels mirror `GEO_ignis_solver.cc` operation by operation (same Boussinesq buoyancy, same
  * vorticity confinement, same MacCormack/BFECC advection with the openvdb limiters, the same 7
- * point Jacobi-CG pressure solve, the same extrapolation of the velocity band). The values are
- * compared against the CPU solver in `doc/tests/ignis_ha_smoke.py`.
+ * point Jacobi-CG pressure solve with an optional coarse grid initial guess, the same extrapolation
+ * of the velocity band). The values are compared against the CPU solver in `doc/tests/ignis_ha_smoke.py`.
  */
 
 #pragma once

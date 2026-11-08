@@ -127,6 +127,10 @@ enum IgnisParam : int {
   P_TURB_REMAP_MAX,
   P_TURB_REMAP_SOFTNESS,
   P_TURB_REMAP_SCALE,
+  /* Coarse grid used for the pressure initial guess (see `coarse_pressure_guess`). */
+  P_COARSE_DX,
+  P_COARSE_DY,
+  P_COARSE_DZ,
   P_COUNT,
 };
 
@@ -209,6 +213,9 @@ const char *GLSL_PRELUDE =
     "#define HA_TURB_REMAP_MAX params[77]\n"
     "#define HA_TURB_REMAP_SOFTNESS params[78]\n"
     "#define HA_TURB_REMAP_SCALE params[79]\n"
+    "#define HA_COARSE_DX int(params[80])\n"
+    "#define HA_COARSE_DY int(params[81])\n"
+    "#define HA_COARSE_DZ int(params[82])\n"
     "int ha_flat(ivec3 c) { return c.x + HA_DX * (c.y + HA_DY * c.z); }\n"
     "void ha_cell(int i, out ivec3 c)\n"
     "{\n"
@@ -871,6 +878,65 @@ const char *KERNEL_UNKNOWN =
     "  mask[index] = here ? (m | HA_UNKNOWN) : (m & ~HA_UNKNOWN);\n"
     "}\n";
 
+/* Two level initial guess for the pressure solve. `KERNEL_RESTRICT_COARSE` aggregates the fine
+ * unknown mask and right hand side onto a grid of 2x2x2 blocks (a coarse cell is unknown when any
+ * of its children is), `KERNEL_PROLONG_COARSE` injects the coarse solution back as the starting
+ * pressure of the fine CG. Summing the eight fine equations gives a coarse operator of
+ * `2^(d-1) * L`, while the coarse Laplacian is `2^2` times the fine one, hence the 1/2 factor so
+ * that the prolongated pressure has the same magnitude as the fine solution. The coarse solve only
+ * changes the starting point; the fine CG still runs to the requested tolerance. */
+const char *KERNEL_RESTRICT_COARSE =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_COARSE_DX * HA_COARSE_DY * HA_COARSE_DZ) { return; }\n"
+    "  int cdx = HA_COARSE_DX;\n"
+    "  int cdy = HA_COARSE_DY;\n"
+    "  int cz = index / (cdx * cdy);\n"
+    "  int rem = index - cz * cdx * cdy;\n"
+    "  ivec3 c = ivec3(rem % cdx, rem / cdx, cz);\n"
+    "  int m = 0;\n"
+    "  float sum = 0.0;\n"
+    "  for (int dz = 0; dz < 2; dz++) {\n"
+    "    for (int dy = 0; dy < 2; dy++) {\n"
+    "      for (int dx = 0; dx < 2; dx++) {\n"
+    "        ivec3 f = 2 * c + ivec3(dx, dy, dz);\n"
+    "        if (!ha_inside(f)) { continue; }\n"
+    "        int i = ha_flat(f);\n"
+    "        if ((mask_in[i] & HA_UNKNOWN) != 0) {\n"
+    "          m = HA_UNKNOWN;\n"
+    "          sum += rhs_in[i];\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  mask_out[index] = m;\n"
+    "  rhs_out[index] = 0.5 * sum;\n"
+    "}\n";
+
+const char *KERNEL_ZERO_FIELD =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  field[index] = 0.0;\n"
+    "}\n";
+
+const char *KERNEL_PROLONG_COARSE =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) {\n"
+    "    pressure[index] = 0.0;\n"
+    "    return;\n"
+    "  }\n"
+    "  int ci = (c.x / 2) + HA_COARSE_DX * ((c.y / 2) + HA_COARSE_DY * (c.z / 2));\n"
+    "  pressure[index] = coarse_pressure[ci];\n"
+    "}\n";
+
 const char *KERNEL_RHS =
     "vec3 ha_vel_at(int mask_value, ivec3 c)\n"
     "{\n"
@@ -1427,6 +1493,9 @@ class HaIgnisSolver {
   void swap_masks();
 
   bool projection(const int64_t cells, std::string &r_reason);
+  /** Two level coarse grid initial guess for the fine pressure CG. */
+  bool coarse_pressure_guess(const int iterations, std::string &r_reason);
+  void upload_coarse_params(Span<const float> fine_params);
   bool advect_velocity(const int64_t cells, std::string &r_reason);
   bool advect_scalars(const int64_t cells, std::string &r_reason);
   bool extrapolate(const int64_t cells, std::string &r_reason);
@@ -1455,6 +1524,14 @@ class HaIgnisSolver {
   HaBuffer params_;
   HaBuffer adv_;
   HaBuffer partial_;
+  HaBuffer coarse_params_;
+  HaBuffer coarse_pressure_;
+  HaBuffer coarse_rhs_;
+  HaBuffer coarse_residual_;
+  HaBuffer coarse_direction_;
+  HaBuffer coarse_product_;
+  HaBuffer coarse_partial_;
+  HaBufferInt coarse_mask_;
   HaBufferInt mask_a_;
   HaBufferInt mask_b_;
   HaBufferInt solid_;
@@ -1466,6 +1543,13 @@ class HaIgnisSolver {
   HaBufferInt *mask_other_ = nullptr;
   int64_t cells_ = 0;
   int64_t blocks_ = 0;
+  int64_t coarse_cells_ = 0;
+  int64_t coarse_blocks_ = 0;
+  int coarse_iterations_ = 12;
+  /* How many fine CG iterations run between two convergence read backs (each read back waits for
+   * the outstanding dispatches). */
+  int cg_check_interval_ = 8;
+  int3 coarse_dims_ = int3(0);
   int64_t radius_ = 0;
   ignis::Settings settings_;
   IgnisDeviceResult *result_ = nullptr;
@@ -1490,6 +1574,9 @@ class HaIgnisSolver {
   gpu::Shader *mask_keep_init_ = nullptr;
   gpu::Shader *dilate_ = nullptr;
   gpu::Shader *unknown_ = nullptr;
+  gpu::Shader *coarse_restrict_ = nullptr;
+  gpu::Shader *coarse_prolong_ = nullptr;
+  gpu::Shader *zero_field_ = nullptr;
   gpu::Shader *rhs_shader_ = nullptr;
   gpu::Shader *cg_product_ = nullptr;
   gpu::Shader *cg_init_ = nullptr;
@@ -1744,6 +1831,35 @@ void HaIgnisSolver::create_shaders()
                     common + GLSL_MASK_HELPERS + KERNEL_UNKNOWN,
                     Span<const HaShaderResource>(unknown_res, 2));
 
+  static const HaShaderResource coarse_restrict_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask_in[]"),
+      HA_READ(2, "float", "rhs_in[]"),
+      HA_WRITE(3, "int", "mask_out[]"),
+      HA_WRITE(4, "float", "rhs_out[]"),
+  };
+  coarse_restrict_ = shader("ignis|coarse_restrict",
+                            common + KERNEL_RESTRICT_COARSE,
+                            Span<const HaShaderResource>(coarse_restrict_res, 5));
+
+  static const HaShaderResource coarse_prolong_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "coarse_pressure[]"),
+      HA_RW(3, "float", "pressure[]"),
+  };
+  coarse_prolong_ = shader("ignis|coarse_prolong",
+                           common + KERNEL_PROLONG_COARSE,
+                           Span<const HaShaderResource>(coarse_prolong_res, 4));
+
+  static const HaShaderResource zero_field_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "field[]"),
+  };
+  zero_field_ = shader("ignis|zero_field",
+                       common + KERNEL_ZERO_FIELD,
+                       Span<const HaShaderResource>(zero_field_res, 2));
+
   static const HaShaderResource rhs_res[] = {
       HA_READ(0, "float", "params[]"),
       HA_READ(1, "float", "velocity[]"),
@@ -1964,6 +2080,8 @@ bool HaIgnisSolver::shaders_valid() const
          tmp_to_scalar_ != nullptr && pack_scalars_ != nullptr && unpack_scalars_ != nullptr &&
          mask_init_ != nullptr && mask_keep_init_ != nullptr &&
          dilate_ != nullptr && unknown_ != nullptr && rhs_shader_ != nullptr &&
+          coarse_restrict_ != nullptr && coarse_prolong_ != nullptr &&
+          zero_field_ != nullptr &&
          cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
          cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_pq_sum_ != nullptr &&
          reduce_pq_ != nullptr && cg_update_ != nullptr && cg_residual_sum_ != nullptr &&
@@ -1993,6 +2111,14 @@ void HaIgnisSolver::release()
   params_.free();
   adv_.free();
   partial_.free();
+  coarse_params_.free();
+  coarse_pressure_.free();
+  coarse_rhs_.free();
+  coarse_residual_.free();
+  coarse_direction_.free();
+  coarse_product_.free();
+  coarse_partial_.free();
+  coarse_mask_.free();
   mask_a_.free();
   mask_b_.free();
   solid_.free();
@@ -2012,6 +2138,11 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
       !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
       !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
       !params_.ensure(P_COUNT) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
+      !coarse_params_.ensure(P_COUNT) || !coarse_pressure_.ensure(coarse_cells_) ||
+      !coarse_rhs_.ensure(coarse_cells_) || !coarse_residual_.ensure(coarse_cells_) ||
+      !coarse_direction_.ensure(coarse_cells_) || !coarse_product_.ensure(coarse_cells_) ||
+      !coarse_partial_.ensure(std::max<int64_t>(1, coarse_blocks_) * 4) ||
+      !coarse_mask_.ensure(coarse_cells_) ||
       !mask_a_.ensure(cells) || !mask_b_.ensure(cells) || !solid_.ensure(cells) ||
       !solid_current_.ensure(cells) || !solid_carve_.ensure(cells) ||
       !collider_velocity_.ensure(3 * 256))
@@ -2145,6 +2276,32 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
   r_params[P_TURB_REMAP_MAX] = s.turbulence_remap_max;
   r_params[P_TURB_REMAP_SOFTNESS] = std::clamp(s.turbulence_remap_softness, 0.0f, 1.0f);
   r_params[P_TURB_REMAP_SCALE] = std::max(0.0f, s.turbulence_remap_scale);
+  r_params[P_COARSE_DX] = float(coarse_dims_.x);
+  r_params[P_COARSE_DY] = float(coarse_dims_.y);
+  r_params[P_COARSE_DZ] = float(coarse_dims_.z);
+}
+
+void HaIgnisSolver::upload_coarse_params(const Span<const float> fine_params)
+{
+  Array<float> params;
+  params.reinitialize(P_COUNT);
+  std::copy(fine_params.begin(), fine_params.end(), params.begin());
+  params[P_CELLS] = float(coarse_cells_);
+  params[P_DX] = float(coarse_dims_.x);
+  params[P_DY] = float(coarse_dims_.y);
+  params[P_DZ] = float(coarse_dims_.z);
+  params[P_VOXEL] = fine_params[P_VOXEL] * 2.0f;
+  params[P_PARTIALS] = float(coarse_blocks_);
+  params[P_MAX_ITERATIONS] = float(std::max(0, coarse_iterations_));
+  params[P_ITERATION] = 0.0f;
+  params[P_CONVERGED] = 0.0f;
+  params[P_RHS_NORM] = 0.0f;
+  params[P_RES_NORM] = 0.0f;
+  params[P_RZ] = 0.0f;
+  params[P_PQ] = 0.0f;
+  params[P_ALPHA] = 0.0f;
+  params[P_BETA] = 0.0f;
+  coarse_params_.upload(params.as_span());
 }
 
 void HaIgnisSolver::write_adv(const float dir,
@@ -2206,6 +2363,159 @@ bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::stri
   return true;
 }
 
+bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_reason)
+{
+  if (coarse_cells_ <= 0 || iterations <= 0) {
+    return true;
+  }
+  const int coarse_count = int(coarse_cells_);
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(rhs_.buf());
+    buffers.append(coarse_mask_.buf());
+    buffers.append(coarse_rhs_.buf());
+    if (!pass(coarse_restrict_, buffers, coarse_count)) {
+      r_reason = "coarse restriction failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(coarse_params_.buf());
+    buffers.append(coarse_pressure_.buf());
+    if (!pass(zero_field_, buffers, coarse_count)) {
+      r_reason = "coarse pressure reset failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(coarse_params_.buf());
+    buffers.append(coarse_product_.buf());
+    if (!pass(zero_field_, buffers, coarse_count)) {
+      r_reason = "coarse product reset failed";
+      return false;
+    }
+  }
+  /* Reuse the fine CG kernels on the coarse params/buffers. This is only a starting point, so the
+   * iteration count is fixed and nothing is read back. The coarse pressure starts at zero, so
+   * `cg_init` sees a zero product and builds the residual straight from the restricted rhs. */
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(coarse_params_.buf());
+    buffers.append(coarse_rhs_.buf());
+    buffers.append(coarse_product_.buf());
+    buffers.append(coarse_mask_.buf());
+    buffers.append(coarse_residual_.buf());
+    buffers.append(coarse_direction_.buf());
+    buffers.append(coarse_partial_.buf());
+    if (!pass(cg_init_, buffers, coarse_count)) {
+      r_reason = "coarse CG initialisation failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(coarse_params_.buf());
+    buffers.append(coarse_partial_.buf());
+    if (!pass(reduce_init_, buffers, 1)) {
+      r_reason = "coarse CG initial reduction failed";
+      return false;
+    }
+  }
+  for (int iteration = 0; iteration < iterations; iteration++) {
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_mask_.buf());
+      buffers.append(coarse_residual_.buf());
+      buffers.append(coarse_direction_.buf());
+      if (!pass(cg_direction_, buffers, coarse_count)) {
+        r_reason = "coarse CG direction pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_mask_.buf());
+      buffers.append(coarse_direction_.buf());
+      buffers.append(coarse_product_.buf());
+      buffers.append(coarse_partial_.buf());
+      if (!pass(cg_laplacian_, buffers, coarse_count)) {
+        r_reason = "coarse CG Laplacian pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_direction_.buf());
+      buffers.append(coarse_product_.buf());
+      buffers.append(coarse_partial_.buf());
+      if (!pass(cg_pq_sum_, buffers, coarse_count)) {
+        r_reason = "coarse CG pq reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_partial_.buf());
+      if (!pass(reduce_pq_, buffers, 1)) {
+        r_reason = "coarse CG pq reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_mask_.buf());
+      buffers.append(coarse_direction_.buf());
+      buffers.append(coarse_product_.buf());
+      buffers.append(coarse_pressure_.buf());
+      buffers.append(coarse_residual_.buf());
+      if (!pass(cg_update_, buffers, coarse_count)) {
+        r_reason = "coarse CG update pass failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_residual_.buf());
+      buffers.append(coarse_partial_.buf());
+      if (!pass(cg_residual_sum_, buffers, coarse_count)) {
+        r_reason = "coarse CG residual reduction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse_params_.buf());
+      buffers.append(coarse_partial_.buf());
+      if (!pass(reduce_res_, buffers, 1)) {
+        r_reason = "coarse CG residual finalize failed";
+        return false;
+      }
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(coarse_pressure_.buf());
+    buffers.append(pressure_.buf());
+    if (!pass(coarse_prolong_, buffers, int(cells_))) {
+      r_reason = "coarse prolongation failed";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
 {
   (void)cells;
@@ -2249,6 +2559,9 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       r_reason = "divergence pass failed";
       return false;
     }
+  }
+  if (!coarse_pressure_guess(coarse_iterations_, r_reason)) {
+    return false;
   }
   {
     Vector<gpu::StorageBuf *> buffers;
@@ -2370,7 +2683,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     iterations++;
     /* Checking the convergence every few iterations keeps the number of GPU reads low: each read
      * waits for the outstanding dispatches. */
-    if ((iterations % 8) == 0 || iterations == max_iterations) {
+    if ((iterations % cg_check_interval_) == 0 || iterations == max_iterations) {
       params_.download(values.as_mutable_span());
       converged = values[P_CONVERGED] != 0.0f;
     }
@@ -2631,6 +2944,26 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   cells_ = cells;
   blocks_ = (cells + GROUP_SIZE - 1) / GROUP_SIZE;
   radius_ = frame.solver_radius;
+  coarse_dims_ = int3((frame.dims.x + 1) / 2, (frame.dims.y + 1) / 2, (frame.dims.z + 1) / 2);
+  coarse_cells_ = int64_t(coarse_dims_.x) * int64_t(coarse_dims_.y) * int64_t(coarse_dims_.z);
+  coarse_blocks_ = (coarse_cells_ + GROUP_SIZE - 1) / GROUP_SIZE;
+  coarse_iterations_ = int(std::clamp<int64_t>(cells / 16384, 6, 12));
+  if (cells < 32768) {
+    /* Below a few ten thousand voxels the CG converges in a handful of iterations, so the extra
+     * dispatches of the coarse solve cost more than they save. */
+    coarse_iterations_ = 0;
+  }
+  if (const char *env = std::getenv("BLENDER_IGNIS_COARSE")) {
+    if (env[0] == '0') {
+      coarse_iterations_ = 0;
+    }
+  }
+  if (const char *env = std::getenv("BLENDER_IGNIS_COARSE_ITERS")) {
+    coarse_iterations_ = std::clamp(std::atoi(env), 0, 64);
+  }
+  if (const char *env = std::getenv("BLENDER_IGNIS_CG_CHECK")) {
+    cg_check_interval_ = std::clamp(std::atoi(env), 1, 64);
+  }
 
   if (frame.settings.advection_scheme == ignis::AdvectionScheme::Bfecc) {
     r_result.reason = "BFECC advection is not implemented on the device";
@@ -2694,6 +3027,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     for (int substep = 0; substep < substeps; substep++) {
       fill_params(frame, step_dt, host_params);
       params_.upload(host_params.as_span());
+      upload_coarse_params(Span<const float>(host_params.data(), host_params.size()));
 
       if (has_source) {
         Vector<gpu::StorageBuf *> buffers;
