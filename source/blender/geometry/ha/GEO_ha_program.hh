@@ -75,6 +75,9 @@ struct HaAccumulation {
   HaType type = HaType::Float;
   /** 0 = leading (inclusive), 1 = trailing (exclusive), 2 = total. */
   int mode = 0;
+  /** GLSL `int` expression of the group id; empty for the ungrouped case. */
+  std::string glsl_group;
+  bool grouped = false;
 };
 
 /** One geometry modifying node of the chain: where every element ends up, and which ones move. */
@@ -193,6 +196,8 @@ struct HaElementStore {
   Vector<HaAttribute> attributes;
   /** Reductions over this element domain (`Attribute Statistic` inside the value field). */
   Vector<HaAggregate> aggregates;
+  /** True when the value/selection reads `Edge Vertices > Position` (binds `position_gather[]`). */
+  bool uses_position_gather = false;
 };
 
 /** Type of the attribute an element pass writes. */
@@ -234,6 +239,8 @@ struct HaElementStep {
   Vector<HaAttribute> attributes;
   /** Reductions over this element domain (`Attribute Statistic` inside the fields). */
   Vector<HaAggregate> aggregates;
+  /** True when the fields read `Edge Vertices > Position` (binds `position_gather[]`). */
+  bool uses_position_gather = false;
 };
 
 /** One `Flip Faces` node: reverses the winding of the selected faces (CORNER domain). */

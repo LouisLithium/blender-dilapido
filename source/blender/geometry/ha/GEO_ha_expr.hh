@@ -123,6 +123,11 @@ enum class HaOp {
    */
   AttributeGather,
   /**
+   * `vec3` at an arbitrary vertex index from the final position buffer (`Edge Vertices` positions
+   * after a position step). `args[0]` is the index; the buffer is `position_gather[]`.
+   */
+  GatherPosition,
+  /**
    * A value from the program's uniform parameter buffer (an animated socket default). The slot is
    * `param_slot * 4`; the buffer is declared as `user_params[]`.
    */

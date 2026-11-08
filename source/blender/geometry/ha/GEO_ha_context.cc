@@ -3963,6 +3963,108 @@ gpu::Shader *ha_shader_get_accumulate_final(const StringRef key,
       LOCAL_GROUP_SIZE);
 }
 
+gpu::Shader *ha_shader_get_accumulate_grouped(const StringRef key,
+                                              const StringRef glsl_value_expr,
+                                              const StringRef glsl_group_expr,
+                                              const int components,
+                                              const int mode,
+                                              const Span<const HaShaderResource> extra_resources)
+{
+  const bool vector = components == 3;
+  const char *value_type = vector ? "vec3" : "float";
+  const char *zero = vector ? "vec3(0.0)" : "0.0";
+  std::string source = std::string(HA_GLSL_HELPERS) + "void main()\n"
+                                                "{\n"
+                                                "  if (int(gl_GlobalInvocationID.x) != 0) {\n"
+                                                "    return;\n"
+                                                "  }\n"
+                                                "  int element_count = int(params[0]);\n"
+                                                "  int base = int(params[1]);\n"
+                                                "  " +
+                       std::string(value_type) + " sums[256];\n"
+                       "  for (int g = 0; g < 256; g++) {\n"
+                       "    sums[g] = " +
+                       std::string(zero) +
+                       ";\n"
+                       "  }\n"
+                       "  for (int i = 0; i < element_count; i++) {\n"
+                       "    int index = i;\n"
+                       "    int pbase = i * 3;\n"
+                       "    vec3 position = vec3(position_in[pbase], position_in[pbase + 1], "
+                       "position_in[pbase + 2]);\n"
+                       "    " +
+                       std::string(value_type) + " value = " + std::string(glsl_value_expr) +
+                       ";\n"
+                       "    int group = " +
+                       std::string(glsl_group_expr) +
+                       ";\n"
+                       "    if (group < 0 || group >= 256) {\n"
+                       "      invalid[0] = 1;\n"
+                       "      continue;\n"
+                       "    }\n"
+                       "    sums[group] = sums[group] + value;\n"
+                       "  }\n";
+  if (mode != 2) {
+    source += "  for (int g = 0; g < 256; g++) {\n"
+              "    sums[g] = " +
+              std::string(zero) +
+              ";\n"
+              "  }\n";
+  }
+  source += "  for (int i = 0; i < element_count; i++) {\n"
+            "    int index = i;\n"
+            "    int pbase = i * 3;\n"
+            "    vec3 position = vec3(position_in[pbase], position_in[pbase + 1], "
+            "position_in[pbase + 2]);\n"
+            "    " +
+            std::string(value_type) + " value = " + std::string(glsl_value_expr) +
+            ";\n"
+            "    int group = " +
+            std::string(glsl_group_expr) +
+            ";\n"
+            "    if (group < 0 || group >= 256) {\n"
+            "      continue;\n"
+            "    }\n";
+  if (mode == 2) {
+    source += vector ? "    vec3 result = sums[group];\n" : "    float result = sums[group];\n";
+  }
+  else if (mode == 1) {
+    source += vector ? "    vec3 result = sums[group];\n" : "    float result = sums[group];\n";
+    source += "    sums[group] = sums[group] + value;\n";
+  }
+  else {
+    source += "    sums[group] = sums[group] + value;\n";
+    source += vector ? "    vec3 result = sums[group];\n" : "    float result = sums[group];\n";
+  }
+  if (vector) {
+    source += "    int obase = base + i * 3;\n"
+              "    output[obase] = result.x;\n"
+              "    output[obase + 1] = result.y;\n"
+              "    output[obase + 2] = result.z;\n";
+  }
+  else {
+    source += "    output[base + i] = result;\n";
+  }
+  source += "  }\n}\n";
+
+  const std::array<HaShaderResource, 3> base_resources = {{
+      {0, HaShaderQualifier::Read, "float", "position_in[]"},
+      {1, HaShaderQualifier::Read, "float", "params[]"},
+      {2, HaShaderQualifier::Write, "float", "output[]"},
+  }};
+  Vector<HaShaderResource> resources;
+  for (const HaShaderResource &resource : base_resources) {
+    resources.append(resource);
+  }
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
+  resources.append({12, HaShaderQualifier::ReadWrite, "int", "invalid[]"});
+  return ha_shader_get_source(
+      key, source, Span<const HaShaderResource>(resources.data(), int64_t(resources.size())),
+      LOCAL_GROUP_SIZE);
+}
+
 void ha_dispatch(gpu::Shader *shader, const int element_count)
 {
   if (shader == nullptr || element_count <= 0) {

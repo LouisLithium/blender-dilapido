@@ -141,6 +141,8 @@ struct CompileContext {
   bool has_accumulation = false;
   /** True in an element pass / store: `Attribute Statistic` reduces over that element domain. */
   bool allow_element_aggregate = false;
+  /** True when an element pass reads `Edge Vertices > Position` after a position step. */
+  bool has_position_gather = false;
   /** True after the first `Set Position` / `Transform` step: `Normal` and `Face Area` would have to
    * be recomputed from the new positions, which the host upload cannot do. */
   bool position_may_have_changed = false;
@@ -1409,6 +1411,7 @@ bool compile_set_shade_smooth(CompileContext &point_ctx, const bNode &node, HaEl
   /* `sharp` is the inverse of the node's `Shade Smooth`; the field's `float -> bool` conversion is
    * `> 0`, exactly like the field system. */
   r_step.glsl_value = "(1.0 - ((" + ha_emit_glsl_scalar(*smooth) + ") > 0.0 ? 1.0 : 0.0))";
+  r_step.uses_position_gather = ctx.has_position_gather;
   return true;
 }
 
@@ -1461,6 +1464,7 @@ bool compile_set_material(CompileContext &point_ctx, const bNode &node, HaElemen
     return false;
   }
   r_step.glsl_selection = ha_emit_glsl_scalar(*selection);
+  r_step.uses_position_gather = ctx.has_position_gather;
   /* The CPU takes a different path when every face is selected (it rebuilds the attribute instead of
    * filling a mask), and that path also decides whether a default slot is added. */
   r_step.all_selected = selection->op == HaOp::Const && selection->value[0] != 0.0f;
@@ -2111,6 +2115,7 @@ bool compile_store(CompileContext &ctx,
   r_element_store.glsl_value = ha_emit_glsl_natural(*compiled);
   r_element_store.glsl_selection = ha_emit_glsl_scalar(*selection);
   r_element_store.default_value = 0.0f;
+  r_element_store.uses_position_gather = element_ctx.has_position_gather;
   r_is_element = true;
   return true;
 }
@@ -2362,8 +2367,8 @@ const HaExpr *compile_accumulate_field(CompileContext &ctx,
   if (!ctx.ok) {
     return &ctx.pool.constant(0.0f);
   }
-  if (group->op != HaOp::Const || group->type != HaType::Int) {
-    fail(ctx, "Accumulate Field: a linked group id is not supported");
+  if (group->type != HaType::Int) {
+    fail(ctx, "Accumulate Field: the group id has to be an integer");
     return &ctx.pool.constant(0.0f);
   }
   if (value->type != type) {
@@ -2377,6 +2382,10 @@ const HaExpr *compile_accumulate_field(CompileContext &ctx,
   accumulation.glsl_value = ha_emit_glsl_natural(*value);
   accumulation.type = type;
   accumulation.mode = modes[socket_index];
+  if (group->op != HaOp::Const) {
+    accumulation.glsl_group = ha_emit_glsl_natural(*group);
+    accumulation.grouped = true;
+  }
   const int slot = int(ctx.accumulations->size());
   ctx.accumulations->append(std::move(accumulation));
   ctx.has_accumulation = true;
@@ -2385,8 +2394,9 @@ const HaExpr *compile_accumulate_field(CompileContext &ctx,
   read.aggregate_slot = slot;
   if (ha_program_debug_enabled()) {
     fprintf(stderr,
-            "HA program: Accumulate Field (%s)\n",
-            socket_index == 0 ? "leading" : socket_index == 1 ? "trailing" : "total");
+            "HA program: Accumulate Field (%s%s)\n",
+            socket_index == 0 ? "leading" : socket_index == 1 ? "trailing" : "total",
+            ctx.accumulations->last().grouped ? ", grouped" : "");
   }
   return &read;
 }
@@ -2521,29 +2531,58 @@ const HaExpr *compile_edge_vertices(CompileContext &ctx, const bNode &node, cons
   }
   const bool second = socket_index == 1 || socket_index == 3;
   const bool position = socket_index >= 2;
-  if (position && ctx.position_may_have_changed) {
-    fail(ctx, "Edge Vertices: reading the positions after a position step is not supported");
-    return &ctx.pool.constant(0.0f);
+  const char *index_name = second ? "__ha_edge_index_2" : "__ha_edge_index_1";
+  const int index_slot = find_or_add_attribute(ctx,
+                                               index_name,
+                                               HaType::Int,
+                                               1,
+                                               second ? HaAttributeKind::EdgeVertex2Index :
+                                                        HaAttributeKind::EdgeVertex1Index,
+                                               int(ctx.domain));
+  HaExpr &index_read = ctx.pool.add(HaType::Int, HaOp::AttributeRead);
+  index_read.attribute_slot = index_slot;
+
+  if (position) {
+    const HaExpr *result;
+    if (!ctx.position_may_have_changed) {
+      /* Before any position step the host can upload the endpoint positions directly. */
+      const char *position_name = second ? "__ha_edge_position_2" : "__ha_edge_position_1";
+      const int position_slot = find_or_add_attribute(
+          ctx,
+          position_name,
+          HaType::Float3,
+          3,
+          second ? HaAttributeKind::EdgeVertex2Position : HaAttributeKind::EdgeVertex1Position,
+          int(ctx.domain));
+      HaExpr &read = ctx.pool.add(HaType::Float3, HaOp::AttributeRead);
+      read.attribute_slot = position_slot;
+      result = &read;
+    }
+    else {
+      /* After a position step the endpoint positions come from the final position buffer, gathered
+       * with the (position independent) endpoint index. The element kernel binds `position_gather[]`
+       * at slot 11. */
+      result = &ctx.pool.add(HaType::Float3, HaOp::GatherPosition, {&index_read});
+      ctx.has_position_gather = true;
+      if (ha_program_debug_enabled()) {
+        fprintf(stderr,
+                "HA program: Edge Vertices (position %d) from the final positions\n",
+                second ? 2 : 1);
+      }
+      return result;
+    }
+    if (ha_program_debug_enabled()) {
+      fprintf(stderr,
+              "HA program: Edge Vertices (position %d)\n",
+              second ? 2 : 1);
+    }
+    return result;
   }
-  const HaAttributeKind kind = position ?
-                                   (second ? HaAttributeKind::EdgeVertex2Position :
-                                             HaAttributeKind::EdgeVertex1Position) :
-                                   (second ? HaAttributeKind::EdgeVertex2Index :
-                                             HaAttributeKind::EdgeVertex1Index);
-  const char *name = position ? (second ? "__ha_edge_position_2" : "__ha_edge_position_1") :
-                                (second ? "__ha_edge_index_2" : "__ha_edge_index_1");
-  const HaType type = position ? HaType::Float3 : HaType::Int;
-  const int slot = find_or_add_attribute(
-      ctx, name, type, position ? 3 : 1, kind, int(ctx.domain));
-  HaExpr &read = ctx.pool.add(type, HaOp::AttributeRead);
-  read.attribute_slot = slot;
+
   if (ha_program_debug_enabled()) {
-    fprintf(stderr,
-            "HA program: Edge Vertices (%s %d)\n",
-            position ? "position" : "index",
-            second ? 2 : 1);
+    fprintf(stderr, "HA program: Edge Vertices (index %d)\n", second ? 2 : 1);
   }
-  return &read;
+  return &index_read;
 }
 
 /** `ShaderNodeFloatCurve`: exact CPU table lookup (`BKE_curvemap_evaluateF`). */
@@ -3688,6 +3727,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
    * inside a block / in the single scan invocation, so the result is deterministic. Slot 12 is used
    * by the position kernel, so at most 9 attributes can be bound together with an accumulation. */
   HaBuffer buffer_accumulation;
+  HaBufferInt buffer_accumulation_invalid;
   std::string accum_key;
   if (has_accumulation_ && !accumulations_.is_empty()) {
     if (attributes_.size() > 9) {
@@ -3721,6 +3761,61 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     for (const int slot : accumulations_.index_range()) {
       const HaAccumulation &accumulation = accumulations_[slot];
       const int components = accumulation.type == HaType::Float3 ? 3 : 1;
+      if (accumulation.grouped) {
+        /* Grouped accumulation: one invocation serializes over the elements with a 256-entry group
+         * table. Out-of-range group ids are reported through `invalid[0]` and make the zone fall
+         * back to the CPU (never a wrong result). */
+        if (attributes_.size() > 8 || has_lut_) {
+          return false;
+        }
+        if (!buffer_params.ensure(4) || !buffer_accumulation_invalid.ensure(1)) {
+          return false;
+        }
+        buffer_accumulation_invalid.clear_to_zero();
+        const std::array<float, 4> grouped_params{
+            float(element_count), float(slot * 3), 0.0f, 0.0f};
+        buffer_params.upload(grouped_params);
+        Vector<HaShaderResource> grouped_resources;
+        grouped_resources.reserve(extra_resources.size());
+        for (const HaShaderResource &resource : extra_resources) {
+          grouped_resources.append(resource);
+        }
+        gpu::Shader *grouped = ha_shader_get_accumulate_grouped(
+            "accgrp|" + accumulation.glsl_value + "|" + accumulation.glsl_group + "|" +
+                std::to_string(components) + "|" + std::to_string(accumulation.mode) +
+                attribute_key,
+            accumulation.glsl_value,
+            accumulation.glsl_group,
+            components,
+            accumulation.mode,
+            Span<const HaShaderResource>(grouped_resources.data(),
+                                         int64_t(grouped_resources.size())));
+        if (grouped == nullptr) {
+          return false;
+        }
+        GPU_shader_bind(grouped);
+        GPU_storagebuf_bind(buffers[0].buf(), 0);
+        GPU_storagebuf_bind(buffer_params.buf(), 1);
+        GPU_storagebuf_bind(buffer_accumulation.buf(), 2);
+        for (const int attribute_i : attributes_.index_range()) {
+          GPU_storagebuf_bind(current_attribute_buffers[attribute_i]->buf(), 3 + attribute_i);
+        }
+        GPU_storagebuf_bind(buffer_accumulation_invalid.buf(), 12);
+        ha_dispatch(grouped, 1);
+        GPU_storagebuf_unbind(buffer_accumulation_invalid.buf());
+        for (const int attribute_i : attributes_.index_range()) {
+          GPU_storagebuf_unbind(current_attribute_buffers[attribute_i]->buf());
+        }
+        GPU_storagebuf_unbind(buffer_accumulation.buf());
+        GPU_storagebuf_unbind(buffer_params.buf());
+        GPU_storagebuf_unbind(buffers[0].buf());
+        GPU_shader_unbind();
+        int invalid = 0;
+        if (!buffer_accumulation_invalid.read_one(invalid) || invalid != 0) {
+          return false;
+        }
+        continue;
+      }
       const std::array<float, 4> params{
           float(element_count), float(block_count), float(slot * 3), 0.0f};
       buffer_params.upload(params);
@@ -4306,6 +4401,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         step_attribute_key += ha_attribute_buffer_glsl(attribute.type);
       }
       HaBuffer element_aggregate;
+      if (step.uses_position_gather && step.attributes.size() > 8) {
+        return false;
+      }
       if (!prepare_element_aggregates(
               step.aggregates,
               count,
@@ -4317,9 +4415,12 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         return false;
       }
       Vector<HaShaderResource> shader_resources;
-      shader_resources.reserve(step_resources.size() + 1);
+      shader_resources.reserve(step_resources.size() + 2);
       for (const HaShaderResource &resource : step_resources) {
         shader_resources.append(resource);
+      }
+      if (step.uses_position_gather) {
+        shader_resources.append({11, HaShaderQualifier::Read, "float", "position_gather[]"});
       }
       if (!step.aggregates.is_empty()) {
         shader_resources.append({12, HaShaderQualifier::Read, "float", "aggregate[]"});
@@ -4327,7 +4428,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       gpu::Shader *element_shader = ha_shader_get_element(
           "element|" + value_expression + "|" + step.glsl_selection + "|" +
               std::to_string(step.components) + step_attribute_key +
-              (step.aggregates.is_empty() ? "" : "|agg"),
+              (step.aggregates.is_empty() ? "" : "|agg") +
+              (step.uses_position_gather ? "|posgather" : ""),
           value_expression,
           step.glsl_selection,
           step.components,
@@ -4342,12 +4444,18 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       for (const int attribute_i : step.attributes.index_range()) {
         GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
       }
+      if (step.uses_position_gather) {
+        GPU_storagebuf_bind(result.buf(), 11);
+      }
       if (!step.aggregates.is_empty()) {
         GPU_storagebuf_bind(element_aggregate.buf(), 12);
       }
       ha_dispatch(element_shader, padded);
       if (!step.aggregates.is_empty()) {
         GPU_storagebuf_unbind(element_aggregate.buf());
+      }
+      if (step.uses_position_gather) {
+        GPU_storagebuf_unbind(result.buf());
       }
       for (const int attribute_i : step.attributes.index_range()) {
         GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());
@@ -4570,6 +4678,9 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         step_attribute_key += ha_attribute_buffer_glsl(field_attribute.type);
       }
       HaBuffer element_aggregate;
+      if (store.uses_position_gather && store.attributes.size() > 8) {
+        return false;
+      }
       if (!prepare_element_aggregates(
               store.aggregates,
               count,
@@ -4581,9 +4692,12 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
         return false;
       }
       Vector<HaShaderResource> shader_resources;
-      shader_resources.reserve(step_resources.size() + 1);
+      shader_resources.reserve(step_resources.size() + 2);
       for (const HaShaderResource &resource : step_resources) {
         shader_resources.append(resource);
+      }
+      if (store.uses_position_gather) {
+        shader_resources.append({11, HaShaderQualifier::Read, "float", "position_gather[]"});
       }
       if (!store.aggregates.is_empty()) {
         shader_resources.append({12, HaShaderQualifier::Read, "float", "aggregate[]"});
@@ -4591,7 +4705,8 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       gpu::Shader *shader = ha_shader_get_element_store(
           "element_store|" + store.glsl_value + "|" + store.glsl_selection + "|" +
               std::to_string(store.components) + "|" + ha_type_glsl(store.type) +
-              step_attribute_key + (store.aggregates.is_empty() ? "" : "|agg"),
+              step_attribute_key + (store.aggregates.is_empty() ? "" : "|agg") +
+              (store.uses_position_gather ? "|posgather" : ""),
           store.glsl_value,
           store.glsl_selection,
           ha_type_glsl(store.type),
@@ -4607,12 +4722,18 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       for (const int attribute_i : store.attributes.index_range()) {
         GPU_storagebuf_bind(step_attribute_buffers[attribute_i].buf(), 3 + attribute_i);
       }
+      if (store.uses_position_gather) {
+        GPU_storagebuf_bind(result.buf(), 11);
+      }
       if (!store.aggregates.is_empty()) {
         GPU_storagebuf_bind(element_aggregate.buf(), 12);
       }
       ha_dispatch(shader, padded);
       if (!store.aggregates.is_empty()) {
         GPU_storagebuf_unbind(element_aggregate.buf());
+      }
+      if (store.uses_position_gather) {
+        GPU_storagebuf_unbind(result.buf());
       }
       for (const int attribute_i : store.attributes.index_range()) {
         GPU_storagebuf_unbind(step_attribute_buffers[attribute_i].buf());

@@ -867,6 +867,13 @@ float3 eval_vector(const HaExpr &expr, int index, Span<float> positions)
       }
       return float3(positions[i], positions[i + 1], positions[i + 2]);
     }
+    case HaOp::GatherPosition: {
+      const int i = eval_int(*expr.args[0], index, positions) * 3;
+      if (i < 0 || i + 2 >= positions.size()) {
+        return float3(0.0f);
+      }
+      return float3(positions[i], positions[i + 1], positions[i + 2]);
+    }
     case HaOp::VoronoiPosition:
       /* The voronoi kernel lives in the GLSL helpers; the CPU reference is the node evaluation. */
       return float3(0.0f);
@@ -1283,6 +1290,11 @@ std::string emit(const HaExpr &expr)
       return emit_conversion(expr);
     case HaOp::Position:
       return "position";
+    case HaOp::GatherPosition: {
+      const std::string at = emit(*expr.args[0]);
+      return "vec3(position_gather[" + at + " * 3], position_gather[" + at +
+             " * 3 + 1], position_gather[" + at + " * 3 + 2])";
+    }
     case HaOp::Index:
       return expr.type == HaType::Int ? "index" : "float(index)";
     case HaOp::Add:

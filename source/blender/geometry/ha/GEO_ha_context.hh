@@ -388,6 +388,20 @@ gpu::Shader *ha_shader_get_accumulate_scan(StringRef key, int components);
 /** \param mode 0 = leading, 1 = trailing, 2 = total. */
 gpu::Shader *ha_shader_get_accumulate_final(StringRef key, int components, int mode);
 
+/**
+ * Grouped `Accumulate Field`: a single invocation serializes over the elements and keeps one
+ * accumulator per group id (0..255). Out-of-range ids set `invalid[0]`; the caller reads it back and
+ * falls back to the CPU when it is set. Useful for moderate element counts only.
+ *
+ * \param mode 0 = leading, 1 = trailing, 2 = total.
+ */
+gpu::Shader *ha_shader_get_accumulate_grouped(StringRef key,
+                                              StringRef glsl_value_expr,
+                                              StringRef glsl_group_expr,
+                                              int components,
+                                              int mode,
+                                              Span<const HaShaderResource> extra_resources = {});
+
 /** Dispatches `ceil(element_count / 64)` work groups. */
 void ha_dispatch(gpu::Shader *shader, int element_count);
 
