@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "BLI_array.hh"
+#include "BLI_array_utils.hh"
 #include "BLI_map.hh"
 #include "BLI_math_matrix.hh"
 #include "BLI_math_rotation.hh"
@@ -1675,6 +1676,26 @@ bool upload_synthetic_attribute(const Mesh &mesh,
       host[i] = areas[i];
     }
   }
+  else if (attribute.kind == HaAttributeKind::VertexCount ||
+           attribute.kind == HaAttributeKind::VertexFaceCount)
+  {
+    Array<int> counts(mesh.verts_num, 0);
+    if (attribute.kind == HaAttributeKind::VertexCount) {
+      array_utils::count_indices(mesh.edges().cast<int>(), counts);
+    }
+    else {
+      array_utils::count_indices(mesh.corner_verts(), counts);
+    }
+    Array<int> host_int(total, 0);
+    for (const int i : IndexRange(std::min(count, int(counts.size())))) {
+      host_int[i] = counts[i];
+    }
+    if (!r_buffer.ensure(total)) {
+      return false;
+    }
+    r_buffer.upload(Span<float>(reinterpret_cast<const float *>(host_int.data()), total));
+    return true;
+  }
   else {
     const bool true_normals = attribute.kind == HaAttributeKind::TrueNormal;
     const VArray<float3> normals = bke::mesh_normals_varray(
@@ -2078,6 +2099,36 @@ const HaExpr *compile_normal(CompileContext &ctx, const bNode &node, const int s
   return &read;
 }
 
+/** `GeometryNodeInputMeshVertexNeighbors`: host-computed vertex/face counts (POINT int). */
+const HaExpr *compile_vertex_neighbors(CompileContext &ctx,
+                                       const bNode &node,
+                                       const int socket_index)
+{
+  if (socket_index != 0 && socket_index != 1) {
+    fail(ctx, "Vertex Neighbors: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  if (ctx.domain != bke::AttrDomain::Point) {
+    fail(ctx, "Vertex Neighbors: only available on the POINT domain");
+    return &ctx.pool.constant(0.0f);
+  }
+  const bool face_count = socket_index == 1;
+  const int slot = find_or_add_attribute(ctx,
+                                         face_count ? "__ha_vertex_face_count" :
+                                                      "__ha_vertex_count",
+                                         HaType::Int,
+                                         1,
+                                         face_count ? HaAttributeKind::VertexFaceCount :
+                                                      HaAttributeKind::VertexCount,
+                                         int(ctx.domain));
+  HaExpr &read = ctx.pool.add(HaType::Int, HaOp::AttributeRead);
+  read.attribute_slot = slot;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Vertex %s\n", face_count ? "Face Count" : "Count");
+  }
+  return &read;
+}
+
 /**
  * `GeometryNodeSampleIndex`: gather a same-domain attribute at an arbitrary element index.
  *
@@ -2365,6 +2416,9 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("GeometryNodeInputNormal"_ustr)) {
     result = compile_normal(ctx, node, socket_index);
+  }
+  else if (node.is_type("GeometryNodeInputMeshVertexNeighbors"_ustr)) {
+    result = compile_vertex_neighbors(ctx, node, socket_index);
   }
   else if (node.is_type("GeometryNodeSampleIndex"_ustr)) {
     result = compile_sample_index(ctx, node, socket_index);

@@ -81,6 +81,8 @@ enum class HaAttributeKind {
   FaceArea,
   Normal,
   TrueNormal,
+  VertexCount,
+  VertexFaceCount,
 };
 
 /** One POINT attribute the program reads, uploaded once per evaluation. */
