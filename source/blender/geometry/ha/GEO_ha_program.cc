@@ -1941,10 +1941,22 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
       return &ctx.pool.constant(0.0f);
   }
 
-  /* Only scalar statistics for now (vector statistics would need a 3-component reduction). */
-  if (node.custom1 != CD_PROP_FLOAT) {
-    fail(ctx, "Attribute Statistic: only float statistics are supported");
+  /* Float and vector statistics; the vector case reduces each component independently. */
+  HaType type;
+  if (node.custom1 == CD_PROP_FLOAT) {
+    type = HaType::Float;
+  }
+  else if (node.custom1 == CD_PROP_FLOAT3) {
+    type = HaType::Float3;
+  }
+  else {
+    fail(ctx, "Attribute Statistic: only float and vector statistics are supported");
     return &ctx.pool.constant(0.0f);
+  }
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr,
+            "HA program: Attribute Statistic (%s)\n",
+            type == HaType::Float3 ? "vector" : "float");
   }
 
   /* `Selection` is applied by the node on the CPU; ignoring it here would reduce over a different
@@ -1970,21 +1982,19 @@ const HaExpr *compile_statistic(CompileContext &ctx, const bNode &node, const in
   const bool old_allow_gather = ctx.allow_gather;
   ctx.allow_params = false;
   ctx.allow_gather = false;
-  const HaExpr *value = compile_input_as(ctx, node, 2, HaType::Float);
+  const HaExpr *value = compile_input_as(ctx, node, 2, type);
   ctx.allow_params = old_allow_params;
   ctx.allow_gather = old_allow_gather;
-  if (!ctx.ok || value == nullptr || value->type != HaType::Float) {
+  if (!ctx.ok || value == nullptr || value->type != type) {
     if (ctx.ok) {
-      fail(ctx, "Attribute Statistic: only scalar attributes are supported");
+      fail(ctx, "Attribute Statistic: this attribute type is not supported");
     }
     return &ctx.pool.constant(0.0f);
   }
 
-  HaExpr &read = ctx.pool.add(HaType::Float, HaOp::AggregateRead);
+  HaExpr &read = ctx.pool.add(type, HaOp::AggregateRead);
   read.aggregate_slot = int(ctx.aggregates.size());
-  /* The reduction kernel stores the value in a `float`, so the expression must not be promoted to a
-   * vector here (`ha_emit_glsl` would wrap a scalar in `vec3(...)`, which does not compile). */
-  ctx.aggregates.append({ha_emit_glsl_scalar(*value), op});
+  ctx.aggregates.append({ha_emit_glsl_natural(*value), op, ha_type_components(type)});
   return &read;
 }
 
@@ -2447,21 +2457,25 @@ const HaExpr *compile_socket(CompileContext &ctx, const bNodeSocket &socket)
   return compile_output(ctx, *socket.link->fromnode, socket.link->fromsock->index());
 }
 
-void aggregate_op_strings(const HaAggregateOp op, std::string &r_combine, std::string &r_identity)
+void aggregate_op_strings(const HaAggregateOp op,
+                          const int components,
+                          std::string &r_combine,
+                          std::string &r_identity)
 {
+  const bool vector = components == 3;
   switch (op) {
     case HaAggregateOp::Sum:
     case HaAggregateOp::Mean:
       r_combine = "(acc + value)";
-      r_identity = "0.0";
+      r_identity = vector ? "vec3(0.0)" : "0.0";
       break;
     case HaAggregateOp::Min:
       r_combine = "min(acc, value)";
-      r_identity = "1e30";
+      r_identity = vector ? "vec3(1e30)" : "1e30";
       break;
     case HaAggregateOp::Max:
       r_combine = "max(acc, value)";
-      r_identity = "-1e30";
+      r_identity = vector ? "vec3(-1e30)" : "-1e30";
       break;
   }
 }
@@ -3053,13 +3067,17 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       const HaAggregate &aggregate = aggregates_[slot];
       std::string combine;
       std::string identity;
-      aggregate_op_strings(aggregate.op, combine, identity);
+      aggregate_op_strings(aggregate.op, aggregate.components, combine, identity);
 
-      const std::string key_prefix = aggregate.glsl_value + "|" + combine + "|";
+      const std::string key_prefix = aggregate.glsl_value + "|" + combine + "|" +
+                                     std::to_string(aggregate.components) + "|";
       gpu::Shader *stage1 = ha_shader_get_reduce_stage1(
-          "s1|" + key_prefix, aggregate.glsl_value, combine, identity);
-      gpu::Shader *stage2 = ha_shader_get_reduce_stage2(
-          "s2|" + key_prefix, combine, identity, aggregate.op == HaAggregateOp::Mean);
+          "s1|" + key_prefix, aggregate.glsl_value, combine, identity, aggregate.components);
+      gpu::Shader *stage2 = ha_shader_get_reduce_stage2("s2|" + key_prefix,
+                                                        combine,
+                                                        identity,
+                                                        aggregate.components,
+                                                        aggregate.op == HaAggregateOp::Mean);
       if (stage1 == nullptr || stage2 == nullptr) {
         return false;
       }

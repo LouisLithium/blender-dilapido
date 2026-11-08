@@ -1371,6 +1371,12 @@ std::string emit(const HaExpr &expr)
       return result;
     }
     case HaOp::AggregateRead:
+      if (expr.type == HaType::Float3) {
+        const std::string base = std::to_string(expr.aggregate_slot * 3);
+        return "vec3(aggregate[" + base + "], aggregate[" +
+               std::to_string(expr.aggregate_slot * 3 + 1) + "], aggregate[" +
+               std::to_string(expr.aggregate_slot * 3 + 2) + "])";
+      }
       return "aggregate[" + std::to_string(expr.aggregate_slot) + " * 3]";
     case HaOp::AttributeRead: {
       const std::string buffer = "attribute_" + std::to_string(expr.attribute_slot);

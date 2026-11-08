@@ -3572,41 +3572,51 @@ gpu::Shader *ha_shader_get_flip_faces(const StringRef key,
 gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                                          const StringRef glsl_value_expr,
                                          const StringRef combine,
-                                         const StringRef identity)
+                                         const StringRef identity,
+                                         const int components)
 {
+  const bool vector = components == 3;
+  const char *value_type = vector ? "vec3" : "float";
   /* One invocation per block; the loop is serial inside the block so that the summation order is
    * fixed (deterministic and close to the CPU result). */
-  const std::string source = std::string(HA_GLSL_HELPERS) + "void main()\n"
-                                         "{\n"
-                                         "  int block = int(gl_GlobalInvocationID.x);\n"
-                                         "  int element_count = int(params[0]);\n"
-                                         "  int block_count = int(params[1]);\n"
-                                         "  if (block >= block_count) {\n"
-                                         "    return;\n"
-                                         "  }\n"
-                                         "  int start = block * " +
-                             std::to_string(HA_REDUCE_BLOCK_SIZE) +
-                             ";\n"
-                             "  int end = min(start + " +
-                             std::to_string(HA_REDUCE_BLOCK_SIZE) +
-                             ", element_count);\n"
-                             "  float acc = " +
-                             std::string(identity) +
-                             ";\n"
-                             "  for (int i = start; i < end; i++) {\n"
-                             "    int index = i;\n"
-                             "    int base = index * 3;\n"
-                             "    vec3 position = vec3(position_in[base], position_in[base + 1], "
-                             "position_in[base + 2]);\n"
-                             "    float value = " +
-                             std::string(glsl_value_expr) +
-                             ";\n"
-                             "    acc = " +
-                             std::string(combine) +
-                             ";\n"
-                             "  }\n"
-                             "  partial[block * 3] = acc;\n"
-                             "}\n";
+  std::string source = std::string(HA_GLSL_HELPERS) + "void main()\n"
+                                                "{\n"
+                                                "  int block = int(gl_GlobalInvocationID.x);\n"
+                                                "  int element_count = int(params[0]);\n"
+                                                "  int block_count = int(params[1]);\n"
+                                                "  if (block >= block_count) {\n"
+                                                "    return;\n"
+                                                "  }\n"
+                                                "  int start = block * " +
+                       std::to_string(HA_REDUCE_BLOCK_SIZE) +
+                       ";\n"
+                       "  int end = min(start + " +
+                       std::to_string(HA_REDUCE_BLOCK_SIZE) +
+                       ", element_count);\n"
+                       "  " +
+                       std::string(value_type) + " acc = " + std::string(identity) +
+                       ";\n"
+                       "  for (int i = start; i < end; i++) {\n"
+                       "    int index = i;\n"
+                       "    int base = index * 3;\n"
+                       "    vec3 position = vec3(position_in[base], position_in[base + 1], "
+                       "position_in[base + 2]);\n"
+                       "    " +
+                       std::string(value_type) + " value = " + std::string(glsl_value_expr) +
+                       ";\n"
+                       "    acc = " +
+                       std::string(combine) +
+                       ";\n"
+                       "  }\n";
+  if (vector) {
+    source += "  partial[block * 3] = acc.x;\n"
+              "  partial[block * 3 + 1] = acc.y;\n"
+              "  partial[block * 3 + 2] = acc.z;\n";
+  }
+  else {
+    source += "  partial[block * 3] = acc;\n";
+  }
+  source += "}\n";
 
   return ha_shader_get_source(
       key, source, as_span(REDUCE_STAGE1_RESOURCES), LOCAL_GROUP_SIZE);
@@ -3615,8 +3625,11 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
 gpu::Shader *ha_shader_get_reduce_stage2(const StringRef key,
                                          const StringRef combine,
                                          const StringRef identity,
+                                         const int components,
                                          const bool divide_by_count)
 {
+  const bool vector = components == 3;
+  const char *value_type = vector ? "vec3" : "float";
   std::string source = std::string("void main()\n"
                                    "{\n"
                                    "  if (int(gl_GlobalInvocationID.x) != 0) {\n"
@@ -3625,11 +3638,15 @@ gpu::Shader *ha_shader_get_reduce_stage2(const StringRef key,
                                    "  int element_count = int(params[0]);\n"
                                    "  int block_count = int(params[1]);\n"
                                    "  int slot = int(params[2]);\n"
-                                   "  float acc = ") +
-                       std::string(identity) +
+                                   "  ") +
+                       std::string(value_type) + " acc = " + std::string(identity) +
                        ";\n"
                        "  for (int b = 0; b < block_count; b++) {\n"
-                       "    float value = partial[b * 3];\n"
+                       "    " +
+                       std::string(value_type) + " value = " +
+                       (vector ? "vec3(partial[b * 3], partial[b * 3 + 1], partial[b * 3 + 2])" :
+                                 "partial[b * 3]") +
+                       ";\n"
                        "    acc = " +
                        std::string(combine) +
                        ";\n"
@@ -3637,7 +3654,15 @@ gpu::Shader *ha_shader_get_reduce_stage2(const StringRef key,
   if (divide_by_count) {
     source += "  acc = acc / float(max(1, element_count));\n";
   }
-  source += "  aggregate[slot * 3] = acc;\n}\n";
+  if (vector) {
+    source += "  aggregate[slot * 3] = acc.x;\n"
+              "  aggregate[slot * 3 + 1] = acc.y;\n"
+              "  aggregate[slot * 3 + 2] = acc.z;\n";
+  }
+  else {
+    source += "  aggregate[slot * 3] = acc;\n";
+  }
+  source += "}\n";
 
   return ha_shader_get_source(
       key, source, as_span(REDUCE_STAGE2_RESOURCES), LOCAL_GROUP_SIZE);

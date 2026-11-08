@@ -344,11 +344,12 @@ gpu::Shader *ha_shader_get_source(StringRef cache_key,
 gpu::Shader *ha_shader_get_reduce_stage1(StringRef key,
                                          StringRef glsl_value_expr,
                                          StringRef combine,
-                                         StringRef identity);
+                                         StringRef identity,
+                                         int components);
 
 /** Second reduction pass: single invocation folding the partial values into the aggregate. */
 gpu::Shader *ha_shader_get_reduce_stage2(
-    StringRef key, StringRef combine, StringRef identity, bool divide_by_count);
+    StringRef key, StringRef combine, StringRef identity, int components, bool divide_by_count);
 
 /** Dispatches `ceil(element_count / 64)` work groups. */
 void ha_dispatch(gpu::Shader *shader, int element_count);

@@ -62,6 +62,8 @@ struct HaAggregate {
   /** GLSL expression evaluated for every element (`vec3 position` / `int index` in scope). */
   std::string glsl_value;
   HaAggregateOp op = HaAggregateOp::Sum;
+  /** 1 for a float reduction, 3 for a vector one. */
+  int components = 1;
 };
 
 /** One geometry modifying node of the chain: where every element ends up, and which ones move. */
