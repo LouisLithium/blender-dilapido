@@ -792,6 +792,33 @@ const char *KERNEL_TMP_TO_SCALAR =
     "  field_out[index * 4 + HA_COMPONENT] = field_in[index];\n"
     "}\n";
 
+/* Density, temperature and fuel live in one interleaved buffer with 4 floats per voxel. The fused
+ * scalar advection packs the first three into a 3 float buffer (the same layout the velocity uses),
+ * so one vec3 advection can handle all three components at once. */
+const char *KERNEL_PACK_SCALARS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int src = index * 4;\n"
+    "  int dst = index * 3;\n"
+    "  packed[dst + 0] = scalars[src + 0];\n"
+    "  packed[dst + 1] = scalars[src + 1];\n"
+    "  packed[dst + 2] = scalars[src + 2];\n"
+    "}\n";
+
+const char *KERNEL_UNPACK_SCALARS =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int src = index * 3;\n"
+    "  int dst = index * 4;\n"
+    "  scalars[dst + 0] = packed[src + 0];\n"
+    "  scalars[dst + 1] = packed[src + 1];\n"
+    "  scalars[dst + 2] = packed[src + 2];\n"
+    "}\n";
+
 const char *KERNEL_MASK_INIT =
     "void main()\n"
     "{\n"
@@ -1417,6 +1444,7 @@ class HaIgnisSolver {
   HaBuffer velocity_aux_;
   HaBuffer scalar_tmp_;
   HaBuffer scalar_aux_;
+  HaBuffer scalar_pack_;
   HaBuffer pressure_;
   HaBuffer rhs_;
   HaBuffer residual_;
@@ -1456,6 +1484,8 @@ class HaIgnisSolver {
   gpu::Shader *limiter_scalar_ = nullptr;
   gpu::Shader *copy_vec3_ = nullptr;
   gpu::Shader *tmp_to_scalar_ = nullptr;
+  gpu::Shader *pack_scalars_ = nullptr;
+  gpu::Shader *unpack_scalars_ = nullptr;
   gpu::Shader *mask_init_ = nullptr;
   gpu::Shader *mask_keep_init_ = nullptr;
   gpu::Shader *dilate_ = nullptr;
@@ -1662,6 +1692,26 @@ void HaIgnisSolver::create_shaders()
                             std::string(GLSL_PRELUDE) + GLSL_ADVECT_CONTROLS +
                                 KERNEL_TMP_TO_SCALAR,
                             Span<const HaShaderResource>(tmp_to_scalar_res, 4));
+  }
+  {
+    static const HaShaderResource pack_scalars_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "scalars[]"),
+        HA_WRITE(2, "float", "packed[]"),
+    };
+    pack_scalars_ = shader("ignis|pack_scalars",
+                           std::string(GLSL_PRELUDE) + KERNEL_PACK_SCALARS,
+                           Span<const HaShaderResource>(pack_scalars_res, 3));
+  }
+  {
+    static const HaShaderResource unpack_scalars_res[] = {
+        HA_READ(0, "float", "params[]"),
+        HA_READ(1, "float", "packed[]"),
+        HA_RW(2, "float", "scalars[]"),
+    };
+    unpack_scalars_ = shader("ignis|unpack_scalars",
+                             std::string(GLSL_PRELUDE) + KERNEL_UNPACK_SCALARS,
+                             Span<const HaShaderResource>(unpack_scalars_res, 3));
   }
 
   static const HaShaderResource mask_init_res[] = {
@@ -1911,7 +1961,8 @@ bool HaIgnisSolver::shaders_valid() const
          vorticity_apply_ != nullptr && advect_vec3_ != nullptr && advect_scalar_ != nullptr &&
          advect_scalar_tmp_ != nullptr && correct_vec3_ != nullptr && correct_scalar_ != nullptr &&
          limiter_vec3_ != nullptr && limiter_scalar_ != nullptr && copy_vec3_ != nullptr &&
-         tmp_to_scalar_ != nullptr && mask_init_ != nullptr && mask_keep_init_ != nullptr &&
+         tmp_to_scalar_ != nullptr && pack_scalars_ != nullptr && unpack_scalars_ != nullptr &&
+         mask_init_ != nullptr && mask_keep_init_ != nullptr &&
          dilate_ != nullptr && unknown_ != nullptr && rhs_shader_ != nullptr &&
          cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
          cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_pq_sum_ != nullptr &&
@@ -1931,6 +1982,7 @@ void HaIgnisSolver::release()
   velocity_aux_.free();
   scalar_tmp_.free();
   scalar_aux_.free();
+  scalar_pack_.free();
   pressure_.free();
   rhs_.free();
   residual_.free();
@@ -1955,7 +2007,8 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
 {
   if (!scalars_.ensure(cells * 4) || !velocity_.ensure(cells * 3) ||
       !velocity_tmp_.ensure(cells * 3) || !velocity_aux_.ensure(cells * 3) ||
-      !scalar_tmp_.ensure(cells) || !scalar_aux_.ensure(cells) || !pressure_.ensure(cells) ||
+      !scalar_tmp_.ensure(cells) || !scalar_aux_.ensure(cells) ||
+      !scalar_pack_.ensure(cells * 3) || !pressure_.ensure(cells) ||
       !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
       !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
       !params_.ensure(P_COUNT) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
@@ -2438,78 +2491,83 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
   const int count = int(cells);
   const ignis::AdvectionScheme scheme = settings_.advection_scheme;
   const int limiter = int(settings_.advection_limiter);
+  if (scheme == ignis::AdvectionScheme::Bfecc) {
+    r_reason = "BFECC advection is not implemented on the device";
+    return false;
+  }
 
-  for (int component = 0; component < 3; component++) {
-    write_adv(-1, scheme == ignis::AdvectionScheme::Midpoint ? 2 : 1, 0, float(component), 0);
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(params_.buf());
-      buffers.append(adv_.buf());
-      buffers.append(scalars_.buf());
-      buffers.append(scalar_tmp_.buf());
-      buffers.append(velocity_.buf());
-      if (!pass(advect_scalar_, buffers, count)) {
-        r_reason = "scalar advection failed";
-        return false;
-      }
-    }
-    if (scheme == ignis::AdvectionScheme::MacCormack) {
-      write_adv(1, 1, 0, float(component), 0);
-      {
-        Vector<gpu::StorageBuf *> buffers;
-        buffers.append(params_.buf());
-        buffers.append(adv_.buf());
-        buffers.append(scalar_tmp_.buf());
-        buffers.append(scalar_aux_.buf());
-        buffers.append(velocity_.buf());
-        if (!pass(advect_scalar_tmp_, buffers, count)) {
-          r_reason = "scalar advection (backward) failed";
-          return false;
-        }
-      }
-      write_adv(0, 1, 0, float(component), 0);
-      {
-        Vector<gpu::StorageBuf *> buffers;
-        buffers.append(params_.buf());
-        buffers.append(adv_.buf());
-        buffers.append(scalars_.buf());
-        buffers.append(scalar_tmp_.buf());
-        buffers.append(scalar_aux_.buf());
-        if (!pass(correct_scalar_, buffers, count)) {
-          r_reason = "scalar advection (correction) failed";
-          return false;
-        }
-      }
-      write_adv(-1, 1, float(limiter), float(component), 0);
-      {
-        Vector<gpu::StorageBuf *> buffers;
-        buffers.append(params_.buf());
-        buffers.append(adv_.buf());
-        buffers.append(scalars_.buf());
-        buffers.append(scalar_tmp_.buf());
-        buffers.append(velocity_.buf());
-        if (!pass(limiter_scalar_, buffers, count)) {
-          r_reason = "scalar advection (limiter) failed";
-          return false;
-        }
-      }
-    }
-    else if (scheme == ignis::AdvectionScheme::Bfecc) {
-      r_reason = "BFECC advection is not implemented on the device";
+  /* Pack density/temperature/fuel into the 3 float layout the vec3 advection kernels use. One
+   * advection then shares the backtrace and the velocity samples between the three components,
+   * instead of running a scalar advection per component. */
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(scalars_.buf());
+    buffers.append(scalar_pack_.buf());
+    if (!pass(pack_scalars_, buffers, count)) {
+      r_reason = "scalar pack failed";
       return false;
     }
+  }
 
-    write_adv(0, 1, 0, float(component), 0);
+  auto advect = [&](HaBuffer &field_in, HaBuffer &field_out) {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(adv_.buf());
+    buffers.append(field_in.buf());
+    buffers.append(field_out.buf());
+    buffers.append(velocity_.buf());
+    return pass(advect_vec3_, buffers, count);
+  };
+
+  write_adv(-1, scheme == ignis::AdvectionScheme::Midpoint ? 2 : 1, 0, 0, 0);
+  if (!advect(scalar_pack_, velocity_tmp_)) {
+    r_reason = "scalar advection failed";
+    return false;
+  }
+
+  if (scheme == ignis::AdvectionScheme::MacCormack) {
+    write_adv(1, 1, 0, 0, 0);
+    if (!advect(velocity_tmp_, velocity_aux_)) {
+      r_reason = "scalar advection (backward) failed";
+      return false;
+    }
+    write_adv(0, 1, 0, 0, 0);
     {
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(adv_.buf());
-      buffers.append(scalar_tmp_.buf());
-      buffers.append(scalars_.buf());
-      if (!pass(tmp_to_scalar_, buffers, count)) {
-        r_reason = "scalar advection copy failed";
+      buffers.append(scalar_pack_.buf());
+      buffers.append(velocity_tmp_.buf());
+      buffers.append(velocity_aux_.buf());
+      if (!pass(correct_vec3_, buffers, count)) {
+        r_reason = "scalar advection (correction) failed";
         return false;
       }
+    }
+    write_adv(-1, 1, float(limiter), 0, 0);
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(adv_.buf());
+      buffers.append(scalar_pack_.buf());
+      buffers.append(velocity_tmp_.buf());
+      buffers.append(velocity_.buf());
+      if (!pass(limiter_vec3_, buffers, count)) {
+        r_reason = "scalar advection (limiter) failed";
+        return false;
+      }
+    }
+  }
+
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(velocity_tmp_.buf());
+    buffers.append(scalars_.buf());
+    if (!pass(unpack_scalars_, buffers, count)) {
+      r_reason = "scalar unpack failed";
+      return false;
     }
   }
   return true;
