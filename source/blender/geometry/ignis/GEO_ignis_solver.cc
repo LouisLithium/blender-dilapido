@@ -423,6 +423,90 @@ typename GridType::Ptr advect_with_velocity(const GridType &grid,
   return advection.template advect<GridType, openvdb::tools::Sampler<1>>(grid, delta_time);
 }
 
+/**
+ * True when density, temperature and fuel occupy exactly the same voxels.
+ *
+ * This is the common case (temperature and fuel are written by the source and the combustion at
+ * the same voxels as density), and then the three grids can be advected as one Vec3 grid: the
+ * backtrace and the four velocity samples are shared instead of being repeated per field. The
+ * limiter still works per component, so the values are the same.
+ */
+bool scalar_grids_share_topology(const State &state)
+{
+  const int64_t density_count = state.density->activeVoxelCount();
+  if (density_count == 0) {
+    return false;
+  }
+  if (state.temperature->activeVoxelCount() != density_count ||
+      state.fuel->activeVoxelCount() != density_count)
+  {
+    return false;
+  }
+  const openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
+  const openvdb::FloatGrid::ConstAccessor fuel = state.fuel->getConstAccessor();
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+    const openvdb::Coord &coord = iter.getCoord();
+    if (!temperature.isValueOn(coord) || !fuel.isValueOn(coord)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Advects density, temperature and fuel in one Vec3 grid. Returns false when not applicable. */
+bool advect_scalars_packed(State &state, const Settings &settings, const float delta_time)
+{
+  if (std::getenv("BLENDER_IGNIS_NO_PACK_SCALARS") != nullptr) {
+    return false;
+  }
+  if (!scalar_grids_share_topology(state)) {
+    return false;
+  }
+  const openvdb::FloatGrid::ConstAccessor density = state.density->getConstAccessor();
+  const openvdb::FloatGrid::ConstAccessor temperature = state.temperature->getConstAccessor();
+  const openvdb::FloatGrid::ConstAccessor fuel = state.fuel->getConstAccessor();
+
+  openvdb::Vec3fGrid::Ptr packed = openvdb::Vec3fGrid::create(openvdb::Vec3f(0.0f));
+  packed->setTransform(state.density->transformPtr());
+  openvdb::Vec3fGrid::Accessor packed_writer = packed->getAccessor();
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+    const openvdb::Coord &coord = iter.getCoord();
+    packed_writer.setValue(coord,
+                           openvdb::Vec3f(density.getValue(coord),
+                                          temperature.getValue(coord),
+                                          fuel.getValue(coord)));
+  }
+
+  Advection advection(*state.velocity);
+  configure_advection(advection, settings);
+  openvdb::Vec3fGrid::Ptr result = advect_with_velocity<openvdb::Vec3fGrid>(
+      *packed, advection, delta_time);
+
+  openvdb::FloatGrid::Ptr new_density = create_float_grid(state.density->transformPtr());
+  openvdb::FloatGrid::Ptr new_temperature = create_float_grid(state.temperature->transformPtr());
+  openvdb::FloatGrid::Ptr new_fuel = create_float_grid(state.fuel->transformPtr());
+  openvdb::FloatGrid::Accessor density_writer = new_density->getAccessor();
+  openvdb::FloatGrid::Accessor temperature_writer = new_temperature->getAccessor();
+  openvdb::FloatGrid::Accessor fuel_writer = new_fuel->getAccessor();
+  const openvdb::Vec3fGrid::ConstAccessor result_reader = result->getConstAccessor();
+  for (auto iter = result->cbeginValueOn(); iter; ++iter) {
+    const openvdb::Coord &coord = iter.getCoord();
+    const openvdb::Vec3f value = result_reader.getValue(coord);
+    density_writer.setValue(coord, value.x());
+    temperature_writer.setValue(coord, value.y());
+    fuel_writer.setValue(coord, value.z());
+  }
+  state.density = new_density;
+  state.temperature = new_temperature;
+  state.fuel = new_fuel;
+
+  if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
+    printf("IGNIS_DEBUG scalars packed: %lld voxels\n",
+           (long long)state.density->activeVoxelCount());
+  }
+  return true;
+}
+
 /** \{ */
 
 /* -------------------------------------------------------------------- */
@@ -2552,18 +2636,23 @@ Volume *solve_frame(const Volume *previous,
     }
     {
       ScopedTimer timer(ms_scalars);
-      /* One advection per field, but the three fields are independent: give each one its own tool and
-       * run them at the same time. The result does not depend on the order, the fields never touch
-       * each other. */
-      const openvdb::Vec3fGrid &velocity = *state.velocity;
-      openvdb::FloatGrid::Ptr *targets[3] = {&state.density, &state.temperature, &state.fuel};
-      threading::parallel_for(IndexRange(3), 1, [&](const IndexRange range) {
-        for (const int i : range) {
-          Advection advection(velocity);
-          configure_advection(advection, settings);
-          *targets[i] = advect_with_velocity<openvdb::FloatGrid>(**targets[i], advection, step_dt);
-        }
-      });
+      /* Density, temperature and fuel usually occupy exactly the same voxels, in which case one
+       * Vec3 advection shares the backtrace and the velocity samples between the three fields.
+       * When they don't, fall back to one advection per field. */
+      if (!advect_scalars_packed(state, settings, step_dt)) {
+        const openvdb::Vec3fGrid &velocity = *state.velocity;
+        openvdb::FloatGrid::Ptr *targets[3] = {&state.density, &state.temperature, &state.fuel};
+        threading::parallel_for(IndexRange(3), 1, [&](const IndexRange range) {
+          for (const int i : range) {
+            if ((*targets[i])->activeVoxelCount() == 0) {
+              continue;
+            }
+            Advection advection(velocity);
+            configure_advection(advection, settings);
+            *targets[i] = advect_with_velocity<openvdb::FloatGrid>(**targets[i], advection, step_dt);
+          }
+        });
+      }
     }
     {
       ScopedTimer timer(ms_combustion);
