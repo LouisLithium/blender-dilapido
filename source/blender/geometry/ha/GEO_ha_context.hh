@@ -271,7 +271,8 @@ struct HaShaderResource {
 gpu::Shader *ha_shader_get(StringRef key,
                            StringRef glsl_position,
                            StringRef glsl_selection,
-                           Span<const HaShaderResource> extra_resources = {});
+                           Span<const HaShaderResource> extra_resources = {},
+                           bool with_lut = false);
 
 /**
  * Compiles a `Store Named Attribute` kernel: writes \a glsl_value (evaluated with `vec3 position`
@@ -345,7 +346,8 @@ gpu::Shader *ha_shader_get_reduce_stage1(StringRef key,
                                          StringRef glsl_value_expr,
                                          StringRef combine,
                                          StringRef identity,
-                                         int components);
+                                         int components,
+                                         Span<const HaShaderResource> extra_resources = {});
 
 /** Second reduction pass: single invocation folding the partial values into the aggregate. */
 gpu::Shader *ha_shader_get_reduce_stage2(

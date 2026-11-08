@@ -3293,10 +3293,72 @@ const char *HA_GLSL_HELPERS =
 gpu::Shader *ha_shader_get(const StringRef key,
                            const StringRef glsl_position,
                            const StringRef glsl_selection,
-                           const Span<const HaShaderResource> extra_resources)
+                           const Span<const HaShaderResource> extra_resources,
+                           const bool with_lut)
 {
+  /* Only included when the kernel binds `lut_table[]`; the helpers reference that buffer, so they
+   * cannot live in the shared prelude. */
+  static const char *LUT_HELPERS =
+      "float ha_float_curve(float value, int base) {\n"
+      "  float mintable = lut_table[base + 257];\n"
+      "  float range = lut_table[base + 258];\n"
+      "  float first_x = lut_table[base + 259];\n"
+      "  float last_x = lut_table[base + 260];\n"
+      "  float fi = (value - mintable) * range;\n"
+      "  int i = int(fi);\n"
+      "  float result;\n"
+      "  if (fi < 0.0 || fi > 256.0) {\n"
+      "    if (value <= first_x) {\n"
+      "      if (lut_table[base + 265] == 0.0) { result = lut_table[base]; }\n"
+      "      else {\n"
+      "        float ext_x = lut_table[base + 261];\n"
+      "        float ext_y = lut_table[base + 262];\n"
+      "        result = ext_x == 0.0 ? lut_table[base] + ext_y * 10000.0\n"
+      "                             : lut_table[base] + ext_y * (value - first_x) / ext_x;\n"
+      "      }\n"
+      "    }\n"
+      "    else if (value >= last_x) {\n"
+      "      if (lut_table[base + 265] == 0.0) { result = lut_table[base + 256]; }\n"
+      "      else {\n"
+      "        float ext_x = lut_table[base + 263];\n"
+      "        float ext_y = lut_table[base + 264];\n"
+      "        result = ext_x == 0.0 ? lut_table[base + 256] - ext_y * 10000.0\n"
+      "                             : lut_table[base + 256] + ext_y * (value - last_x) / ext_x;\n"
+      "      }\n"
+      "    }\n"
+      "    else {\n"
+      "      result = 0.0;\n"
+      "    }\n"
+      "  }\n"
+      "  else if (i < 0) { result = lut_table[base]; }\n"
+      "  else if (i >= 256) { result = lut_table[base + 256]; }\n"
+      "  else {\n"
+      "    fi = fi - float(i);\n"
+      "    result = (1.0 - fi) * lut_table[base + i] + fi * lut_table[base + i + 1];\n"
+      "  }\n"
+      "  if (lut_table[base + 268] != 0.0) {\n"
+      "    result = clamp(result, lut_table[base + 266], lut_table[base + 267]);\n"
+      "  }\n"
+      "  return result;\n"
+      "}\n"
+      "vec4 ha_color_ramp(float fac, int base) {\n"
+      "  if (lut_table[base + 1028] != 0.0) {\n"
+      "    int i = clamp(int(round(fac * 256.0)), 0, 256);\n"
+      "    int a = base + i * 4;\n"
+      "    return vec4(lut_table[a], lut_table[a + 1], lut_table[a + 2], lut_table[a + 3]);\n"
+      "  }\n"
+      "  float fi = clamp(fac, 0.0, 1.0) * 256.0;\n"
+      "  int i = int(fi);\n"
+      "  if (i >= 256) { i = 255; }\n"
+      "  fi = fi - float(i);\n"
+      "  int a = base + i * 4;\n"
+      "  int b = a + 4;\n"
+      "  vec4 ca = vec4(lut_table[a], lut_table[a + 1], lut_table[a + 2], lut_table[a + 3]);\n"
+      "  vec4 cb = vec4(lut_table[b], lut_table[b + 1], lut_table[b + 2], lut_table[b + 3]);\n"
+      "  return mix(ca, cb, fi);\n"
+      "}\n";
   const std::string source =
-      std::string(HA_GLSL_HELPERS) +
+      std::string(HA_GLSL_HELPERS) + (with_lut ? LUT_HELPERS : "") +
       "void main()\n"
                   "{\n"
                   "  int index = int(gl_GlobalInvocationID.x);\n"
@@ -3573,7 +3635,8 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
                                          const StringRef glsl_value_expr,
                                          const StringRef combine,
                                          const StringRef identity,
-                                         const int components)
+                                         const int components,
+                                         const Span<const HaShaderResource> extra_resources)
 {
   const bool vector = components == 3;
   const char *value_type = vector ? "vec3" : "float";
@@ -3618,8 +3681,18 @@ gpu::Shader *ha_shader_get_reduce_stage1(const StringRef key,
   }
   source += "}\n";
 
-  return ha_shader_get_source(
-      key, source, as_span(REDUCE_STAGE1_RESOURCES), LOCAL_GROUP_SIZE);
+  Vector<HaShaderResource> resources;
+  for (const HaShaderResource &resource : REDUCE_STAGE1_RESOURCES) {
+    resources.append(resource);
+  }
+  for (const HaShaderResource &resource : extra_resources) {
+    resources.append(resource);
+  }
+  return ha_shader_get_source(key,
+                              source,
+                              Span<const HaShaderResource>(resources.data(),
+                                                           int64_t(resources.size())),
+                              LOCAL_GROUP_SIZE);
 }
 
 gpu::Shader *ha_shader_get_reduce_stage2(const StringRef key,

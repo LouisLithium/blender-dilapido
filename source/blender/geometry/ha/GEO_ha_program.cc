@@ -10,6 +10,7 @@
 #include "BLI_array.hh"
 #include "BLI_array_utils.hh"
 #include "BLI_map.hh"
+#include "MEM_guardedalloc.h"
 #include "BLI_math_matrix.hh"
 #include "BLI_math_rotation.hh"
 #include "BLI_math_vector_types.hh"
@@ -17,6 +18,8 @@
 #include "BKE_anim_data.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_attribute.hh"
+#include "BKE_colorband.hh"
+#include "BKE_colortools.hh"
 #include "BKE_curves.hh"
 #include "BKE_geometry_fields.hh"
 #include "BKE_lib_id.hh"
@@ -30,6 +33,7 @@
 
 #include "DNA_action_types.h"
 #include "DNA_anim_types.h"
+#include "DNA_color_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_node_types.h"
 
@@ -120,6 +124,9 @@ struct CompileContext {
    * binds that buffer. */
   bool allow_gather = true;
   bool has_gather = false;
+  /** Baked LUT tables (`Float Curve` / `Color Ramp`), concatenated into one buffer. */
+  Vector<float> lut_data;
+  bool has_lut = false;
   /** True after the first `Set Position` / `Transform` step: `Normal` and `Face Area` would have to
    * be recomputed from the new positions, which the host upload cannot do. */
   bool position_may_have_changed = false;
@@ -2147,6 +2154,95 @@ const HaExpr *compile_vertex_neighbors(CompileContext &ctx,
   return &read;
 }
 
+/** `ShaderNodeFloatCurve`: exact CPU table lookup (`BKE_curvemap_evaluateF`). */
+const HaExpr *compile_float_curve(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0) {
+    fail(ctx, "Float Curve: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  auto *cumap = static_cast<CurveMapping *>(node.storage);
+  if (cumap == nullptr) {
+    fail(ctx, "Float Curve: missing curve mapping");
+    return &ctx.pool.constant(0.0f);
+  }
+  BKE_curvemapping_init(cumap);
+  const CurveMap &cuma = cumap->cm[0];
+  if (cuma.table == nullptr) {
+    fail(ctx, "Float Curve: the curve table is not initialized");
+    return &ctx.pool.constant(0.0f);
+  }
+  const int base = int(ctx.lut_data.size());
+  for (int i = 0; i <= CM_TABLE; i++) {
+    ctx.lut_data.append(cuma.table[i].y);
+  }
+  ctx.lut_data.append(cuma.mintable);
+  ctx.lut_data.append(cuma.range);
+  ctx.lut_data.append(cuma.table[0].x);
+  ctx.lut_data.append(cuma.table[CM_TABLE].x);
+  ctx.lut_data.append(cuma.ext_in[0]);
+  ctx.lut_data.append(cuma.ext_in[1]);
+  ctx.lut_data.append(cuma.ext_out[0]);
+  ctx.lut_data.append(cuma.ext_out[1]);
+  ctx.lut_data.append((cumap->flag & CUMA_EXTEND_EXTRAPOLATE) != 0 ? 1.0f : 0.0f);
+  ctx.lut_data.append(cumap->clipr.ymin);
+  ctx.lut_data.append(cumap->clipr.ymax);
+  ctx.lut_data.append((cumap->flag & CUMA_DO_CLIP) != 0 ? 1.0f : 0.0f);
+  ctx.has_lut = true;
+
+  const HaExpr *factor = compile_input_as(ctx, node, 0, HaType::Float);
+  const HaExpr *value = compile_input_as(ctx, node, 1, HaType::Float);
+  if (!ctx.ok) {
+    return &ctx.pool.constant(0.0f);
+  }
+  HaExpr &sample = ctx.pool.add(HaType::Float, HaOp::LutSample, {value});
+  sample.lut_offset = base;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Float Curve\n");
+  }
+  /* `(1 - fac) * value + fac * curve(value)`, exactly like the CPU. */
+  return &ctx.pool.add(HaType::Float, HaOp::Mix, {factor, value, &sample});
+}
+
+/** `ShaderNodeValToRGB`: the baked `BKE_colorband_evaluate_table_rgba` table. */
+const HaExpr *compile_color_ramp(CompileContext &ctx, const bNode &node, const int socket_index)
+{
+  if (socket_index != 0 && socket_index != 1) {
+    fail(ctx, "Color Ramp: unexpected output socket");
+    return &ctx.pool.constant(0.0f);
+  }
+  const auto *coba = static_cast<const ColorBand *>(node.storage);
+  if (coba == nullptr) {
+    fail(ctx, "Color Ramp: missing color band");
+    return &ctx.pool.constant(0.0f);
+  }
+  float *table = nullptr;
+  int size = 0;
+  BKE_colorband_evaluate_table_rgba(coba, &table, &size);
+  const int base = int(ctx.lut_data.size());
+  for (int i = 0; i < size * 4; i++) {
+    ctx.lut_data.append(table[i]);
+  }
+  /* Flag for constant interpolation (nearest sampling); the table itself is baked by the CPU. */
+  ctx.lut_data.append(coba->ipotype == COLBAND_INTERP_CONSTANT ? 1.0f : 0.0f);
+  MEM_delete(table);
+  ctx.has_lut = true;
+
+  const HaExpr *factor = compile_input_as(ctx, node, 0, HaType::Float);
+  if (!ctx.ok) {
+    return &ctx.pool.constant(0.0f);
+  }
+  HaExpr &color = ctx.pool.add(HaType::Color, HaOp::ColorRamp, {factor});
+  color.lut_offset = base;
+  if (ha_program_debug_enabled()) {
+    fprintf(stderr, "HA program: Color Ramp\n");
+  }
+  if (socket_index == 0) {
+    return &color;
+  }
+  return &ctx.pool.add(HaType::Float, HaOp::SplitW, {&color});
+}
+
 /**
  * `GeometryNodeSampleIndex`: gather a same-domain attribute at an arbitrary element index.
  *
@@ -2437,6 +2533,12 @@ const HaExpr *compile_output(CompileContext &ctx, const bNode &node, const int s
   }
   else if (node.is_type("GeometryNodeInputMeshVertexNeighbors"_ustr)) {
     result = compile_vertex_neighbors(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeFloatCurve"_ustr)) {
+    result = compile_float_curve(ctx, node, socket_index);
+  }
+  else if (node.is_type("ShaderNodeValToRGB"_ustr)) {
+    result = compile_color_ramp(ctx, node, socket_index);
   }
   else if (node.is_type("GeometryNodeSampleIndex"_ustr)) {
     result = compile_sample_index(ctx, node, socket_index);
@@ -2780,6 +2882,8 @@ std::unique_ptr<HaZoneProgram> HaZoneProgram::try_build(const bNodeTree &tree,
     program->operations_.insert(0, step_operation);
   }
   program->has_gather_ = ctx.has_gather;
+  program->lut_data_ = ctx.lut_data;
+  program->has_lut_ = ctx.has_lut;
   return program;
 }
 
@@ -3029,6 +3133,7 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
    * rebuilds the shader. Slot 15 is reserved for this buffer; keep the attribute count below 13. */
   HaBuffer params_buffer;
   HaBuffer gather_buffer;
+  HaBuffer lut_buffer;
   Vector<HaShaderResource> position_resources;
   position_resources.reserve(extra_resources.size() + 1);
   for (const HaShaderResource &resource : extra_resources) {
@@ -3120,6 +3225,21 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     gather_key = "|gather";
   }
 
+  /* Baked LUT tables (`Float Curve` / `Color Ramp`). Slot 13 is used, so at most 10 attributes can
+   * be bound together with a LUT. */
+  std::string lut_key;
+  if (has_lut_) {
+    if (attributes_.size() > 10) {
+      return false;
+    }
+    if (!lut_buffer.ensure(int64_t(lut_data_.size()))) {
+      return false;
+    }
+    lut_buffer.upload(lut_data_);
+    position_resources.append({13, HaShaderQualifier::Read, "float", "lut_table[]"});
+    lut_key = "|lut";
+  }
+
   /* Aggregates first: every step reads them, and they are all reduced over the *zone input*
    * geometry (that is what `Attribute Statistic` is wired to). Two passes per aggregate: one
    * invocation per block writes a partial value, then a single invocation folds them. */
@@ -3142,9 +3262,24 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       aggregate_op_strings(aggregate.op, aggregate.components, combine, identity);
 
       const std::string key_prefix = aggregate.glsl_value + "|" + combine + "|" +
-                                     std::to_string(aggregate.components) + "|";
+                                     std::to_string(aggregate.components) + "|" + attribute_key +
+                                     lut_key;
+      Vector<HaShaderResource> aggregate_resources;
+      aggregate_resources.reserve(extra_resources.size() + 1);
+      for (const HaShaderResource &resource : extra_resources) {
+        aggregate_resources.append(resource);
+      }
+      if (has_lut_) {
+        aggregate_resources.append({13, HaShaderQualifier::Read, "float", "lut_table[]"});
+      }
       gpu::Shader *stage1 = ha_shader_get_reduce_stage1(
-          "s1|" + key_prefix, aggregate.glsl_value, combine, identity, aggregate.components);
+          "s1|" + key_prefix,
+          aggregate.glsl_value,
+          combine,
+          identity,
+          aggregate.components,
+          Span<const HaShaderResource>(aggregate_resources.data(),
+                                       int64_t(aggregate_resources.size())));
       gpu::Shader *stage2 = ha_shader_get_reduce_stage2("s2|" + key_prefix,
                                                         combine,
                                                         identity,
@@ -3162,7 +3297,19 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       GPU_storagebuf_bind(buffers[0].buf(), 0);
       GPU_storagebuf_bind(buffer_params.buf(), 1);
       GPU_storagebuf_bind(buffer_partial.buf(), 2);
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_bind(current_attribute_buffers[attribute_i]->buf(), 3 + attribute_i);
+      }
+      if (has_lut_) {
+        GPU_storagebuf_bind(lut_buffer.buf(), 13);
+      }
       ha_dispatch(stage1, block_count);
+      if (has_lut_) {
+        GPU_storagebuf_unbind(lut_buffer.buf());
+      }
+      for (const int attribute_i : attributes_.index_range()) {
+        GPU_storagebuf_unbind(current_attribute_buffers[attribute_i]->buf());
+      }
       GPU_storagebuf_unbind(buffer_partial.buf());
       GPU_storagebuf_unbind(buffer_params.buf());
       GPU_storagebuf_unbind(buffers[0].buf());
@@ -3197,11 +3344,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
     if (operation.kind == HaChainOperation::Kind::Step) {
       const HaProgramStep &step = steps_[operation.index];
       gpu::Shader *shader = ha_shader_get(
-          step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key + gather_key,
+          step.glsl_position + '#' + step.glsl_selection + attribute_key + param_key + gather_key +
+              lut_key,
           step.glsl_position,
           step.glsl_selection,
           Span<const HaShaderResource>(position_resources.data(),
-                                       int64_t(position_resources.size())));
+                                       int64_t(position_resources.size())),
+          has_lut_);
       if (shader == nullptr) {
         return false;
       }
@@ -3220,7 +3369,13 @@ bool HaZoneProgram::evaluate(const bke::GeometrySet &input,
       if (has_gather_) {
         GPU_storagebuf_bind(gather_buffer.buf(), 14);
       }
+      if (has_lut_) {
+        GPU_storagebuf_bind(lut_buffer.buf(), 13);
+      }
       ha_dispatch(shader, padded_count);
+      if (has_lut_) {
+        GPU_storagebuf_unbind(lut_buffer.buf());
+      }
       if (has_gather_) {
         GPU_storagebuf_unbind(gather_buffer.buf());
       }

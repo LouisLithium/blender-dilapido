@@ -548,6 +548,10 @@ float eval_float(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::WhiteNoise:
       /* The hash lives in the GLSL helpers; the CPU reference is the node evaluation. */
       return 0.0f;
+    case HaOp::LutSample:
+    case HaOp::SplitW:
+      /* LUT sampling and color components are only available on the GPU. */
+      return 0.0f;
     case HaOp::NoiseTexture:
       /* The Perlin noise lives in the GLSL helpers; the CPU reference is the node evaluation. */
       return 0.0f;
@@ -818,6 +822,8 @@ float4 eval_color(const HaExpr &expr, int index, Span<float> positions)
     case HaOp::AttributeGather:
     case HaOp::AggregateRead:
     case HaOp::ParamRead:
+      return float4(0.0f);
+    case HaOp::ColorRamp:
       return float4(0.0f);
     case HaOp::Select:
       return eval_float(*expr.args[0], index, positions) > 0.0f ?
@@ -1307,6 +1313,14 @@ std::string emit(const HaExpr &expr)
       return "(" + emit_as_vector(*expr.args[0]) + ").y";
     case HaOp::SplitZ:
       return "(" + emit_as_vector(*expr.args[0]) + ").z";
+    case HaOp::SplitW:
+      return "(" + emit(*expr.args[0]) + ").w";
+    case HaOp::LutSample:
+      return "ha_float_curve(" + emit(*expr.args[0]) + ", " +
+             std::to_string(expr.lut_offset) + ")";
+    case HaOp::ColorRamp:
+      return "ha_color_ramp(" + emit(*expr.args[0]) + ", " +
+             std::to_string(expr.lut_offset) + ")";
     case HaOp::Length:
       return "length(" + emit_as_vector(*expr.args[0]) + ")";
     case HaOp::Abs:

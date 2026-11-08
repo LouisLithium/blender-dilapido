@@ -297,6 +297,9 @@ class HaZoneProgram {
   Vector<HaCornerStep> corner_steps_;
   /** True when the program contains an `AttributeGather` (needs `gather_params[]`). */
   bool has_gather_ = false;
+  /** Baked LUT tables for `Float Curve` / `Color Ramp` (needs `lut_table[]`). */
+  Vector<float> lut_data_;
+  bool has_lut_ = false;
 };
 
 }  // namespace geometry::ha

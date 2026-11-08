@@ -235,6 +235,16 @@ enum class HaOp {
   VoronoiW,
   /** `Voronoi Texture > Radius` (N-Sphere feature): args vector, w, scale, randomness. */
   VoronoiRadius,
+  /**
+   * `Float Curve`: `args[0]` is the value; `lut_offset` points into `lut_table[]`, where
+   * `[0..CM_TABLE]` are the table Y values followed by mintable/range/first_x/last_x/ext_in/
+   * ext_out/extrapolate. Evaluated by the `ha_float_curve()` helper.
+   */
+  LutSample,
+  /** `Color Ramp`: `args[0]` is the factor; `lut_offset` points into the baked RGBA table. */
+  ColorRamp,
+  /** vec4 -> float: the alpha component of a `Color` expression (`Color Ramp > Alpha`). */
+  SplitW,
 };
 
 /** Bit offset of the Voronoi dimension (1..4) in #HaExpr::param. */
@@ -258,6 +268,8 @@ struct HaExpr {
   int attribute_slot = -1;
   /** Used by #HaOp::ParamRead. */
   int param_slot = -1;
+  /** Used by #HaOp::LutSample / #HaOp::ColorRamp: base offset into `lut_table[]`. */
+  int lut_offset = -1;
   /** Used by the ops that need an operation selector (see #HaParam). */
   int param = 0;
   Vector<const HaExpr *> args;
