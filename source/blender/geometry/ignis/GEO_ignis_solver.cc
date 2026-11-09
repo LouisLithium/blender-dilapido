@@ -2713,8 +2713,38 @@ Volume *solve_frame(const Volume *previous,
     for (auto iter = state.temperature->cbeginValueOn(); iter; ++iter) {
       max_temperature = std::max(max_temperature, iter.getValue());
     }
+    int density_01 = 0;
+    int density_10 = 0;
+    int flame_voxels = 0;
+    double density_sum = 0.0;
+    for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+      const float density = iter.getValue();
+      if (density > 1e-4f) {
+        density_sum += double(density);
+        if (density > 0.01f) {
+          density_01++;
+        }
+        if (density > 0.1f) {
+          density_10++;
+        }
+      }
+    }
+    for (auto iter = state.flame->cbeginValueOn(); iter; ++iter) {
+      if (iter.getValue() > 1e-4f) {
+        flame_voxels++;
+      }
+    }
     printf("IGNIS_DEBUG temperature max %.3f | ", double(max_temperature));
-    printf("IGNIS_DEBUG bbox z %.3f..%.3f mean_vz %.3f | ",
+    printf("IGNIS_DEBUG density sum %.1f (>0.01=%d >0.1=%d) flame=%d | ",
+           density_sum,
+           density_01,
+           density_10,
+           flame_voxels);
+    printf("IGNIS_DEBUG bbox x %.3f..%.3f y %.3f..%.3f z %.3f..%.3f mean_vz %.3f | ",
+           bbox_min.x(),
+           bbox_max.x(),
+           bbox_min.y(),
+           bbox_max.y(),
            bbox_min.z(),
            bbox_max.z(),
            weight_sum > 0.0 ? weighted_vz / weight_sum : 0.0);

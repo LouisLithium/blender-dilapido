@@ -224,6 +224,8 @@ const char *GLSL_PRELUDE =
     "#define HA_COARSE_DX int(params[80])\n"
     "#define HA_COARSE_DY int(params[81])\n"
     "#define HA_COARSE_DZ int(params[82])\n"
+    /* Reuses the retired coarse-grid slot 80: damping applied to the coarse correction. */
+    "#define HA_MG_PROLONG params[80]\n"
     "#define HA_ACTIVE_MARGIN int(params[83])\n"
     /* Brick pool (doc/ignis-brick-sparse.md). The layout is appended to the param buffer so every
      * kernel already has it bound; `HA_BRICK_BASE` must stay equal to `P_COUNT` on the C++ side. */
@@ -1250,9 +1252,11 @@ const char *KERNEL_RESIDUAL =
     "  residual[index] = rhs[index] - sum;\n"
     "}\n";
 
-/* Coarse unknown mask: a coarse cell belongs to the domain when any of its 2^3 fine children is
- * unknown. This kernel is compiled with the coarse brick constants (4^3 cells) and reads the fine
- * mask with the fine cell stride (8^3 = 512). */
+/* Coarse unknown mask: a coarse cell belongs to the domain only when **all** of its 2^3 fine
+ * children are unknown. The intersection keeps the coarse operator consistent with the fine one
+ * (the "any child" superset over-corrects at the thin smoke boundary and slowly injects energy).
+ * This kernel is compiled with the coarse brick constants (4^3 cells) and reads the fine mask with
+ * the fine cell stride (8^3 = 512). */
 const char *KERNEL_COARSE_MASK =
     "void main()\n"
     "{\n"
@@ -1266,15 +1270,15 @@ const char *KERNEL_COARSE_MASK =
     "  int child_edge = 2 * HA_BRICK_EDGE;\n"
     "  int child = slot * HA_CHILD_CELLS + (2 * lx) +\n"
     "              child_edge * ((2 * ly) + child_edge * (2 * lz));\n"
-    "  int any = 0;\n"
+    "  int all = HA_UNKNOWN;\n"
     "  for (int dz = 0; dz < 2; dz++) {\n"
     "    for (int dy = 0; dy < 2; dy++) {\n"
     "      for (int dx = 0; dx < 2; dx++) {\n"
-    "        any |= fine_mask[child + dx + child_edge * (dy + child_edge * dz)] & HA_UNKNOWN;\n"
+    "        all &= fine_mask[child + dx + child_edge * (dy + child_edge * dz)] & HA_UNKNOWN;\n"
     "      }\n"
     "    }\n"
     "  }\n"
-    "  coarse_mask[index] = any != 0 ? HA_UNKNOWN : 0;\n"
+    "  coarse_mask[index] = all != 0 ? HA_UNKNOWN : 0;\n"
     "}\n";
 
 /* Full-weighting with constant prolongation: average the 8 fine residuals into the coarse rhs. */
@@ -1320,7 +1324,7 @@ const char *KERNEL_PROLONG_PRESSURE =
     "  int coarse = slot * HA_PARENT_CELLS + (lx >> 1) +\n"
     "               HA_PARENT_EDGE * ((ly >> 1) + HA_PARENT_EDGE * (lz >> 1));\n"
     "  if ((coarse_mask[coarse] & HA_UNKNOWN) != 0) {\n"
-    "    fine_pressure[index] += coarse_pressure[coarse];\n"
+    "    fine_pressure[index] += HA_MG_PROLONG * coarse_pressure[coarse];\n"
     "  }\n"
     "}\n";
 
@@ -2124,6 +2128,8 @@ class HaIgnisSolver {
   int64_t coarse2_cells_ = 0;
   bool use_multigrid_ = false;
   int multigrid_cycles_ = 4;
+  /** Damping of the coarse-grid correction (`HA_MG_PROLONG`); below 1 for stability. */
+  float multigrid_prolong_ = 1.0f;
   /** Brick pool of the current frame (`doc/ignis-brick-sparse.md`). The parameter buffer gets the
    * brick map and coordinates appended after `P_COUNT`. */
   IgnisBrickGrid bricks_;
@@ -3138,6 +3144,7 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
                                 MutableSpan<float> r_params)
 {
   r_params.take_front(P_COUNT).fill(0.0f);
+  r_params[P_COARSE_DX] = multigrid_prolong_;
   const ignis::Settings &s = frame.settings;
   r_params[P_CELLS] = float(pool_cells_);
   r_params[P_DX] = float(frame.dims.x);
@@ -4221,6 +4228,10 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   if (const char *env = std::getenv("BLENDER_IGNIS_MG_CYCLES")) {
     multigrid_cycles_ = std::clamp(std::atoi(env), 1, 32);
   }
+  multigrid_prolong_ = 1.0f;
+  if (const char *env = std::getenv("BLENDER_IGNIS_MG_PROLONG")) {
+    multigrid_prolong_ = std::clamp(float(std::atof(env)), 0.0f, 2.0f);
+  }
 
   const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
   if (cells <= 0) {
@@ -4236,6 +4247,9 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
       {int(radius_), int(std::ceil(settings_.cfl)), settings_.extrapolate, 4});
   active_margin_tiles_ = std::max(
       1, (active_radius_voxels + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE);
+  if (const char *env = std::getenv("BLENDER_IGNIS_ACTIVE_MARGIN")) {
+    active_margin_tiles_ = std::clamp(std::atoi(env), 0, 8);
+  }
   /* Brick pool (doc/ignis-brick-sparse.md): the content plus the same voxel margin the dense box
    * gives the solver, grown in brick units. The content bricks are measured to be ~10-16% of the
    * box, so the pool is a few times smaller than the dense box. */
@@ -4610,12 +4624,60 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
 
   if (debug_enabled()) {
     float max_speed = 0.0f;
-    for (int64_t i = 0; i < cells_; i++) {
-      const float vx = frame.velocity[i * 3 + 0];
-      const float vy = frame.velocity[i * 3 + 1];
-      const float vz = frame.velocity[i * 3 + 2];
-      max_speed = std::max(max_speed, std::sqrt(vx * vx + vy * vy + vz * vz));
+    int3 dmin = frame.dims;
+    int3 dmax = int3(-1);
+    int density_voxels = 0;
+    int density_01 = 0;
+    int density_10 = 0;
+    double density_sum = 0.0;
+    int flame_voxels = 0;
+    for (int z = 0; z < frame.dims.z; z++) {
+      for (int y = 0; y < frame.dims.y; y++) {
+        for (int x = 0; x < frame.dims.x; x++) {
+          const int64_t i = x + int64_t(frame.dims.x) * (y + int64_t(frame.dims.y) * z);
+          const float density = frame.scalars[i * 4];
+          if (density > 1e-4f) {
+            density_voxels++;
+            density_sum += double(density);
+            if (density > 0.01f) {
+              density_01++;
+            }
+            if (density > 0.1f) {
+              density_10++;
+            }
+            dmin = int3(std::min(dmin.x, x), std::min(dmin.y, y), std::min(dmin.z, z));
+            dmax = int3(std::max(dmax.x, x), std::max(dmax.y, y), std::max(dmax.z, z));
+          }
+          if (frame.scalars[i * 4 + 3] > 1e-4f) {
+            flame_voxels++;
+          }
+          const float vx = frame.velocity[i * 3 + 0];
+          const float vy = frame.velocity[i * 3 + 1];
+          const float vz = frame.velocity[i * 3 + 2];
+          max_speed = std::max(max_speed, std::sqrt(vx * vx + vy * vy + vz * vz));
+        }
+      }
     }
+    debug_log("IGNIS_HA bbox: density=%d (>0.01=%d >0.1=%d sum=%.1f flame=%d) "
+              "idx=%d,%d,%d..%d,%d,%d "
+              "world_x=%.2f..%.2f world_y=%.2f..%.2f world_z=%.2f..%.2f\n",
+              density_voxels,
+              density_01,
+              density_10,
+              density_sum,
+              flame_voxels,
+              dmin.x,
+              dmin.y,
+              dmin.z,
+              dmax.x,
+              dmax.y,
+              dmax.z,
+              double((frame.index_min.x + dmin.x) * frame.voxel_size),
+              double((frame.index_min.x + dmax.x) * frame.voxel_size),
+              double((frame.index_min.y + dmin.y) * frame.voxel_size),
+              double((frame.index_min.y + dmax.y) * frame.voxel_size),
+              double((frame.index_min.z + dmin.z) * frame.voxel_size),
+              double((frame.index_min.z + dmax.z) * frame.voxel_size));
     debug_log(
         "IGNIS_HA frame: cells=%lld passes=%d substeps=%d active=%d pressure=%d "
         "budget=%d residual=%.5f div %.4f -> %.4f raw(before=%.6g after=%.6g count=%.1f "
