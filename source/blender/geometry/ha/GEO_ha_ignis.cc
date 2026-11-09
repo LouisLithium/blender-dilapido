@@ -241,10 +241,18 @@ const char *GLSL_PRELUDE =
     "#define HA_BRICK_NEIGHBORS (HA_BRICK_COORDS + 3 * HA_BRICK_COUNT)\n"
     /* 8^3 leaves (M149). The brick constants must match `IGNIS_BRICK_EDGE` / `IGNIS_BRICK_CELLS`
      * in the host code; the work group size is `HA_BRICK_CELLS`. */
+    "#ifndef HA_BRICK_EDGE\n"
     "#define HA_BRICK_EDGE 8\n"
+    "#endif\n"
+    "#ifndef HA_BRICK_SHIFT\n"
     "#define HA_BRICK_SHIFT 3\n"
+    "#endif\n"
+    "#ifndef HA_BRICK_MASK\n"
     "#define HA_BRICK_MASK 7\n"
+    "#endif\n"
+    "#ifndef HA_BRICK_CELLS\n"
     "#define HA_BRICK_CELLS 512\n"
+    "#endif\n"
     /* Cell index of this invocation. In active-list mode each work group is one brick of the
      * per-substep list (built by `build_active_list`), so the empty margin is never dispatched.
      * `ha_cg_index` (in `GLSL_CG_LIST`) is the same idea for the pressure list. */
@@ -1186,6 +1194,108 @@ const char *KERNEL_SET_MODES =
     "  params[HA_BRICK_BASE + 7] = mode[1];\n"
     "}\n";
 
+/* Sparse two level V-cycle (M150). The coarse grid is the same brick set at half resolution:
+ * every fine 8^3 brick becomes a 4^3 coarse brick, so the slot map / neighbours are reused. */
+const char *KERNEL_JACOBI_SMOOTH =
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  ha_init_neighbors(index);\n"
+    "  if ((mask[index] & HA_UNKNOWN) == 0) { pressure_out[index] = 0.0; return; }\n"
+    "  ivec3 c;\n"
+    "  ha_cell(index, c);\n"
+    "  float sum = -6.0 * pressure_in[index];\n"
+    "  int n;\n"
+    "  n = ha_at(c + ivec3(1, 0, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  n = ha_at(c + ivec3(-1, 0, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 1, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  n = ha_at(c + ivec3(0, -1, 0));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 0, 1));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  n = ha_at(c + ivec3(0, 0, -1));\n"
+    "  if (n >= 0 && (mask[n] & HA_UNKNOWN) != 0) { sum += pressure_in[n]; }\n"
+    "  pressure_out[index] = pressure_in[index] - (2.0 / 3.0) * (rhs[index] - sum) / 6.0;\n"
+    "}\n";
+
+/* Coarse unknown mask: a coarse cell belongs to the domain when any of its 2^3 fine children is
+ * unknown. This kernel is compiled with the coarse brick constants (4^3 cells) and reads the fine
+ * mask with the fine cell stride (8^3 = 512). */
+const char *KERNEL_COARSE_MASK =
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int slot = index / HA_BRICK_CELLS;\n"
+    "  int local = index % HA_BRICK_CELLS;\n"
+    "  int lx = local & 3;\n"
+    "  int ly = (local >> 2) & 3;\n"
+    "  int lz = (local >> 4) & 3;\n"
+    "  int fine = slot * 512 + (2 * lx) + 8 * ((2 * ly) + 8 * (2 * lz));\n"
+    "  int any = 0;\n"
+    "  for (int dz = 0; dz < 2; dz++) {\n"
+    "    for (int dy = 0; dy < 2; dy++) {\n"
+    "      for (int dx = 0; dx < 2; dx++) {\n"
+    "        any |= fine_mask[fine + dx + 8 * (dy + 8 * dz)] & HA_UNKNOWN;\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  coarse_mask[index] = any != 0 ? HA_UNKNOWN : 0;\n"
+    "}\n";
+
+/* Full-weighting with constant prolongation: average the 8 fine residuals into the coarse rhs. */
+const char *KERNEL_RESTRICT_RESIDUAL =
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  int slot = index / HA_BRICK_CELLS;\n"
+    "  int local = index % HA_BRICK_CELLS;\n"
+    "  int lx = local & 3;\n"
+    "  int ly = (local >> 2) & 3;\n"
+    "  int lz = (local >> 4) & 3;\n"
+    "  int fine = slot * 512 + (2 * lx) + 8 * ((2 * ly) + 8 * (2 * lz));\n"
+    "  float sum = 0.0;\n"
+    "  for (int dz = 0; dz < 2; dz++) {\n"
+    "    for (int dy = 0; dy < 2; dy++) {\n"
+    "      for (int dx = 0; dx < 2; dx++) {\n"
+    "        int child = fine + dx + 8 * (dy + 8 * dz);\n"
+    "        if ((fine_mask[child] & HA_UNKNOWN) != 0) { sum += fine_residual[child]; }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  coarse_rhs[index] = (coarse_mask[index] & HA_UNKNOWN) != 0 ? sum * 0.125 : 0.0;\n"
+    "}\n";
+
+/* Constant prolongation of the coarse correction, only for unknown fine cells. */
+const char *KERNEL_PROLONG_PRESSURE =
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  if (index >= HA_CELL_COUNT) { return; }\n"
+    "  if ((fine_mask[index] & HA_UNKNOWN) == 0) { return; }\n"
+    "  int slot = index / HA_BRICK_CELLS;\n"
+    "  int local = index % HA_BRICK_CELLS;\n"
+    "  int lx = local & 7;\n"
+    "  int ly = (local >> 3) & 7;\n"
+    "  int lz = (local >> 6) & 7;\n"
+    "  int coarse = slot * 64 + (lx >> 1) + 4 * ((ly >> 1) + 4 * (lz >> 1));\n"
+    "  if ((coarse_mask[coarse] & HA_UNKNOWN) != 0) {\n"
+    "    fine_pressure[index] += 1.0 * coarse_pressure[coarse];\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_CLEAR_FIELD =
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  if (index < HA_CELL_COUNT) { field[index] = 0.0; }\n"
+    "}\n";
+
 /** Index of the cell this invocation handles: from the brick list when the CG runs list mode. */
 const char *GLSL_CG_LIST =
     "int ha_cg_index()\n"
@@ -1883,6 +1993,11 @@ class HaIgnisSolver {
   bool pass(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int count);
   /** Dispatch one work group per brick of the per-substep active list (indirect). */
   bool pass_active(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers);
+  /** Dispatch over the CG/unknown brick list (`brick_list_`) instead of the active list. */
+  bool pass_cg(gpu::Shader *shader,
+               Span<gpu::StorageBuf *> buffers,
+               const int count,
+               const int group_size);
   bool pass_impl(gpu::Shader *shader,
                  Span<gpu::StorageBuf *> buffers,
                  const int count,
@@ -1892,6 +2007,9 @@ class HaIgnisSolver {
   void swap_masks();
 
   bool projection(const int64_t cells, std::string &r_reason);
+  /** Sparse two level V-cycle on the pressure (M150); falls back to the CG loop on failure. */
+  bool multigrid_pressure(int cg_count, std::string &r_reason);
+  void build_coarse_params(const IgnisDeviceFrame &frame);
   bool advect_velocity(const int64_t cells, std::string &r_reason);
   bool advect_scalars(const int64_t cells, std::string &r_reason);
   bool extrapolate(const int64_t cells, std::string &r_reason);
@@ -1900,6 +2018,11 @@ class HaIgnisSolver {
   gpu::Shader *shader(const char *key,
                       const std::string &source,
                       Span<const HaShaderResource> resources);
+  gpu::Shader *shader_level(const char *key,
+                            const std::string &defines,
+                            const std::string &source,
+                            Span<const HaShaderResource> resources,
+                            int group_size);
   bool shaders_valid() const;
   void create_shaders();
 
@@ -1911,6 +2034,14 @@ class HaIgnisSolver {
   HaBuffer scalar_aux_;
   HaBuffer scalar_pack_;
   HaBuffer pressure_;
+  /** Ping-pong target for the Jacobi smoother (fine level). */
+  HaBuffer pressure_tmp_;
+  /** Coarse level of the V-cycle: same brick slots, 4^3 cells per brick. */
+  HaBuffer coarse1_params_;
+  HaBuffer coarse1_pressure_;
+  HaBuffer coarse1_pressure_tmp_;
+  HaBuffer coarse1_rhs_;
+  HaBufferInt coarse1_mask_;
   HaBuffer rhs_;
   HaBuffer residual_;
   HaBuffer direction_;
@@ -1947,6 +2078,9 @@ class HaIgnisSolver {
   HaBufferInt *mask_other_ = nullptr;
   int64_t cells_ = 0;
   int64_t blocks_ = 0;
+  int64_t coarse1_cells_ = 0;
+  bool use_multigrid_ = false;
+  int multigrid_cycles_ = 4;
   /** Brick pool of the current frame (`doc/ignis-brick-sparse.md`). The parameter buffer gets the
    * brick map and coordinates appended after `P_COUNT`. */
   IgnisBrickGrid bricks_;
@@ -2003,6 +2137,12 @@ class HaIgnisSolver {
   gpu::Shader *cg_direction_ = nullptr;
   gpu::Shader *cg_laplacian_ = nullptr;
   gpu::Shader *cg_fused_ = nullptr;
+  gpu::Shader *mg_smooth_ = nullptr;
+  gpu::Shader *mg_smooth_c1_ = nullptr;
+  gpu::Shader *mg_coarse_mask_ = nullptr;
+  gpu::Shader *mg_restrict_ = nullptr;
+  gpu::Shader *mg_prolong_ = nullptr;
+  gpu::Shader *mg_clear_c1_ = nullptr;
   gpu::Shader *reduce_pq_ = nullptr;
   gpu::Shader *cg_update_ = nullptr;
   gpu::Shader *reduce_res_ = nullptr;
@@ -2023,6 +2163,15 @@ gpu::Shader *HaIgnisSolver::shader(const char *key,
                                    const std::string &source,
                                    const Span<const HaShaderResource> resources)
 {
+  return shader_level(key, "", source, resources, GROUP_SIZE);
+}
+
+gpu::Shader *HaIgnisSolver::shader_level(const char *key,
+                                         const std::string &defines,
+                                         const std::string &source,
+                                         const Span<const HaShaderResource> resources,
+                                         const int group_size)
+{
   /* Every kernel binds the active list at slot 8 (see `pass_impl`), so declare it once here instead
    * of touching all resource tables. Kernels that do not index through `ha_active_index()` simply
    * leave the binding unused. */
@@ -2032,7 +2181,8 @@ gpu::Shader *HaIgnisSolver::shader(const char *key,
     all.append(resource);
   }
   all.append(res(8, HaShaderQualifier::Read, "int", "active_list[]"));
-  return ha_shader_get_source(key, source, Span<const HaShaderResource>(all.data(), all.size()), GROUP_SIZE);
+  const std::string full = defines + source;
+  return ha_shader_get_source(key, full, Span<const HaShaderResource>(all.data(), all.size()), group_size);
 }
 
 void HaIgnisSolver::create_shaders()
@@ -2425,6 +2575,79 @@ void HaIgnisSolver::create_shaders()
                      common + GLSL_CG_LIST + KERNEL_CG_DIRECTION_LAPLACIAN,
                      Span<const HaShaderResource>(cg_fused_res, 8));
 
+  /* Sparse two level V-cycle (M150). The coarse shaders are the same kernels compiled with 4^3
+   * brick constants; they bind the coarse params buffer at slot 0. */
+  const std::string c1_defines =
+      "#define HA_BRICK_EDGE 4\n"
+      "#define HA_BRICK_SHIFT 2\n"
+      "#define HA_BRICK_MASK 3\n"
+      "#define HA_BRICK_CELLS 64\n";
+  static const HaShaderResource mg_smooth_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "pressure_in[]"),
+      HA_WRITE(3, "float", "pressure_out[]"),
+      HA_READ(4, "float", "rhs[]"),
+      HA_READ(9, "int", "brick_list[]"),
+  };
+  mg_smooth_ = shader("ignis|mg_smooth",
+                      common + GLSL_CG_LIST + KERNEL_JACOBI_SMOOTH,
+                      Span<const HaShaderResource>(mg_smooth_res, 6));
+  mg_smooth_c1_ = shader_level("ignis|mg_smooth_c1",
+                               c1_defines,
+                               common + GLSL_CG_LIST + KERNEL_JACOBI_SMOOTH,
+                               Span<const HaShaderResource>(mg_smooth_res, 6),
+                               64);
+
+  static const HaShaderResource mg_coarse_mask_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "fine_mask[]"),
+      HA_WRITE(2, "int", "coarse_mask[]"),
+      HA_READ(9, "int", "brick_list[]"),
+  };
+  mg_coarse_mask_ = shader_level("ignis|mg_coarse_mask",
+                                 c1_defines,
+                                 common + GLSL_CG_LIST + KERNEL_COARSE_MASK,
+                                 Span<const HaShaderResource>(mg_coarse_mask_res, 4),
+                                 64);
+
+  static const HaShaderResource mg_restrict_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "float", "fine_residual[]"),
+      HA_READ(2, "int", "fine_mask[]"),
+      HA_READ(3, "int", "coarse_mask[]"),
+      HA_WRITE(4, "float", "coarse_rhs[]"),
+      HA_READ(9, "int", "brick_list[]"),
+  };
+  mg_restrict_ = shader_level("ignis|mg_restrict",
+                              c1_defines,
+                              common + GLSL_CG_LIST + KERNEL_RESTRICT_RESIDUAL,
+                              Span<const HaShaderResource>(mg_restrict_res, 6),
+                              64);
+
+  static const HaShaderResource mg_prolong_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "fine_mask[]"),
+      HA_READ(2, "int", "coarse_mask[]"),
+      HA_READ(3, "float", "coarse_pressure[]"),
+      HA_RW(4, "float", "fine_pressure[]"),
+      HA_READ(9, "int", "brick_list[]"),
+  };
+  mg_prolong_ = shader("ignis|mg_prolong",
+                       common + GLSL_CG_LIST + KERNEL_PROLONG_PRESSURE,
+                       Span<const HaShaderResource>(mg_prolong_res, 6));
+
+  static const HaShaderResource mg_clear_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_RW(1, "float", "field[]"),
+      HA_READ(9, "int", "brick_list[]"),
+  };
+  mg_clear_c1_ = shader_level("ignis|mg_clear_c1",
+                              c1_defines,
+                              common + GLSL_CG_LIST + KERNEL_CLEAR_FIELD,
+                              Span<const HaShaderResource>(mg_clear_res, 3),
+                              64);
+
   static const HaShaderResource reduce_pq_res[] = {
       HA_RW(0, "float", "params[]"),
       HA_READ(1, "float", "partial[]"),
@@ -2571,6 +2794,8 @@ bool HaIgnisSolver::shaders_valid() const
          active_flag_ != nullptr && active_expand_ != nullptr && active_clear_ != nullptr &&
          active_compact_ != nullptr && active_copy_ != nullptr && set_modes_ != nullptr &&
          cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_fused_ != nullptr &&
+         mg_smooth_ != nullptr && mg_smooth_c1_ != nullptr && mg_coarse_mask_ != nullptr &&
+         mg_restrict_ != nullptr && mg_prolong_ != nullptr && mg_clear_c1_ != nullptr &&
          reduce_pq_ != nullptr && cg_update_ != nullptr &&
          reduce_res_ != nullptr && cg_gradient_ != nullptr && divergence_after_ != nullptr &&
          reduce_divergence_ != nullptr && clamp_solids_ != nullptr && combust_ != nullptr &&
@@ -2589,6 +2814,12 @@ void HaIgnisSolver::release()
   scalar_aux_.free();
   scalar_pack_.free();
   pressure_.free();
+  pressure_tmp_.free();
+  coarse1_params_.free();
+  coarse1_pressure_.free();
+  coarse1_pressure_tmp_.free();
+  coarse1_rhs_.free();
+  coarse1_mask_.free();
   rhs_.free();
   residual_.free();
   direction_.free();
@@ -2627,6 +2858,12 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
       !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
       !direction_next_.ensure(cells) ||
       !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
+      !pressure_tmp_.ensure(cells) ||
+      !coarse1_params_.ensure(P_COUNT + brick_block_) ||
+      !coarse1_pressure_.ensure(std::max<int64_t>(1, coarse1_cells_)) ||
+      !coarse1_pressure_tmp_.ensure(std::max<int64_t>(1, coarse1_cells_)) ||
+      !coarse1_rhs_.ensure(std::max<int64_t>(1, coarse1_cells_)) ||
+      !coarse1_mask_.ensure(std::max<int64_t>(1, coarse1_cells_)) ||
       !params_.ensure(P_COUNT + brick_block_) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
       /* The coarse initial guess was removed, so its buffers are not allocated (M146). */
       !brick_flags_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
@@ -2853,6 +3090,38 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
   r_params[P_ACTIVE_MARGIN] = float(active_margin_tiles_);
 }
 
+void HaIgnisSolver::build_coarse_params(const IgnisDeviceFrame &frame)
+{
+  Array<float> params;
+  params.reinitialize(int(params_host_.size()));
+  for (int i = 0; i < int(params_host_.size()); i++) {
+    params[i] = params_host_[i];
+  }
+  params[P_CELLS] = float(coarse1_cells_);
+  params[P_DX] = float((frame.dims.x + 1) / 2);
+  params[P_DY] = float((frame.dims.y + 1) / 2);
+  params[P_DZ] = float((frame.dims.z + 1) / 2);
+  params[P_VOXEL] = params_host_[P_VOXEL] * 2.0f;
+  params[P_PARTIALS] = float(pool_blocks_);
+  params[P_COUNT + 0] = 1.0f;
+  params[P_COUNT + 1] = float(bricks_.tile_count);
+  params[P_COUNT + 2] = float(bricks_.brick_dims.x);
+  params[P_COUNT + 3] = float(bricks_.brick_dims.y);
+  params[P_COUNT + 4] = float(bricks_.brick_dims.z);
+  /* The V-cycle walks the CG/unknown brick list, not the active list. */
+  params[P_COUNT + 5] = 1.0f;
+  params[P_COUNT + 6] = float(bricks_.brick_count);
+  params[P_COUNT + 7] = 0.0f;
+  /* The coarse brick origin is the fine origin / 2 (8 fine voxels become 4 coarse voxels). */
+  for (int slot = 0; slot < bricks_.brick_count; slot++) {
+    const int base = P_COUNT + 8 + bricks_.tile_count + slot * 3;
+    params[base + 0] = float(bricks_.coords[slot].x / 2);
+    params[base + 1] = float(bricks_.coords[slot].y / 2);
+    params[base + 2] = float(bricks_.coords[slot].z / 2);
+  }
+  coarse1_params_.upload(params.as_span());
+}
+
 void HaIgnisSolver::write_adv(const float dir,
                               const float order,
                               const float limiter,
@@ -2881,6 +3150,32 @@ bool HaIgnisSolver::pass_active(gpu::Shader *shader, Span<gpu::StorageBuf *> buf
     return pass_impl(shader, buffers, int(pool_cells_), false);
   }
   return pass_impl(shader, buffers, 0, true);
+}
+
+bool HaIgnisSolver::pass_cg(gpu::Shader *shader,
+                            Span<gpu::StorageBuf *> buffers,
+                            const int count,
+                            const int group_size)
+{
+  if (shader == nullptr) {
+    return false;
+  }
+  for (const gpu::StorageBuf *buffer : buffers) {
+    if (buffer == nullptr) {
+      return false;
+    }
+  }
+  if (int(buffers.size()) + 2 < int(GPU_shader_get_ssbo_input_len(shader))) {
+    return false;
+  }
+  GPU_shader_bind(shader);
+  ha_bind_storage_buffers(buffers);
+  ha_bind_storage_buffer_at(active_list_.buf(), 8);
+  ha_bind_storage_buffer_at(brick_list_.buf(), 9);
+  ha_dispatch(shader, count, group_size);
+  GPU_memory_barrier(GPU_BARRIER_SHADER_STORAGE);
+  result_->passes++;
+  return true;
 }
 
 bool HaIgnisSolver::pass_impl(gpu::Shader *shader,
@@ -3053,6 +3348,157 @@ bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::stri
   return true;
 }
 
+bool HaIgnisSolver::multigrid_pressure(const int cg_count, std::string &r_reason)
+{
+  Array<float> values;
+  values.reinitialize(P_COUNT);
+  params_.download(values.as_mutable_span());
+  if (values[P_CONVERGED] != 0.0f) {
+    return true;
+  }
+  const int list_count = cg_count / int(IGNIS_BRICK_CELLS);
+  const int coarse_count = list_count * 64;
+  const int coarse_sweeps = 6;
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(coarse1_params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(coarse1_mask_.buf());
+    if (!pass_cg(mg_coarse_mask_, buffers, coarse_count, 64)) {
+      r_reason = "V-cycle coarse mask failed";
+      return false;
+    }
+  }
+  HaBuffer *p = &pressure_;
+  HaBuffer *p_tmp = &pressure_tmp_;
+  HaBuffer *c = &coarse1_pressure_;
+  HaBuffer *c_tmp = &coarse1_pressure_tmp_;
+  auto fine_smooth = [&]() -> bool {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(p->buf());
+    buffers.append(p_tmp->buf());
+    buffers.append(rhs_.buf());
+    if (!pass_cg(mg_smooth_, buffers, cg_count, GROUP_SIZE)) {
+      return false;
+    }
+    std::swap(p, p_tmp);
+    return true;
+  };
+  auto fine_residual = [&]() -> bool {
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(p->buf());
+      buffers.append(mask_->buf());
+      buffers.append(product_.buf());
+      buffers.append(brick_list_.buf());
+      if (!pass(cg_product_, buffers, cg_count)) {
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(rhs_.buf());
+      buffers.append(product_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(residual_.buf());
+      buffers.append(direction_.buf());
+      buffers.append(partial_.buf());
+      buffers.append(brick_list_.buf());
+      if (!pass(cg_init_, buffers, cg_count)) {
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(partial_.buf());
+      if (!pass(reduce_res_, buffers, 1)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  /* Two pre-smoothing sweeps; then each cycle uses the residual after the previous post-smooth. */
+  for (int sweep = 0; sweep < 2; sweep++) {
+    if (!fine_smooth()) {
+      r_reason = "V-cycle fine pre-smooth failed";
+      return false;
+    }
+  }
+  for (int cycle = 0; cycle < multigrid_cycles_; cycle++) {
+    if (!fine_residual()) {
+      r_reason = "V-cycle fine residual failed";
+      return false;
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse1_params_.buf());
+      buffers.append(residual_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(coarse1_mask_.buf());
+      buffers.append(coarse1_rhs_.buf());
+      if (!pass_cg(mg_restrict_, buffers, coarse_count, 64)) {
+        r_reason = "V-cycle restriction failed";
+        return false;
+      }
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse1_params_.buf());
+      buffers.append(coarse1_pressure_.buf());
+      if (!pass_cg(mg_clear_c1_, buffers, coarse_count, 64)) {
+        r_reason = "V-cycle coarse clear failed";
+        return false;
+      }
+    }
+    for (int sweep = 0; sweep < coarse_sweeps; sweep++) {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(coarse1_params_.buf());
+      buffers.append(coarse1_mask_.buf());
+      buffers.append(c->buf());
+      buffers.append(c_tmp->buf());
+      buffers.append(coarse1_rhs_.buf());
+      if (!pass_cg(mg_smooth_c1_, buffers, coarse_count, 64)) {
+        r_reason = "V-cycle coarse smooth failed";
+        return false;
+      }
+      std::swap(c, c_tmp);
+    }
+    {
+      Vector<gpu::StorageBuf *> buffers;
+      buffers.append(params_.buf());
+      buffers.append(mask_->buf());
+      buffers.append(coarse1_mask_.buf());
+      buffers.append(c->buf());
+      buffers.append(p->buf());
+      if (!pass_cg(mg_prolong_, buffers, cg_count, GROUP_SIZE)) {
+        r_reason = "V-cycle prolongation failed";
+        return false;
+      }
+    }
+    if (!fine_smooth()) {
+      r_reason = "V-cycle fine post-smooth failed";
+      return false;
+    }
+  }
+  /* Keep the final pressure in `pressure_` (the post-smooth toggles the ping-pong buffer). */
+  if ((multigrid_cycles_ % 2) != 0) {
+    if (!fine_smooth()) {
+      r_reason = "V-cycle final smooth failed";
+      return false;
+    }
+  }
+  if (!fine_residual()) {
+    r_reason = "V-cycle final residual failed";
+    return false;
+  }
+  return true;
+}
+
 bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
 {
   (void)cells;
@@ -3180,6 +3626,12 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
               double(values[P_UNKNOWN_COUNT]),
               double(values[P_RHS_NORM]));
   }
+  if (use_multigrid_) {
+    if (!multigrid_pressure(cg_count, r_reason)) {
+      return false;
+    }
+  }
+  else {
   bool converged = values[P_CONVERGED] != 0.0f;
   int iterations = 0;
   const int max_iterations = std::max(1, int(values[P_MAX_ITERATIONS]));
@@ -3278,8 +3730,10 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     }
   }
 
-  /* The CG is over: switch back from its unknown-brick list to the active list for the remaining
-   * passes of this substep. */
+  }
+
+  /* The pressure solve is over: switch back from its unknown-brick list to the active list for the
+   * remaining passes of this substep. */
   set_modes(use_active_list_ ? 1 : 0, 0);
 
   /* u -= grad p on the whole band, then measure the remaining divergence. */
@@ -3529,6 +3983,13 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   result_ = &r_result;
   settings_ = frame.settings;
   use_active_list_ = std::getenv("BLENDER_IGNIS_NO_ACTIVE") == nullptr;
+  /* Sparse V-cycle is the default now; `BLENDER_IGNIS_MG=0` falls back to the CG loop. */
+  const char *mg_env = std::getenv("BLENDER_IGNIS_MG");
+  use_multigrid_ = use_active_list_ && (mg_env == nullptr || mg_env[0] != '0');
+  multigrid_cycles_ = 8;
+  if (const char *env = std::getenv("BLENDER_IGNIS_MG_CYCLES")) {
+    multigrid_cycles_ = std::clamp(std::atoi(env), 1, 32);
+  }
 
   const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
   if (cells <= 0) {
@@ -3563,6 +4024,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   }
   pool_cells_ = bricks_.pool_cells;
   pool_blocks_ = bricks_.brick_count;
+  coarse1_cells_ = bricks_.brick_count * 64;
   blocks_ = pool_blocks_;
   brick_block_ = 8 + bricks_.tile_count + bricks_.brick_count * 9;
   if (debug_enabled()) {
@@ -3583,6 +4045,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
       cg_list_ = false;
     }
   }
+  use_multigrid_ = use_multigrid_ && cg_list_;
   /* Measured on `HWA_test`: fusing direction+Laplacian removes ~12% of the dispatches but the
    * cross-brick direction recompute makes it neutral/slightly slower. Keep it opt-in for future
    * experiments. */
@@ -3647,6 +4110,9 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         params_host_[nb_base + slot * 6 + i] = float(bricks_.neighbor[slot * 6 + i]);
       }
     }
+  }
+  if (use_multigrid_) {
+    build_coarse_params(frame);
   }
   const int substeps = frame.delta_time > 0.0f ? std::max(1, frame.substeps) : 0;
   bool has_source = false;
