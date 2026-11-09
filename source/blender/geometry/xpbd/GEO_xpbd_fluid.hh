@@ -643,7 +643,8 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidNeighborList &
                                                        const MutableSpan<float3> r_corrections,
                                                        const MutableSpan<float> r_solid_fractions,
                                                        const FluidBoundary &boundary,
-                                                       const FluidBoundary &coupled)
+                                                       const FluidBoundary &coupled,
+                                                       const MutableSpan<float3> r_coupled_corrections = {})
 {
   const int points_num = int(positions.size());
   if (points_num == 0 || neighbors.is_empty()) {
@@ -759,6 +760,10 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidNeighborList &
       }
       const float lambda_i = r_lambdas[i];
       float3 correction = float3(0.0f);
+      /* The part of the correction that comes from the coupled solids. It is tracked separately so
+       * the velocity layer can remove the normal velocity it would otherwise create (see
+       * `update_linear_velocities` in the solver). */
+      float3 coupled_correction = float3(0.0f);
       neighbors.foreach_neighbor(i, positions, [&](const int j, const float3 &r_vec, const float r_sq) {
         if (j == i) {
           return;
@@ -777,7 +782,8 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidNeighborList &
       if (lambda_i != 0.0f) {
         /* The boundary and the coupled particles never have a multiplier of their own, so only the
          * multiplier of the fluid particle pushes here. */
-        const auto accumulate_boundary = [&](const FluidBoundary &boundary_particles) {
+        const auto accumulate_boundary = [&](const FluidBoundary &boundary_particles,
+                                              float3 *r_coupled) {
           if (!boundary_particles.is_valid()) {
             return;
           }
@@ -790,20 +796,27 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidNeighborList &
                   return;
                 }
                 const float r = math::sqrt(r_sq);
-                correction += lambda_i * boundary_particles.masses[j] *
-                              (-(kernel.spiky_gradient_length(r) / r) * r_vec);
+                const float3 contribution = lambda_i * boundary_particles.masses[j] *
+                                            (-(kernel.spiky_gradient_length(r) / r) * r_vec);
+                correction += contribution;
+                if (r_coupled != nullptr) {
+                  *r_coupled += contribution;
+                }
               });
         };
-        accumulate_boundary(coupled);
+        accumulate_boundary(coupled, &coupled_correction);
         if (use_boundary[i]) {
-          accumulate_boundary(boundary);
+          accumulate_boundary(boundary, nullptr);
         }
       }
-      correction *= math::safe_rcp(rest_density[i]);
+      const float inv_rest_density = math::safe_rcp(rest_density[i]);
+      correction *= inv_rest_density;
+      float clamp_scale = 1.0f;
       if (settings.max_correction > 0.0f) {
         const float length = math::length(correction);
         if (length > settings.max_correction) {
-          correction *= settings.max_correction / length;
+          clamp_scale = settings.max_correction / length;
+          correction *= clamp_scale;
         }
       }
       if (UNLIKELY(!(std::isfinite(correction.x) && std::isfinite(correction.y) &&
@@ -811,8 +824,18 @@ inline FluidDensityStats fluid_solve_density_iteration(const FluidNeighborList &
       {
         /* Never let a single degenerate particle poison the whole fluid. */
         correction = float3(0.0f);
+        coupled_correction = float3(0.0f);
       }
       r_corrections[i] = correction;
+      if (!r_coupled_corrections.is_empty()) {
+        /* Near a coupled solid (or a boundary particle) the *whole* density correction is a
+         * depenetration. Track it, so the velocity layer can remove its normal component instead
+         * of turning the pressure wave into a splash. */
+        const float3 push = r_solid_fractions[i] > 0.0f ?
+                                correction :
+                                coupled_correction * inv_rest_density * clamp_scale;
+        r_coupled_corrections[i] += push;
+      }
     }
   });
 

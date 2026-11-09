@@ -475,6 +475,12 @@ struct FluidChunkData {
 
   /** Fraction of the density of each particle that comes from the boundary particles. */
   Array<float> solid_fractions;
+  /**
+   * Sum of the part of the density correction that comes from the coupled solids over the
+   * iterations of the current substep. The velocity update removes its normal component so a
+   * depenetration does not turn into a bounce (see #update_linear_velocities).
+   */
+  Array<float3> coupled_push;
 };
 
 /**
@@ -1602,6 +1608,8 @@ class XpbdSolverStep {
       fluid.omega_magnitudes.reinitialize(points_num);
       fluid.solid_fractions.reinitialize(points_num);
       fluid.solid_fractions.fill(0.0f);
+      fluid.coupled_push.reinitialize(points_num);
+      fluid.coupled_push.fill(float3(0.0f));
     }
   }
 
@@ -4034,6 +4042,7 @@ class XpbdSolverStep {
     xpbd::fluid_build_neighbors(fluid.grid, positions, fluid.neighbors);
     this->debug_compare_gpu_neighbors(positions, fluid.support_radius, fluid.neighbors);
     fluid.lambdas.fill(0.0f);
+    fluid.coupled_push.fill(float3(0.0f));
 
     this->simulate__update_fluid_boundary__chunk(chunk_i, solver_refs_i);
 
@@ -5282,7 +5291,9 @@ class XpbdSolverStep {
         fluid.corrections,
         fluid.solid_fractions,
         boundary,
-        coupled);
+        coupled,
+        fluid.has_coupled ? fluid.coupled_push.as_mutable_span().slice(points) :
+                            MutableSpan<float3>());
     updater.add_residual_error(geo_i,
                                stats.average_error_squared *
                                    error_scale_from_threshold(constraint.error_threshold));
@@ -6734,10 +6745,15 @@ class XpbdSolverStep {
     const int data_key_i = chunk.data_key_i;
     GeometryData &geo_data = *geometries_.data[data_key_i];
     xpbd::GeometryRef &ref = geometries_.solver_refs[solver_refs_i][data_key_i];
+    FluidChunkData &fluid = chunks_data_[chunk_i].fluid;
+    const Span<float3> coupled_push = fluid.active ?
+                                          fluid.coupled_push.as_span().slice(points_range) :
+                                          Span<float3>();
     this->update_linear_velocities(sub_delta_time_,
                                    ref.prev_positions.slice(points_range),
                                    ref.positions.slice(points_range),
-                                   geo_data.velocity_attr.span.slice(points_range));
+                                   geo_data.velocity_attr.span.slice(points_range),
+                                   coupled_push);
     if (geo_data.uses_rotation) {
       this->update_angular_velocities(sub_delta_time_,
                                       ref.prev_rotations.slice(points_range),
@@ -6872,14 +6888,27 @@ class XpbdSolverStep {
   void update_linear_velocities(const float delta_time,
                                 const Span<float3> prev_positions,
                                 const Span<float3> new_positions,
-                                MutableSpan<float3> r_velocities)
+                                MutableSpan<float3> r_velocities,
+                                const Span<float3> position_offsets = {})
   {
     const float inv_delta_time = math::safe_rcp(delta_time);
+    const bool has_offsets = position_offsets.size() == r_velocities.size();
     for (const int i : r_velocities.index_range()) {
       const float3 &old_pos = prev_positions[i];
       const float3 &new_pos = new_positions[i];
-      const float3 diff = new_pos - old_pos;
-      const float3 velocity = diff * inv_delta_time;
+      float3 velocity = (new_pos - old_pos) * inv_delta_time;
+      if (has_offsets) {
+        /* A position correction from the coupled solids is a depenetration, not a physical
+         * velocity. Remove the velocity component along the correction, so a particle that was
+         * pushed out of the cloth does not bounce back up (the fluid still gets the tangential
+         * part, which is what makes it slide along the surface). */
+        const float3 &offset = position_offsets[i];
+        const float length = math::length(offset);
+        if (length > 1e-12f) {
+          const float3 normal = offset / length;
+          velocity -= math::dot(velocity, normal) * normal;
+        }
+      }
       r_velocities[i] = velocity;
     }
   }

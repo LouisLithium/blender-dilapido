@@ -904,16 +904,19 @@ std::string fluid_kernel(const char *prologue,
                          const char *fluid_body,
                          const char *boundary_body,
                          const char *epilogue,
-                         const char *coupled_body = nullptr)
+                         const char *coupled_body = nullptr,
+                         const char *coupled_epilogue = nullptr)
 {
   const bool with_boundary = boundary_body != nullptr;
-  const bool with_coupled = coupled_body != nullptr;
   std::string source = std::string(GLSL_PRELUDE) + GLSL_FLUID_HELPERS + "void main()\n{\n";
   source += FLUID_PROLOGUE;
   source += prologue;
   source += fluid_neighbor_loops(
       fluid_body, with_boundary ? boundary_body : "", with_boundary, coupled_body);
   source += epilogue;
+  if (coupled_epilogue != nullptr) {
+    source += coupled_epilogue;
+  }
   source += "}\n";
   return source;
 }
@@ -960,9 +963,19 @@ const char *KERNEL_UPDATE_VELOCITY =
     "  if (i >= int(params[0])) { return; }\n"
     "  int base = i * 3;\n"
     "  float inv_dt = params[13];\n"
-    "  velocity_out[base + 0] = (position_in[base + 0] - prev_position[base + 0]) * inv_dt;\n"
-    "  velocity_out[base + 1] = (position_in[base + 1] - prev_position[base + 1]) * inv_dt;\n"
-    "  velocity_out[base + 2] = (position_in[base + 2] - prev_position[base + 2]) * inv_dt;\n"
+    "  vec3 velocity = (vec3(position_in[base + 0], position_in[base + 1],\n"
+    "                        position_in[base + 2]) -\n"
+    "                   vec3(prev_position[base + 0], prev_position[base + 1],\n"
+    "                        prev_position[base + 2])) * inv_dt;\n"
+    "  vec3 push = vec3(coupled_push[base + 0], coupled_push[base + 1], coupled_push[base + 2]);\n"
+    "  float push_length = length(push);\n"
+    "  if (push_length > 1e-12) {\n"
+    "    vec3 normal = push / push_length;\n"
+    "    velocity -= dot(velocity, normal) * normal;\n"
+    "  }\n"
+    "  velocity_out[base + 0] = velocity.x;\n"
+    "  velocity_out[base + 1] = velocity.y;\n"
+    "  velocity_out[base + 2] = velocity.z;\n"
     "}\n";
 
 const char *KERNEL_DAMPING =
@@ -1040,7 +1053,9 @@ const char *DELTA_PROLOGUE =
     "    return;\n"
     "  }\n"
     "  float lambda_i = particle_state[i * HA_STATE + 0];\n"
-    "  vec3 correction = vec3(0.0);\n";
+    "  vec3 correction = vec3(0.0);\n"
+    "  vec3 coupled_correction = vec3(0.0);\n"
+    "  float clamp_scale = 1.0;\n";
 
 const char *DELTA_LOOP =
     "    if (j == i) { continue; }\n"
@@ -1079,7 +1094,9 @@ const char *DENSITY_COUPLED_LOOP =
 const char *DELTA_COUPLED_LOOP =
     "    if (r_sq_c >= 1e-12) {\n"
     "      float r_c = sqrt(r_sq_c);\n"
-    "      correction += lambda_i * mass_c * (-(ha_spiky_length(r_c) / r_c) * r_vec_c);\n"
+    "      vec3 coupled_term = lambda_i * mass_c * (-(ha_spiky_length(r_c) / r_c) * r_vec_c);\n"
+    "      correction += coupled_term;\n"
+    "      coupled_correction += coupled_term;\n"
     "    }\n";
 
 /**
@@ -1150,16 +1167,26 @@ const char *KERNEL_COUPLED_REACTION =
     "}\n";
 
 const char *DELTA_EPILOGUE =
-    "  correction *= 1.0 / props[i * HA_PROP + 2];\n"
+    "  float inv_rest_density = 1.0 / props[i * HA_PROP + 2];\n"
+    "  correction *= inv_rest_density;\n"
+    "  coupled_correction *= inv_rest_density;\n"
     "  float max_correction = params[11];\n"
     "  float correction_length = length(correction);\n"
     "  if (max_correction > 0.0 && correction_length > max_correction) {\n"
-    "    correction *= max_correction / correction_length;\n"
+    "    clamp_scale = max_correction / correction_length;\n"
+    "    correction *= clamp_scale;\n"
     "  }\n"
-    "  if (!ha_is_finite(correction)) { correction = vec3(0.0); }\n"
+    "  if (!ha_is_finite(correction)) { correction = vec3(0.0); coupled_correction = vec3(0.0); }\n"
     "  particle_state[i * HA_STATE + 4] = correction.x;\n"
     "  particle_state[i * HA_STATE + 5] = correction.y;\n"
     "  particle_state[i * HA_STATE + 6] = correction.z;\n";
+
+const char *DELTA_COUPLED_EPILOGUE =
+    "  coupled_correction *= clamp_scale;\n"
+    "  vec3 density_push = particle_state[i * HA_STATE + 3] > 0.0 ? correction : coupled_correction;\n"
+    "  coupled_push[base + 0] += density_push.x;\n"
+    "  coupled_push[base + 1] += density_push.y;\n"
+    "  coupled_push[base + 2] += density_push.z;\n";
 
 const char *VORTICITY_PROLOGUE =
     "  vec3 velocity_i = vec3(velocity_in[i * 3 + 0], velocity_in[i * 3 + 1],\n"
@@ -1460,11 +1487,12 @@ std::array<HaShaderResource, 4> APPLY_RESOURCES = {{
     {3, HaShaderQualifier::Read, "float", "params[]"},
 }};
 
-std::array<HaShaderResource, 4> UPDATE_VELOCITY_RESOURCES = {{
+std::array<HaShaderResource, 5> UPDATE_VELOCITY_RESOURCES = {{
     {0, HaShaderQualifier::Read, "float", "position_in[]"},
     {1, HaShaderQualifier::Read, "float", "prev_position[]"},
     {2, HaShaderQualifier::Write, "float", "velocity_out[]"},
     {3, HaShaderQualifier::Read, "float", "params[]"},
+    {4, HaShaderQualifier::Read, "float", "coupled_push[]"},
 }};
 
 /** Density pass with boundary particles. */
@@ -1619,7 +1647,9 @@ Vector<HaShaderResource> fluid_step_resources(const bool with_boundary, const bo
   resources.append(HaShaderResource{3, HaShaderQualifier::Read, "float", "props[]"});
   resources.append(HaShaderResource{4, HaShaderQualifier::ReadWrite, "float", "particle_state[]"});
   resources.append(HaShaderResource{5, HaShaderQualifier::Read, "float", "params[]"});
-  int slot = 6;
+  /* The density pass does not use it, but both passes share this layout. */
+  resources.append(HaShaderResource{6, HaShaderQualifier::ReadWrite, "float", "coupled_push[]"});
+  int slot = 7;
   if (with_boundary) {
     resources.append(HaShaderResource{slot++, HaShaderQualifier::Read, "float", "boundary_in[]"});
     resources.append(
@@ -1906,8 +1936,7 @@ const char *KERNEL_SDF_FRICTION =
     "  ha_sdf_value_normal(p, distance_to_surface, normal);\n"
     "  if (distance_to_surface >= contact_radius) { return; }\n"
     "  vec3 v = vec3(velocity_io[base + 0], velocity_io[base + 1], velocity_io[base + 2]);\n"
-    "  float normal_velocity = dot(v, normal);\n"
-    "  if (normal_velocity < 0.0) { v -= normal * normal_velocity; }\n"
+    "  v -= normal * dot(v, normal);\n"
     "  vec3 tangent = v - normal * dot(v, normal);\n"
     "  v -= tangent * clamp(sdf_params[8], 0.0, 1.0);\n"
     "  velocity_io[base + 0] = v.x;\n"
@@ -2120,6 +2149,7 @@ void HaXpbdFluid::free()
   boundary_grid_.free();
   props_.free();
   particle_state_.free();
+  coupled_push_.free();
   velocities_.free();
   velocities_tmp_.free();
   prev_positions_.free();
@@ -2334,11 +2364,12 @@ bool HaXpbdFluid::bind(const HaXpbdFluidInputs &inputs,
       !particle_state_.ensure(int64_t(particle_count) * HA_STATE_STRIDE) ||
       !velocities_.ensure(vec_floats) || !velocities_tmp_.ensure(vec_floats) ||
       !prev_positions_.ensure(vec_floats) || !external_force_.ensure(vec_floats) ||
-      !params_.ensure(FLUID_PARAM_COUNT_TOTAL))
+      !coupled_push_.ensure(vec_floats) || !params_.ensure(FLUID_PARAM_COUNT_TOTAL))
   {
     last_error_ = "buffer allocation failed";
     return false;
   }
+  coupled_push_.clear_to_zero();
 
   const int64_t prop_floats = int64_t(particle_count) * HA_PROP_STRIDE;
   Array<float> host_positions(vec_floats);
@@ -2733,6 +2764,9 @@ bool HaXpbdFluid::begin_substep(const ContactHook &contact_hook)
   }
   const int count = particle_count_;
 
+  /* The velocity update removes the normal component of this push, so it has to start from zero
+   * for every substep. */
+  coupled_push_.clear_to_zero();
   stats_ = {};
   if (!ha_xpbd_grid_build_device(grid_) || !ha_xpbd_neighbors_build(grid_)) {
     last_error_ = "grid or neighbour pass failed";
@@ -2812,7 +2846,8 @@ bool HaXpbdFluid::iterate()
                    DELTA_LOOP,
                    with_boundary ? DELTA_BOUNDARY_LOOP : nullptr,
                    DELTA_EPILOGUE,
-                   with_coupled ? DELTA_COUPLED_LOOP : nullptr),
+                   with_coupled ? DELTA_COUPLED_LOOP : nullptr,
+                   with_coupled ? DELTA_COUPLED_EPILOGUE : nullptr),
       step_span,
       LOCAL_GROUP_SIZE);
   gpu::Shader *apply = ha_shader_get_source("xpbd|apply",
@@ -2849,6 +2884,7 @@ bool HaXpbdFluid::iterate()
   step_buffers.append(props_.buf());
   step_buffers.append(particle_state_.buf());
   step_buffers.append(params_.buf());
+  step_buffers.append(coupled_push_.buf());
   if (with_boundary) {
     step_buffers.append(boundary_particles_.buf());
     step_buffers.append(boundary_offsets_.buf());
@@ -2985,8 +3021,11 @@ bool HaXpbdFluid::finish_substep()
   }
 
   {
-    std::array<gpu::StorageBuf *, 4> buffers{
-        grid_.positions.buf(), prev_positions_.buf(), velocity_current().buf(), params_.buf()};
+    std::array<gpu::StorageBuf *, 5> buffers{grid_.positions.buf(),
+                                             prev_positions_.buf(),
+                                             velocity_current().buf(),
+                                             params_.buf(),
+                                             coupled_push_.buf()};
     dispatch_pass(update_velocity, buffer_span(buffers), count);
     stats_.passes++;
   }

@@ -460,6 +460,12 @@ class HaXpbdFluid {
    * vorticity magnitude. One buffer instead of two keeps the density pass at nine storage buffers.
    */
   HaBuffer particle_state_;
+  /**
+   * Sum of the coupled density correction over the iterations of the current substep (xyz per
+   * particle). The velocity update removes the velocity component along it, so a depenetration
+   * does not become a bounce.
+   */
+  HaBuffer coupled_push_;
   HaBuffer velocities_;
   HaBuffer velocities_tmp_;
   HaBuffer prev_positions_;
