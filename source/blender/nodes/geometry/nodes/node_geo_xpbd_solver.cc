@@ -5361,6 +5361,15 @@ class XpbdSolverStep {
       if (!fluid.active || !fluid.has_coupled) {
         continue;
       }
+      /* A device fluid applies both reactions itself: the contact multipliers after every substep
+       * in #simulate__gpu_fluid_substep and the density reaction once per frame at the last substep.
+       * The CPU path below runs once per constraint iteration, so without this guard the same
+       * multipliers would be applied a second (and third, ...) time and the cloth would be launched
+       * out of the water (measured on `HWA_test`: a 0.6 m/frame cloth jump right when the water
+       * reaches it). */
+      if (fluid.gpu_active) {
+        continue;
+      }
       for (FluidChunkData::CoupledVertexScratch &scratch : fluid.coupled_scratch) {
         scratch.correction_sums.fill(float3(0.0f));
         scratch.weight_sums.fill(0.0f);
