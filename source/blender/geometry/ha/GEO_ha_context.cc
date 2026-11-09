@@ -734,6 +734,11 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
   key += cache_key;
   key += '#';
   key += std::to_string(std::hash<std::string>{}(std::string(source)));
+  /* The resource list is not part of the source string, so include its size: adding a binding
+   * without touching the kernel (e.g. the active list at slot 8) must not hit the in-memory shader
+   * entry created before it. */
+  key += "#r";
+  key += std::to_string(resources.size());
   if (gpu::Shader **found = shader_cache().lookup_ptr(key)) {
     return *found;
   }
@@ -4065,12 +4070,12 @@ gpu::Shader *ha_shader_get_accumulate_grouped(const StringRef key,
       LOCAL_GROUP_SIZE);
 }
 
-void ha_dispatch(gpu::Shader *shader, const int element_count)
+void ha_dispatch(gpu::Shader *shader, const int element_count, const int local_group_size)
 {
-  if (shader == nullptr || element_count <= 0) {
+  if (shader == nullptr || element_count <= 0 || local_group_size <= 0) {
     return;
   }
-  const uint groups = divide_ceil_u(uint(element_count), uint(LOCAL_GROUP_SIZE));
+  const uint groups = divide_ceil_u(uint(element_count), uint(local_group_size));
   if (int(groups) > GPU_max_work_group_count(0)) {
     /* Would need a 2D dispatch; not needed for the intended scale (4M elements). */
     return;
@@ -4085,6 +4090,25 @@ std::array<gpu::StorageBuf *, HA_MAX_BIND_SLOTS> g_bound_slots{};
 
 }  // namespace
 
+void ha_bind_storage_buffer_at(gpu::StorageBuf *buffer, const int slot)
+{
+  if (slot < 0 || slot >= HA_MAX_BIND_SLOTS) {
+    return;
+  }
+  if (g_bound_slots[slot] == buffer) {
+    return;
+  }
+  if (buffer == nullptr) {
+    /* Never hand a null buffer to the backend: it ends up in the shader's resource access info
+     * and crashes in the Vulkan render graph. Callers that can have missing buffers check for
+     * null themselves and skip the dispatch (see `HaIgnisSolver::pass_impl`). */
+    g_bound_slots[slot] = nullptr;
+    return;
+  }
+  GPU_storagebuf_bind(buffer, slot);
+  g_bound_slots[slot] = buffer;
+}
+
 void ha_bind_storage_buffers(const Span<gpu::StorageBuf *> buffers, const int first_slot)
 {
   for (const int i : buffers.index_range()) {
@@ -4092,11 +4116,7 @@ void ha_bind_storage_buffers(const Span<gpu::StorageBuf *> buffers, const int fi
     if (slot >= HA_MAX_BIND_SLOTS) {
       break;
     }
-    if (g_bound_slots[slot] == buffers[i]) {
-      continue;
-    }
-    GPU_storagebuf_bind(buffers[i], slot);
-    g_bound_slots[slot] = buffers[i];
+    ha_bind_storage_buffer_at(buffers[i], slot);
   }
 }
 

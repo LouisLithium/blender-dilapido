@@ -1465,6 +1465,15 @@ void project_velocity(State &state,
   if (count == 0) {
     return;
   }
+  if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
+    printf("IGNIS_DEBUG projection: box=%dx%dx%d domain=%lld unknown=%d\n",
+           dims.x(),
+           dims.y(),
+           dims.z(),
+           (long long)coords.size(),
+           count);
+    fflush(stdout);
+  }
   auto unknown_at = [&](const Coord &coord) {
     return in_box(coord) ? unknown_index[flat(coord)] : -1;
   };

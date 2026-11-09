@@ -18,6 +18,7 @@
 #include "GEO_ha_ignis.hh"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -31,6 +32,7 @@
 #include "BLI_span.hh"
 #include "BLI_vector.hh"
 
+#include "GPU_compute.hh"
 #include "GPU_shader.hh"
 #include "GPU_state.hh"
 #include "GPU_storage_buffer.hh"
@@ -127,15 +129,18 @@ enum IgnisParam : int {
   P_TURB_REMAP_MAX,
   P_TURB_REMAP_SOFTNESS,
   P_TURB_REMAP_SCALE,
-  /* Coarse grid used for the pressure initial guess (see `coarse_pressure_guess`). */
+  /* Reserved: the coarse pressure initial guess was removed in M146. Keeping the slots avoids
+   * renumbering `P_ACTIVE_MARGIN` / `HA_BRICK_BASE` for no benefit. */
   P_COARSE_DX,
   P_COARSE_DY,
   P_COARSE_DZ,
+  /* Brick layers the active list grows around the content each substep (see `build_active_list`). */
+  P_ACTIVE_MARGIN,
   P_COUNT,
 };
 
 /** `HA_BRICK_BASE` in `GLSL_PRELUDE` must match, the brick pool is appended after the params. */
-static_assert(P_COUNT == 83, "update HA_BRICK_BASE in GLSL_PRELUDE when adding a parameter");
+static_assert(P_COUNT == 84, "update HA_BRICK_BASE in GLSL_PRELUDE when adding a parameter");
 
 const char *GLSL_PRELUDE =
     "#define HA_SMOKE 1\n"
@@ -219,9 +224,10 @@ const char *GLSL_PRELUDE =
     "#define HA_COARSE_DX int(params[80])\n"
     "#define HA_COARSE_DY int(params[81])\n"
     "#define HA_COARSE_DZ int(params[82])\n"
+    "#define HA_ACTIVE_MARGIN int(params[83])\n"
     /* Brick pool (doc/ignis-brick-sparse.md). The layout is appended to the param buffer so every
      * kernel already has it bound; `HA_BRICK_BASE` must stay equal to `P_COUNT` on the C++ side. */
-    "#define HA_BRICK_BASE 83\n"
+    "#define HA_BRICK_BASE 84\n"
     "#define HA_BRICK_SPARSE int(params[HA_BRICK_BASE + 0])\n"
     "#define HA_BRICK_TILES int(params[HA_BRICK_BASE + 1])\n"
     "#define HA_BRICK_DX int(params[HA_BRICK_BASE + 2])\n"
@@ -231,7 +237,24 @@ const char *GLSL_PRELUDE =
     "#define HA_BRICK_COORDS (HA_BRICK_BASE + 8 + HA_BRICK_TILES)\n"
     "#define HA_BRICK_COUNT int(params[HA_BRICK_BASE + 6])\n"
     "#define HA_LIST_MODE int(params[HA_BRICK_BASE + 5])\n"
+    "#define HA_ACTIVE_MODE int(params[HA_BRICK_BASE + 7])\n"
     "#define HA_BRICK_NEIGHBORS (HA_BRICK_COORDS + 3 * HA_BRICK_COUNT)\n"
+    /* 8^3 leaves (M149). The brick constants must match `IGNIS_BRICK_EDGE` / `IGNIS_BRICK_CELLS`
+     * in the host code; the work group size is `HA_BRICK_CELLS`. */
+    "#define HA_BRICK_EDGE 8\n"
+    "#define HA_BRICK_SHIFT 3\n"
+    "#define HA_BRICK_MASK 7\n"
+    "#define HA_BRICK_CELLS 512\n"
+    /* Cell index of this invocation. In active-list mode each work group is one brick of the
+     * per-substep list (built by `build_active_list`), so the empty margin is never dispatched.
+     * `ha_cg_index` (in `GLSL_CG_LIST`) is the same idea for the pressure list. */
+    "int ha_active_index()\n"
+    "{\n"
+    "  if (HA_ACTIVE_MODE != 0) {\n"
+    "    return int(active_list[gl_WorkGroupID.x]) * HA_BRICK_CELLS + int(gl_LocalInvocationIndex);\n"
+    "  }\n"
+    "  return int(gl_GlobalInvocationID.x);\n"
+    "}\n"
     "int ha_flat(ivec3 c) { return c.x + HA_DX * (c.y + HA_DY * c.z); }\n"
     "void ha_cell(int i, out ivec3 c)\n"
     "{\n"
@@ -244,12 +267,12 @@ const char *GLSL_PRELUDE =
     "    c.z = i / dy;\n"
     "    return;\n"
     "  }\n"
-    "  int slot = i >> 6;\n"
-    "  int local = i & 63;\n"
+    "  int slot = i / HA_BRICK_CELLS;\n"
+    "  int local = i % HA_BRICK_CELLS;\n"
     "  int base = HA_BRICK_COORDS + slot * 3;\n"
-    "  c = ivec3(int(params[base + 0]) + (local & 3),\n"
-    "            int(params[base + 1]) + ((local >> 2) & 3),\n"
-    "            int(params[base + 2]) + ((local >> 4) & 3));\n"
+    "  c = ivec3(int(params[base + 0]) + (local & HA_BRICK_MASK),\n"
+    "            int(params[base + 1]) + ((local >> HA_BRICK_SHIFT) & HA_BRICK_MASK),\n"
+    "            int(params[base + 2]) + ((local >> (2 * HA_BRICK_SHIFT)) & HA_BRICK_MASK));\n"
     "}\n"
     "bool ha_inside(ivec3 c)\n"
     "{\n"
@@ -270,7 +293,7 @@ const char *GLSL_PRELUDE =
     "  if (HA_BRICK_SPARSE == 0) { return; }\n"
     "  ivec3 cc;\n"
     "  ha_cell(index, cc);\n"
-    "  ivec3 t = ivec3(cc.x >> 2, cc.y >> 2, cc.z >> 2);\n"
+    "  ivec3 t = ivec3(cc.x >> HA_BRICK_SHIFT, cc.y >> HA_BRICK_SHIFT, cc.z >> HA_BRICK_SHIFT);\n"
     "  int local = int(gl_LocalInvocationIndex);\n"
     "  if (local == 0) { ha_nb_center = t; }\n"
     "  if (local < 27) {\n"
@@ -289,7 +312,7 @@ const char *GLSL_PRELUDE =
     "{\n"
     "  if (!ha_inside(c)) { return -1; }\n"
     "  if (HA_BRICK_SPARSE == 0) { return ha_flat(c); }\n"
-    "  ivec3 t = ivec3(c.x >> 2, c.y >> 2, c.z >> 2);\n"
+    "  ivec3 t = ivec3(c.x >> HA_BRICK_SHIFT, c.y >> HA_BRICK_SHIFT, c.z >> HA_BRICK_SHIFT);\n"
     "  ivec3 d = t - ha_nb_center;\n"
     "  int slot;\n"
     "  if (d.x >= -1 && d.x <= 1 && d.y >= -1 && d.y <= 1 && d.z >= -1 && d.z <= 1) {\n"
@@ -299,16 +322,21 @@ const char *GLSL_PRELUDE =
     "    slot = int(params[HA_BRICK_SLOTS + t.x + HA_BRICK_DX * (t.y + HA_BRICK_DY * t.z)]);\n"
     "  }\n"
     "  if (slot < 0) { return -1; }\n"
-    "  int local = (c.x & 3) + 4 * ((c.y & 3) + 4 * (c.z & 3));\n"
-    "  return slot * 64 + local;\n"
+    "  int local = (c.x & HA_BRICK_MASK) +\n"
+    "              HA_BRICK_EDGE * ((c.y & HA_BRICK_MASK) + HA_BRICK_EDGE * (c.z & HA_BRICK_MASK));\n"
+    "  return slot * HA_BRICK_CELLS + local;\n"
     "}\n"
     "int ha_at_global(ivec3 c)\n"
     "{\n"
     "  if (!ha_inside(c)) { return -1; }\n"
     "  if (HA_BRICK_SPARSE == 0) { return ha_flat(c); }\n"
-    "  int slot = int(params[HA_BRICK_SLOTS + (c.x >> 2) + HA_BRICK_DX * ((c.y >> 2) + HA_BRICK_DY * (c.z >> 2))]);\n"
+    "  int slot = int(params[HA_BRICK_SLOTS + (c.x >> HA_BRICK_SHIFT) +\n"
+    "                        HA_BRICK_DX * ((c.y >> HA_BRICK_SHIFT) +\n"
+    "                                       HA_BRICK_DY * (c.z >> HA_BRICK_SHIFT))]);\n"
     "  if (slot < 0) { return -1; }\n"
-    "  return slot * 64 + ((c.x & 3) + 4 * ((c.y & 3) + 4 * (c.z & 3)));\n"
+    "  return slot * HA_BRICK_CELLS + ((c.x & HA_BRICK_MASK) +\n"
+    "                                   HA_BRICK_EDGE * ((c.y & HA_BRICK_MASK) +\n"
+    "                                                    HA_BRICK_EDGE * (c.z & HA_BRICK_MASK)));\n"
     "}\n"
     "vec3 ha_world(ivec3 c) { return (HA_ORIGIN + vec3(c)) * HA_VOXEL; }\n";
 
@@ -616,7 +644,7 @@ const char *GLSL_FORCE_HELPERS =
 const char *KERNEL_SOURCE_MERGE =
     "void main()\n"
     "{\n"
-    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  int i = ha_active_index();\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
     "  float source_density = source[i * 7 + 0];\n"
     "  if (source_density <= 0.0) { return; }\n"
@@ -644,7 +672,7 @@ const char *KERNEL_SOURCE_MERGE =
 const char *KERNEL_FORCES =
     "void main()\n"
     "{\n"
-    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  int i = ha_active_index();\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(i);\n"
     "  if (scalars[i * 4 + 0] <= 1e-4) { return; }\n"
@@ -690,7 +718,7 @@ const char *KERNEL_FORCES =
 const char *KERNEL_VORTICITY_CURL =
     "void main()\n"
     "{\n"
-    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  int i = ha_active_index();\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(i);\n"
     "  ivec3 c;\n"
@@ -726,7 +754,7 @@ const char *KERNEL_VORTICITY_APPLY =
     "float ha_curl_length(ivec3 c) { int i = ha_at(c); return i < 0 ? 0.0 : curl[i * 4 + 3]; }\n"
     "void main()\n"
     "{\n"
-    "  int i = int(gl_GlobalInvocationID.x);\n"
+    "  int i = ha_active_index();\n"
     "  if (i >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(i);\n"
     "  if ((mask[i] & HA_BAND) == 0) { return; }\n"
@@ -752,7 +780,7 @@ const char *KERNEL_VORTICITY_APPLY =
 const char *KERNEL_ADVECT_PASS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -772,7 +800,7 @@ const char *KERNEL_ADVECT_PASS =
 const char *KERNEL_ADVECT_CORRECT_VEC3 =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -789,7 +817,7 @@ const char *KERNEL_ADVECT_CORRECT_VEC3 =
 const char *KERNEL_ADVECT_CORRECT_SCALAR =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -806,7 +834,7 @@ const char *KERNEL_ADVECT_CORRECT_SCALAR =
 const char *KERNEL_ADVECT_LIMITER_VEC3 =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  if (HA_LIMITER == 0) { return; }\n"
@@ -846,7 +874,7 @@ const char *KERNEL_ADVECT_LIMITER_VEC3 =
 const char *KERNEL_ADVECT_LIMITER_SCALAR =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  if (HA_LIMITER == 0) { return; }\n"
@@ -886,7 +914,7 @@ const char *KERNEL_ADVECT_LIMITER_SCALAR =
 const char *KERNEL_COPY_VEC3 =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int base = index * 3;\n"
@@ -898,7 +926,7 @@ const char *KERNEL_COPY_VEC3 =
 const char *KERNEL_TMP_TO_SCALAR =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  field_out[index * 4 + HA_COMPONENT] = field_in[index];\n"
@@ -910,7 +938,7 @@ const char *KERNEL_TMP_TO_SCALAR =
 const char *KERNEL_PACK_SCALARS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int src = index * 4;\n"
@@ -923,7 +951,7 @@ const char *KERNEL_PACK_SCALARS =
 const char *KERNEL_UNPACK_SCALARS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int src = index * 3;\n"
@@ -936,7 +964,7 @@ const char *KERNEL_UNPACK_SCALARS =
 const char *KERNEL_MASK_INIT =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int m = solid[index];\n"
@@ -947,7 +975,7 @@ const char *KERNEL_MASK_INIT =
 const char *KERNEL_DILATE =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -973,7 +1001,7 @@ const char *KERNEL_UNKNOWN =
     "}\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -990,68 +1018,6 @@ const char *KERNEL_UNKNOWN =
     "  mask[index] = here ? (m | HA_UNKNOWN) : (m & ~HA_UNKNOWN);\n"
     "}\n";
 
-/* Two level initial guess for the pressure solve. `KERNEL_RESTRICT_COARSE` aggregates the fine
- * unknown mask and right hand side onto a grid of 2x2x2 blocks (a coarse cell is unknown when any
- * of its children is), `KERNEL_PROLONG_COARSE` injects the coarse solution back as the starting
- * pressure of the fine CG. Summing the eight fine equations gives a coarse operator of
- * `2^(d-1) * L`, while the coarse Laplacian is `2^2` times the fine one, hence the 1/2 factor so
- * that the prolongated pressure has the same magnitude as the fine solution. The coarse solve only
- * changes the starting point; the fine CG still runs to the requested tolerance. */
-const char *KERNEL_RESTRICT_COARSE =
-    "void main()\n"
-    "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_COARSE_DX * HA_COARSE_DY * HA_COARSE_DZ) { return; }\n"
-    "  int cdx = HA_COARSE_DX;\n"
-    "  int cdy = HA_COARSE_DY;\n"
-    "  int cz = index / (cdx * cdy);\n"
-    "  int rem = index - cz * cdx * cdy;\n"
-    "  ivec3 c = ivec3(rem % cdx, rem / cdx, cz);\n"
-    "  int m = 0;\n"
-    "  float sum = 0.0;\n"
-    "  for (int dz = 0; dz < 2; dz++) {\n"
-    "    for (int dy = 0; dy < 2; dy++) {\n"
-    "      for (int dx = 0; dx < 2; dx++) {\n"
-    "        ivec3 f = 2 * c + ivec3(dx, dy, dz);\n"
-    "        int i = ha_at_global(f);\n"
-    "        if (i < 0) { continue; }\n"
-    "        if ((mask_in[i] & HA_UNKNOWN) != 0) {\n"
-    "          m = HA_UNKNOWN;\n"
-    "          sum += rhs_in[i];\n"
-    "        }\n"
-    "      }\n"
-    "    }\n"
-    "  }\n"
-    "  mask_out[index] = m;\n"
-    "  rhs_out[index] = 0.5 * sum;\n"
-    "}\n";
-
-const char *KERNEL_ZERO_FIELD =
-    "void main()\n"
-    "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  ha_init_neighbors(index);\n"
-    "  field[index] = 0.0;\n"
-    "}\n";
-
-const char *KERNEL_PROLONG_COARSE =
-    "void main()\n"
-    "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
-    "  if (index >= HA_CELL_COUNT) { return; }\n"
-    "  ha_init_neighbors(index);\n"
-    "  ivec3 c;\n"
-    "  ha_cell(index, c);\n"
-    "  if (!ha_inside(c)) { return; }\n"
-    "  if ((mask[index] & HA_UNKNOWN) == 0) {\n"
-    "    pressure[index] = 0.0;\n"
-    "    return;\n"
-    "  }\n"
-    "  int ci = (c.x / 2) + HA_COARSE_DX * ((c.y / 2) + HA_COARSE_DY * (c.z / 2));\n"
-    "  pressure[index] = coarse_pressure[ci];\n"
-    "}\n";
-
 /* Per projection brick lists: `KERNEL_BRICK_FLAG` marks the bricks that contain a cell of the given
  * mask bit (UNKNOWN here), `KERNEL_BRICK_COMPACT` builds the list in slot order (deterministic) and
  * zeroes the reduction slots of the bricks that are not in it, so the `reduce_*` kernels can keep
@@ -1061,9 +1027,9 @@ const char *KERNEL_BRICK_FLAG =
     "{\n"
     "  int brick = int(gl_GlobalInvocationID.x);\n"
     "  if (brick >= HA_BRICK_COUNT) { return; }\n"
-    "  int base = brick * 64;\n"
+    "  int base = brick * HA_BRICK_CELLS;\n"
     "  int has = 0;\n"
-    "  for (int i = 0; i < 64; i++) {\n"
+    "  for (int i = 0; i < HA_BRICK_CELLS; i++) {\n"
     "    if ((mask[base + i] & HA_UNKNOWN) != 0) { has = 1; break; }\n"
     "  }\n"
     "  flag[brick] = has;\n"
@@ -1089,12 +1055,143 @@ const char *KERNEL_BRICK_COMPACT =
     "  count_out[0] = count;\n"
     "}\n";
 
+/* Per-substep active brick list (M144). Every pass that used to visit the whole pool now visits
+ * only the bricks that carry content plus `HA_ACTIVE_MARGIN` brick layers (enough for the pressure
+ * domain dilation, the velocity band and one CFL step). The empty frame margin stays in the pool as
+ * storage but is no longer dispatched. */
+const char *KERNEL_ACTIVE_FLAG =
+    "void main()\n"
+    "{\n"
+    "  int brick = int(gl_GlobalInvocationID.x);\n"
+    "  if (brick >= HA_BRICK_COUNT) { return; }\n"
+    "  int base = brick * HA_BRICK_CELLS;\n"
+    "  int has = 0;\n"
+    "  for (int i = 0; i < HA_BRICK_CELLS; i++) {\n"
+    "    int index = base + i;\n"
+    "    if (solid[index] != 0 || solid_current[index] != 0 || solid_carve[index] != 0) {\n"
+    "      has = 1;\n"
+    "      break;\n"
+    "    }\n"
+    "    if (scalars[index * 4 + 0] != 0.0 || scalars[index * 4 + 1] != 0.0 ||\n"
+    "        scalars[index * 4 + 2] != 0.0 || scalars[index * 4 + 3] != 0.0) {\n"
+    "      has = 1;\n"
+    "      break;\n"
+    "    }\n"
+    "    int vb = index * 3;\n"
+    "    if (velocity[vb + 0] != 0.0 || velocity[vb + 1] != 0.0 || velocity[vb + 2] != 0.0) {\n"
+    "      has = 1;\n"
+    "      break;\n"
+    "    }\n"
+    "    int sb = index * 7;\n"
+    "    if (source[sb + 0] != 0.0 || source[sb + 1] != 0.0 || source[sb + 2] != 0.0 ||\n"
+    "        source[sb + 3] != 0.0 || source[sb + 4] != 0.0 || source[sb + 5] != 0.0 ||\n"
+    "        source[sb + 6] != 0.0) {\n"
+    "      has = 1;\n"
+    "      break;\n"
+    "    }\n"
+    "  }\n"
+    "  flag[brick] = has;\n"
+    "}\n";
+
+const char *KERNEL_ACTIVE_EXPAND =
+    "void main()\n"
+    "{\n"
+    "  int brick = int(gl_GlobalInvocationID.x);\n"
+    "  if (brick >= HA_BRICK_COUNT) { return; }\n"
+    "  int base = HA_BRICK_COORDS + brick * 3;\n"
+    "  int tx = int(params[base + 0]) >> HA_BRICK_SHIFT;\n"
+    "  int ty = int(params[base + 1]) >> HA_BRICK_SHIFT;\n"
+    "  int tz = int(params[base + 2]) >> HA_BRICK_SHIFT;\n"
+    "  int has = 0;\n"
+    "  for (int dz = -1; dz <= 1 && has == 0; dz++) {\n"
+    "    for (int dy = -1; dy <= 1 && has == 0; dy++) {\n"
+    "      for (int dx = -1; dx <= 1 && has == 0; dx++) {\n"
+    "        int nx = tx + dx;\n"
+    "        int ny = ty + dy;\n"
+    "        int nz = tz + dz;\n"
+    "        if (nx < 0 || ny < 0 || nz < 0 || nx >= HA_BRICK_DX || ny >= HA_BRICK_DY ||\n"
+    "            nz >= HA_BRICK_DZ) {\n"
+    "          continue;\n"
+    "        }\n"
+    "        int slot = int(params[HA_BRICK_SLOTS + nx + HA_BRICK_DX * (ny + HA_BRICK_DY * nz)]);\n"
+    "        if (slot >= 0 && flag_in[slot] != 0) {\n"
+    "          has = 1;\n"
+    "          break;\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  flag_out[brick] = has;\n"
+    "}\n";
+
+const char *KERNEL_ACTIVE_CLEAR =
+    "void main()\n"
+    "{\n"
+    "  int brick = int(gl_GlobalInvocationID.x);\n"
+    "  if (brick >= HA_BRICK_COUNT) { return; }\n"
+    /* Only bricks that were active last substep (or the whole pool on the first one) can carry
+     * stale fields; bricks that were already empty stay zero. */
+    "  if (prev_flag[brick] == 0 || flag[brick] != 0) { return; }\n"
+    "  int base = brick * HA_BRICK_CELLS;\n"
+    "  for (int i = 0; i < HA_BRICK_CELLS; i++) {\n"
+    "    int index = base + i;\n"
+    "    mask_a[index] = 0;\n"
+    "    mask_b[index] = 0;\n"
+    "    scalars[index * 4 + 0] = 0.0;\n"
+    "    scalars[index * 4 + 1] = 0.0;\n"
+    "    scalars[index * 4 + 2] = 0.0;\n"
+    "    scalars[index * 4 + 3] = 0.0;\n"
+    "    velocity[index * 3 + 0] = 0.0;\n"
+    "    velocity[index * 3 + 1] = 0.0;\n"
+    "    velocity[index * 3 + 2] = 0.0;\n"
+    "    pressure[index] = 0.0;\n"
+    "  }\n"
+    "}\n";
+
+const char *KERNEL_ACTIVE_COMPACT =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  int count = 0;\n"
+    "  for (int brick = 0; brick < HA_BRICK_COUNT; brick++) {\n"
+    "    if (flag[brick] != 0) {\n"
+    "      list[count] = brick;\n"
+    "      count++;\n"
+    "    }\n"
+    "    else {\n"
+    "      partial[brick * 4 + 0] = 0.0;\n"
+    "      partial[brick * 4 + 1] = 0.0;\n"
+    "      partial[brick * 4 + 2] = 0.0;\n"
+    "      partial[brick * 4 + 3] = 0.0;\n"
+    "    }\n"
+    "  }\n"
+    "  count_out[0] = count;\n"
+    "  count_out[1] = 1;\n"
+    "  count_out[2] = 1;\n"
+    "}\n";
+
+const char *KERNEL_ACTIVE_COPY =
+    "void main()\n"
+    "{\n"
+    "  int brick = int(gl_GlobalInvocationID.x);\n"
+    "  if (brick >= HA_BRICK_COUNT) { return; }\n"
+    "  flag_out[brick] = flag_in[brick];\n"
+    "}\n";
+
+const char *KERNEL_SET_MODES =
+    "void main()\n"
+    "{\n"
+    "  if (int(gl_GlobalInvocationID.x) != 0) { return; }\n"
+    "  params[HA_BRICK_BASE + 5] = mode[0];\n"
+    "  params[HA_BRICK_BASE + 7] = mode[1];\n"
+    "}\n";
+
 /** Index of the cell this invocation handles: from the brick list when the CG runs list mode. */
 const char *GLSL_CG_LIST =
     "int ha_cg_index()\n"
     "{\n"
     "  if (HA_LIST_MODE != 0) {\n"
-    "    return int(brick_list[gl_WorkGroupID.x]) * 64 + int(gl_LocalInvocationIndex);\n"
+    "    return int(brick_list[gl_WorkGroupID.x]) * HA_BRICK_CELLS + int(gl_LocalInvocationIndex);\n"
     "  }\n"
     "  return int(gl_GlobalInvocationID.x);\n"
     "}\n";
@@ -1118,7 +1215,7 @@ const char *KERNEL_RHS =
     "}\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -1130,10 +1227,10 @@ const char *KERNEL_RHS =
     "  else {\n"
     "    rhs[index] = 0.0;\n"
     "  }\n"
-    "  if (index % 64 == 0) {\n"
+    "  if (index % HA_BRICK_CELLS == 0) {\n"
     "    float sum = 0.0;\n"
     "    float count = 0.0;\n"
-    "    int end = min(index + 64, HA_CELL_COUNT);\n"
+    "    int end = min(index + HA_BRICK_CELLS, HA_CELL_COUNT);\n"
     "    for (int j = index; j < end; j++) {\n"
     "      if ((mask[j] & HA_UNKNOWN) == 0) { continue; }\n"
     "      ivec3 cj;\n"
@@ -1142,8 +1239,8 @@ const char *KERNEL_RHS =
     "      sum += divergence * divergence;\n"
     "      count += 1.0;\n"
     "    }\n"
-    "    partial[(index / 64) * 4 + 0] = sum;\n"
-    "    partial[(index / 64) * 4 + 2] = count;\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 0] = sum;\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 2] = count;\n"
     "  }\n"
     "}\n";
 
@@ -1181,14 +1278,14 @@ const char *KERNEL_CG_INIT =
     "  float value = (mask[index] & HA_UNKNOWN) != 0 ? rhs[index] - product[index] : 0.0;\n"
     "  residual[index] = value;\n"
     "  direction[index] = value / 6.0;\n"
-    "  if (index % 64 == 0) {\n"
+    "  if (index % HA_BRICK_CELLS == 0) {\n"
     "    float sum = 0.0;\n"
-    "    int end = min(index + 64, HA_CELL_COUNT);\n"
+    "    int end = min(index + HA_BRICK_CELLS, HA_CELL_COUNT);\n"
     "    for (int j = index; j < end; j++) {\n"
     "      float r = (mask[j] & HA_UNKNOWN) != 0 ? rhs[j] - product[j] : 0.0;\n"
     "      sum += r * r;\n"
     "    }\n"
-    "    partial[(index / 64) * 4 + 1] = sum;\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 1] = sum;\n"
     "  }\n"
     "}\n";
 
@@ -1226,10 +1323,10 @@ const char *KERNEL_CG_DIRECTION =
 /* The Laplacian pass also reduces `direction * product` per 64 cell work group (a shared memory
  * tree, fixed order, so it stays deterministic). That replaces the separate pq pass with a few
  * shared memory adds and one global write per group. `gl_LocalInvocationIndex` and the shared array
- * are sized by the dispatch group size (#LOCAL_GROUP_SIZE = 64), and every invocation reaches the
+ * are sized by the dispatch group size (#HA_BRICK_CELLS = 512), and every invocation reaches the
  * barriers, including the ones past the last voxel. */
 const char *KERNEL_CG_LAPLACIAN =
-    "shared float ha_block_pq[64];\n"
+    "shared float ha_block_pq[HA_BRICK_CELLS];\n"
     "void main()\n"
     "{\n"
     "  int index = ha_cg_index();\n"
@@ -1243,7 +1340,6 @@ const char *KERNEL_CG_LAPLACIAN =
     "    else {\n"
     "      ivec3 c;\n"
     "      ha_cell(index, c);\n"
-    "  if (!ha_inside(c)) { return; }\n"
     "      float sum = -6.0 * direction[index];\n"
     "      int n;\n"
     "      n = ha_at(c + ivec3(1, 0, 0));\n"
@@ -1264,12 +1360,75 @@ const char *KERNEL_CG_LAPLACIAN =
     "  }\n"
     "  ha_block_pq[local] = pq;\n"
     "  barrier();\n"
-    "  for (int stride = 32; stride > 0; stride >>= 1) {\n"
+    "  for (int stride = HA_BRICK_CELLS / 2; stride > 0; stride >>= 1) {\n"
     "    if (local < stride) { ha_block_pq[local] += ha_block_pq[local + stride]; }\n"
     "    barrier();\n"
     "  }\n"
     "  if (local == 0) {\n"
-    "    partial[(index >> 6) * 4 + 0] = ha_block_pq[0];\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 0] = ha_block_pq[0];\n"
+    "  }\n"
+    "}\n";
+
+/* Fused `direction` + Laplacian. The old pair read/wrote `direction[]` over the whole grid twice:
+ * once to form the new direction and once to apply the 7 point stencil. Here a work group is one
+ * brick: it writes the new direction into shared memory (and the output buffer), then the stencil
+ * reads intra-brick neighbours from shared memory. Cross-brick neighbours are recomputed from the
+ * *previous* direction (ping-ponged buffers), so the result does not depend on work group order. */
+const char *KERNEL_CG_DIRECTION_LAPLACIAN =
+    "shared float ha_block_pq[HA_BRICK_CELLS];\n"
+    "shared float ha_dir[HA_BRICK_CELLS];\n"
+    "float ha_dir_at(ivec3 c, int brick)\n"
+    "{\n"
+    "  int n = ha_at(c);\n"
+    "  if (n < 0 || (mask[n] & HA_UNKNOWN) == 0) { return 0.0; }\n"
+    "  if ((n / HA_BRICK_CELLS) == brick) { return ha_dir[n % HA_BRICK_CELLS]; }\n"
+    "  return residual[n] / 6.0 + HA_BETA * direction_in[n];\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "  int index = ha_cg_index();\n"
+    "  int local = int(gl_LocalInvocationIndex);\n"
+    "  ha_init_neighbors(index);\n"
+    "  float dir = 0.0;\n"
+    "  if (index < HA_CELL_COUNT && (mask[index] & HA_UNKNOWN) != 0) {\n"
+    "    dir = residual[index] / 6.0 + HA_BETA * direction_in[index];\n"
+    "    direction_out[index] = dir;\n"
+    "  }\n"
+    "  ha_dir[local] = dir;\n"
+    "  barrier();\n"
+    "  float pq = 0.0;\n"
+    "  if (index < HA_CELL_COUNT) {\n"
+    "    if ((mask[index] & HA_UNKNOWN) == 0) {\n"
+    "      product[index] = 0.0;\n"
+    "    }\n"
+    "    else {\n"
+    "      ivec3 c;\n"
+    "      ha_cell(index, c);\n"
+    "      if (!ha_inside(c)) {\n"
+    "        product[index] = 0.0;\n"
+    "      }\n"
+    "      else {\n"
+    "        int brick = index / HA_BRICK_CELLS;\n"
+    "        float sum = -6.0 * dir;\n"
+    "        sum += ha_dir_at(c + ivec3(1, 0, 0), brick);\n"
+    "        sum += ha_dir_at(c + ivec3(-1, 0, 0), brick);\n"
+    "        sum += ha_dir_at(c + ivec3(0, 1, 0), brick);\n"
+    "        sum += ha_dir_at(c + ivec3(0, -1, 0), brick);\n"
+    "        sum += ha_dir_at(c + ivec3(0, 0, 1), brick);\n"
+    "        sum += ha_dir_at(c + ivec3(0, 0, -1), brick);\n"
+    "        product[index] = sum;\n"
+    "        pq = dir * sum;\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  ha_block_pq[local] = pq;\n"
+    "  barrier();\n"
+    "  for (int stride = HA_BRICK_CELLS / 2; stride > 0; stride >>= 1) {\n"
+    "    if (local < stride) { ha_block_pq[local] += ha_block_pq[local + stride]; }\n"
+    "    barrier();\n"
+    "  }\n"
+    "  if (local == 0) {\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 0] = ha_block_pq[0];\n"
     "  }\n"
     "}\n";
 
@@ -1285,7 +1444,7 @@ const char *KERNEL_REDUCE_PQ =
     "}\n";
 
 const char *KERNEL_CG_UPDATE =
-    "shared float ha_block_rr[64];\n"
+    "shared float ha_block_rr[HA_BRICK_CELLS];\n"
     "void main()\n"
     "{\n"
     "  int index = ha_cg_index();\n"
@@ -1299,12 +1458,12 @@ const char *KERNEL_CG_UPDATE =
     "  }\n"
     "  ha_block_rr[local] = rr;\n"
     "  barrier();\n"
-    "  for (int stride = 32; stride > 0; stride >>= 1) {\n"
+    "  for (int stride = HA_BRICK_CELLS / 2; stride > 0; stride >>= 1) {\n"
     "    if (local < stride) { ha_block_rr[local] += ha_block_rr[local + stride]; }\n"
     "    barrier();\n"
     "  }\n"
     "  if (local == 0) {\n"
-    "    partial[(index >> 6) * 4 + 1] = ha_block_rr[0];\n"
+    "    partial[(index / HA_BRICK_CELLS) * 4 + 1] = ha_block_rr[0];\n"
     "  }\n"
     "}\n";
 
@@ -1332,7 +1491,7 @@ const char *KERNEL_CG_GRADIENT =
     "}\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int m = mask[index];\n"
@@ -1362,12 +1521,12 @@ const char *KERNEL_DIVERGENCE_AFTER =
     "}\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
-    "  if (index % 64 != 0) { return; }\n"
+    "  if (index % HA_BRICK_CELLS != 0) { return; }\n"
     "  float sum = 0.0;\n"
-    "  int end = min(index + 64, HA_CELL_COUNT);\n"
+    "  int end = min(index + HA_BRICK_CELLS, HA_CELL_COUNT);\n"
     "  for (int j = index; j < end; j++) {\n"
     "    if ((mask[j] & HA_UNKNOWN) == 0) { continue; }\n"
     "    ivec3 cj;\n"
@@ -1378,7 +1537,7 @@ const char *KERNEL_DIVERGENCE_AFTER =
     "                        (ha_vel_after(cj + ivec3(0, 0, 1)).z - v.z)) / HA_VOXEL;\n"
     "    sum += divergence * divergence;\n"
     "  }\n"
-    "  partial[(index / 64) * 4 + 0] = sum;\n"
+    "  partial[(index / HA_BRICK_CELLS) * 4 + 0] = sum;\n"
     "}\n";
 
 const char *KERNEL_REDUCE_DIVERGENCE =
@@ -1419,7 +1578,7 @@ const char *KERNEL_CLAMP_SOLIDS =
     "}\n"
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -1454,7 +1613,7 @@ const char *KERNEL_CLAMP_SOLIDS =
 const char *KERNEL_COMBUST =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  float fuel = scalars[index * 4 + 2];\n"
@@ -1473,7 +1632,7 @@ const char *KERNEL_COMBUST =
 const char *KERNEL_CLIP_BOUNDS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  if (HA_USE_BOUNDS == 0) { return; }\n"
@@ -1493,7 +1652,7 @@ const char *KERNEL_CLIP_BOUNDS =
 const char *KERNEL_MASK_KEEP_INIT =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int m = solid[index];\n"
@@ -1504,7 +1663,7 @@ const char *KERNEL_MASK_KEEP_INIT =
 const char *KERNEL_EXTRAPOLATE_SETUP =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  int m = mask[index];\n"
@@ -1528,7 +1687,7 @@ const char *KERNEL_EXTRAPOLATE_SETUP =
 const char *KERNEL_EXTRAPOLATE_PASS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  ivec3 c;\n"
@@ -1574,7 +1733,7 @@ const char *KERNEL_EXTRAPOLATE_PASS =
 const char *KERNEL_CARVE_SOLIDS =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  if ((solid_carve[index] & HA_SOLID) == 0) { return; }\n"
@@ -1590,7 +1749,7 @@ const char *KERNEL_CARVE_SOLIDS =
 const char *KERNEL_FLAME_FILTER =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  scalars[index * 4 + 3] = max(0.0, scalars[index * 4 + 3] - HA_FLAME_THRESHOLD);\n"
@@ -1599,7 +1758,7 @@ const char *KERNEL_FLAME_FILTER =
 const char *KERNEL_DOMAIN_MASK =
     "void main()\n"
     "{\n"
-    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
     "  if (HA_USE_DOMAIN_MASK == 0) { return; }\n"
@@ -1633,7 +1792,7 @@ const char *KERNEL_DOMAIN_MASK =
  * origins), so the kernels need no extra storage buffer.
  * \{ */
 
-constexpr int IGNIS_BRICK_EDGE = 4;
+constexpr int IGNIS_BRICK_EDGE = 8;
 constexpr int IGNIS_BRICK_CELLS = IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE * IGNIS_BRICK_EDGE;
 
 struct IgnisBrickGrid {
@@ -1678,7 +1837,7 @@ static void ignis_bricks_selftest(const IgnisDeviceFrame &frame,
 /** \name Device solver
  * \{ */
 
-constexpr int GROUP_SIZE = 64;
+constexpr int GROUP_SIZE = 512;
 
 double time_now_ms()
 {
@@ -1722,12 +1881,17 @@ class HaIgnisSolver {
                  const float component,
                  const float correct_mode);
   bool pass(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int count);
+  /** Dispatch one work group per brick of the per-substep active list (indirect). */
+  bool pass_active(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers);
+  bool pass_impl(gpu::Shader *shader,
+                 Span<gpu::StorageBuf *> buffers,
+                 const int count,
+                 const bool active_list);
+  void set_modes(const int active, const int cg);
+  bool build_active_list(std::string &r_reason);
   void swap_masks();
 
   bool projection(const int64_t cells, std::string &r_reason);
-  /** Two level coarse grid initial guess for the fine pressure CG. */
-  bool coarse_pressure_guess(const int iterations, std::string &r_reason);
-  void upload_coarse_params(Span<const float> fine_params);
   bool advect_velocity(const int64_t cells, std::string &r_reason);
   bool advect_scalars(const int64_t cells, std::string &r_reason);
   bool extrapolate(const int64_t cells, std::string &r_reason);
@@ -1750,23 +1914,28 @@ class HaIgnisSolver {
   HaBuffer rhs_;
   HaBuffer residual_;
   HaBuffer direction_;
+  /** Ping-pong partner for the fused direction+Laplacian pass (M146). */
+  HaBuffer direction_next_;
   HaBuffer product_;
   HaBuffer curl_;
   HaBuffer source_;
   HaBuffer params_;
   HaBuffer adv_;
   HaBuffer partial_;
-  HaBuffer coarse_params_;
-  HaBuffer coarse_pressure_;
-  HaBuffer coarse_rhs_;
-  HaBuffer coarse_residual_;
-  HaBuffer coarse_direction_;
-  HaBuffer coarse_product_;
-  HaBuffer coarse_partial_;
-  HaBufferInt coarse_mask_;
   HaBufferInt brick_flags_;
   HaBufferInt brick_list_;
   HaBufferInt brick_list_count_;
+  /* Per-substep content list: every pass (except the CG, which has its own list) dispatches over
+   * these bricks. `active_list_count_` is a 3 int indirect dispatch argument. */
+  HaBufferInt active_list_;
+  HaBufferInt active_list_count_;
+  HaBufferInt active_flags_;
+  HaBufferInt active_flags_other_;
+  HaBufferInt prev_active_flags_;
+  HaBuffer modes_;
+  int active_margin_tiles_ = 3;
+  /** false = dispatch the whole pool (old behaviour, `BLENDER_IGNIS_NO_ACTIVE=1`). */
+  bool use_active_list_ = true;
   HaBufferInt mask_a_;
   HaBufferInt mask_b_;
   HaBufferInt solid_;
@@ -1790,13 +1959,11 @@ class HaIgnisSolver {
   Array<float> params_host_;
   /** Dispatch the fine CG over the bricks that contain an unknown cell instead of the whole pool. */
   bool cg_list_ = true;
-  int64_t coarse_cells_ = 0;
-  int64_t coarse_blocks_ = 0;
-  int coarse_iterations_ = 12;
+  /** Fuse the direction and Laplacian passes (M146); `BLENDER_IGNIS_CG_NO_FUSED=1` for A/B. */
+  bool cg_fuse_passes_ = true;
   /* How many fine CG iterations run between two convergence read backs (each read back waits for
    * the outstanding dispatches). */
   int cg_check_interval_ = 8;
-  int3 coarse_dims_ = int3(0);
   int64_t radius_ = 0;
   ignis::Settings settings_;
   IgnisDeviceResult *result_ = nullptr;
@@ -1821,17 +1988,21 @@ class HaIgnisSolver {
   gpu::Shader *mask_keep_init_ = nullptr;
   gpu::Shader *dilate_ = nullptr;
   gpu::Shader *unknown_ = nullptr;
-  gpu::Shader *coarse_restrict_ = nullptr;
-  gpu::Shader *coarse_prolong_ = nullptr;
-  gpu::Shader *zero_field_ = nullptr;
   gpu::Shader *rhs_shader_ = nullptr;
   gpu::Shader *cg_product_ = nullptr;
   gpu::Shader *brick_flag_ = nullptr;
   gpu::Shader *brick_compact_ = nullptr;
+  gpu::Shader *active_flag_ = nullptr;
+  gpu::Shader *active_expand_ = nullptr;
+  gpu::Shader *active_clear_ = nullptr;
+  gpu::Shader *active_compact_ = nullptr;
+  gpu::Shader *active_copy_ = nullptr;
+  gpu::Shader *set_modes_ = nullptr;
   gpu::Shader *cg_init_ = nullptr;
   gpu::Shader *reduce_init_ = nullptr;
   gpu::Shader *cg_direction_ = nullptr;
   gpu::Shader *cg_laplacian_ = nullptr;
+  gpu::Shader *cg_fused_ = nullptr;
   gpu::Shader *reduce_pq_ = nullptr;
   gpu::Shader *cg_update_ = nullptr;
   gpu::Shader *reduce_res_ = nullptr;
@@ -1852,7 +2023,16 @@ gpu::Shader *HaIgnisSolver::shader(const char *key,
                                    const std::string &source,
                                    const Span<const HaShaderResource> resources)
 {
-  return ha_shader_get_source(key, source, resources, GROUP_SIZE);
+  /* Every kernel binds the active list at slot 8 (see `pass_impl`), so declare it once here instead
+   * of touching all resource tables. Kernels that do not index through `ha_active_index()` simply
+   * leave the binding unused. */
+  Vector<HaShaderResource> all;
+  all.reserve(resources.size() + 1);
+  for (const HaShaderResource &resource : resources) {
+    all.append(resource);
+  }
+  all.append(res(8, HaShaderQualifier::Read, "int", "active_list[]"));
+  return ha_shader_get_source(key, source, Span<const HaShaderResource>(all.data(), all.size()), GROUP_SIZE);
 }
 
 void HaIgnisSolver::create_shaders()
@@ -2078,35 +2258,6 @@ void HaIgnisSolver::create_shaders()
                     common + GLSL_MASK_HELPERS + KERNEL_UNKNOWN,
                     Span<const HaShaderResource>(unknown_res, 2));
 
-  static const HaShaderResource coarse_restrict_res[] = {
-      HA_READ(0, "float", "params[]"),
-      HA_READ(1, "int", "mask_in[]"),
-      HA_READ(2, "float", "rhs_in[]"),
-      HA_WRITE(3, "int", "mask_out[]"),
-      HA_WRITE(4, "float", "rhs_out[]"),
-  };
-  coarse_restrict_ = shader("ignis|coarse_restrict",
-                            common + KERNEL_RESTRICT_COARSE,
-                            Span<const HaShaderResource>(coarse_restrict_res, 5));
-
-  static const HaShaderResource coarse_prolong_res[] = {
-      HA_READ(0, "float", "params[]"),
-      HA_READ(1, "int", "mask[]"),
-      HA_READ(2, "float", "coarse_pressure[]"),
-      HA_RW(3, "float", "pressure[]"),
-  };
-  coarse_prolong_ = shader("ignis|coarse_prolong",
-                           common + KERNEL_PROLONG_COARSE,
-                           Span<const HaShaderResource>(coarse_prolong_res, 4));
-
-  static const HaShaderResource zero_field_res[] = {
-      HA_READ(0, "float", "params[]"),
-      HA_RW(1, "float", "field[]"),
-  };
-  zero_field_ = shader("ignis|zero_field",
-                       common + KERNEL_ZERO_FIELD,
-                       Span<const HaShaderResource>(zero_field_res, 2));
-
   static const HaShaderResource rhs_res[] = {
       HA_READ(0, "float", "params[]"),
       HA_READ(1, "float", "velocity[]"),
@@ -2137,6 +2288,71 @@ void HaIgnisSolver::create_shaders()
   brick_compact_ = shader("ignis|brick_compact",
                           common + KERNEL_BRICK_COMPACT,
                           Span<const HaShaderResource>(brick_compact_res, 5));
+
+  static const HaShaderResource active_flag_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "solid[]"),
+      HA_READ(2, "int", "solid_current[]"),
+      HA_READ(3, "int", "solid_carve[]"),
+      HA_READ(4, "float", "scalars[]"),
+      HA_READ(5, "float", "velocity[]"),
+      HA_READ(6, "float", "source[]"),
+      HA_WRITE(7, "int", "flag[]"),
+  };
+  active_flag_ = shader("ignis|active_flag",
+                        common + KERNEL_ACTIVE_FLAG,
+                        Span<const HaShaderResource>(active_flag_res, 8));
+
+  static const HaShaderResource active_expand_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "flag_in[]"),
+      HA_WRITE(2, "int", "flag_out[]"),
+  };
+  active_expand_ = shader("ignis|active_expand",
+                          common + KERNEL_ACTIVE_EXPAND,
+                          Span<const HaShaderResource>(active_expand_res, 3));
+
+  static const HaShaderResource active_clear_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "flag[]"),
+      HA_READ(2, "int", "prev_flag[]"),
+      HA_RW(3, "int", "mask_a[]"),
+      HA_RW(4, "int", "mask_b[]"),
+      HA_RW(5, "float", "scalars[]"),
+      HA_RW(6, "float", "velocity[]"),
+      HA_RW(7, "float", "pressure[]"),
+  };
+  active_clear_ = shader("ignis|active_clear",
+                         common + KERNEL_ACTIVE_CLEAR,
+                         Span<const HaShaderResource>(active_clear_res, 8));
+
+  static const HaShaderResource active_compact_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "flag[]"),
+      HA_WRITE(2, "int", "list[]"),
+      HA_WRITE(3, "int", "count_out[]"),
+      HA_RW(4, "float", "partial[]"),
+  };
+  active_compact_ = shader("ignis|active_compact",
+                           common + KERNEL_ACTIVE_COMPACT,
+                           Span<const HaShaderResource>(active_compact_res, 5));
+
+  static const HaShaderResource active_copy_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "flag_in[]"),
+      HA_WRITE(2, "int", "flag_out[]"),
+  };
+  active_copy_ = shader("ignis|active_copy",
+                        common + KERNEL_ACTIVE_COPY,
+                        Span<const HaShaderResource>(active_copy_res, 3));
+
+  static const HaShaderResource set_modes_res[] = {
+      HA_RW(0, "float", "params[]"),
+      HA_READ(1, "float", "mode[]"),
+  };
+  set_modes_ = shader("ignis|set_modes",
+                      common + KERNEL_SET_MODES,
+                      Span<const HaShaderResource>(set_modes_res, 2));
 
   static const HaShaderResource cg_product_res[] = {
       HA_READ(0, "float", "params[]"),
@@ -2194,6 +2410,20 @@ void HaIgnisSolver::create_shaders()
   cg_laplacian_ = shader("ignis|cg_laplacian",
                          common + GLSL_MASK_HELPERS + GLSL_CG_LIST + KERNEL_CG_LAPLACIAN,
                          Span<const HaShaderResource>(cg_laplacian_res, 6));
+
+  static const HaShaderResource cg_fused_res[] = {
+      HA_READ(0, "float", "params[]"),
+      HA_READ(1, "int", "mask[]"),
+      HA_READ(2, "float", "residual[]"),
+      HA_READ(3, "float", "direction_in[]"),
+      HA_WRITE(4, "float", "direction_out[]"),
+      HA_WRITE(5, "float", "product[]"),
+      HA_RW(6, "float", "partial[]"),
+      HA_READ(7, "int", "brick_list[]"),
+  };
+  cg_fused_ = shader("ignis|cg_fused",
+                     common + GLSL_CG_LIST + KERNEL_CG_DIRECTION_LAPLACIAN,
+                     Span<const HaShaderResource>(cg_fused_res, 8));
 
   static const HaShaderResource reduce_pq_res[] = {
       HA_RW(0, "float", "params[]"),
@@ -2336,11 +2566,11 @@ bool HaIgnisSolver::shaders_valid() const
          tmp_to_scalar_ != nullptr && pack_scalars_ != nullptr && unpack_scalars_ != nullptr &&
          mask_init_ != nullptr && mask_keep_init_ != nullptr &&
          dilate_ != nullptr && unknown_ != nullptr && rhs_shader_ != nullptr &&
-          coarse_restrict_ != nullptr && coarse_prolong_ != nullptr &&
-          zero_field_ != nullptr &&
          cg_product_ != nullptr && cg_init_ != nullptr && reduce_init_ != nullptr &&
           brick_flag_ != nullptr && brick_compact_ != nullptr &&
-         cg_direction_ != nullptr && cg_laplacian_ != nullptr &&
+         active_flag_ != nullptr && active_expand_ != nullptr && active_clear_ != nullptr &&
+         active_compact_ != nullptr && active_copy_ != nullptr && set_modes_ != nullptr &&
+         cg_direction_ != nullptr && cg_laplacian_ != nullptr && cg_fused_ != nullptr &&
          reduce_pq_ != nullptr && cg_update_ != nullptr &&
          reduce_res_ != nullptr && cg_gradient_ != nullptr && divergence_after_ != nullptr &&
          reduce_divergence_ != nullptr && clamp_solids_ != nullptr && combust_ != nullptr &&
@@ -2362,23 +2592,22 @@ void HaIgnisSolver::release()
   rhs_.free();
   residual_.free();
   direction_.free();
+  direction_next_.free();
   product_.free();
   curl_.free();
   source_.free();
   params_.free();
   adv_.free();
   partial_.free();
-  coarse_params_.free();
-  coarse_pressure_.free();
-  coarse_rhs_.free();
-  coarse_residual_.free();
-  coarse_direction_.free();
-  coarse_product_.free();
-  coarse_partial_.free();
-  coarse_mask_.free();
   brick_flags_.free();
   brick_list_.free();
   brick_list_count_.free();
+  active_list_.free();
+  active_list_count_.free();
+  active_flags_.free();
+  active_flags_other_.free();
+  prev_active_flags_.free();
+  modes_.free();
   mask_a_.free();
   mask_b_.free();
   solid_.free();
@@ -2396,16 +2625,19 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
       !scalar_tmp_.ensure(cells) || !scalar_aux_.ensure(cells) ||
       !scalar_pack_.ensure(cells * 3) || !pressure_.ensure(cells) ||
       !rhs_.ensure(cells) || !residual_.ensure(cells) || !direction_.ensure(cells) ||
+      !direction_next_.ensure(cells) ||
       !product_.ensure(cells) || !curl_.ensure(cells * 4) || !source_.ensure(cells * 7) ||
       !params_.ensure(P_COUNT + brick_block_) || !adv_.ensure(8) || !partial_.ensure(blocks * 4) ||
-      !coarse_params_.ensure(P_COUNT + 8) || !coarse_pressure_.ensure(coarse_cells_) ||
-      !coarse_rhs_.ensure(coarse_cells_) || !coarse_residual_.ensure(coarse_cells_) ||
-      !coarse_direction_.ensure(coarse_cells_) || !coarse_product_.ensure(coarse_cells_) ||
-      !coarse_partial_.ensure(std::max<int64_t>(1, coarse_blocks_) * 4) ||
-      !coarse_mask_.ensure(coarse_cells_) ||
+      /* The coarse initial guess was removed, so its buffers are not allocated (M146). */
       !brick_flags_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
       !brick_list_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
       !brick_list_count_.ensure(1) ||
+      !active_list_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !active_list_count_.ensure(3) ||
+      !active_flags_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !active_flags_other_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !prev_active_flags_.ensure(std::max<int64_t>(1, pool_blocks_)) ||
+      !modes_.ensure(2) ||
       !mask_a_.ensure(cells) || !mask_b_.ensure(cells) || !solid_.ensure(cells) ||
       !solid_current_.ensure(cells) || !solid_carve_.ensure(cells) ||
       !collider_velocity_.ensure(3 * 256))
@@ -2413,6 +2645,10 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
     r_reason = "device allocation failed (out of GPU memory)";
     return false;
   }
+  /* The first substep of a frame must clear the whole inactive pool (the second mask buffer is not
+   * initialized by the upload); treat every brick as "previously active" once. */
+  Array<int> ones(int(std::max<int64_t>(1, pool_blocks_)), 1);
+  prev_active_flags_.upload(ones.as_span());
   return true;
 }
 
@@ -2614,35 +2850,7 @@ void HaIgnisSolver::fill_params(const IgnisDeviceFrame &frame,
   r_params[P_TURB_REMAP_MAX] = s.turbulence_remap_max;
   r_params[P_TURB_REMAP_SOFTNESS] = std::clamp(s.turbulence_remap_softness, 0.0f, 1.0f);
   r_params[P_TURB_REMAP_SCALE] = std::max(0.0f, s.turbulence_remap_scale);
-  r_params[P_COARSE_DX] = float(coarse_dims_.x);
-  r_params[P_COARSE_DY] = float(coarse_dims_.y);
-  r_params[P_COARSE_DZ] = float(coarse_dims_.z);
-}
-
-void HaIgnisSolver::upload_coarse_params(const Span<const float> fine_params)
-{
-  Array<float> params;
-  params.reinitialize(P_COUNT + 8);
-  params.fill(0.0f);
-  std::copy(fine_params.begin(), fine_params.begin() + P_COUNT, params.begin());
-  /* The coarse grid is a dense box of its own, so it keeps the dense cell addressing. */
-  params[P_COUNT + 0] = 0.0f;
-  params[P_CELLS] = float(coarse_cells_);
-  params[P_DX] = float(coarse_dims_.x);
-  params[P_DY] = float(coarse_dims_.y);
-  params[P_DZ] = float(coarse_dims_.z);
-  params[P_VOXEL] = fine_params[P_VOXEL] * 2.0f;
-  params[P_PARTIALS] = float(coarse_blocks_);
-  params[P_MAX_ITERATIONS] = float(std::max(0, coarse_iterations_));
-  params[P_ITERATION] = 0.0f;
-  params[P_CONVERGED] = 0.0f;
-  params[P_RHS_NORM] = 0.0f;
-  params[P_RES_NORM] = 0.0f;
-  params[P_RZ] = 0.0f;
-  params[P_PQ] = 0.0f;
-  params[P_ALPHA] = 0.0f;
-  params[P_BETA] = 0.0f;
-  coarse_params_.upload(params.as_span());
+  r_params[P_ACTIVE_MARGIN] = float(active_margin_tiles_);
 }
 
 void HaIgnisSolver::write_adv(const float dir,
@@ -2664,14 +2872,152 @@ void HaIgnisSolver::write_adv(const float dir,
 
 bool HaIgnisSolver::pass(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int count)
 {
+  return pass_impl(shader, buffers, count, false);
+}
+
+bool HaIgnisSolver::pass_active(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers)
+{
+  if (!use_active_list_) {
+    return pass_impl(shader, buffers, int(pool_cells_), false);
+  }
+  return pass_impl(shader, buffers, 0, true);
+}
+
+bool HaIgnisSolver::pass_impl(gpu::Shader *shader,
+                              Span<gpu::StorageBuf *> buffers,
+                              const int count,
+                              const bool active_list)
+{
   if (shader == nullptr) {
+    return false;
+  }
+  /* The Vulkan backend builds its resource access info from the shader's declared buffers and the
+   * bound slots. A null `StorageBuf*` there is dereferenced in the render graph (null access
+   * violation), so reject the pass before dispatching and let the caller fall back to the CPU. */
+  for (const gpu::StorageBuf *buffer : buffers) {
+    if (buffer == nullptr) {
+      return false;
+    }
+  }
+  /* A missing binding also dereferences a null storage buffer in the Vulkan render graph, so check
+   * the shader's declaration count too (this catches a pass that forgot a resource, which is how the
+   * coarse CG initialisation crashed). The active list is bound separately at slot 8, so allow one
+   * more declared buffer than the span. */
+  if (int(buffers.size()) + 1 < int(GPU_shader_get_ssbo_input_len(shader))) {
     return false;
   }
   GPU_shader_bind(shader);
   ha_bind_storage_buffers(buffers);
-  ha_dispatch(shader, count);
+  ha_bind_storage_buffer_at(active_list_.buf(), 8);
+  if (active_list) {
+    /* The group count is the per-substep list length written by `active_compact`. */
+    GPU_memory_barrier(GPU_BARRIER_COMMAND);
+    GPU_compute_dispatch_indirect(shader, active_list_count_.buf());
+  }
+  else {
+    ha_dispatch(shader, count, GROUP_SIZE);
+  }
   GPU_memory_barrier(GPU_BARRIER_SHADER_STORAGE);
   result_->passes++;
+  return true;
+}
+
+void HaIgnisSolver::set_modes(const int active, const int cg)
+{
+  /* Keep the host copy in sync: every full `params_` upload (projection sets the CG list mode) must
+   * carry the same modes the device has, otherwise the next upload would clear them. */
+  params_host_[P_COUNT + 5] = float(cg);
+  params_host_[P_COUNT + 7] = float(active);
+  Array<float> values;
+  values.reinitialize(2);
+  values[0] = float(cg);
+  values[1] = float(active);
+  modes_.upload(values.as_span());
+  std::array<gpu::StorageBuf *, 2> buffers = {params_.buf(), modes_.buf()};
+  pass(set_modes_, Span<gpu::StorageBuf *>(buffers.data(), 2), 1);
+}
+
+bool HaIgnisSolver::build_active_list(std::string &r_reason)
+{
+  if (!use_active_list_ || bricks_.brick_count <= 0) {
+    return true;
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(solid_.buf());
+    buffers.append(solid_current_.buf());
+    buffers.append(solid_carve_.buf());
+    buffers.append(scalars_.buf());
+    buffers.append(velocity_.buf());
+    buffers.append(source_.buf());
+    buffers.append(active_flags_.buf());
+    if (!pass(active_flag_, buffers, bricks_.brick_count)) {
+      r_reason = "active list flag pass failed";
+      return false;
+    }
+  }
+  HaBufferInt *flag_in = &active_flags_;
+  HaBufferInt *flag_out = &active_flags_other_;
+  for (int layer = 0; layer < active_margin_tiles_; layer++) {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(flag_in->buf());
+    buffers.append(flag_out->buf());
+    if (!pass(active_expand_, buffers, bricks_.brick_count)) {
+      r_reason = "active list expansion pass failed";
+      return false;
+    }
+    std::swap(flag_in, flag_out);
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(flag_in->buf());
+    buffers.append(prev_active_flags_.buf());
+    buffers.append(mask_->buf());
+    buffers.append(mask_other_->buf());
+    buffers.append(scalars_.buf());
+    buffers.append(velocity_.buf());
+    buffers.append(pressure_.buf());
+    if (!pass(active_clear_, buffers, bricks_.brick_count)) {
+      r_reason = "active list clear pass failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(flag_in->buf());
+    buffers.append(active_list_.buf());
+    buffers.append(active_list_count_.buf());
+    buffers.append(partial_.buf());
+    if (!pass(active_compact_, buffers, 1)) {
+      r_reason = "active list compaction failed";
+      return false;
+    }
+  }
+  {
+    Vector<gpu::StorageBuf *> buffers;
+    buffers.append(params_.buf());
+    buffers.append(flag_in->buf());
+    buffers.append(prev_active_flags_.buf());
+    if (!pass(active_copy_, buffers, bricks_.brick_count)) {
+      r_reason = "active list flag copy failed";
+      return false;
+    }
+  }
+  set_modes(1, 0);
+  if (const char *env = std::getenv("BLENDER_IGNIS_ACTIVE_DEBUG")) {
+    if (env[0] != '0') {
+      int count = 0;
+      active_list_count_.download(MutableSpan<int>(&count, 1));
+      debug_log("IGNIS_HA active list: %d/%d bricks (margin %d)\n",
+                count,
+                bricks_.brick_count,
+                active_margin_tiles_);
+    }
+  }
   return true;
 }
 
@@ -2698,147 +3044,11 @@ bool HaIgnisSolver::dilate_mask(const int radius, const int bit_index, std::stri
     buffers.append(params_.buf());
     buffers.append(mask_->buf());
     buffers.append(mask_other_->buf());
-    if (!pass(dilate_, buffers, int(pool_cells_))) {
+    if (!pass_active(dilate_, buffers)) {
       r_reason = "mask dilation pass failed";
       return false;
     }
     swap_masks();
-  }
-  return true;
-}
-
-bool HaIgnisSolver::coarse_pressure_guess(const int iterations, std::string &r_reason)
-{
-  if (coarse_cells_ <= 0 || iterations <= 0) {
-    return true;
-  }
-  const int coarse_count = int(coarse_cells_);
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(params_.buf());
-    buffers.append(mask_->buf());
-    buffers.append(rhs_.buf());
-    buffers.append(coarse_mask_.buf());
-    buffers.append(coarse_rhs_.buf());
-    if (!pass(coarse_restrict_, buffers, coarse_count)) {
-      r_reason = "coarse restriction failed";
-      return false;
-    }
-  }
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(coarse_params_.buf());
-    buffers.append(coarse_pressure_.buf());
-    if (!pass(zero_field_, buffers, coarse_count)) {
-      r_reason = "coarse pressure reset failed";
-      return false;
-    }
-  }
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(coarse_params_.buf());
-    buffers.append(coarse_product_.buf());
-    if (!pass(zero_field_, buffers, coarse_count)) {
-      r_reason = "coarse product reset failed";
-      return false;
-    }
-  }
-  /* Reuse the fine CG kernels on the coarse params/buffers. This is only a starting point, so the
-   * iteration count is fixed and nothing is read back. The coarse pressure starts at zero, so
-   * `cg_init` sees a zero product and builds the residual straight from the restricted rhs. */
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(coarse_params_.buf());
-    buffers.append(coarse_rhs_.buf());
-    buffers.append(coarse_product_.buf());
-    buffers.append(coarse_mask_.buf());
-    buffers.append(coarse_residual_.buf());
-    buffers.append(coarse_direction_.buf());
-    buffers.append(coarse_partial_.buf());
-    if (!pass(cg_init_, buffers, coarse_count)) {
-      r_reason = "coarse CG initialisation failed";
-      return false;
-    }
-  }
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(coarse_params_.buf());
-    buffers.append(coarse_partial_.buf());
-    if (!pass(reduce_init_, buffers, 1)) {
-      r_reason = "coarse CG initial reduction failed";
-      return false;
-    }
-  }
-  for (int iteration = 0; iteration < iterations; iteration++) {
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_mask_.buf());
-      buffers.append(coarse_residual_.buf());
-      buffers.append(coarse_direction_.buf());
-      buffers.append(brick_list_.buf());
-      if (!pass(cg_direction_, buffers, coarse_count)) {
-        r_reason = "coarse CG direction pass failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_mask_.buf());
-      buffers.append(coarse_direction_.buf());
-      buffers.append(coarse_product_.buf());
-      buffers.append(coarse_partial_.buf());
-      buffers.append(brick_list_.buf());
-      if (!pass(cg_laplacian_, buffers, coarse_count)) {
-        r_reason = "coarse CG Laplacian pass failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_partial_.buf());
-      if (!pass(reduce_pq_, buffers, 1)) {
-        r_reason = "coarse CG pq reduction failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_mask_.buf());
-      buffers.append(coarse_direction_.buf());
-      buffers.append(coarse_product_.buf());
-      buffers.append(coarse_pressure_.buf());
-      buffers.append(coarse_residual_.buf());
-      buffers.append(coarse_partial_.buf());
-      buffers.append(brick_list_.buf());
-      if (!pass(cg_update_, buffers, coarse_count)) {
-        r_reason = "coarse CG update pass failed";
-        return false;
-      }
-    }
-    {
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(coarse_params_.buf());
-      buffers.append(coarse_partial_.buf());
-      if (!pass(reduce_res_, buffers, 1)) {
-        r_reason = "coarse CG residual finalize failed";
-        return false;
-      }
-    }
-  }
-  {
-    Vector<gpu::StorageBuf *> buffers;
-    buffers.append(params_.buf());
-    buffers.append(mask_->buf());
-    buffers.append(coarse_pressure_.buf());
-    buffers.append(pressure_.buf());
-    if (!pass(coarse_prolong_, buffers, int(pool_cells_))) {
-      r_reason = "coarse prolongation failed";
-      return false;
-    }
   }
   return true;
 }
@@ -2854,7 +3064,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(scalars_.buf());
     buffers.append(solid_.buf());
     buffers.append(mask_other_->buf());
-    if (!pass(mask_init_, buffers, int(pool_cells_))) {
+    if (!pass_active(mask_init_, buffers)) {
       r_reason = "pressure domain pass failed";
       return false;
     }
@@ -2867,7 +3077,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
     buffers.append(mask_->buf());
-    if (!pass(unknown_, buffers, int(pool_cells_))) {
+    if (!pass_active(unknown_, buffers)) {
       r_reason = "pressure unknown pass failed";
       return false;
     }
@@ -2916,14 +3126,15 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(mask_->buf());
     buffers.append(rhs_.buf());
     buffers.append(partial_.buf());
-    if (!pass(rhs_shader_, buffers, count)) {
+    if (!pass_active(rhs_shader_, buffers)) {
       r_reason = "divergence pass failed";
       return false;
     }
   }
-  if (!coarse_pressure_guess(coarse_iterations_, r_reason)) {
-    return false;
-  }
+  /* The two level coarse initial guess was removed: with an unbounded domain its dense coarse grid
+   * is ~1/8 of the frame box (hundreds of thousands of cells) and costs ~17% of the projection,
+   * while it only bought a few percent of iteration count (M139). The fine CG now starts from the
+   * warm started pressure/zero pressure. */
   {
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
@@ -2972,31 +3183,53 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
   bool converged = values[P_CONVERGED] != 0.0f;
   int iterations = 0;
   const int max_iterations = std::max(1, int(values[P_MAX_ITERATIONS]));
+  HaBuffer *dir_in = &direction_;
+  HaBuffer *dir_out = cg_fuse_passes_ ? &direction_next_ : &direction_;
   while (!converged && iterations < max_iterations) {
-    {
+    if (cg_fuse_passes_) {
+      /* Direction + Laplacian in one dispatch: the new direction is written to `dir_out` and
+       * shared inside the work group; cross-brick neighbours use the *previous* `dir_in`, so no
+       * work group reads data another one is still writing. */
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(mask_->buf());
       buffers.append(residual_.buf());
-      buffers.append(direction_.buf());
-      buffers.append(brick_list_.buf());
-      if (!pass(cg_direction_, buffers, cg_count)) {
-        r_reason = "CG direction pass failed";
-        return false;
-      }
-    }
-    {
-      /* Laplacian + the pq block reduction (shared memory, one dispatch). */
-      Vector<gpu::StorageBuf *> buffers;
-      buffers.append(params_.buf());
-      buffers.append(mask_->buf());
-      buffers.append(direction_.buf());
+      buffers.append(dir_in->buf());
+      buffers.append(dir_out->buf());
       buffers.append(product_.buf());
       buffers.append(partial_.buf());
       buffers.append(brick_list_.buf());
-      if (!pass(cg_laplacian_, buffers, cg_count)) {
-        r_reason = "CG Laplacian pass failed";
+      if (!pass(cg_fused_, buffers, cg_count)) {
+        r_reason = "CG fused direction/Laplacian pass failed";
         return false;
+      }
+    }
+    else {
+      {
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(mask_->buf());
+        buffers.append(residual_.buf());
+        buffers.append(dir_in->buf());
+        buffers.append(brick_list_.buf());
+        if (!pass(cg_direction_, buffers, cg_count)) {
+          r_reason = "CG direction pass failed";
+          return false;
+        }
+      }
+      {
+        /* Laplacian + the pq block reduction (shared memory, one dispatch). */
+        Vector<gpu::StorageBuf *> buffers;
+        buffers.append(params_.buf());
+        buffers.append(mask_->buf());
+        buffers.append(dir_in->buf());
+        buffers.append(product_.buf());
+        buffers.append(partial_.buf());
+        buffers.append(brick_list_.buf());
+        if (!pass(cg_laplacian_, buffers, cg_count)) {
+          r_reason = "CG Laplacian pass failed";
+          return false;
+        }
       }
     }
     {
@@ -3013,7 +3246,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(mask_->buf());
-      buffers.append(direction_.buf());
+      buffers.append(dir_out->buf());
       buffers.append(product_.buf());
       buffers.append(pressure_.buf());
       buffers.append(residual_.buf());
@@ -3033,6 +3266,9 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
         return false;
       }
     }
+    if (cg_fuse_passes_) {
+      std::swap(dir_in, dir_out);
+    }
     iterations++;
     /* Checking the convergence every few iterations keeps the number of GPU reads low: each read
      * waits for the outstanding dispatches. */
@@ -3042,6 +3278,10 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     }
   }
 
+  /* The CG is over: switch back from its unknown-brick list to the active list for the remaining
+   * passes of this substep. */
+  set_modes(use_active_list_ ? 1 : 0, 0);
+
   /* u -= grad p on the whole band, then measure the remaining divergence. */
   {
     Vector<gpu::StorageBuf *> buffers;
@@ -3049,7 +3289,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(mask_->buf());
     buffers.append(pressure_.buf());
     buffers.append(velocity_.buf());
-    if (!pass(cg_gradient_, buffers, count)) {
+    if (!pass_active(cg_gradient_, buffers)) {
       r_reason = "CG gradient pass failed";
       return false;
     }
@@ -3060,7 +3300,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
     buffers.append(mask_->buf());
     buffers.append(velocity_.buf());
     buffers.append(partial_.buf());
-    if (!pass(divergence_after_, buffers, count)) {
+    if (!pass_active(divergence_after_, buffers)) {
       r_reason = "divergence after pass failed";
       return false;
     }
@@ -3079,7 +3319,7 @@ bool HaIgnisSolver::projection(const int64_t cells, std::string &r_reason)
 
 bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
 {
-  const int count = int(cells);
+  (void)cells;
   const ignis::AdvectionScheme scheme = settings_.advection_scheme;
   const int limiter = int(settings_.advection_limiter);
 
@@ -3091,7 +3331,7 @@ bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
         buffers.append(field_in.buf());
         buffers.append(field_out.buf());
         buffers.append(velocity.buf());
-        return pass(shader, buffers, count);
+        return pass_active(shader, buffers);
       };
 
   if (scheme == ignis::AdvectionScheme::SemiLagrangian ||
@@ -3123,12 +3363,12 @@ bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
       buffers.append(velocity_tmp_.buf());
       buffers.append(velocity_aux_.buf());
       write_adv(0, 1, 0, 0, 0);
-      if (!pass(correct_vec3_, buffers, count)) {
+      if (!pass_active(correct_vec3_, buffers)) {
         r_reason = "velocity advection (correction) failed";
         return false;
       }
       write_adv(-1, 1, float(limiter), 0, 0);
-      if (!pass(limiter_vec3_, buffers, count)) {
+      if (!pass_active(limiter_vec3_, buffers)) {
         r_reason = "velocity advection (limiter) failed";
         return false;
       }
@@ -3144,7 +3384,7 @@ bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
     buffers.append(params_.buf());
     buffers.append(velocity_tmp_.buf());
     buffers.append(velocity_.buf());
-    if (!pass(copy_vec3_, buffers, count)) {
+    if (!pass_active(copy_vec3_, buffers)) {
       r_reason = "velocity advection copy failed";
       return false;
     }
@@ -3154,7 +3394,7 @@ bool HaIgnisSolver::advect_velocity(const int64_t cells, std::string &r_reason)
 
 bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
 {
-  const int count = int(cells);
+  (void)cells;
   const ignis::AdvectionScheme scheme = settings_.advection_scheme;
   const int limiter = int(settings_.advection_limiter);
   if (scheme == ignis::AdvectionScheme::Bfecc) {
@@ -3170,7 +3410,7 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
     buffers.append(params_.buf());
     buffers.append(scalars_.buf());
     buffers.append(scalar_pack_.buf());
-    if (!pass(pack_scalars_, buffers, count)) {
+    if (!pass_active(pack_scalars_, buffers)) {
       r_reason = "scalar pack failed";
       return false;
     }
@@ -3183,7 +3423,7 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
     buffers.append(field_in.buf());
     buffers.append(field_out.buf());
     buffers.append(velocity_.buf());
-    return pass(advect_vec3_, buffers, count);
+    return pass_active(advect_vec3_, buffers);
   };
 
   write_adv(-1, scheme == ignis::AdvectionScheme::Midpoint ? 2 : 1, 0, 0, 0);
@@ -3206,7 +3446,7 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
       buffers.append(scalar_pack_.buf());
       buffers.append(velocity_tmp_.buf());
       buffers.append(velocity_aux_.buf());
-      if (!pass(correct_vec3_, buffers, count)) {
+      if (!pass_active(correct_vec3_, buffers)) {
         r_reason = "scalar advection (correction) failed";
         return false;
       }
@@ -3219,7 +3459,7 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
       buffers.append(scalar_pack_.buf());
       buffers.append(velocity_tmp_.buf());
       buffers.append(velocity_.buf());
-      if (!pass(limiter_vec3_, buffers, count)) {
+      if (!pass_active(limiter_vec3_, buffers)) {
         r_reason = "scalar advection (limiter) failed";
         return false;
       }
@@ -3231,7 +3471,7 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
     buffers.append(params_.buf());
     buffers.append(velocity_tmp_.buf());
     buffers.append(scalars_.buf());
-    if (!pass(unpack_scalars_, buffers, count)) {
+    if (!pass_active(unpack_scalars_, buffers)) {
       r_reason = "scalar unpack failed";
       return false;
     }
@@ -3241,14 +3481,14 @@ bool HaIgnisSolver::advect_scalars(const int64_t cells, std::string &r_reason)
 
 bool HaIgnisSolver::extrapolate(const int64_t cells, std::string &r_reason)
 {
-  const int count = int(cells);
+  (void)cells;
   {
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
     buffers.append(scalars_.buf());
     buffers.append(solid_.buf());
     buffers.append(mask_other_->buf());
-    if (!pass(mask_keep_init_, buffers, count)) {
+    if (!pass_active(mask_keep_init_, buffers)) {
       r_reason = "velocity band init failed";
       return false;
     }
@@ -3262,7 +3502,7 @@ bool HaIgnisSolver::extrapolate(const int64_t cells, std::string &r_reason)
     buffers.append(params_.buf());
     buffers.append(mask_->buf());
     buffers.append(velocity_.buf());
-    if (!pass(extrapolate_setup_, buffers, count)) {
+    if (!pass_active(extrapolate_setup_, buffers)) {
       r_reason = "velocity band setup failed";
       return false;
     }
@@ -3273,7 +3513,7 @@ bool HaIgnisSolver::extrapolate(const int64_t cells, std::string &r_reason)
     buffers.append(mask_->buf());
     buffers.append(mask_other_->buf());
     buffers.append(velocity_.buf());
-    if (!pass(extrapolate_pass_, buffers, count)) {
+    if (!pass_active(extrapolate_pass_, buffers)) {
       r_reason = "velocity extrapolation failed";
       return false;
     }
@@ -3288,6 +3528,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   r_result = IgnisDeviceResult{};
   result_ = &r_result;
   settings_ = frame.settings;
+  use_active_list_ = std::getenv("BLENDER_IGNIS_NO_ACTIVE") == nullptr;
 
   const int64_t cells = int64_t(frame.dims.x) * int64_t(frame.dims.y) * int64_t(frame.dims.z);
   if (cells <= 0) {
@@ -3296,6 +3537,13 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   }
   cells_ = cells;
   radius_ = frame.solver_radius;
+  /* One substep has to cover the pressure-domain dilation, the velocity band and a CFL step. The
+   * active list grows by that many bricks around the content; the rest of the frame margin stays in
+   * the pool as storage but is not dispatched (M144). */
+  const int active_radius_voxels = std::max(
+      {int(radius_), int(std::ceil(settings_.cfl)), settings_.extrapolate, 4});
+  active_margin_tiles_ = std::max(
+      1, (active_radius_voxels + IGNIS_BRICK_EDGE - 1) / IGNIS_BRICK_EDGE);
   /* Brick pool (doc/ignis-brick-sparse.md): the content plus the same voxel margin the dense box
    * gives the solver, grown in brick units. The content bricks are measured to be ~10-16% of the
    * box, so the pool is a few times smaller than the dense box. */
@@ -3326,23 +3574,6 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
               cells_ > 0 ? double(pool_cells_) / double(cells_) : 0.0,
               margin);
   }
-  coarse_dims_ = int3((frame.dims.x + 1) / 2, (frame.dims.y + 1) / 2, (frame.dims.z + 1) / 2);
-  coarse_cells_ = int64_t(coarse_dims_.x) * int64_t(coarse_dims_.y) * int64_t(coarse_dims_.z);
-  coarse_blocks_ = (coarse_cells_ + GROUP_SIZE - 1) / GROUP_SIZE;
-  coarse_iterations_ = int(std::clamp<int64_t>(cells / 16384, 6, 12));
-  if (cells < 32768) {
-    /* Below a few ten thousand voxels the CG converges in a handful of iterations, so the extra
-     * dispatches of the coarse solve cost more than they save. */
-    coarse_iterations_ = 0;
-  }
-  if (const char *env = std::getenv("BLENDER_IGNIS_COARSE")) {
-    if (env[0] == '0') {
-      coarse_iterations_ = 0;
-    }
-  }
-  if (const char *env = std::getenv("BLENDER_IGNIS_COARSE_ITERS")) {
-    coarse_iterations_ = std::clamp(std::atoi(env), 0, 64);
-  }
   if (const char *env = std::getenv("BLENDER_IGNIS_CG_CHECK")) {
     cg_check_interval_ = std::clamp(std::atoi(env), 1, 64);
   }
@@ -3352,6 +3583,10 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
       cg_list_ = false;
     }
   }
+  /* Measured on `HWA_test`: fusing direction+Laplacian removes ~12% of the dispatches but the
+   * cross-brick direction recompute makes it neutral/slightly slower. Keep it opt-in for future
+   * experiments. */
+  cg_fuse_passes_ = std::getenv("BLENDER_IGNIS_CG_FUSED") != nullptr;
 
   if (frame.settings.advection_scheme == ignis::AdvectionScheme::Bfecc) {
     r_result.reason = "BFECC advection is not implemented on the device";
@@ -3426,13 +3661,16 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     /* First or paused frame: CPU behaviour is "only show the sources, do not integrate". */
     fill_params(frame, 0.0f, params_host_);
     params_.upload(params_host_.as_span());
+    if (!build_active_list(r_result.reason)) {
+      return false;
+    }
     if (has_source) {
       Vector<gpu::StorageBuf *> buffers;
       buffers.append(params_.buf());
       buffers.append(scalars_.buf());
       buffers.append(velocity_.buf());
       buffers.append(source_.buf());
-      if (!pass(source_merge_, buffers, int(pool_cells_))) {
+      if (!pass_active(source_merge_, buffers)) {
         r_result.reason = "source merge failed";
         return false;
       }
@@ -3443,7 +3681,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
       buffers.append(solid_carve_.buf());
       buffers.append(scalars_.buf());
       buffers.append(velocity_.buf());
-      if (!pass(carve_solids_, buffers, int(pool_cells_))) {
+      if (!pass_active(carve_solids_, buffers)) {
         r_result.reason = "solid carve failed";
         return false;
       }
@@ -3451,18 +3689,24 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
   }
   else {
     const float step_dt = frame.delta_time / float(substeps);
+    double t_build = 0.0, t_pre = 0.0, t_proj = 0.0, t_scal = 0.0, t_extr = 0.0, t_tail = 0.0;
     for (int substep = 0; substep < substeps; substep++) {
       fill_params(frame, step_dt, params_host_);
       params_.upload(params_host_.as_span());
-      upload_coarse_params(Span<const float>(params_host_.data(), params_host_.size()));
+      double stage_start = time_now_ms();
+      if (!build_active_list(r_result.reason)) {
+        return false;
+      }
+      t_build += time_now_ms() - stage_start;
 
+      stage_start = time_now_ms();
       if (has_source) {
         Vector<gpu::StorageBuf *> buffers;
         buffers.append(params_.buf());
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
         buffers.append(source_.buf());
-        if (!pass(source_merge_, buffers, int(pool_cells_))) {
+        if (!pass_active(source_merge_, buffers)) {
           r_result.reason = "source merge failed";
           return false;
         }
@@ -3473,7 +3717,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
         buffers.append(pressure_.buf());
-        if (!pass(forces_, buffers, int(pool_cells_))) {
+        if (!pass_active(forces_, buffers)) {
           r_result.reason = "force pass failed";
           return false;
         }
@@ -3485,7 +3729,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(velocity_.buf());
         buffers.append(mask_->buf());
         buffers.append(curl_.buf());
-        if (!pass(vorticity_curl_, buffers, int(pool_cells_))) {
+        if (!pass_active(vorticity_curl_, buffers)) {
           r_result.reason = "vorticity curl pass failed";
           return false;
         }
@@ -3494,7 +3738,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers_apply.append(velocity_.buf());
         buffers_apply.append(mask_->buf());
         buffers_apply.append(curl_.buf());
-        if (!pass(vorticity_apply_, buffers_apply, int(pool_cells_))) {
+        if (!pass_active(vorticity_apply_, buffers_apply)) {
           r_result.reason = "vorticity apply pass failed";
           return false;
         }
@@ -3510,21 +3754,25 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         buffers.append(solid_current_.buf());
         buffers.append(collider_velocity_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(clamp_solids_, buffers, int(pool_cells_))) {
+        if (!pass_active(clamp_solids_, buffers)) {
           r_result.reason = "solid clamp pass failed";
           return false;
         }
       }
+      t_pre += time_now_ms() - stage_start;
+      stage_start = time_now_ms();
       if (!projection(pool_cells_, r_result.reason)) {
         return false;
       }
+      t_proj += time_now_ms() - stage_start;
+      stage_start = time_now_ms();
       {
         Vector<gpu::StorageBuf *> buffers;
         buffers.append(params_.buf());
         buffers.append(solid_current_.buf());
         buffers.append(collider_velocity_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(clamp_solids_, buffers, int(pool_cells_))) {
+        if (!pass_active(clamp_solids_, buffers)) {
           r_result.reason = "solid clamp pass failed";
           return false;
         }
@@ -3536,29 +3784,43 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
         Vector<gpu::StorageBuf *> buffers;
         buffers.append(params_.buf());
         buffers.append(scalars_.buf());
-        if (!pass(combust_, buffers, int(pool_cells_))) {
+        if (!pass_active(combust_, buffers)) {
           r_result.reason = "combustion pass failed";
           return false;
         }
-        if (!pass(clip_bounds_, buffers, int(pool_cells_))) {
+        if (!pass_active(clip_bounds_, buffers)) {
           r_result.reason = "bounds pass failed";
           return false;
         }
       }
+      t_scal += time_now_ms() - stage_start;
+      stage_start = time_now_ms();
       if (!extrapolate(pool_cells_, r_result.reason)) {
         return false;
       }
+      t_extr += time_now_ms() - stage_start;
+      stage_start = time_now_ms();
       {
         Vector<gpu::StorageBuf *> buffers;
         buffers.append(params_.buf());
         buffers.append(solid_carve_.buf());
         buffers.append(scalars_.buf());
         buffers.append(velocity_.buf());
-        if (!pass(carve_solids_, buffers, int(pool_cells_))) {
+        if (!pass_active(carve_solids_, buffers)) {
           r_result.reason = "solid carve failed";
           return false;
         }
       }
+      t_tail += time_now_ms() - stage_start;
+    }
+    if (debug_enabled()) {
+      debug_log("IGNIS_HA stages: build=%.1f pre=%.1f proj=%.1f scal=%.1f extr=%.1f tail=%.1f\n",
+                t_build,
+                t_pre,
+                t_proj,
+                t_scal,
+                t_extr,
+                t_tail);
     }
   }
 
@@ -3566,7 +3828,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     Vector<gpu::StorageBuf *> buffers;
     buffers.append(params_.buf());
     buffers.append(scalars_.buf());
-    if (!pass(flame_filter_, buffers, int(pool_cells_))) {
+    if (!pass_active(flame_filter_, buffers)) {
       r_result.reason = "flame filter failed";
       return false;
     }
@@ -3578,7 +3840,7 @@ bool HaIgnisSolver::solve(IgnisDeviceFrame &frame, IgnisDeviceResult &r_result)
     buffers.append(velocity_.buf());
     buffers.append(pressure_.buf());
     buffers.append(mask_->buf());
-    if (!pass(domain_mask_, buffers, int(pool_cells_))) {
+    if (!pass_active(domain_mask_, buffers)) {
       r_result.reason = "domain mask failed";
       return false;
     }

@@ -402,8 +402,8 @@ gpu::Shader *ha_shader_get_accumulate_grouped(StringRef key,
                                               int mode,
                                               Span<const HaShaderResource> extra_resources = {});
 
-/** Dispatches `ceil(element_count / 64)` work groups. */
-void ha_dispatch(gpu::Shader *shader, int element_count);
+/** Dispatches `ceil(element_count / local_group_size)` work groups. */
+void ha_dispatch(gpu::Shader *shader, int element_count, int local_group_size = 64);
 
 /** Highest storage buffer slot the device layer uses. */
 constexpr int HA_MAX_BIND_SLOTS = 16;
@@ -419,6 +419,9 @@ constexpr int HA_MAX_BIND_SLOTS = 16;
  * layer).
  */
 void ha_bind_storage_buffers(Span<gpu::StorageBuf *> buffers, int first_slot = 0);
+
+/** Binds one buffer to an explicit slot (cached like #ha_bind_storage_buffers). */
+void ha_bind_storage_buffer_at(gpu::StorageBuf *buffer, int slot);
 
 /** Forgets what #ha_bind_storage_buffers bound. */
 void ha_bindings_invalidate();
