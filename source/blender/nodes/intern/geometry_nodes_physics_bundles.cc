@@ -255,6 +255,12 @@ const FlatBundleTypePtr &FluidBundle::get_bundle_type()
         .description(
             "How strongly the fluid pushes the other simulated geometries of the same world "
             "(cloth, soft bodies); 0 disables the two way coupling");
+    b.add<decl::Float>("coupling_compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description(
+            "XPBD compliance of the point/triangle contact with the coupled solids; 0 is a hard "
+            "contact. The solver divides it by the substep time squared");
     b.add<decl::Float>("error_threshold"_ustr).default_value(1e-2f).min(1e-5f);
     const FlatBundleTypePtr bundle_type = b.build();
     BundleTypeRegistry::register_type(bundle_type);

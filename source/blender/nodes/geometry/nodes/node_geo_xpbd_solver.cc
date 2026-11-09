@@ -366,6 +366,12 @@ struct FluidConstraint {
   float boundary_friction = 0.5f;
   /** Strength of the two way coupling with the other simulated geometries in the world. */
   float coupling = 1.0f;
+  /**
+   * XPBD compliance of the point/triangle contacts with the coupled solids (cloth, soft bodies).
+   * Zero keeps the hard contact; the gather multiplies it by `1 / dt^2` like every other XPBD
+   * compliance.
+   */
+  float coupling_compliance = 0.0f;
   float error_threshold = 1e-2f;
 };
 
@@ -631,6 +637,8 @@ struct GeometryData {
   Array<bool> fluid_use_boundary;
   /** Per point strength of the two way coupling with the other simulated geometries. */
   Array<float> fluid_coupling;
+  /** Per point compliance of the point/triangle contacts with the coupled solids. */
+  Array<float> fluid_coupling_compliance;
 
   GeometryData(const bke::MutableAttributeAccessor attributes) : attributes(attributes) {}
 };
@@ -1382,6 +1390,8 @@ class XpbdSolverStep {
           1.0f);
       fluid.coupling = math::clamp(
           bundle.lookup<float>(*BundleKey::from_str("coupling")).value_or(1.0f), 0.0f, 1.0f);
+      fluid.coupling_compliance = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("coupling_compliance")).value_or(0.0f));
       fluid.negative_pressure_limit = math::clamp(
           bundle.lookup<float>(*BundleKey::from_str("negative_pressure_limit")).value_or(0.0f),
           0.0f,
@@ -1479,6 +1489,12 @@ class XpbdSolverStep {
                                       0.0f,
                                       1.0f,
                                       geo_data.fluid_coupling);
+        this->materialize_float_param(data_key_i,
+                                      "puncliga_coupling_compliance",
+                                      fluid_params.coupling_compliance,
+                                      0.0f,
+                                      FLT_MAX,
+                                      geo_data.fluid_coupling_compliance);
         if (std::getenv("XPBD_REACTION_DEBUG") != nullptr) {
           float coupling_min = 1e30f;
           float coupling_max = -1e30f;
@@ -5063,6 +5079,7 @@ class XpbdSolverStep {
         geometries_.solver_refs[solver_refs_i][chunk.data_key_i].positions;
     const Span<float3> prev_positions =
         geometries_.solver_refs[solver_refs_i][chunk.data_key_i].prev_positions;
+    const Span<float> coupling_compliances = geo_data.fluid_coupling_compliance.as_span();
 
     for (const CoupledSurface &surface : coupled_surfaces_) {
       const Mesh &mesh = *surface.mesh;
@@ -5193,7 +5210,14 @@ class XpbdSolverStep {
         r_contacts.contacts.face_margins.append(0.0f);
         r_contacts.contacts.static_frictions.append(static_friction);
         r_contacts.contacts.dynamic_frictions.append(dynamic_friction);
-        r_contacts.contacts.compliance_terms.append(0.0f);
+        /* Same XPBD scaling as the collider contacts: the raw compliance is divided by the
+         * substep time squared, so the value the user sets does not depend on the frame rate or
+         * the substep count. */
+        const float coupling_compliance = point_i < coupling_compliances.size() ?
+                                              coupling_compliances[point_i] :
+                                              0.0f;
+        r_contacts.contacts.compliance_terms.append(
+            std::max(0.0f, substep_compliance_factor_ * coupling_compliance));
         r_contacts.contacts.error_scales.append(error_scale_from_threshold(1e-2f));
         r_contacts.contacts.active_states.append(false);
         r_contacts.contacts.lambdas_normal.append(0.0f);
@@ -5852,8 +5876,10 @@ class XpbdSolverStep {
     }
     /* Coupled fluids run on the device with the *compliant* point/triangle contacts of the CPU:
      * the host gathers them once per substep from the predicted positions and the device solves the
-     * same constraint set (with the same compliance term) together with the density iterations. The
-     * old hard distance-field projection could not hold a dense falling column (M118). */
+     * same constraint set together with the density iterations. The per point compliance comes
+     * from `Coupling Compliance` (0 is the old hard contact), so the device and the CPU solve the
+     * exact same constraint. The old hard distance-field projection could not hold a dense falling
+     * column (M118). */
     /* Small fluids are faster on the (multi threaded) CPU: the device pays ~0.1 ms per dispatch and
      * ~100 passes per frame, which is all fixed cost below a few thousand particles. Measured on
      * earlier hardware: 8.8k particles were 206 ms on the device and 208 ms on the CPU, i.e. the

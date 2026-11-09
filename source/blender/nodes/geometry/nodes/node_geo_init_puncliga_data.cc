@@ -102,6 +102,7 @@ constexpr StringRefNull surface_tension = "puncliga_surface_tension";
 constexpr StringRefNull boundary_friction = "puncliga_boundary_friction";
 constexpr StringRefNull negative_pressure_limit = "puncliga_negative_pressure_limit";
 constexpr StringRefNull coupling = "puncliga_coupling";
+constexpr StringRefNull coupling_compliance = "puncliga_coupling_compliance";
 constexpr StringRefNull boundary_particles = "puncliga_boundary_particles";
 constexpr StringRefNull stretchiness = "puncliga_stretchiness";
 constexpr StringRefNull bendiness = "puncliga_bendiness";
@@ -223,6 +224,16 @@ static void node_declare(NodeDeclarationBuilder &b)
         .description(
             "How strongly this fluid pushes the other simulated geometries of the same simulation "
             "(cloth, soft bodies); 0 disables the two way coupling");
+    panel.add_input<decl::Float>("Coupling Compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, fluid)
+        .description(
+            "XPBD compliance of the point/triangle contact with the coupled cloth and soft bodies. "
+            "Zero is a hard contact (the previous behaviour); a positive value lets the fluid sink "
+            "a little into the surface before it is stopped, which is the same soft-constraint "
+            "formulation the CPU uses for colliders. The solver divides it by the substep time "
+            "squared, like every other XPBD compliance");
   }
   {
     auto &panel = b.add_panel("Shared"_ustr).default_closed(true);
@@ -455,6 +466,10 @@ static void node_geo_exec(GeoNodeExecParams params)
                            attribute_names::coupling,
                            bke::AttrDomain::Point,
                            params.get_input<float>("Coupling"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::coupling_compliance,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Coupling Compliance"_ustr));
       write_uniform<bool>(geometry,
                           attribute_names::boundary_particles,
                           bke::AttrDomain::Point,
