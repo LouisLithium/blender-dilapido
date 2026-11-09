@@ -1122,6 +1122,7 @@ class NODE_MT_gn_dilapido_ignis_base(node_add_menu.NodeMenu):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeInitIgnisData")
         self.node_operator(layout, "GeometryNodeIgnisSolver")
+        self.node_operator(layout, "GeometryNodeIgnisVisualize")
 
 
 class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):

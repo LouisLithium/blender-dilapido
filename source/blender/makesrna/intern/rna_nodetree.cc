@@ -10772,6 +10772,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeDilapidoForce");
   define("GeometryNode", "GeometryNodeDilapidoFieldRemap");
   define("GeometryNode", "GeometryNodeIgnisSolver");
+  define("GeometryNode", "GeometryNodeIgnisVisualize");
   define("GeometryNode", "GeometryNodeInitIgnisData");
   define("GeometryNode", "GeometryNodeHWAccelerateInput", def_geo_hw_accelerate_input);
   define("GeometryNode", "GeometryNodeHWAccelerateOutput", def_geo_hw_accelerate_output);
