@@ -573,6 +573,13 @@ void HaBuffer::download(const MutableSpan<float> r_data) const
       .copy_from(tmp.as_span().take_front(int(copy_size)));
 }
 
+void HaBuffer::clear_to_zero()
+{
+  if (buf_ != nullptr) {
+    GPU_storagebuf_clear_to_zero(buf_);
+  }
+}
+
 void HaBuffer::free()
 {
   if (buf_ != nullptr) {

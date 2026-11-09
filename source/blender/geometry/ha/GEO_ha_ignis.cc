@@ -3008,6 +3008,25 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
     r_reason = "device allocation failed (out of GPU memory)";
     return false;
   }
+  /* Fresh storage is not guaranteed to be zeroed by the driver. Several fields are sampled outside
+   * the dispatched (active) bricks (advection backtraces, vorticity neighbours, pressure-domain
+   * dilation) and the coarse smoothers read neighbours outside the CG brick list. On some GPUs the
+   * allocator returns stale contents here, which made the solver explode non-deterministically
+   * (RTX 5060). A well defined zero is also what the dense-box solver means by "outside". */
+  if (std::getenv("BLENDER_IGNIS_NO_ZERO_SCRATCH") == nullptr) {
+    velocity_tmp_.clear_to_zero();
+    velocity_aux_.clear_to_zero();
+    scalar_pack_.clear_to_zero();
+    curl_.clear_to_zero();
+    pressure_tmp_.clear_to_zero();
+    mask_b_.clear_to_zero();
+    coarse1_mask_.clear_to_zero();
+    coarse2_mask_.clear_to_zero();
+    coarse1_pressure_.clear_to_zero();
+    coarse1_pressure_tmp_.clear_to_zero();
+    coarse2_pressure_.clear_to_zero();
+    coarse2_pressure_tmp_.clear_to_zero();
+  }
   /* The first substep of a frame must clear the whole inactive pool (the second mask buffer is not
    * initialized by the upload); treat every brick as "previously active" once. */
   Array<int> ones(int(std::max<int64_t>(1, pool_blocks_)), 1);

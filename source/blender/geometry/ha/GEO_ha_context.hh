@@ -175,6 +175,8 @@ HaMemoryBudget *ha_memory_budget_current();
   bool ensure(int64_t elements);
   void upload(Span<float> data);
   void download(MutableSpan<float> r_data) const;
+  /** Zeroes the whole buffer (freshly allocated storage is not guaranteed to be zeroed). */
+  void clear_to_zero();
   void free();
 
   bool is_valid() const
