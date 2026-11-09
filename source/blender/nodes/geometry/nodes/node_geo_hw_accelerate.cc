@@ -62,7 +62,7 @@ static void draw_memory_status(ui::Layout &layout, const bNode &node)
   if (status.vram_limit > 0) {
     BLI_snprintf(line,
                  sizeof(line),
-                 "VRAM: %.1f / %.1f MB (peak %.1f)",
+                 "VRAM: %.2f / %.2f MB (peak %.2f)",
                  double(status.vram_used) / (1024.0 * 1024.0),
                  double(status.vram_limit) / (1024.0 * 1024.0),
                  double(status.vram_peak) / (1024.0 * 1024.0));
@@ -70,7 +70,7 @@ static void draw_memory_status(ui::Layout &layout, const bNode &node)
   else {
     BLI_snprintf(line,
                  sizeof(line),
-                 "VRAM: %.1f MB (peak %.1f)",
+                 "VRAM: %.2f MB (peak %.2f)",
                  double(status.vram_used) / (1024.0 * 1024.0),
                  double(status.vram_peak) / (1024.0 * 1024.0));
   }

@@ -50,7 +50,9 @@ struct HaNodeStatus {
    * the zone is cheap while a second zone is not. Zero when the node does not report it.
    */
   int steps = 0;
-  /** Device storage buffers charged to this zone during the last evaluation. */
+  /** Peak device storage buffers charged to this zone during the last evaluation. The buffers are
+   * temporary, so the current usage is zero when the UI reads the status; the peak is the amount
+   * the evaluation actually needed. */
   int64_t vram_used = 0;
   int64_t vram_peak = 0;
   /** Zone budget in bytes; zero means unlimited. */
@@ -62,6 +64,17 @@ void ha_status_set(const bNodeTree &tree, const bNode &node, const HaNodeStatus 
 
 /** Forgets the state of \a node (used when it is not hardware accelerated at all). */
 void ha_status_clear(const bNodeTree &tree, const bNode &node);
+
+/**
+ * Updates only the memory fields of an existing status. The zone publishes its fallback state before
+ * the body runs, but the body is what allocates the device buffers, so the peak is only known
+ * afterwards. Does nothing when the node has no status (for example `Force CPU`).
+ */
+void ha_status_update_memory(const bNodeTree &tree,
+                             const bNode &node,
+                             int64_t used,
+                             int64_t peak,
+                             int64_t limit);
 
 /** Reads the state of the last evaluation. False when the node did not publish one. */
 bool ha_status_get(const bNodeTree &tree, const bNode &node, HaNodeStatus &r_status);

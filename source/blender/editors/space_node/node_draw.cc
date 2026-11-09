@@ -3042,12 +3042,12 @@ static void node_draw_basis(const bContext &C,
         }
       }
       if (ha_status.vram_limit > 0) {
-        tip += fmt::format("\nVRAM: {:.1f} / {:.1f} MB",
+        tip += fmt::format("\nVRAM: {:.2f} / {:.2f} MB",
                            double(ha_status.vram_used) / (1024.0 * 1024.0),
                            double(ha_status.vram_limit) / (1024.0 * 1024.0));
       }
       else if (ha_status.vram_used > 0) {
-        tip += fmt::format("\nVRAM: {:.1f} MB",
+        tip += fmt::format("\nVRAM: {:.2f} MB",
                            double(ha_status.vram_used) / (1024.0 * 1024.0));
       }
       iconofs -= iconbutw;

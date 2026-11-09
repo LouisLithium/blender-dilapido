@@ -8,6 +8,8 @@
 
 #include "GEO_ha_status.hh"
 
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #include "BLI_map.hh"
@@ -64,6 +66,30 @@ void ha_status_clear(const bNodeTree &tree, const bNode &node)
 {
   std::lock_guard lock{status_mutex()};
   status_map().remove(status_key(tree, node));
+}
+
+void ha_status_update_memory(const bNodeTree &tree,
+                             const bNode &node,
+                             const int64_t used,
+                             const int64_t peak,
+                             const int64_t limit)
+{
+  std::lock_guard lock{status_mutex()};
+  HaNodeStatus *status = status_map().lookup_ptr(status_key(tree, node));
+  if (status == nullptr) {
+    return;
+  }
+  status->vram_used = used;
+  status->vram_peak = peak;
+  status->vram_limit = limit;
+  if (std::getenv("BLENDER_HA_DEBUG") != nullptr) {
+    fprintf(stderr,
+            "HA status memory: used=%.2f peak=%.2f limit=%.2f MB\n",
+            double(used) / (1024.0 * 1024.0),
+            double(peak) / (1024.0 * 1024.0),
+            double(limit) / (1024.0 * 1024.0));
+    fflush(stderr);
+  }
 }
 
 bool ha_status_get(const bNodeTree &tree, const bNode &node, HaNodeStatus &r_status)

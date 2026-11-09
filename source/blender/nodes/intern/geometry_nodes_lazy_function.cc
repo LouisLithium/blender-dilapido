@@ -1960,6 +1960,7 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     if (!reported_memory && memory_budget.exceeded()) {
       this->report_memory_limit(body_context, memory_budget);
     }
+    this->update_status_memory(memory_budget);
   }
 
   /**
@@ -2053,7 +2054,11 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
       status.reason = std::move(reason);
     }
     if (memory_budget != nullptr) {
-      status.vram_used = memory_budget->used();
+      /* The buffers charged to a zone are temporary: they are freed before the evaluation returns,
+       * so `used()` is zero by the time the UI reads the status. The high-water mark is what the
+       * evaluation actually needed, so show that as the used amount (the budget's lifetime is one
+       * evaluation, not the whole session). */
+      status.vram_used = memory_budget->peak();
       status.vram_peak = memory_budget->peak();
       status.vram_limit = memory_budget->limit();
     }
@@ -2069,6 +2074,21 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
       fflush(stderr);
     }
     geometry::ha::ha_status_set(btree_, *input_node, status);
+  }
+
+  /**
+   * The fallback status is published before the body runs, but the body is what allocates the
+   * device buffers. Update the memory fields after it so the node line shows the peak of the
+   * evaluation instead of the zero it had before any allocation.
+   */
+  void update_status_memory(const geometry::ha::HaMemoryBudget &memory_budget) const
+  {
+    const bNode *input_node = zone_.input_node();
+    if (input_node == nullptr) {
+      return;
+    }
+    geometry::ha::ha_status_update_memory(
+        btree_, *input_node, memory_budget.peak(), memory_budget.peak(), memory_budget.limit());
   }
 
   /**
@@ -2093,7 +2113,7 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     }
     std::string full_reason = reason;
     if (memory_exceeded) {
-      full_reason += fmt::format("; VRAM limit exceeded (peak {} of {} MB)",
+      full_reason += fmt::format("; VRAM limit exceeded (peak {:.2f} of {:.2f} MB)",
                                  double(memory_budget->peak()) / (1024.0 * 1024.0),
                                  double(memory_budget->limit()) / (1024.0 * 1024.0));
     }
@@ -2124,8 +2144,8 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
         context,
         *input_node,
         NodeWarningType::Warning,
-        fmt::format("HW Accelerate zone: VRAM limit exceeded (peak {} of {} MB); stopped dispatching "
-                    "to the device",
+        fmt::format("HW Accelerate zone: VRAM limit exceeded (peak {:.2f} of {:.2f} MB); stopped "
+                    "dispatching to the device",
                     double(memory_budget.peak()) / (1024.0 * 1024.0),
                     double(memory_budget.limit()) / (1024.0 * 1024.0)));
   }
