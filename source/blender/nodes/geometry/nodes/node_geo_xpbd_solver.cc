@@ -2767,6 +2767,18 @@ class XpbdSolverStep {
         const OffsetIndices<int> faces = mesh.faces();
         const VArray<float> rest_volumes = *geo_data.attributes.lookup<float>("rest_volume",
                                                                              AttrDomain::Face);
+        /* Per point compliance written by `Init Puncliga Data > Soft Body`. The bundle values are
+         * only the fallback for hand-built worlds. */
+        const VArray<float> volume_compliances = this->lookup_attribute_default<float>(
+            data_key_i,
+            "puncliga_volume_compliance",
+            AttrDomain::Point,
+            constraint.compliance);
+        const VArray<float> edge_compliances = this->lookup_attribute_default<float>(
+            data_key_i,
+            "puncliga_edge_compliance",
+            AttrDomain::Point,
+            constraint.edge_compliance);
         /* The elements are the four cornered faces. A tetrahedral mesh also carries its boundary as
          * three cornered faces (`Tetrahedralize` writes them so the same mesh is a closed surface),
          * and those are not elements: they have no rest volume and no gradient of their own. */
@@ -2820,7 +2832,10 @@ class XpbdSolverStep {
             OffsetIndices<int>(constraint_usage.element_offsets.as_span()),
             element_points.as_span());
         constraint_usage.compliances.reinitialize(element_num);
-        constraint_usage.compliances.fill(constraint.compliance);
+        for (const int element_i : IndexRange(element_num)) {
+          constraint_usage.compliances[element_i] =
+              volume_compliances[element_points[element_i * 4]];
+        }
         constraint_usage.lambdas = tls.allocator.allocate_array<float>(element_num);
         constraint_usage.lambdas.fill(0.0f);
 
@@ -2878,7 +2893,9 @@ class XpbdSolverStep {
           }
         }
         constraint_usage.edge_compliances.reinitialize(edges.size());
-        constraint_usage.edge_compliances.fill(constraint.edge_compliance);
+        for (const int edge_i : IndexRange(edges.size())) {
+          constraint_usage.edge_compliances[edge_i] = edge_compliances[edges[edge_i].x];
+        }
         constraint_usage.edge_lambdas = tls.allocator.allocate_array<float>(edges.size());
         constraint_usage.edge_lambdas.fill(0.0f);
 

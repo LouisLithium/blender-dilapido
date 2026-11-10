@@ -104,6 +104,8 @@ constexpr StringRefNull negative_pressure_limit = "puncliga_negative_pressure_li
 constexpr StringRefNull coupling = "puncliga_coupling";
 constexpr StringRefNull coupling_compliance = "puncliga_coupling_compliance";
 constexpr StringRefNull boundary_particles = "puncliga_boundary_particles";
+constexpr StringRefNull volume_compliance = "puncliga_volume_compliance";
+constexpr StringRefNull edge_compliance = "puncliga_edge_compliance";
 constexpr StringRefNull stretchiness = "puncliga_stretchiness";
 constexpr StringRefNull bendiness = "puncliga_bendiness";
 constexpr StringRefNull linear_damping = "puncliga_linear_damping";
@@ -119,12 +121,6 @@ static void node_declare(NodeDeclarationBuilder &b)
       .static_items(puncliga_type_items)
       .default_value(MenuValue(int(PuncligaType::Fluid)))
       .description("How this piece of geometry is simulated");
-  b.add_input<decl::Menu>("Emission"_ustr)
-      .static_items(puncliga_emission_items)
-      .default_value(MenuValue(int(PuncligaEmission::None)))
-      .description(
-          "Whether the geometry of a fluid is only the initial state, or a source that emits new "
-          "particles (see the items for the difference between the two modes)");
 
   /* Every type specific socket is only used by one type, so the others are hidden.
    * `.usage_by_menu` feeds the socket usage inference, which is what drives the visibility of the
@@ -135,6 +131,33 @@ static void node_declare(NodeDeclarationBuilder &b)
   const int fluid = int(PuncligaType::Fluid);
   const int soft = int(PuncligaType::SoftBody);
 
+  /* General properties first, then the panels of the individual types. */
+  {
+    auto &panel = b.add_panel("Shared"_ustr).default_closed(true);
+    panel.add_input<decl::Float>("Mass"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .description(
+            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, soft body: the "
+            "volume of the elements around the point, otherwise 0.1 kg)");
+    panel.add_input<decl::Float>("Friction"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .description("Contact friction of the points against the colliders");
+    panel.add_input<decl::Float>("Collision Radius"_ustr)
+        .default_value(0.05f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .description("Radius of the points for the point/mesh collider contacts");
+    panel.add_input<decl::Int>("Piece ID"_ustr)
+        .default_value(0)
+        .min(0)
+        .description(
+            "Number of this piece, written as the `puncliga_piece_id` attribute. Several pieces of "
+            "the same type can be told apart after the simulation with it (the `Split Puncliga "
+            "Data` group filters by it); every piece defaults to 0, so it can be ignored when there "
+            "is only one");
+  }
   {
     auto &panel = b.add_panel("Cloth"_ustr).default_closed(false);
     panel.add_input<decl::Float>("Stretchiness"_ustr)
@@ -167,6 +190,13 @@ static void node_declare(NodeDeclarationBuilder &b)
   }
   {
     auto &panel = b.add_panel("Fluid"_ustr).default_closed(false);
+    panel.add_input<decl::Menu>("Emission"_ustr)
+        .static_items(puncliga_emission_items)
+        .default_value(MenuValue(int(PuncligaEmission::None)))
+        .usage_by_menu("Type"_ustr, fluid)
+        .description(
+            "Whether the geometry of a fluid is only the initial state, or a source that emits new "
+            "particles (see the items for the difference between the two modes)");
     panel.add_input<decl::Float>("Rest Density"_ustr)
         .default_value(1000.0f)
         .min(1e-3f)
@@ -236,32 +266,6 @@ static void node_declare(NodeDeclarationBuilder &b)
             "squared, like every other XPBD compliance");
   }
   {
-    auto &panel = b.add_panel("Shared"_ustr).default_closed(true);
-    panel.add_input<decl::Float>("Mass"_ustr)
-        .default_value(0.0f)
-        .min(0.0f)
-        .description(
-            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, soft body: the "
-            "volume of the elements around the point, otherwise 0.1 kg)");
-    panel.add_input<decl::Float>("Friction"_ustr)
-        .default_value(0.5f)
-        .min(0.0f)
-        .description("Contact friction of the points against the colliders");
-    panel.add_input<decl::Float>("Collision Radius"_ustr)
-        .default_value(0.05f)
-        .min(0.0f)
-        .subtype(PROP_DISTANCE)
-        .description("Radius of the points for the point/mesh collider contacts");
-    panel.add_input<decl::Int>("Piece ID"_ustr)
-        .default_value(0)
-        .min(0)
-        .description(
-            "Number of this piece, written as the `puncliga_piece_id` attribute. Several pieces of "
-            "the same type can be told apart after the simulation with it (the `Split Puncliga "
-            "Data` group filters by it); every piece defaults to 0, so it can be ignored when there "
-            "is only one");
-  }
-  {
     auto &panel = b.add_panel("Soft Body"_ustr).default_closed(false);
     panel.add_input<decl::Float>("Density"_ustr)
         .default_value(1000.0f)
@@ -270,6 +274,20 @@ static void node_declare(NodeDeclarationBuilder &b)
         .description(
             "Density of the material in kg/m^3, used to compute the mass of the vertices from the "
             "volume of the tetrahedra around them");
+    panel.add_input<decl::Float>("Volume Compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, soft)
+        .description(
+            "Softness of the volume constraint of the soft body. Zero keeps the volume of the "
+            "tetrahedra, larger values let them compress");
+    panel.add_input<decl::Float>("Edge Compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, soft)
+        .description(
+            "Softness of the distance constraints on the edges of the elements. This is the shear "
+            "stiffness: zero is stiff jelly, 1e-3 is very soft");
   }
 
   b.add_output<decl::Geometry>("Geometry"_ustr).propagate_all();
@@ -488,6 +506,14 @@ static void node_geo_exec(GeoNodeExecParams params)
           writer.finish();
         }
       }
+      write_uniform<float>(geometry,
+                           attribute_names::volume_compliance,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Volume Compliance"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::edge_compliance,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Edge Compliance"_ustr));
       /* The mass comes from the volume of the tetrahedra, not from a uniform point mass. */
       const float mass_input = params.get_input<float>("Mass"_ustr);
       if (mass_input <= 0.0f) {
