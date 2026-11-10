@@ -43,6 +43,7 @@
 #include "GEO_xpbd_constraint_pin_rotation.hh"
 #include "GEO_xpbd_constraint_point_contact.hh"
 #include "GEO_xpbd_constraint_segment_contact.hh"
+#include "GEO_xpbd_constraint_segment_face.hh"
 #include "GEO_xpbd_hair_grid.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
@@ -731,6 +732,240 @@ struct CoupledSurface {
 };
 
 /**
+ * One contact between a hair segment and a triangle of a cloth or a soft body.
+ *
+ * The segment is pushed away from the triangle, and the triangle vertices are pushed in the
+ * opposite direction with the barycentric weights, so the hair and the solid body interact in both
+ * directions.
+ */
+struct HairSolidContact {
+  int segment = -1;
+  /** Global point indices of the triangle corners. */
+  int3 triangle = int3(0);
+  /** Unit direction that pushes the segment away from the surface. */
+  float3 normal = float3(0.0f);
+  /** Barycentric position of the closest point on the segment. */
+  float segment_s = 0.0f;
+  /** Barycentric weights of the closest point on the triangle. */
+  float3 face_weights = float3(0.0f);
+  float min_distance = 0.0f;
+};
+
+/**
+ * Segment/triangle contacts between the hair and the cloth/soft bodies it shares a world with.
+ *
+ * The hair points and the solid vertices share one flat point space (like the hair self contacts)
+ * so one constraint set can move both sides. The solid triangles are static topology; only their
+ * positions and BVH trees are refreshed every substep.
+ */
+struct HairSolidContacts {
+  /** Global point space: hair points first, then the vertices of every participating solid. */
+  Vector<int> point_geo;
+  Vector<int> point_local;
+  Vector<float> point_inv_mass;
+
+  /** Hair segments in the global point space. */
+  Vector<int> segment_point_a;
+  Vector<int> segment_point_b;
+  Vector<float> segment_radius;
+  Vector<float> segment_thickness;
+
+  /** Triangles of the solids, in the global point space. */
+  Vector<int3> triangle_points;
+
+  /** For the debug output of the constraint set. */
+  Vector<int> affected_geo_indices;
+
+  Array<int> contact_offsets;
+  Vector<int> contact_points;
+  Vector<float3> contact_normals;
+  Vector<float2> contact_segment_weights;
+  Vector<float3> contact_face_weights;
+  Vector<float> contact_min_distances;
+  Vector<float> contact_compliances;
+  Array<float> contact_lambdas;
+  xpbd::ConstraintColoring coloring;
+  std::optional<xpbd::SegmentFaceContactConstraintSet> constraint_set;
+
+  bool is_empty() const
+  {
+    return segment_point_a.is_empty() || triangle_points.is_empty();
+  }
+};
+
+/** Barycentric weights of a point on a triangle, clamped like the solver's `triangle_weights`. */
+static float3 hair_triangle_weights(const float3 &v0,
+                                    const float3 &v1,
+                                    const float3 &v2,
+                                    const float3 &point)
+{
+  const float3 e0 = v1 - v0;
+  const float3 e1 = v2 - v0;
+  const float3 offset = point - v0;
+  const float d00 = math::dot(e0, e0);
+  const float d01 = math::dot(e0, e1);
+  const float d11 = math::dot(e1, e1);
+  const float d20 = math::dot(offset, e0);
+  const float d21 = math::dot(offset, e1);
+  const float denominator = d00 * d11 - d01 * d01;
+  if (std::abs(denominator) < 1e-16f) {
+    return float3(1.0f, 0.0f, 0.0f);
+  }
+  const float b = (d11 * d20 - d01 * d21) / denominator;
+  const float c = (d00 * d21 - d01 * d20) / denominator;
+  const float a = 1.0f - b - c;
+  float3 weights(
+      math::clamp(a, 0.0f, 1.0f), math::clamp(b, 0.0f, 1.0f), math::clamp(c, 0.0f, 1.0f));
+  const float sum = weights.x + weights.y + weights.z;
+  if (sum > 1e-8f) {
+    weights /= sum;
+  }
+  return weights;
+}
+
+/**
+ * Closest point pair between the segment `p0-p1` and the triangle `v0-v1-v2`.
+ *
+ * The minimum of the three segment/edge distances and the two endpoint/triangle distances is exact:
+ * the closest features of a segment and a triangle are either on an edge pair, or at a segment
+ * endpoint, or perpendicular above the triangle interior (which the endpoint tests cover when the
+ * projection is inside, and an edge covers otherwise).
+ */
+static float closest_segment_triangle_distance_squared(const float3 &p0,
+                                                       const float3 &p1,
+                                                       const float3 &v0,
+                                                       const float3 &v1,
+                                                       const float3 &v2,
+                                                       float &r_s,
+                                                       float3 &r_face_weights)
+{
+  float best_sq = 1e30f;
+  float best_s = 0.0f;
+  float3 best_weights(1.0f, 0.0f, 0.0f);
+  const auto consider = [&](const float s,
+                            const float3 &weights,
+                            const float3 &q_segment,
+                            const float3 &q_face) {
+    const float sq = math::length_squared(q_face - q_segment);
+    if (sq < best_sq) {
+      best_sq = sq;
+      best_s = s;
+      best_weights = weights;
+    }
+  };
+
+  const float3 corners[3] = {v0, v1, v2};
+  for (const int edge_i : IndexRange(3)) {
+    const int e0 = edge_i;
+    const int e1 = (edge_i + 1) % 3;
+    float s;
+    float t;
+    xpbd::closest_points_on_segments(p0, p1, corners[e0], corners[e1], s, t);
+    float3 weights(0.0f);
+    weights[e0] = 1.0f - t;
+    weights[e1] = t;
+    consider(s,
+             weights,
+             math::interpolate(p0, p1, s),
+             math::interpolate(corners[e0], corners[e1], t));
+  }
+  for (const int endpoint_i : IndexRange(2)) {
+    const float3 &point = endpoint_i == 0 ? p0 : p1;
+    float nearest[3];
+    closest_on_tri_to_point_v3(
+        nearest, reinterpret_cast<const float *>(&point), reinterpret_cast<const float *>(&v0),
+        reinterpret_cast<const float *>(&v1), reinterpret_cast<const float *>(&v2));
+    const float3 nearest_v(nearest[0], nearest[1], nearest[2]);
+    consider(float(endpoint_i),
+             hair_triangle_weights(v0, v1, v2, nearest_v),
+             point,
+             nearest_v);
+  }
+
+  r_s = best_s;
+  r_face_weights = best_weights;
+  return best_sq;
+}
+
+/** Query state of one hair segment against one solid BVH (see `BLI_bvhtree_range_query`). */
+struct HairSolidRangeQuery {
+  const CoupledSurface *surface = nullptr;
+  int surface_point_start = 0;
+  int segment = -1;
+  float3 p0 = float3(0.0f);
+  float3 p1 = float3(0.0f);
+  float segment_radius = 0.0f;
+  float segment_thickness = 0.0f;
+  /** Largest collision radius of the solid (conservative for the contact distance). */
+  float solid_radius = 0.0f;
+  Vector<HairSolidContact> *out = nullptr;
+  int output_start = 0;
+  int max_contacts_per_segment = 32;
+};
+
+static void hair_solid_range_query_callback(void *user_data,
+                                            const int index,
+                                            const float * /*co*/,
+                                            const float /*dist_sq*/)
+{
+  HairSolidRangeQuery &query = *static_cast<HairSolidRangeQuery *>(user_data);
+  if (query.out->size() - query.output_start >= query.max_contacts_per_segment) {
+    return;
+  }
+  const Mesh &mesh = *query.surface->mesh;
+  const Span<int3> corner_tris = mesh.corner_tris();
+  if (index < 0 || index >= corner_tris.size()) {
+    return;
+  }
+  const Span<int> corner_verts = mesh.corner_verts();
+  const Span<float3> positions = mesh.vert_positions();
+  const int3 &tri = corner_tris[index];
+  const int3 verts(corner_verts[tri[0]], corner_verts[tri[1]], corner_verts[tri[2]]);
+  const float3 v0 = positions[verts[0]];
+  const float3 v1 = positions[verts[1]];
+  const float3 v2 = positions[verts[2]];
+
+  float segment_s;
+  float3 face_weights;
+  const float distance_sq = closest_segment_triangle_distance_squared(
+      query.p0, query.p1, v0, v1, v2, segment_s, face_weights);
+  const float min_distance = query.segment_radius + query.solid_radius +
+                             std::max(query.segment_thickness, 0.0f);
+  if (!(distance_sq < min_distance * min_distance)) {
+    return;
+  }
+
+  const float3 q_segment = math::interpolate(query.p0, query.p1, segment_s);
+  const float3 q_face = v0 * face_weights.x + v1 * face_weights.y + v2 * face_weights.z;
+  float3 normal = q_segment - q_face;
+  const float length = math::length(normal);
+  if (length > 1e-7f) {
+    normal /= length;
+  }
+  else {
+    /* The segment crosses the triangle: push it to the side its midpoint is on. */
+    normal = math::normalize(math::cross(v1 - v0, v2 - v0));
+    if (!(math::length_squared(normal) > 1e-12f)) {
+      return;
+    }
+    if (math::dot(query.p0 + query.p1 - 2.0f * q_face, normal) < 0.0f) {
+      normal = -normal;
+    }
+  }
+
+  HairSolidContact contact;
+  contact.segment = query.segment;
+  contact.triangle = int3(query.surface_point_start + verts[0],
+                          query.surface_point_start + verts[1],
+                          query.surface_point_start + verts[2]);
+  contact.normal = normal;
+  contact.segment_s = segment_s;
+  contact.face_weights = face_weights;
+  contact.min_distance = min_distance;
+  query.out->append(contact);
+}
+
+/**
  * The point to point contacts of the simulated solids with themselves (see
  * #xpbd::PointContactConstraintSet).
  *
@@ -1297,6 +1532,18 @@ class XpbdSolverStep {
    */
   Vector<CoupledSurface> coupled_surfaces_;
 
+  /**
+   * Collision surfaces of the cloth and soft bodies for the hair, plus the segment/triangle
+   * contacts between them. CPU only for now.
+   */
+  Vector<CoupledSurface> hair_solid_surfaces_;
+  Vector<float> hair_solid_surface_max_radius;
+  /** First global point index of each surface (its vertices follow the hair points). */
+  Vector<int> hair_solid_surface_point_start_;
+  HairSolidContacts hair_solid_contacts_;
+  bool hair_solid_active_ = false;
+  std::unique_ptr<ResourceScope> hair_solid_memory_;
+
   /** Point to point contacts of the solids with themselves (empty when disabled). */
   SelfContacts self_contacts_;
   /** Whether at least one geometry enabled `Self Collision` for this frame. */
@@ -1408,6 +1655,7 @@ class XpbdSolverStep {
     this->prepare_coupled_surfaces();
     this->prepare_self_contacts();
     this->prepare_hair_contacts();
+    this->prepare_hair_solid_contacts();
     this->prepare_fluid_gpu();
 
     if (profile) {
@@ -1458,6 +1706,7 @@ class XpbdSolverStep {
     this->write_back__rod_stretch_shear();
 
     this->free_coupled_surfaces();
+    this->free_hair_solid_surfaces();
 
     this->finish_common_attribute_writers();
     this->write_back_geometries_to_world();
@@ -4000,6 +4249,7 @@ class XpbdSolverStep {
         }
         this->simulate__update_self_contacts(solver_refs_i);
         this->simulate__update_hair_contacts(solver_refs_i);
+        this->simulate__update_hair_solid_contacts(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
         /* A fluid that runs on the device owns its whole substep (grid, predict, the density
@@ -4052,6 +4302,10 @@ class XpbdSolverStep {
     }
     /* The hair contacts also span all curve geometries, so they need the whole world loop. */
     if (hair_contacts_active_ || hair_self_collision_) {
+      return false;
+    }
+    /* The hair/cloth/soft body segment contacts span geometries too. */
+    if (hair_solid_active_) {
       return false;
     }
     for (const int data_key_i : geometries_.data_keys.index_range()) {
@@ -4987,6 +5241,187 @@ class XpbdSolverStep {
       }
     }
     coupled_surfaces_.clear();
+  }
+
+  void free_hair_solid_surfaces()
+  {
+    for (CoupledSurface &surface : hair_solid_surfaces_) {
+      if (surface.mesh != nullptr) {
+        BKE_id_free(nullptr, surface.mesh);
+        surface.mesh = nullptr;
+      }
+    }
+    hair_solid_surfaces_.clear();
+    hair_solid_surface_max_radius.clear();
+    hair_solid_surface_point_start_.clear();
+  }
+
+  /**
+   * Prepares the CPU segment/triangle contacts between the hair and the cloth/soft bodies of the
+   * world.
+   *
+   * Hair points and solid vertices are put into one flat point space so one constraint set can move
+   * both sides. The solid triangles are topology, so only their positions and the BVH trees are
+   * refreshed every substep. The whole pass is skipped when there is no hair or no solid mesh in the
+   * world.
+   */
+  void prepare_hair_solid_contacts()
+  {
+    HairSolidContacts &contacts = hair_solid_contacts_;
+    contacts = {};
+    hair_solid_active_ = false;
+    this->free_hair_solid_surfaces();
+
+    /* Cheap gate first: without a solid mesh there is nothing to couple the hair with, and the
+     * per frame gather of the hair points is not free for a large hairstyle. */
+    Vector<int> solid_geometry_ids;
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      const GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.curves != nullptr || geo_data.fluid_constraint_i >= 0) {
+        continue;
+      }
+      if (geo_data.domain != AttrDomain::Point) {
+        continue;
+      }
+      if (geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size) {
+        continue;
+      }
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      const GeometrySet &geometry = geometries_.geometry_sets[data_key.geo_bundle_i].geometry;
+      const Mesh *mesh = geometry.get_mesh();
+      if (mesh == nullptr || mesh->corner_tris().is_empty() || mesh->verts_num != geo_data.size) {
+        continue;
+      }
+      solid_geometry_ids.append(data_key_i);
+    }
+    if (solid_geometry_ids.is_empty()) {
+      return;
+    }
+
+    Vector<int> affected_geo_indices;
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.curves == nullptr || geo_data.domain != AttrDomain::Point) {
+        continue;
+      }
+      if (geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size) {
+        continue;
+      }
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+      GeometrySet &geometry = geo_set_data.geometry;
+      if (!geometry.has(data_key.type)) {
+        continue;
+      }
+
+      this->ensure_radius_loaded(data_key_i, 0.002f);
+      const VArraySpan<float> radii = geo_data.radii;
+      const Span<float3> positions = geometry_component_positions(geometry, data_key.type);
+      if (positions.size() != geo_data.size) {
+        continue;
+      }
+      Array<float> thickness_values;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::hair_contact_thickness,
+                                    hair_contact_thickness_,
+                                    0.0f,
+                                    1.0e9f,
+                                    thickness_values);
+
+      const int start = contacts.point_geo.size();
+      const int size = geo_data.size;
+      for (const int point_i : IndexRange(size)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(point_i);
+        contacts.point_inv_mass.append(geo_data.is_hard_pinned[point_i] ?
+                                           0.0f :
+                                           geo_data.inv_masses[point_i]);
+      }
+
+      const bke::CurvesGeometry &curves = *geo_data.curves;
+      const OffsetIndices<int> points_by_curve = curves.points_by_curve();
+      const VArray<bool> cyclic = curves.cyclic();
+      for (const int curve_i : points_by_curve.index_range()) {
+        const IndexRange points = points_by_curve[curve_i];
+        const int points_num = points.size();
+        if (points_num < 2) {
+          continue;
+        }
+        const int segments_num = points_num - (cyclic[curve_i] ? 0 : 1);
+        for (const int local_i : IndexRange(segments_num)) {
+          const int point_a = points[local_i];
+          const int point_b = points[(local_i + 1) % points_num];
+          contacts.segment_point_a.append(start + point_a);
+          contacts.segment_point_b.append(start + point_b);
+          contacts.segment_radius.append(std::max(radii[point_a], radii[point_b]));
+          contacts.segment_thickness.append(
+              std::max(thickness_values[point_a], thickness_values[point_b]));
+        }
+      }
+      affected_geo_indices.append(data_key_i);
+    }
+    if (contacts.segment_point_a.is_empty()) {
+      contacts = {};
+      return;
+    }
+
+    for (const int data_key_i : solid_geometry_ids) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+      GeometrySet &geometry = geo_set_data.geometry;
+      const Mesh *mesh = geometry.get_mesh();
+
+      this->ensure_radius_loaded(data_key_i, 0.01f);
+      const VArraySpan<float> radii = geo_data.radii;
+      float max_radius = 0.0f;
+      for (const float radius : radii) {
+        max_radius = std::max(max_radius, radius);
+      }
+
+      hair_solid_surfaces_.append({});
+      CoupledSurface &surface = hair_solid_surfaces_.last();
+      surface.geometry_i = data_key_i;
+      surface.mesh = BKE_mesh_copy_for_eval(*mesh);
+      surface.prev_positions.reinitialize(mesh->verts_num);
+      surface.prev_positions.as_mutable_span().copy_from(mesh->vert_positions());
+      hair_solid_surface_max_radius.append(max_radius);
+      hair_solid_surface_point_start_.append(contacts.point_geo.size());
+
+      const int start = contacts.point_geo.size();
+      for (const int vertex_i : IndexRange(mesh->verts_num)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(vertex_i);
+        contacts.point_inv_mass.append(geo_data.is_hard_pinned[vertex_i] ?
+                                           0.0f :
+                                           geo_data.inv_masses[vertex_i]);
+      }
+      const Span<int3> corner_tris = mesh->corner_tris();
+      const Span<int> corner_verts = mesh->corner_verts();
+      for (const int3 &tri : corner_tris) {
+        contacts.triangle_points.append(
+            int3(start + corner_verts[tri[0]],
+                 start + corner_verts[tri[1]],
+                 start + corner_verts[tri[2]]));
+      }
+      affected_geo_indices.append(data_key_i);
+    }
+
+    if (contacts.triangle_points.is_empty()) {
+      contacts = {};
+      this->free_hair_solid_surfaces();
+      return;
+    }
+
+    VectorSet<int> unique_geo_indices;
+    for (const int data_key_i : affected_geo_indices) {
+      unique_geo_indices.add(data_key_i);
+    }
+    contacts.affected_geo_indices.reserve(unique_geo_indices.size());
+    for (const int data_key_i : unique_geo_indices) {
+      contacts.affected_geo_indices.append(data_key_i);
+    }
+    hair_solid_active_ = true;
   }
 
   /**
@@ -6095,6 +6530,195 @@ class XpbdSolverStep {
       surface.mesh->tag_positions_changed();
       surface.bvh = surface.mesh->bvh_corner_tris();
     }
+  }
+
+  /**
+   * Refreshes the solid BVH trees and gathers the segment/triangle contacts of this substep.
+   *
+   * The contacts are rebuilt every substep because both sides move. They are collected in per
+   * chunk vectors, sorted and deduplicated so the contact set (and the coloring) is deterministic,
+   * and capped per segment and in total as a safety valve for pathological input.
+   */
+  void simulate__update_hair_solid_contacts(const int solver_refs_i)
+  {
+    HairSolidContacts &contacts = hair_solid_contacts_;
+    if (!hair_solid_active_) {
+      return;
+    }
+    contacts.contact_offsets.reinitialize(0);
+    contacts.contact_points.clear();
+    contacts.contact_normals.clear();
+    contacts.contact_segment_weights.clear();
+    contacts.contact_face_weights.clear();
+    contacts.contact_min_distances.clear();
+    contacts.contact_compliances.clear();
+    contacts.contact_lambdas.reinitialize(0);
+    contacts.coloring = {};
+    contacts.constraint_set.reset();
+
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (CoupledSurface &surface : hair_solid_surfaces_) {
+      const Span<float3> positions = refs[surface.geometry_i].positions;
+      if (positions.size() != surface.mesh->verts_num) {
+        continue;
+      }
+      surface.prev_positions.as_mutable_span().copy_from(surface.mesh->vert_positions());
+      MutableSpan<float3> surface_positions = surface.mesh->vert_positions_for_write();
+      surface_positions.copy_from(positions);
+      surface.mesh->tag_positions_changed();
+      surface.bvh = surface.mesh->bvh_corner_tris();
+    }
+
+    const auto position = [&](const int global_point_i) -> const float3 & {
+      return refs[contacts.point_geo[global_point_i]].positions[contacts.point_local[global_point_i]];
+    };
+
+    const int segments_num = contacts.segment_point_a.size();
+    const int chunk_size = 1024;
+    const int chunks_num = std::max(1, (segments_num + chunk_size - 1) / chunk_size);
+    Array<Vector<HairSolidContact>> chunk_contacts(chunks_num);
+    constexpr int MAX_CONTACTS_PER_SEGMENT = 32;
+    threading::parallel_for(IndexRange(chunks_num), 1, [&](const IndexRange chunk_range) {
+      for (const int chunk_i : chunk_range) {
+        const int begin = chunk_i * chunk_size;
+        const int end = std::min(begin + chunk_size, segments_num);
+        Vector<HairSolidContact> &out = chunk_contacts[chunk_i];
+        for (const int segment_i : IndexRange(begin, end - begin)) {
+          const float3 p0 = position(contacts.segment_point_a[segment_i]);
+          const float3 p1 = position(contacts.segment_point_b[segment_i]);
+          const float3 mid = 0.5f * (p0 + p1);
+          const float half_length = 0.5f * math::distance(p0, p1);
+          const float radius = contacts.segment_radius[segment_i];
+          const float thickness = std::max(contacts.segment_thickness[segment_i], 0.0f);
+          const int output_start = out.size();
+          for (const int surface_i : hair_solid_surfaces_.index_range()) {
+            const CoupledSurface &surface = hair_solid_surfaces_[surface_i];
+            if (surface.bvh.tree == nullptr) {
+              continue;
+            }
+            HairSolidRangeQuery query;
+            query.surface = &surface;
+            query.surface_point_start = hair_solid_surface_point_start_[surface_i];
+            query.segment = segment_i;
+            query.p0 = p0;
+            query.p1 = p1;
+            query.segment_radius = radius;
+            query.segment_thickness = thickness;
+            query.solid_radius = hair_solid_surface_max_radius[surface_i];
+            query.out = &out;
+            query.output_start = output_start;
+            query.max_contacts_per_segment = MAX_CONTACTS_PER_SEGMENT;
+            const float search_radius = half_length + radius + query.solid_radius + thickness;
+            BLI_bvhtree_range_query(surface.bvh.tree,
+                                    reinterpret_cast<const float *>(&mid),
+                                    search_radius,
+                                    hair_solid_range_query_callback,
+                                    &query);
+          }
+        }
+      }
+    });
+
+    int total = 0;
+    for (const Vector<HairSolidContact> &chunk : chunk_contacts) {
+      total += chunk.size();
+    }
+    if (total == 0) {
+      return;
+    }
+    Vector<HairSolidContact> all_contacts;
+    all_contacts.reserve(total);
+    for (const Vector<HairSolidContact> &chunk : chunk_contacts) {
+      all_contacts.extend(chunk);
+    }
+    const auto key_less = [](const HairSolidContact &a, const HairSolidContact &b) {
+      if (a.segment != b.segment) {
+        return a.segment < b.segment;
+      }
+      if (a.triangle.x != b.triangle.x) {
+        return a.triangle.x < b.triangle.x;
+      }
+      if (a.triangle.y != b.triangle.y) {
+        return a.triangle.y < b.triangle.y;
+      }
+      return a.triangle.z < b.triangle.z;
+    };
+    parallel_sort(all_contacts.as_mutable_span(), key_less);
+    const auto key_equal = [](const HairSolidContact &a, const HairSolidContact &b) {
+      return a.segment == b.segment && a.triangle.x == b.triangle.x &&
+             a.triangle.y == b.triangle.y && a.triangle.z == b.triangle.z;
+    };
+    auto last = std::unique(all_contacts.begin(), all_contacts.end(), key_equal);
+
+    const int64_t max_contacts = std::min<int64_t>(1 << 20, std::max<int64_t>(1 << 14,
+                                                                              int64_t(segments_num) * 8));
+    Vector<HairSolidContact> limited;
+    limited.reserve(std::min<int64_t>(std::distance(all_contacts.begin(), last), max_contacts));
+    int last_segment = -1;
+    int segment_contacts = 0;
+    for (auto it = all_contacts.begin(); it != last; ++it) {
+      if (it->segment != last_segment) {
+        last_segment = it->segment;
+        segment_contacts = 0;
+      }
+      if (segment_contacts >= MAX_CONTACTS_PER_SEGMENT) {
+        continue;
+      }
+      segment_contacts++;
+      limited.append(*it);
+      if (limited.size() >= max_contacts) {
+        break;
+      }
+    }
+
+    const int contacts_num = limited.size();
+    if (contacts_num == 0) {
+      return;
+    }
+    contacts.contact_offsets.reinitialize(contacts_num + 1);
+    contacts.contact_points.reinitialize(contacts_num * 5);
+    contacts.contact_normals.reinitialize(contacts_num);
+    contacts.contact_segment_weights.reinitialize(contacts_num);
+    contacts.contact_face_weights.reinitialize(contacts_num);
+    contacts.contact_min_distances.reinitialize(contacts_num);
+    contacts.contact_compliances.reinitialize(contacts_num);
+    contacts.contact_compliances.fill(0.0f);
+    for (const int contact_i : IndexRange(contacts_num)) {
+      const HairSolidContact &contact = limited[contact_i];
+      const int base = contact_i * 5;
+      contacts.contact_offsets[contact_i] = base;
+      contacts.contact_points[base + 0] = contacts.segment_point_a[contact.segment];
+      contacts.contact_points[base + 1] = contacts.segment_point_b[contact.segment];
+      contacts.contact_points[base + 2] = contact.triangle.x;
+      contacts.contact_points[base + 3] = contact.triangle.y;
+      contacts.contact_points[base + 4] = contact.triangle.z;
+      contacts.contact_normals[contact_i] = contact.normal;
+      contacts.contact_segment_weights[contact_i] = float2(contact.segment_s, 0.0f);
+      contacts.contact_face_weights[contact_i] = contact.face_weights;
+      contacts.contact_min_distances[contact_i] = contact.min_distance;
+    }
+    contacts.contact_offsets[contacts_num] = contacts_num * 5;
+
+    contacts.contact_lambdas.reinitialize(contacts_num);
+    contacts.contact_lambdas.fill(0.0f);
+
+    hair_solid_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    const GroupedSpan<int> contact_points(OffsetIndices<int>(contacts.contact_offsets),
+                                          contacts.contact_points.as_span());
+    contacts.coloring = xpbd::color_constraints__n_ary(contact_points,
+                                                       hair_solid_memory_->allocator());
+    contacts.constraint_set.emplace(contacts.affected_geo_indices,
+                                    contact_points,
+                                    contacts.contact_normals.as_span(),
+                                    contacts.contact_segment_weights.as_span(),
+                                    contacts.contact_face_weights.as_span(),
+                                    contacts.contact_min_distances.as_span(),
+                                    contacts.contact_compliances.as_span(),
+                                    contacts.point_geo.as_span(),
+                                    contacts.point_local.as_span(),
+                                    contacts.point_inv_mass.as_span(),
+                                    error_scale_from_threshold(0.01f),
+                                    contacts.contact_lambdas.as_mutable_span());
   }
 
   /**
@@ -7715,6 +8339,23 @@ class XpbdSolverStep {
       xpbd::SegmentContactConstraintSet &constraint = *hair_contacts_.constraint_set;
       for (const int color_i : hair_contacts_.coloring.colors.index_range()) {
         const IndexMask &mask = hair_contacts_.coloring.colors[color_i];
+        threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
+          const IndexMask sliced_mask = mask.slice(range);
+          xpbd::GaussSeidelUpdater updater{solver_refs};
+          constraint.solve_sequential(solve_params, updater, sliced_mask);
+          error_tls.local().total_error_squared += updater.total_error_squared();
+          error_tls.local().total_error_count += updater.total_error_count();
+        });
+      }
+    }
+
+    if (hair_solid_contacts_.constraint_set.has_value()) {
+      /* Hair against the cloth and the soft bodies: the constraint moves the hair segment and the
+       * triangle it touches, so the coupling is two way. */
+      xpbd::SegmentFaceContactConstraintSet &constraint =
+          *hair_solid_contacts_.constraint_set;
+      for (const int color_i : hair_solid_contacts_.coloring.colors.index_range()) {
+        const IndexMask &mask = hair_solid_contacts_.coloring.colors[color_i];
         threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
           const IndexMask sliced_mask = mask.slice(range);
           xpbd::GaussSeidelUpdater updater{solver_refs};
