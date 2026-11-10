@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -20,8 +21,10 @@
 #include "BKE_mesh_sample.hh"
 #include "BKE_pointcloud.hh"
 
+#include "BLI_math_bits.h"
 #include "BLI_math_geom.h"
 #include "BLI_set.hh"
+#include "BLI_sort.hh"
 #include "BLI_stack.hh"
 #include "BLI_string_utf8.h"
 #include "BLI_virtual_array_range_spans.hh"
@@ -39,6 +42,8 @@
 #include "GEO_xpbd_constraint_pin_position.hh"
 #include "GEO_xpbd_constraint_pin_rotation.hh"
 #include "GEO_xpbd_constraint_point_contact.hh"
+#include "GEO_xpbd_constraint_segment_contact.hh"
+#include "GEO_xpbd_hair_grid.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
 #include "GEO_xpbd_constraint_volume.hh"
@@ -79,6 +84,11 @@ constexpr StringRefNull moment_of_inertia = "moment_of_inertia";
 constexpr StringRefNull static_friction = "static_friction";
 constexpr StringRefNull dynamic_friction = "dynamic_friction";
 constexpr StringRefNull radius = "radius";
+constexpr StringRefNull self_collision = "puncliga_self_collision";
+constexpr StringRefNull contact_thickness = "puncliga_contact_thickness";
+constexpr StringRefNull hair_self_collision = "puncliga_hair_self_collision";
+constexpr StringRefNull hair_contact_thickness = "puncliga_hair_contact_thickness";
+constexpr StringRefNull same_strand_collision = "puncliga_same_strand_collision";
 
 }  // namespace attribute_names
 
@@ -169,6 +179,22 @@ static void node_declare(NodeDeclarationBuilder &b)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
         .description("Extra distance kept between two colliding points, on top of their radii");
+    solver_panel.add_input<decl::Bool>("Hair Self Collision"_ustr)
+        .default_value(false)
+        .description(
+            "Keep the hair strands apart with segment/segment contacts. The segments need a "
+            "`radius` attribute, which `Init Puncliga Data > Hair` writes; the roots of neighbouring "
+            "strands are ignored when they already touch in the rest pose");
+    solver_panel.add_input<decl::Float>("Hair Contact Thickness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .description("Extra distance kept between two hair segments, on top of their radii");
+    solver_panel.add_input<decl::Bool>("Same Strand Collision"_ustr)
+        .default_value(false)
+        .description(
+            "Also collide segments of the same strand with each other. Off keeps a strand from "
+            "pushing its own neighbouring segments apart; curly hair may want it on");
     solver_panel.add_input<decl::String>("Solver Path"_ustr)
         .default_value("")
         .description("Optional output path in the world bundle for solver data");
@@ -593,6 +619,12 @@ struct GeometryData {
 
   VArraySpan<float3> external_force_attr;
   VArraySpan<float3> external_torque_attr;
+  /**
+   * Uniform acceleration from `Blender.DilapidoForce` bundles (wind). It is added to the force per
+   * unit mass in the inertial update, so it applies to hair, cloth and soft bodies without needing a
+   * closure field.
+   */
+  Vector<float3> external_acceleration;
 
   CacheMutex load_friction_mutex;
   VArray<float> static_frictions;
@@ -720,6 +752,8 @@ struct SelfContacts {
   Vector<int> point_geo;
   Vector<int> point_local;
   Vector<float> point_radius;
+  /** Extra contact distance of the point's geometry (the `Contact Thickness` of `Init Puncliga Data`). */
+  Vector<float> point_thickness;
   /** Inverse mass per point; zero for a hard pinned point (see the constraint set). */
   Vector<float> point_inv_mass;
   /** Concatenated positions and rest positions of all those points. */
@@ -753,6 +787,267 @@ struct SelfContacts {
     return point_geo.is_empty();
   }
 };
+
+/** Packed key of an unordered segment pair, used by the rest pose filter. */
+static uint64_t hair_pair_key(const int segment_i, const int segment_j)
+{
+  const uint32_t a = uint32_t(std::min(segment_i, segment_j));
+  const uint32_t b = uint32_t(std::max(segment_i, segment_j));
+  return (uint64_t(a) << 32) | uint64_t(b);
+}
+
+/**
+ * Open addressing hash set of packed segment pairs (see #hair_pair_key).
+ *
+ * The rest pose filter is queried once for every candidate of the broad phase. The previous
+ * implementation kept the keys sorted and ran a binary search (about 20 comparisons for a large
+ * hairstyle); with open addressing and a 50% load factor a query is usually one or two probes.
+ *
+ * The table size is rounded up to a power of two, which lets the probe sequence wrap with a mask.
+ * `EMPTY` is `UINT64_MAX`, which can never be a valid key because the low word is a segment index.
+ */
+class HairPairSet {
+ public:
+  static constexpr uint64_t EMPTY = ~uint64_t(0);
+
+  void build(const Span<uint64_t> pairs)
+  {
+    keys_.reinitialize(0);
+    mask_ = 0;
+    if (pairs.is_empty()) {
+      return;
+    }
+    int64_t capacity = 16;
+    while (capacity < int64_t(pairs.size()) * 2) {
+      capacity <<= 1;
+    }
+    keys_.reinitialize(capacity);
+    keys_.fill(EMPTY);
+    mask_ = uint32_t(capacity - 1);
+    for (const uint64_t key : pairs) {
+      uint32_t slot = uint32_t(this->hash(key)) & mask_;
+      while (keys_[slot] != EMPTY) {
+        slot = (slot + 1) & mask_;
+      }
+      keys_[slot] = key;
+    }
+  }
+
+  bool contains(const uint64_t key) const
+  {
+    if (keys_.is_empty()) {
+      return false;
+    }
+    uint32_t slot = uint32_t(this->hash(key)) & mask_;
+    while (true) {
+      const uint64_t stored = keys_[slot];
+      if (stored == key) {
+        return true;
+      }
+      if (stored == EMPTY) {
+        return false;
+      }
+      slot = (slot + 1) & mask_;
+    }
+  }
+
+ private:
+  Array<uint64_t> keys_;
+  uint32_t mask_ = 0;
+
+  static uint64_t hash(uint64_t key)
+  {
+    /* Fibonacci hashing: the high 32 bits (the smaller segment index) are the coarse part, the
+     * multiplicative mixing spreads both halves over the table. */
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return key;
+  }
+};
+
+/**
+ * Segment/segment contacts of the hair strands with themselves (see
+ * #xpbd::SegmentContactConstraintSet).
+ *
+ * A hair strand is a chain of segments. Every segment of every curve geometry takes part in one
+ * index space. The pairs are built once per frame with a displacement margin (the strands can move
+ * between the substeps without rebuilding the broad phase), and the rest pose is used to skip pairs
+ * that already touch in the rest pose (the roots of neighbouring strands are always close), so the
+ * pass does not explode a combed hairstyle.
+ *
+ * All arrays are flat and only indexed by integers, which is what a future device implementation
+ * needs: `pair_points` / `pair_min_distances` / `pair_lambdas` can be uploaded as SSBOs and solved
+ * with one invocation per pair, mirroring `KERNEL_CONTACT_POSITION` of the fluid.
+ */
+struct HairSelfContacts {
+  /** The participating curve geometries, with the range of the global points of each. */
+  Vector<int> geometry_data_key;
+  Vector<int> geometry_start;
+  Vector<int> geometry_size;
+  Vector<int> affected_geo_indices;
+
+  Vector<int> point_geo;
+  Vector<int> point_local;
+  Vector<float> point_inv_mass;
+  Array<float3> positions;
+  Array<float3> rest_positions;
+
+  /** Segments, one per consecutive pair of points of a curve. */
+  Vector<int> segment_geometry;
+  Vector<int> segment_strand;
+  Vector<int> segment_point_a;
+  Vector<int> segment_point_b;
+  Vector<float> segment_radius;
+  /** Extra contact distance of the segment's geometry (`Hair Contact Thickness`). */
+  Vector<float> segment_thickness;
+  /** Whether segments of this strand may collide with each other (`Same Strand Collision`). */
+  Vector<uint8_t> segment_same_strand;
+  /**
+   * Upper bound of how far the two endpoints of the segment can move during the frame. The broad
+   * phase is built once per frame, so a pair that is still this much apart can become a contact in a
+   * later substep and has to be kept. This makes the pair list conservative instead of re-collecting
+   * it every substep.
+   */
+  Vector<float> segment_margin;
+
+  /** Hash set of the segment pairs that already touch in the rest pose. */
+  HairPairSet rest_pairs;
+  int rest_pair_count = 0;
+
+  /** Contacts, four global point indices per pair (two segments). */
+  Array<int> pair_offsets;
+  Vector<int> pair_points;
+  Vector<int2> pair_segments;
+  Vector<float> pair_min_distances;
+  Vector<float> pair_compliances;
+  Array<float> pair_lambdas;
+  xpbd::ConstraintColoring coloring;
+  std::optional<xpbd::SegmentContactConstraintSet> constraint_set;
+
+  bool is_empty() const
+  {
+    return point_geo.is_empty();
+  }
+};
+
+/**
+ * Process wide cache of the rest pose pair sets.
+ *
+ * The rest pose of a groom does not change while the hair is simulated, but the pair set costs
+ * hundreds of milliseconds for a large hairstyle (a 10k strand groom has more than a million pairs
+ * that already touch in the rest pose). The cache is keyed by a content hash of the rest positions
+ * and radii, so an edited or animated groom simply misses and rebuilds.
+ *
+ * Only one entry is kept: alternating between two large grooms rebuilds each frame, which is the
+ * uncached behaviour and still correct.
+ */
+struct HairRestPairCache {
+  std::mutex mutex;
+  uint64_t key = 0;
+  int pair_count = 0;
+  HairPairSet pairs;
+};
+
+static HairRestPairCache &hair_rest_pair_cache()
+{
+  static HairRestPairCache cache;
+  return cache;
+}
+
+static uint64_t hair_rest_pair_key_hash(const HairSelfContacts &contacts)
+{
+  uint64_t hash = 1469598103934665603ULL;
+  const auto mix = [&](const void *data, const size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; i++) {
+      hash ^= uint64_t(bytes[i]);
+      hash *= 1099511628211ULL;
+    }
+  };
+  const int segments_num = contacts.segment_geometry.size();
+  const int points_num = contacts.rest_positions.size();
+  mix(&segments_num, sizeof(segments_num));
+  mix(&points_num, sizeof(points_num));
+  mix(contacts.rest_positions.data(), contacts.rest_positions.size() * sizeof(float3));
+  mix(contacts.segment_radius.data(), contacts.segment_radius.size() * sizeof(float));
+  mix(contacts.segment_thickness.data(), contacts.segment_thickness.size() * sizeof(float));
+  return hash;
+}
+
+/** Squared closest distance between two segments of \a contacts in the given point space. */
+static float hair_segment_distance_squared(const HairSelfContacts &contacts,
+                                           const Span<float3> &points,
+                                           const int segment_i,
+                                           const int segment_j,
+                                           float &r_s,
+                                           float &r_t)
+{
+  const float3 p0 = points[contacts.segment_point_a[segment_i]];
+  const float3 p1 = points[contacts.segment_point_b[segment_i]];
+  const float3 q0 = points[contacts.segment_point_a[segment_j]];
+  const float3 q1 = points[contacts.segment_point_b[segment_j]];
+  xpbd::closest_points_on_segments(p0, p1, q0, q1, r_s, r_t);
+  const float3 qa = math::interpolate(p0, p1, r_s);
+  const float3 qb = math::interpolate(q0, q1, r_t);
+  return math::length_squared(qb - qa);
+}
+
+/**
+ * Greedy coloring specialized for hair segment pairs.
+ *
+ * The generic `color_constraints__binary` builds a multi value map from every segment to all its
+ * constraints and allocates a lot for large hairstyles (measured: 1.8 s for 710k pairs). The pair
+ * builder already guarantees that two constraints only conflict when they share a *segment*, so a
+ * per segment color bitmask is enough: for a new pair, the union of the two masks is the set of
+ * colors that cannot be used, and the lowest free bit is the color.
+ *
+ * 8 words = 512 colors. That is far more than the degree of a hair segment in practice; if a scene
+ * ever exceeds it, the generic coloring is used as a fallback.
+ */
+static xpbd::ConstraintColoring color_hair_segment_pairs(const Span<int2> pairs,
+                                                         const int segments_num,
+                                                         LinearAllocator<> &memory)
+{
+  constexpr int WORDS = 8;
+  Array<uint64_t> masks(segments_num * WORDS, uint64_t(0));
+  Array<int> colors(pairs.size());
+  for (const int pair_i : pairs.index_range()) {
+    const int segment_i = pairs[pair_i].x;
+    const int segment_j = pairs[pair_i].y;
+    int color = -1;
+    for (const int word : IndexRange(WORDS)) {
+      const uint64_t used = masks[segment_i * WORDS + word] | masks[segment_j * WORDS + word];
+      const uint64_t available = ~used;
+      if (available != 0) {
+        const int bit = int(bitscan_forward_uint64(available));
+        color = word * 64 + bit;
+        const uint64_t bit_mask = uint64_t(1) << bit;
+        masks[segment_i * WORDS + word] |= bit_mask;
+        masks[segment_j * WORDS + word] |= bit_mask;
+        break;
+      }
+    }
+    if (color < 0) {
+      return xpbd::color_constraints__binary(pairs, memory);
+    }
+    colors[pair_i] = color;
+  }
+
+  xpbd::ConstraintColoring coloring;
+  if (colors.is_empty()) {
+    return coloring;
+  }
+  const int colors_num = *std::max_element(colors.begin(), colors.end()) + 1;
+  Array<Vector<int>> color_indices(colors_num);
+  for (const int pair_i : colors.index_range()) {
+    color_indices[colors[pair_i]].append(pair_i);
+  }
+  for (const int color_i : color_indices.index_range()) {
+    coloring.colors.append(IndexMask::from_indices<int>(color_indices[color_i], memory));
+  }
+  return coloring;
+}
 
 struct SubstepInterval {
   int current_i;
@@ -957,6 +1252,13 @@ class XpbdSolverStep {
   /** Extra distance kept between two colliding points, on top of their two radii. */
   const float contact_thickness_;
 
+  /** Whether the hair segments collide with each other (see #HairSelfContacts). */
+  const bool hair_self_collision_;
+  /** Extra distance kept between two hair segments, on top of their two radii. */
+  const float hair_contact_thickness_;
+  /** Whether segments of the same strand may collide with each other. */
+  const bool hair_same_strand_collision_;
+
   /* Fine grained profile of the substep loop (only filled when XPBD_PROFILE is set). */
   double prof_coupled_ = 0.0;
   double prof_constraints_ = 0.0;
@@ -997,12 +1299,21 @@ class XpbdSolverStep {
 
   /** Point to point contacts of the solids with themselves (empty when disabled). */
   SelfContacts self_contacts_;
+  /** Whether at least one geometry enabled `Self Collision` for this frame. */
+  bool self_contacts_active_ = false;
   /**
    * Memory of the contact colors of the current substep. The colors are rebuilt together with the
    * pairs, so the memory of the previous substep is released instead of accumulating over the
    * substeps of the frame.
    */
   std::unique_ptr<ResourceScope> self_contacts_memory_;
+
+  /** Segment to segment contacts of the hair with itself (empty when disabled). */
+  HairSelfContacts hair_contacts_;
+  /** Whether at least one hair geometry enabled `Hair Self Collision` for this frame. */
+  bool hair_contacts_active_ = false;
+  /** Memory of the contact colors of the current substep (see #self_contacts_memory_). */
+  std::unique_ptr<ResourceScope> hair_contacts_memory_;
 
   Mutex field_evaluators_mutex_;
 
@@ -1019,6 +1330,9 @@ class XpbdSolverStep {
                  const int constraint_iterations,
                  const bool self_collision,
                  const float contact_thickness,
+                 const bool hair_self_collision,
+                 const float hair_contact_thickness,
+                 const bool hair_same_strand_collision,
                  const float interpolation_begin,
                  const float interpolation_end,
                  const StringRef geometry_tag_filter,
@@ -1029,6 +1343,9 @@ class XpbdSolverStep {
         sub_delta_time_(total_delta_time / substeps_),
         self_collision_(self_collision),
         contact_thickness_(std::max(contact_thickness, 0.0f)),
+        hair_self_collision_(hair_self_collision),
+        hair_contact_thickness_(std::max(hair_contact_thickness, 0.0f)),
+        hair_same_strand_collision_(hair_same_strand_collision),
         interpolation_begin_(interpolation_begin),
         interpolation_end_(interpolation_end),
         world_to_simulation_(math::invert(simulation_to_world)),
@@ -1071,6 +1388,7 @@ class XpbdSolverStep {
     this->gather_from_world__pin_positions();
     this->gather_from_world__pin_rotations();
     this->gather_from_world__collision_contacts();
+    this->gather_from_world__dilapido_forces();
 
     if (profile) {
       ms_gather = ms_since(phase_start);
@@ -1089,6 +1407,7 @@ class XpbdSolverStep {
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
     this->prepare_self_contacts();
+    this->prepare_hair_contacts();
     this->prepare_fluid_gpu();
 
     if (profile) {
@@ -2010,6 +2329,54 @@ class XpbdSolverStep {
       }
 
       constraints_.collision_contacts.append({path});
+    }
+  }
+
+  /**
+   * Applies the uniform `acceleration` of every `Blender.DilapidoForce` bundle in the world to all
+   * simulated geometries. This is the wind force for hair, cloth and soft bodies (the Ignis solver
+   * reads the same bundle directly). The bundle has no filter, so it applies to every geometry in
+   * the world; `Combine Bundle` can still be used to group it with colliders.
+   */
+  void gather_from_world__dilapido_forces()
+  {
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      geo_data.external_acceleration.reinitialize(geo_data.size);
+      geo_data.external_acceleration.fill(float3(0.0f));
+    }
+
+    const Span<std::string> paths = nested_bundle_paths_.lookup(
+        std::string("Blender.DilapidoForce"));
+    for (const StringRef path : paths) {
+      const BundlePtr *bundle_ptr = world_.lookup_path_ptr<BundlePtr>(path);
+      if (!bundle_ptr || !*bundle_ptr) {
+        continue;
+      }
+      const Bundle &bundle = **bundle_ptr;
+      const float3 acceleration = bundle.lookup<float3>(*BundleKey::from_str("acceleration"))
+                                      .value_or(float3(0.0f));
+      if (math::is_zero(acceleration)) {
+        continue;
+      }
+      if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
+        printf("XPBD_DILAPIDO_FORCE path '%s' acceleration (%.3f %.3f %.3f)\n",
+               std::string(path).c_str(),
+               double(acceleration.x),
+               double(acceleration.y),
+               double(acceleration.z));
+      }
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        if (geo_data.external_acceleration.size() != geo_data.size) {
+          continue;
+        }
+        threading::parallel_for(IndexRange(geo_data.size), 4096, [&](const IndexRange range) {
+          for (const int i : range) {
+            geo_data.external_acceleration[i] += acceleration;
+          }
+        });
+      }
     }
   }
 
@@ -3632,6 +3999,7 @@ class XpbdSolverStep {
           mark = std::chrono::steady_clock::now();
         }
         this->simulate__update_self_contacts(solver_refs_i);
+        this->simulate__update_hair_contacts(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
         this->simulate__reset_forces();
         /* A fluid that runs on the device owns its whole substep (grid, predict, the density
@@ -3679,7 +4047,11 @@ class XpbdSolverStep {
     /* The self contacts of the solids are a constraint set that spans all geometries, so they need
      * the substep loop that owns the whole world (the multi chunk path solves every chunk
      * independently). */
-    if (self_collision_) {
+    if (self_contacts_active_ || self_collision_) {
+      return false;
+    }
+    /* The hair contacts also span all curve geometries, so they need the whole world loop. */
+    if (hair_contacts_active_ || hair_self_collision_) {
       return false;
     }
     for (const int data_key_i : geometries_.data_keys.index_range()) {
@@ -3788,7 +4160,8 @@ class XpbdSolverStep {
                                       ref.positions.slice(points_range),
                                       geo_data.velocity_attr.span.slice(points_range),
                                       geo_data.inv_masses.as_span().slice(points_range),
-                                      geo_data.external_force_attr.slice(points_range));
+                                      geo_data.external_force_attr.slice(points_range),
+                                      geo_data.external_acceleration.as_span().slice(points_range));
     if (geo_data.uses_rotation) {
       this->integrate_angular_velocities(
           sub_delta_time_,
@@ -4673,9 +5046,7 @@ class XpbdSolverStep {
   {
     SelfContacts &contacts = self_contacts_;
     contacts = {};
-    if (!self_collision_) {
-      return;
-    }
+    self_contacts_active_ = false;
 
     /* The pairs that are connected by an edge or by the corners of a face, in global indices. */
     Vector<int2> bonds;
@@ -4695,12 +5066,37 @@ class XpbdSolverStep {
       if (geo_data.fluid_constraint_i >= 0) {
         continue;
       }
+      /* Hair and other curve networks have their own segment/segment contacts. The point/point pass
+       * is for meshes (cloth, soft bodies); mixing both contact sets on the same curve points is
+       * redundant and makes `Self Collision` depend on the hair solver. */
+      if (geo_data.curves != nullptr) {
+        continue;
+      }
       const DataKey &data_key = geometries_.data_keys[data_key_i];
       GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
       GeometrySet &geometry = geo_set_data.geometry;
       if (!geometry.has(data_key.type)) {
         continue;
       }
+
+      /* The switches live on the `Init Puncliga Data` node of the geometry. Without the attribute
+       * the solver input is the fallback, which keeps hand built worlds working. */
+      bool participates = self_collision_;
+      if (const VArray<bool> values = *geo_data.attributes.lookup<bool>(
+              attribute_names::self_collision, AttrDomain::Point))
+      {
+        participates = values.size() > 0 && values[0];
+      }
+      if (!participates) {
+        continue;
+      }
+      Array<float> thickness_values;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::contact_thickness,
+                                    contact_thickness_,
+                                    0.0f,
+                                    1.0e9f,
+                                    thickness_values);
 
       this->ensure_radius_loaded(data_key_i);
       const VArraySpan<float> radii = geo_data.radii;
@@ -4756,6 +5152,7 @@ class XpbdSolverStep {
         contacts.point_geo.append(data_key_i);
         contacts.point_local.append(point_i);
         contacts.point_radius.append(radii[point_i]);
+        contacts.point_thickness.append(thickness_values[point_i]);
         const bool pinned = geo_data.is_hard_pinned[point_i] || rigid_pin[point_i];
         contacts.point_inv_mass.append(pinned ? 0.0f : inv_masses[point_i]);
       }
@@ -4815,6 +5212,7 @@ class XpbdSolverStep {
     if (points_num == 0) {
       return;
     }
+    self_contacts_active_ = true;
     contacts.positions.reinitialize(points_num);
     contacts.rest_positions.reinitialize(points_num);
     contacts.rest_positions.as_mutable_span().copy_from(rest_positions_combined.as_span());
@@ -4909,10 +5307,14 @@ class XpbdSolverStep {
     for (const float radius : contacts.point_radius) {
       max_radius = std::max(max_radius, radius);
     }
+    float max_thickness = 0.0f;
+    for (const float thickness : contacts.point_thickness) {
+      max_thickness = std::max(max_thickness, thickness);
+    }
     /* Points within 25% of the contact distance are kept as candidates as well, so that a pair
      * that another constraint pushes into contact during the iterations is already in the list. */
     constexpr float probe_factor = 1.25f;
-    const float cell_size = (2.0f * max_radius + contact_thickness_) * probe_factor;
+    const float cell_size = (2.0f * max_radius + max_thickness) * probe_factor;
     if (!(cell_size > 0.0f)) {
       return;
     }
@@ -4921,7 +5323,7 @@ class XpbdSolverStep {
     const Span<float3> rest_positions = contacts.rest_positions;
     const Span<int> island_ids = contacts.island_ids;
     const Span<float> radii = contacts.point_radius;
-    const float thickness = contact_thickness_;
+    const Span<float> thickness = contacts.point_thickness;
     const float cell_sq = cell_size * cell_size;
 
     const auto is_candidate = [&](const int point_i0,
@@ -4930,7 +5332,8 @@ class XpbdSolverStep {
       if (point_i1 <= point_i0 || r_sq >= cell_sq) {
         return false;
       }
-      const float contact_distance = radii[point_i0] + radii[point_i1] + thickness;
+      const float contact_distance = radii[point_i0] + radii[point_i1] +
+                                     std::max(thickness[point_i0], thickness[point_i1]);
       const float probe = contact_distance * probe_factor;
       if (r_sq >= probe * probe) {
         return false;
@@ -4989,7 +5392,8 @@ class XpbdSolverStep {
                 return;
               }
               contacts.point_pairs[cursor] = int2(point_i0, point_i1);
-              contacts.min_distances[cursor] = radii[point_i0] + radii[point_i1] + thickness;
+              contacts.min_distances[cursor] = radii[point_i0] + radii[point_i1] +
+                                               std::max(thickness[point_i0], thickness[point_i1]);
               cursor++;
             });
       }
@@ -5049,6 +5453,625 @@ class XpbdSolverStep {
       contacts.positions.as_mutable_span().slice(slice).copy_from(positions);
     }
     this->build_self_contact_pairs(contacts);
+  }
+
+  /**
+   * Gathers all hair segments of the curve geometries into one index space and prepares the rest
+   * positions, the inverse masses and the per segment displacement margins. Runs once per frame and
+   * also builds the segment pairs: the margin makes the pair list conservative enough to stay valid
+   * for every substep of the frame.
+   */
+  void prepare_hair_contacts()
+  {
+    HairSelfContacts &contacts = hair_contacts_;
+    contacts = {};
+    hair_contacts_active_ = false;
+
+    const float frame_dt = sub_delta_time_ * float(substeps_);
+    Vector<float3> positions_combined;
+    Vector<float3> rest_positions_combined;
+    Vector<float3> velocities_combined;
+    Vector<float> geometry_contact_max;
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.curves == nullptr) {
+        continue;
+      }
+      if (geo_data.domain != AttrDomain::Point) {
+        continue;
+      }
+      if (geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size) {
+        continue;
+      }
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+      GeometrySet &geometry = geo_set_data.geometry;
+      if (!geometry.has(data_key.type)) {
+        continue;
+      }
+
+      /* The switches live on the `Init Puncliga Data` node of the geometry. Without the attribute
+       * the solver inputs are the fallback, which keeps hand built worlds working. */
+      bool participates = hair_self_collision_;
+      if (const VArray<bool> values = *geo_data.attributes.lookup<bool>(
+              attribute_names::hair_self_collision, AttrDomain::Point))
+      {
+        participates = values.size() > 0 && values[0];
+      }
+      if (!participates) {
+        continue;
+      }
+      Array<float> thickness_values;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::hair_contact_thickness,
+                                    hair_contact_thickness_,
+                                    0.0f,
+                                    1.0e9f,
+                                    thickness_values);
+      bool allow_same_strand = hair_same_strand_collision_;
+      if (const VArray<bool> strand_values = *geo_data.attributes.lookup<bool>(
+              attribute_names::same_strand_collision, AttrDomain::Point))
+      {
+        allow_same_strand = strand_values.size() > 0 && strand_values[0];
+      }
+
+      this->ensure_radius_loaded(data_key_i, 0.002f);
+      const VArraySpan<float> radii = geo_data.radii;
+      const Span<float3> positions = geometry_component_positions(geometry, data_key.type);
+      if (positions.size() != geo_data.size) {
+        continue;
+      }
+      const VArray<float3> rest_attr = this->lookup_rest_positions(data_key_i);
+      const VArraySpan<float3> rest_positions = rest_attr;
+      const bool has_rest_positions = rest_positions.size() == positions.size();
+
+      const int start = contacts.point_geo.size();
+      const int size = geo_data.size;
+      const int geometry_i = contacts.geometry_data_key.size();
+      contacts.geometry_data_key.append(data_key_i);
+      contacts.geometry_start.append(start);
+      contacts.geometry_size.append(size);
+      contacts.affected_geo_indices.append(data_key_i);
+
+      Array<bool> rigid_pin(size, false);
+      for (const PinPositionConstraintUsage &usage : geo_data.pin_position_constraints) {
+        for (const int pin_i : usage.points.index_range()) {
+          const int point_i = usage.points[pin_i];
+          if (!IndexRange(size).contains(point_i)) {
+            continue;
+          }
+          const float compliance_term = usage.compliances[pin_i] * substep_compliance_factor_;
+          if (compliance_term < 0.01f * geo_data.inv_masses[point_i]) {
+            rigid_pin[point_i] = true;
+          }
+        }
+      }
+      const Span<float3> velocities = geo_data.velocity_attr.span;
+      for (const int point_i : IndexRange(size)) {
+        velocities_combined.append(velocities.size() == size ? velocities[point_i] : float3(0.0f));
+      }
+      float max_radius = 0.0f;
+      for (const float radius : radii) {
+        max_radius = std::max(max_radius, radius);
+      }
+      float max_thickness = 0.0f;
+      for (const float value : thickness_values) {
+        max_thickness = std::max(max_thickness, value);
+      }
+      geometry_contact_max.append(2.0f * max_radius + max_thickness);
+      for (const int point_i : IndexRange(size)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(point_i);
+        const bool pinned = geo_data.is_hard_pinned[point_i] || rigid_pin[point_i];
+        contacts.point_inv_mass.append(pinned ? 0.0f : geo_data.inv_masses[point_i]);
+        positions_combined.append(positions[point_i]);
+        rest_positions_combined.append(has_rest_positions ? rest_positions[point_i] :
+                                                           positions[point_i]);
+      }
+
+      const bke::CurvesGeometry &curves = *geo_data.curves;
+      const OffsetIndices<int> points_by_curve = curves.points_by_curve();
+      const VArray<bool> cyclic = curves.cyclic();
+      for (const int curve_i : points_by_curve.index_range()) {
+        const IndexRange points = points_by_curve[curve_i];
+        const int points_num = points.size();
+        if (points_num < 2) {
+          continue;
+        }
+        const int segments_num = points_num - (cyclic[curve_i] ? 0 : 1);
+        for (const int local_i : IndexRange(segments_num)) {
+          const int point_a = points[local_i];
+          const int point_b = points[(local_i + 1) % points_num];
+          contacts.segment_geometry.append(geometry_i);
+          contacts.segment_strand.append(curve_i);
+          contacts.segment_point_a.append(start + point_a);
+          contacts.segment_point_b.append(start + point_b);
+          contacts.segment_radius.append(std::max(radii[point_a], radii[point_b]));
+          contacts.segment_thickness.append(
+              std::max(thickness_values[point_a], thickness_values[point_b]));
+          contacts.segment_same_strand.append(allow_same_strand ? 1 : 0);
+        }
+      }
+    }
+
+    const int points_num = contacts.point_geo.size();
+    if (points_num == 0) {
+      return;
+    }
+    hair_contacts_active_ = true;
+    contacts.positions.reinitialize(points_num);
+    contacts.positions.as_mutable_span().copy_from(positions_combined.as_span());
+    contacts.rest_positions.reinitialize(points_num);
+    contacts.rest_positions.as_mutable_span().copy_from(rest_positions_combined.as_span());
+
+    this->build_rest_close_pairs(contacts);
+
+    /* The pair list is built once per frame, so every segment is expanded by how far it can move
+     * relative to the rest of the hair before the next rebuild. Uniform accelerations (gravity,
+     * wind) move all points together and do not change the distance between two strands, so the
+     * margin uses the deviation from the mean velocity; that covers a swinging strand without
+     * inflating the query for gravity. The margin is capped relative to the contact distance:
+     * sparse grooms can afford a generous margin, dense grooms cannot (every extra pair is solved in
+     * every iteration). A very dense groom (many segments already touch in the rest pose) keeps a
+     * tight list. */
+    const int segments_num = contacts.segment_geometry.size();
+    contacts.segment_margin.reinitialize(segments_num);
+    const float rest_ratio = float(contacts.rest_pair_count) / float(std::max(1, segments_num));
+    float margin_scale = std::clamp(1.5f / (1.0f + 8.0f * rest_ratio), 0.25f, 1.5f);
+    if (rest_ratio > 4.0f) {
+      margin_scale = 0.0f;
+    }
+    if (const char *env = std::getenv("XPBD_HAIR_MARGIN_SCALE")) {
+      margin_scale = std::max(float(std::atof(env)), 0.0f);
+    }
+    Array<float> point_margins(points_num, 0.0f);
+    for (const int geometry_i : IndexRange(contacts.geometry_start.size())) {
+      const IndexRange slice(contacts.geometry_start[geometry_i], contacts.geometry_size[geometry_i]);
+      const float margin_cap = std::max(geometry_contact_max[geometry_i] * margin_scale, 1e-4f);
+      float3 mean_velocity(0.0f);
+      for (const int point_i : slice) {
+        mean_velocity += velocities_combined[point_i];
+      }
+      mean_velocity /= float(slice.size());
+      for (const int point_i : slice) {
+        const float speed = frame_dt > 0.0f ?
+                                math::length(velocities_combined[point_i] - mean_velocity) :
+                                0.0f;
+        point_margins[point_i] = std::min(speed * frame_dt * 1.5f + 1e-4f, margin_cap);
+      }
+    }
+    for (const int segment_i : IndexRange(segments_num)) {
+      contacts.segment_margin[segment_i] = std::max(
+          point_margins[contacts.segment_point_a[segment_i]],
+          point_margins[contacts.segment_point_b[segment_i]]);
+    }
+
+    /* Build the pairs once per frame; `simulate__update_hair_contacts` only mirrors the positions
+     * (they are used for debugging), the contact solver reads the live solver positions. */
+    this->build_hair_contact_pairs(contacts);
+  }
+
+  /**
+   * Rebuilds the set of segment pairs that already touch in the rest pose.
+   *
+   * This is static for the whole frame, so it is computed once. Without it, every candidate pair
+   * would run the exact rest segment/segment distance again in every frame.
+   */
+  void build_rest_close_pairs(HairSelfContacts &contacts)
+  {
+    contacts.rest_pairs = {};
+    contacts.rest_pair_count = 0;
+    const int segments_num = contacts.segment_geometry.size();
+    if (segments_num < 2) {
+      return;
+    }
+    const bool debug = std::getenv("XPBD_HAIR_DEBUG") != nullptr;
+    const auto start_time = std::chrono::steady_clock::now();
+
+    const uint64_t cache_key = hair_rest_pair_key_hash(contacts);
+    HairRestPairCache &cache = hair_rest_pair_cache();
+    {
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      if (cache.key == cache_key) {
+        contacts.rest_pairs = cache.pairs;
+        contacts.rest_pair_count = cache.pair_count;
+        if (debug) {
+          printf("XPBD_HAIR rest_pairs %d cache=hit\n", contacts.rest_pair_count);
+        }
+        return;
+      }
+    }
+
+    const Span<float3> rest_positions = contacts.rest_positions;
+    float max_radius = 0.0f;
+    for (const float radius : contacts.segment_radius) {
+      max_radius = std::max(max_radius, radius);
+    }
+    float max_thickness = 0.0f;
+    for (const float thickness : contacts.segment_thickness) {
+      max_thickness = std::max(max_thickness, thickness);
+    }
+    constexpr float probe_factor = 1.25f;
+    const float contact_max = 2.0f * max_radius + max_thickness;
+    const float cell_size = std::max(contact_max, 1e-4f) * probe_factor;
+    if (!(cell_size > 0.0f)) {
+      return;
+    }
+
+    xpbd::HairSegmentGrid grid;
+    grid.build(rest_positions,
+               contacts.segment_point_a.as_span(),
+               contacts.segment_point_b.as_span(),
+               cell_size);
+
+    const int chunk_size = 1024;
+    const int chunks_num = (segments_num + chunk_size - 1) / chunk_size;
+    Array<Vector<uint64_t>> chunk_pairs(chunks_num);
+    threading::parallel_for(IndexRange(chunks_num), 1, [&](const IndexRange chunk_range) {
+      for (const int chunk_i : chunk_range) {
+        const int begin = chunk_i * chunk_size;
+        const int end = std::min(begin + chunk_size, segments_num);
+        Vector<uint64_t> &pairs = chunk_pairs[chunk_i];
+        for (const int segment_i : IndexRange(begin, end - begin)) {
+          grid.foreach_candidate(segment_i,
+                                 rest_positions,
+                                 contacts.segment_point_a.as_span(),
+                                 contacts.segment_point_b.as_span(),
+                                 contact_max * probe_factor,
+                                 [&](const int segment_j) {
+                                   if (segment_j <= segment_i) {
+                                     return;
+                                   }
+                                   /* Adjacent segments of one strand share an endpoint; the pair
+                                    * builder never creates a contact for them, so they must not
+                                    * inflate the rest set (that would also make the groom look
+                                    * denser than it is). */
+                                   if (contacts.segment_point_a[segment_i] ==
+                                           contacts.segment_point_a[segment_j] ||
+                                       contacts.segment_point_a[segment_i] ==
+                                           contacts.segment_point_b[segment_j] ||
+                                       contacts.segment_point_b[segment_i] ==
+                                           contacts.segment_point_a[segment_j] ||
+                                       contacts.segment_point_b[segment_i] ==
+                                           contacts.segment_point_b[segment_j])
+                                   {
+                                     return;
+                                   }
+                                   const float contact_distance =
+                                       contacts.segment_radius[segment_i] +
+                                       contacts.segment_radius[segment_j] +
+                                       std::max(contacts.segment_thickness[segment_i],
+                                                contacts.segment_thickness[segment_j]);
+                                   const float probe = contact_distance * probe_factor;
+                                   float s;
+                                   float t;
+                                   if (hair_segment_distance_squared(contacts,
+                                                                     rest_positions,
+                                                                     segment_i,
+                                                                     segment_j,
+                                                                     s,
+                                                                     t) < probe * probe)
+                                   {
+                                     pairs.append(hair_pair_key(segment_i, segment_j));
+                                   }
+                                 });
+        }
+      }
+    });
+
+    Vector<uint64_t> sorted_pairs;
+    int total = 0;
+    for (const Vector<uint64_t> &pairs : chunk_pairs) {
+      total += pairs.size();
+    }
+    sorted_pairs.reserve(total);
+    for (const Vector<uint64_t> &pairs : chunk_pairs) {
+      sorted_pairs.extend(pairs);
+    }
+    parallel_sort(sorted_pairs.as_mutable_span());
+    auto last = std::unique(sorted_pairs.begin(), sorted_pairs.end());
+    sorted_pairs.resize(std::distance(sorted_pairs.begin(), last));
+    contacts.rest_pair_count = sorted_pairs.size();
+    contacts.rest_pairs.build(sorted_pairs.as_span());
+    {
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      cache.key = cache_key;
+      cache.pairs = contacts.rest_pairs;
+      cache.pair_count = contacts.rest_pair_count;
+    }
+    if (debug) {
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start_time)
+                            .count();
+      printf("XPBD_HAIR rest_pairs %d build_ms %.1f cache=miss\n",
+             contacts.rest_pair_count,
+             ms);
+    }
+  }
+
+  /**
+   * Builds the hair segment pairs that can collide during this frame.
+   *
+   * The broad phase is a uniform AABB grid over the segments, with a cell size close to the contact
+   * distance. Every segment is expanded by its own displacement margin (how far its endpoints can
+   * move until the end of the frame), so a pair that is not touching yet but can touch in a later
+   * substep is still collected. That makes the pair list valid for all substeps instead of
+   * re-collecting it in each of them.
+   *
+   * The pair filter uses the rest-pose hash set for the pairs that already touch, and finally the
+   * exact segment/segment distance. Dense regions are capped: a segment keeps at most
+   * #MAX_NEIGHBORS_PER_SEGMENT contacts and the whole list at most #max_pairs pairs. The caps are
+   * applied after the deterministic sort, so the kept set does not depend on thread scheduling.
+   */
+  void build_hair_contact_pairs(HairSelfContacts &contacts)
+  {
+    constexpr int MAX_NEIGHBORS_PER_SEGMENT = 64;
+
+    contacts.pair_offsets.reinitialize(0);
+    contacts.pair_points.clear();
+    contacts.pair_segments.clear();
+    contacts.pair_min_distances.clear();
+    contacts.pair_compliances.clear();
+    contacts.pair_lambdas.reinitialize(0);
+    contacts.coloring = {};
+    contacts.constraint_set.reset();
+
+    const int segments_num = contacts.segment_geometry.size();
+    if (segments_num < 2) {
+      return;
+    }
+    const bool debug = std::getenv("XPBD_HAIR_DEBUG") != nullptr;
+    const auto start_time = std::chrono::steady_clock::now();
+    auto collect_end = start_time;
+    const Span<float3> positions = contacts.positions;
+    float max_radius = 0.0f;
+    for (const float radius : contacts.segment_radius) {
+      max_radius = std::max(max_radius, radius);
+    }
+    float max_thickness = 0.0f;
+    for (const float thickness : contacts.segment_thickness) {
+      max_thickness = std::max(max_thickness, thickness);
+    }
+    constexpr float probe_factor = 1.25f;
+    const float contact_max = 2.0f * max_radius + max_thickness;
+    const float cell_size = std::max(contact_max, 1e-4f) * probe_factor;
+    if (!(cell_size > 0.0f)) {
+      return;
+    }
+
+    const Span<int> segment_geometry = contacts.segment_geometry;
+    const Span<int> segment_strand = contacts.segment_strand;
+    const Span<int> segment_point_a = contacts.segment_point_a;
+    const Span<int> segment_point_b = contacts.segment_point_b;
+    const Span<float> segment_radius = contacts.segment_radius;
+    const Span<float> segment_thickness = contacts.segment_thickness;
+    const Span<uint8_t> segment_same_strand = contacts.segment_same_strand;
+    const Span<float> segment_margin = contacts.segment_margin;
+    const HairPairSet &rest_pairs = contacts.rest_pairs;
+
+    const auto is_candidate = [&](const int segment_i, const int segment_j) -> bool {
+      if (segment_j <= segment_i) {
+        return false;
+      }
+      const bool same_geometry = segment_geometry[segment_i] == segment_geometry[segment_j];
+      const bool same_curve = same_geometry && segment_strand[segment_i] == segment_strand[segment_j];
+      if (same_curve && segment_same_strand[segment_i] == 0) {
+        return false;
+      }
+      /* Adjacent segments of one strand share an endpoint and must not push each other apart. */
+      if (segment_point_a[segment_i] == segment_point_a[segment_j] ||
+          segment_point_a[segment_i] == segment_point_b[segment_j] ||
+          segment_point_b[segment_i] == segment_point_a[segment_j] ||
+          segment_point_b[segment_i] == segment_point_b[segment_j])
+      {
+        return false;
+      }
+      const float contact_distance = segment_radius[segment_i] + segment_radius[segment_j] +
+                                     std::max(segment_thickness[segment_i],
+                                              segment_thickness[segment_j]);
+      /* Pairs that already touch in the rest pose (the roots of neighbouring strands) would push
+       * each other apart forever. */
+      if (rest_pairs.contains(hair_pair_key(segment_i, segment_j))) {
+        return false;
+      }
+      /* Both segments can move by their margin before the end of the frame. */
+      const float probe = contact_distance * probe_factor + segment_margin[segment_i] +
+                          segment_margin[segment_j];
+      float s;
+      float t;
+      return hair_segment_distance_squared(contacts, positions, segment_i, segment_j, s, t) <
+             probe * probe;
+    };
+
+    xpbd::HairSegmentGrid grid;
+    grid.build(positions,
+               contacts.segment_point_a.as_span(),
+               contacts.segment_point_b.as_span(),
+               cell_size);
+
+    int64_t max_pairs = std::max<int64_t>(1 << 18, int64_t(segments_num) * 16);
+    max_pairs = std::min<int64_t>(max_pairs, 1 << 22);
+    /* A pair can be emitted from several cells of the query AABB, so the collection buffer is larger
+     * than the final pair list; it is still bounded to keep pathological input from exhausting the
+     * memory before the duplicate removal. */
+    const int collect_cap = int(std::min<int64_t>(max_pairs * 8, int64_t(1) << 30));
+    const int chunk_size = 1024;
+    const int chunks_num = (segments_num + chunk_size - 1) / chunk_size;
+    const int chunk_cap = std::max(256, collect_cap / std::max(1, chunks_num));
+    Array<Vector<int2>> chunk_pairs(chunks_num);
+    std::atomic<int> capped_chunks{0};
+    threading::parallel_for(IndexRange(chunks_num), 1, [&](const IndexRange chunk_range) {
+      for (const int chunk_i : chunk_range) {
+        const int begin = chunk_i * chunk_size;
+        const int end = std::min(begin + chunk_size, segments_num);
+        Vector<int2> &pairs = chunk_pairs[chunk_i];
+        for (const int segment_i : IndexRange(begin, end - begin)) {
+          if (pairs.size() >= size_t(chunk_cap)) {
+            capped_chunks.fetch_add(1, std::memory_order_relaxed);
+            break;
+          }
+          const float query_expand = contact_max * probe_factor + segment_margin[segment_i];
+          grid.foreach_candidate(segment_i,
+                                 positions,
+                                 contacts.segment_point_a.as_span(),
+                                 contacts.segment_point_b.as_span(),
+                                 query_expand,
+                                 [&](const int segment_j) {
+                                   if (pairs.size() >= size_t(chunk_cap)) {
+                                     return;
+                                   }
+                                   if (is_candidate(segment_i, segment_j)) {
+                                     pairs.append(int2(segment_i, segment_j));
+                                   }
+                                 });
+        }
+      }
+    });
+
+    int total = 0;
+    for (const Vector<int2> &pairs : chunk_pairs) {
+      total += pairs.size();
+    }
+    if (total == 0) {
+      return;
+    }
+    contacts.pair_segments.reserve(total);
+    for (const Vector<int2> &pairs : chunk_pairs) {
+      contacts.pair_segments.extend(pairs);
+    }
+    collect_end = std::chrono::steady_clock::now();
+    parallel_sort(contacts.pair_segments.as_mutable_span(),
+                  [](const int2 &a, const int2 &b) {
+                    return a.x < b.x || (a.x == b.x && a.y < b.y);
+                  });
+    auto last = std::unique(contacts.pair_segments.begin(),
+                            contacts.pair_segments.end(),
+                            [](const int2 &a, const int2 &b) {
+                              return a.x == b.x && a.y == b.y;
+                            });
+    int pairs_num = int(std::distance(contacts.pair_segments.begin(), last));
+    const auto sort_end = std::chrono::steady_clock::now();
+
+    /* Cap the pair list and the degree of every segment. The list is sorted, so the kept set is
+     * deterministic; the caps are a safety valve for pathological input (a whole hairstyle collapsed
+     * into one point would otherwise produce a quadratic number of pairs). */
+    const bool list_capped = pairs_num > max_pairs;
+    if (list_capped) {
+      pairs_num = int(max_pairs);
+    }
+    Array<int> neighbor_counts(segments_num, 0);
+    Vector<int2> limited_pairs;
+    limited_pairs.reserve(pairs_num);
+    int neighbor_dropped = 0;
+    for (const int pair_i : IndexRange(pairs_num)) {
+      const int2 &pair = contacts.pair_segments[pair_i];
+      if (neighbor_counts[pair.x] >= MAX_NEIGHBORS_PER_SEGMENT ||
+          neighbor_counts[pair.y] >= MAX_NEIGHBORS_PER_SEGMENT)
+      {
+        neighbor_dropped++;
+        continue;
+      }
+      neighbor_counts[pair.x]++;
+      neighbor_counts[pair.y]++;
+      limited_pairs.append(pair);
+    }
+    if (list_capped || neighbor_dropped > 0 || capped_chunks.load() > 0) {
+      contacts.pair_segments = std::move(limited_pairs);
+      pairs_num = contacts.pair_segments.size();
+      this->report(NodeWarningType::Warning,
+                   "Hair self collision reached its contact safety limit; some contacts were "
+                   "skipped. Reduce the strand count or Hair Thickness, or increase the solver "
+                   "iterations.");
+    }
+    else {
+      contacts.pair_segments.resize(pairs_num);
+    }
+
+    contacts.pair_offsets.reinitialize(pairs_num + 1);
+    contacts.pair_points.reinitialize(pairs_num * 4);
+    contacts.pair_min_distances.reinitialize(pairs_num);
+    contacts.pair_compliances.reinitialize(pairs_num);
+    contacts.pair_compliances.fill(0.0f);
+    for (const int pair_i : IndexRange(pairs_num)) {
+      const int2 &pair = contacts.pair_segments[pair_i];
+      contacts.pair_offsets[pair_i] = pair_i * 4;
+      const int base = pair_i * 4;
+      contacts.pair_points[base + 0] = segment_point_a[pair.x];
+      contacts.pair_points[base + 1] = segment_point_b[pair.x];
+      contacts.pair_points[base + 2] = segment_point_a[pair.y];
+      contacts.pair_points[base + 3] = segment_point_b[pair.y];
+      contacts.pair_min_distances[pair_i] = segment_radius[pair.x] + segment_radius[pair.y] +
+                                            std::max(segment_thickness[pair.x],
+                                                     segment_thickness[pair.y]);
+    }
+    contacts.pair_offsets[pairs_num] = pairs_num * 4;
+
+    contacts.pair_lambdas.reinitialize(pairs_num);
+    contacts.pair_lambdas.fill(0.0f);
+
+    hair_contacts_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    contacts.coloring = color_hair_segment_pairs(contacts.pair_segments.as_span(),
+                                                 segments_num,
+                                                 hair_contacts_memory_->allocator());
+    const auto color_end = std::chrono::steady_clock::now();
+
+    const GroupedSpan<int> pair_points(OffsetIndices<int>(contacts.pair_offsets),
+                                       contacts.pair_points.as_span());
+    contacts.constraint_set.emplace(contacts.affected_geo_indices,
+                                    pair_points,
+                                    contacts.pair_min_distances.as_span(),
+                                    contacts.pair_compliances.as_span(),
+                                    contacts.pair_segments.as_span(),
+                                    contacts.point_geo.as_span(),
+                                    contacts.point_local.as_span(),
+                                    contacts.point_inv_mass.as_span(),
+                                    error_scale_from_threshold(0.01f),
+                                    contacts.pair_lambdas.as_mutable_span());
+
+    if (debug) {
+      const auto ms = [](const auto &a, const auto &b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      printf("XPBD_HAIR points %d segments %d rest_pairs %d pairs %d capped %d neighbor_dropped %d "
+             "collect_ms %.1f sort_ms %.1f color_ms %.1f total_ms %.1f margin_max %.4f\n",
+             int(contacts.point_geo.size()),
+             segments_num,
+             contacts.rest_pair_count,
+             pairs_num,
+             int(capped_chunks.load()),
+             neighbor_dropped,
+             ms(start_time, collect_end),
+             ms(collect_end, sort_end),
+             ms(sort_end, color_end),
+             ms(start_time, color_end),
+             contacts.segment_margin.is_empty() ?
+                 0.0f :
+                 *std::max_element(contacts.segment_margin.begin(), contacts.segment_margin.end()));
+    }
+  }
+
+  /**
+   * Mirrors the current solver positions into the hair contact space.
+   *
+   * The pairs are built once per frame (with a displacement margin), so this no longer rebuilds the
+   * broad phase. The mirrored positions are only used for debugging; the constraint solver reads the
+   * live solver positions directly.
+   */
+  void simulate__update_hair_contacts(const int solver_refs_i)
+  {
+    HairSelfContacts &contacts = hair_contacts_;
+    if (contacts.is_empty()) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int i : contacts.geometry_data_key.index_range()) {
+      const IndexRange slice(contacts.geometry_start[i], contacts.geometry_size[i]);
+      const Span<float3> positions = refs[contacts.geometry_data_key[i]].positions;
+      if (positions.size() != slice.size()) {
+        continue;
+      }
+      contacts.positions.as_mutable_span().slice(slice).copy_from(positions);
+    }
   }
 
   /**
@@ -6279,7 +7302,21 @@ class XpbdSolverStep {
       geometry::ha::HaXpbdFluidInputs inputs;
       inputs.positions = geo_data.position_attr.span.slice(points);
       inputs.velocities = geo_data.velocity_attr.span.slice(points);
-      inputs.external_force = geo_data.external_force_attr.slice(points);
+      const Span<float3> external_force = geo_data.external_force_attr.slice(points);
+      const Span<float3> external_acceleration = geo_data.external_acceleration.as_span().slice(
+          points);
+      Vector<float3> external_force_with_wind;
+      if (external_acceleration.size() == points.size()) {
+        const Span<float> masses = geo_data.fluid_masses.as_span().slice(points);
+        external_force_with_wind.reinitialize(points.size());
+        for (const int i : points.index_range()) {
+          external_force_with_wind[i] = external_force[i] + external_acceleration[i] * masses[i];
+        }
+        inputs.external_force = external_force_with_wind.as_span();
+      }
+      else {
+        inputs.external_force = external_force;
+      }
       inputs.masses = geo_data.fluid_masses.as_span().slice(points);
       inputs.inv_masses = geo_data.inv_masses.as_span().slice(points);
       inputs.rest_density = geo_data.fluid_rest_density.as_span().slice(points);
@@ -6566,6 +7603,11 @@ class XpbdSolverStep {
         constraint.constraint->reset_forces();
       }
     }
+    /* The hair contacts are built once per frame and keep their multipliers across the substeps, so
+     * reset them like every other constraint set. */
+    if (hair_contacts_.constraint_set.has_value()) {
+      hair_contacts_.constraint_set->reset_forces();
+    }
   }
 
   void simulate__reset_forces__chunk(const int chunk_i)
@@ -6657,6 +7699,22 @@ class XpbdSolverStep {
       xpbd::PointContactConstraintSet &constraint = *self_contacts_.constraint_set;
       for (const int color_i : self_contacts_.coloring.colors.index_range()) {
         const IndexMask &mask = self_contacts_.coloring.colors[color_i];
+        threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
+          const IndexMask sliced_mask = mask.slice(range);
+          xpbd::GaussSeidelUpdater updater{solver_refs};
+          constraint.solve_sequential(solve_params, updater, sliced_mask);
+          error_tls.local().total_error_squared += updater.total_error_squared();
+          error_tls.local().total_error_count += updater.total_error_count();
+        });
+      }
+    }
+
+    if (hair_contacts_.constraint_set.has_value()) {
+      /* The hair contacts also span all curve geometries, so they are solved after the per chunk
+       * constraints and the point contacts. */
+      xpbd::SegmentContactConstraintSet &constraint = *hair_contacts_.constraint_set;
+      for (const int color_i : hair_contacts_.coloring.colors.index_range()) {
+        const IndexMask &mask = hair_contacts_.coloring.colors[color_i];
         threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
           const IndexMask sliced_mask = mask.slice(range);
           xpbd::GaussSeidelUpdater updater{solver_refs};
@@ -6864,13 +7922,21 @@ class XpbdSolverStep {
                                    MutableSpan<float3> new_positions,
                                    MutableSpan<float3> velocities,
                                    const Span<float> inv_masses,
-                                   const Span<float3> forces)
+                                   const Span<float3> forces,
+                                   const Span<float3> external_accelerations)
   {
+    const bool has_external_acceleration = external_accelerations.size() == old_positions.size();
     for (const int i : old_positions.index_range()) {
       const float3 external_force = forces[i];
       const float inv_mass = inv_masses[i];
       const float3 &old_pos = old_positions[i];
-      const float3 acceleration = external_force * inv_mass;
+      /* A force field applies to free points only. Pinned points have zero inverse mass and must
+       * stay where the pin constraint put them; adding the acceleration unconditionally would move
+       * the roots (and cloth pins) every substep before the pin pulls them back. */
+      const float3 acceleration = external_force * inv_mass +
+                                  (has_external_acceleration && inv_mass > 0.0f ?
+                                       external_accelerations[i] :
+                                       float3(0.0f));
       const float3 new_velocity = velocities[i] + acceleration * delta_time;
       velocities[i] = new_velocity;
       new_positions[i] = old_pos + new_velocity * delta_time;
@@ -7376,6 +8442,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   const int constraint_iterations = params.get_input<int>("Constraint Iterations"_ustr);
   const bool self_collision = params.get_input<bool>("Self Collision"_ustr);
   const float contact_thickness = params.get_input<float>("Contact Thickness"_ustr);
+  const bool hair_self_collision = params.get_input<bool>("Hair Self Collision"_ustr);
+  const float hair_contact_thickness = params.get_input<float>("Hair Contact Thickness"_ustr);
+  const bool hair_same_strand_collision = params.get_input<bool>("Same Strand Collision"_ustr);
   const float delta_time = std::max(0.0f, params.get_input<float>("Delta Time"_ustr));
   Bundle &world = world_ptr.ensure_mutable_inplace();
   const std::string geometry_tag_filter = params.extract_input<std::string>("Filter"_ustr);
@@ -7395,6 +8464,9 @@ static void node_geo_exec(GeoNodeExecParams params)
                       constraint_iterations,
                       self_collision,
                       contact_thickness,
+                      hair_self_collision,
+                      hair_contact_thickness,
+                      hair_same_strand_collision,
                       interpolation_begin,
                       interpolation_end,
                       geometry_tag_filter,
