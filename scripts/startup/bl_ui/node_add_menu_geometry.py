@@ -1147,6 +1147,7 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeDilapidoForce")
         self.node_operator(layout, "GeometryNodeDilapidoFieldRemap")
         self.node_operator(layout, "GeometryNodePointDeform")
+        self.node_operator(layout, "GeometryNodeDistributePoints")
         self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         layout.separator()
         self.draw_menu(layout, "RBD")

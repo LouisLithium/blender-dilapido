@@ -10719,6 +10719,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeCurveToPoints");
   define("GeometryNode", "GeometryNodeDeformCurvesOnSurface");
   define("GeometryNode", "GeometryNodeDeleteGeometry");
+  define("GeometryNode", "GeometryNodeDistributePoints");
   define("GeometryNode", "GeometryNodeDistributePointsInGrid");
   define("GeometryNode", "GeometryNodeDistributePointsInVolume");
   define("GeometryNode", "GeometryNodeDistributePointsOnFaces", def_geo_distribute_points_on_faces);
