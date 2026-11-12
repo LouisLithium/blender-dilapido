@@ -115,6 +115,8 @@ constexpr StringRefNull coupling_compliance = "puncliga_coupling_compliance";
 constexpr StringRefNull boundary_particles = "puncliga_boundary_particles";
 constexpr StringRefNull volume_compliance = "puncliga_volume_compliance";
 constexpr StringRefNull edge_compliance = "puncliga_edge_compliance";
+constexpr StringRefNull emission_spacing = "puncliga_emission_spacing";
+constexpr StringRefNull emission_velocity_jitter = "puncliga_emission_velocity_jitter";
 constexpr StringRefNull stretchiness = "puncliga_stretchiness";
 constexpr StringRefNull bendiness = "puncliga_bendiness";
 constexpr StringRefNull root_bendiness = "puncliga_root_bendiness";
@@ -230,6 +232,23 @@ static void node_declare(NodeDeclarationBuilder &b)
         .description(
             "Whether the geometry of a fluid is only the initial state, or a source that emits new "
             "particles (see the items for the difference between the two modes)");
+    panel.add_input<decl::Float>("Emission Spacing"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, fluid)
+        .description(
+            "Do not emit a particle when the nearest particle of the existing fluid is closer than "
+            "this distance. This is a density limit: it stops a static or slow emitter from stacking "
+            "new particles on top of the old ones (0 disables the check)");
+    panel.add_input<decl::Float>("Emission Velocity Jitter"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, fluid)
+        .description(
+            "Random per particle speed variation (fraction of the emitted velocity). A small value "
+            "smears the discrete batches of `Per Frame` into a continuous stream");
     panel.add_input<decl::Float>("Rest Density"_ustr)
         .default_value(1000.0f)
         .min(1e-3f)
@@ -828,6 +847,14 @@ static void node_geo_exec(GeoNodeExecParams params)
                            attribute_names::coupling_compliance,
                            bke::AttrDomain::Point,
                            params.get_input<float>("Coupling Compliance"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::emission_spacing,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Emission Spacing"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::emission_velocity_jitter,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Emission Velocity Jitter"_ustr));
       write_uniform<bool>(geometry,
                           attribute_names::boundary_particles,
                           bke::AttrDomain::Point,
