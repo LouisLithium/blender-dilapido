@@ -141,6 +141,7 @@ set(SRC
   nodes/node_geo_index_switch.cc
   nodes/node_geo_init_puncliga_data.cc
   nodes/node_geo_init_rigid_body.cc
+  nodes/node_geo_init_textura_data.cc
   nodes/node_geo_hw_accelerate.cc
   nodes/node_geo_input_active_camera.cc
   nodes/node_geo_input_collection.cc
@@ -296,6 +297,7 @@ set(SRC
   nodes/node_geo_switch.cc
   nodes/node_geo_tag_filter.cc
   nodes/node_geo_tetrahedralize.cc
+  nodes/node_geo_textura_solver.cc
   nodes/node_geo_tool_3d_cursor.cc
   nodes/node_geo_tool_active_element.cc
   nodes/node_geo_tool_face_set.cc

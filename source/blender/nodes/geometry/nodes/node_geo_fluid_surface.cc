@@ -330,14 +330,14 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Int>("Smoothing"_ustr)
       .default_value(2)
       .min(0)
-      .max(20)
+      .max(60)
       .description(
           "Iterations of the volume preserving Taubin smoothing of the extracted surface. Removes "
           "the staircase look of the marching cubes");
   b.add_input<decl::Int>("Density Smoothing"_ustr)
       .default_value(2)
       .min(0)
-      .max(10)
+      .max(100)
       .description(
           "Relaxation passes on the density field. The surface of the particles is quilted at the "
           "scale of the particle spacing without this; the mesh smoothing above only removes the "

@@ -1125,6 +1125,17 @@ class NODE_MT_gn_dilapido_ignis_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeIgnisVisualize")
 
 
+class NODE_MT_gn_dilapido_textura_base(node_add_menu.NodeMenu):
+    """The MPM solver: fluids and sand."""
+
+    bl_label = "Textura"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeInitTexturaData")
+        self.node_operator(layout, "GeometryNodeTexturaSolver")
+
+
 class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
     """Everything the Dilapido solvers share, plus one submenu per solver."""
 
@@ -1141,6 +1152,7 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         self.draw_menu(layout, "RBD")
         self.draw_menu(layout, "Puncliga")
         self.draw_menu(layout, "Ignis")
+        self.draw_menu(layout, "Textura")
         layout.separator()
         # Zones must be created as a *pair* (`node.add_zone`), otherwise the two nodes are not
         # paired and the tree contains no zone at all (Blender shows the nodes with an error
@@ -1189,6 +1201,7 @@ add_menus = {
     "NODE_MT_geometry_node_GEO_DILAPIDO_RBD": NODE_MT_gn_dilapido_rbd_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_PUNCLIGA": NODE_MT_gn_dilapido_puncliga_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_IGNIS": NODE_MT_gn_dilapido_ignis_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_TEXTURA": NODE_MT_gn_dilapido_textura_base,
     "NODE_MT_category_GEO_VOLUME": NODE_MT_gn_volume_base,
     "NODE_MT_geometry_node_GEO_VOLUME_READ": NODE_MT_gn_volume_read_base,
     "NODE_MT_geometry_node_volume_sample": NODE_MT_gn_volume_sample_base,

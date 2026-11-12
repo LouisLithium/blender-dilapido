@@ -10788,6 +10788,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeIndexSwitch", def_geo_index_switch);
   define("GeometryNode", "GeometryNodeInitPuncligaData");
   define("GeometryNode", "GeometryNodeInitRigidBody");
+  define("GeometryNode", "GeometryNodeInitTexturaData");
   define("GeometryNode", "GeometryNodeInputActiveCamera");
   define("GeometryNode", "GeometryNodeInputCollection", def_geo_input_collection);
   define("GeometryNode", "GeometryNodeInputCurveHandlePositions");
@@ -10940,6 +10941,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeSwitch");
   define("GeometryNode", "GeometryNodeTagFilter");
   define("GeometryNode", "GeometryNodeTetrahedralize");
+  define("GeometryNode", "GeometryNodeTexturaSolver");
   define("GeometryNode", "GeometryNodeTool3DCursor");
   define("GeometryNode", "GeometryNodeToolActiveElement");
   define("GeometryNode", "GeometryNodeToolFaceSet");
