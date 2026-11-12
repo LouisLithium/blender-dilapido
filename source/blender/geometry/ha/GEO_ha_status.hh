@@ -24,8 +24,10 @@
 #include <cstdint>
 #include <string>
 
+namespace blender {
 struct bNode;
 struct bNodeTree;
+}  // namespace blender
 
 namespace blender::geometry::ha {
 

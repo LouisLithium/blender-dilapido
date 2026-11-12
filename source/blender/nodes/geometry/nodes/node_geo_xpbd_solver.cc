@@ -21,6 +21,7 @@
 #include "BKE_mesh_sample.hh"
 #include "BKE_pointcloud.hh"
 
+#include "BLI_hash.h"
 #include "BLI_kdopbvh.hh"
 #include "BLI_math_bits.h"
 #include "BLI_math_geom.h"
