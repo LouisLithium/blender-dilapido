@@ -63,6 +63,7 @@ struct MaterialParameters {
   float bulk_modulus = 5.0e4f;
   float viscosity = 0.2f;
   float tension = 0.0f;
+  float surface_tension = 0.0f;
   float young_modulus = 1.0e5f;
   float poisson_ratio = 0.3f;
   float friction_angle = 30.0f;
@@ -102,6 +103,7 @@ void write_component(GeometryComponent &component,
   float bulk = params.bulk_modulus;
   float viscosity = params.viscosity;
   float tension = params.tension;
+  float surface_tension = params.surface_tension;
   float friction = 0.0f;
   float cohesion = 0.0f;
   float damage_rate = 0.0f;
@@ -110,6 +112,7 @@ void write_component(GeometryComponent &component,
     bulk = 0.0f;
     viscosity = 0.0f;
     tension = 0.0f;
+    surface_tension = 0.0f;
     friction = std::tan(std::max(params.friction_angle, 0.0f) * PI / 180.0f);
     cohesion = std::max(params.cohesion, 0.0f);
     damage_rate = std::max(params.damage_rate, 0.0f);
@@ -140,6 +143,7 @@ void write_component(GeometryComponent &component,
   write_scalar(geometry::textura::attribute_names::lame_lambda, lambda);
   write_scalar(geometry::textura::attribute_names::viscosity, viscosity);
   write_scalar(geometry::textura::attribute_names::tension, tension);
+  write_scalar(geometry::textura::attribute_names::surface_tension, surface_tension);
   write_scalar(geometry::textura::attribute_names::friction, friction);
   write_scalar(geometry::textura::attribute_names::cohesion, cohesion);
   /* An existing damage attribute is authored (weak planes / pre-cracked regions), so keep it. */
@@ -286,6 +290,16 @@ static void node_declare(NodeDeclarationBuilder &b)
         .description("Fraction of the negative pressure a fluid transmits. Water has no tensile "
                      "strength, so 0 is the correct value; raising it makes the material pull "
                      "itself together like gel");
+    panel.add_input<decl::Float>("Surface Tension"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(2.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Fluid))
+        .description("Surface tension coefficient in N/m. Water is 0.072 at room temperature; 0 "
+                     "disables the force. A colour field is splatted to the grid and the force is "
+                     "sigma * laplacian(c) * normal, so the fluid rounds off and pulls small "
+                     "droplets together. Calibrated for a particle spacing close to the voxel "
+                     "size");
   }
 
   {
@@ -344,6 +358,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   material.bulk_modulus = std::max(params.extract_input<float>("Bulk Modulus"_ustr), 0.0f);
   material.viscosity = std::max(params.extract_input<float>("Viscosity"_ustr), 0.0f);
   material.tension = math::clamp(params.extract_input<float>("Tensile Stress"_ustr), 0.0f, 1.0f);
+  material.surface_tension = math::clamp(params.extract_input<float>("Surface Tension"_ustr),
+                                         0.0f,
+                                         2.0f);
   material.young_modulus = std::max(params.extract_input<float>("Young's Modulus"_ustr), 1.0f);
   material.poisson_ratio = math::clamp(params.extract_input<float>("Poisson Ratio"_ustr),
                                        0.0f,

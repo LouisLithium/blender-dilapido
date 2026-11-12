@@ -51,6 +51,8 @@ constexpr StringRefNull shear_modulus = "textura_shear_modulus";
 constexpr StringRefNull lame_lambda = "textura_lame_lambda";
 constexpr StringRefNull viscosity = "textura_viscosity";
 constexpr StringRefNull tension = "textura_tension";
+/** Surface tension coefficient in N/m (water is 0.072). 0 disables the force. */
+constexpr StringRefNull surface_tension = "textura_surface_tension";
 constexpr StringRefNull friction = "textura_friction";
 constexpr StringRefNull cohesion = "textura_cohesion";
 /** Accumulated damage, 0 = intact, 1 = no shear strength left. Grows with plastic strain. */
@@ -126,6 +128,8 @@ struct ParticleData {
   Vector<float> viscosity;
   /** How much of a tensile (negative) pressure a fluid transmits. 0 = water, 1 = fully elastic. */
   Vector<float> tension;
+  /** Surface tension coefficient, in N/m. */
+  Vector<float> surface_tension;
   Vector<float> friction;
   Vector<float> cohesion;
   /**
@@ -163,6 +167,17 @@ struct GridData {
   Vector<float> mass;
   Vector<float3> momentum;
   Vector<float3> velocity;
+  /**
+   * Smoothed colour field (1 inside the fluid, 0 outside), used by the surface tension force.
+   * Only filled when at least one particle has a non zero surface tension coefficient.
+   */
+  Vector<float> color;
+  /**
+   * Indices of the cells that P2G touched in the current substep, in particle order. `clear` and
+   * `update_grid` only visit these instead of the whole box, which matters because the domain is
+   * an AABB and can be mostly empty.
+   */
+  Vector<int> active;
 
   int cell_count() const
   {
@@ -179,7 +194,11 @@ struct GridData {
     return x >= 0 && y >= 0 && z >= 0 && x < dims.x && y < dims.y && z < dims.z;
   }
 
+  /** Allocates and zeroes the whole grid. Used once per frame when the domain is built. */
   void clear();
+
+  /** Zeroes the cells of the previous substep and forgets the list. */
+  void clear_active();
 };
 
 struct Stats {
@@ -188,9 +207,9 @@ struct Stats {
   int active_cells = 0;
   int substeps = 0;
   float max_speed = 0.0f;
-  /** Largest `det(F)` seen during the solve; a fluid should stay close to 1. */
+  /** Largest `det(F)` at the end of the frame; a fluid should stay close to 1. */
   float max_volume_ratio = 1.0f;
-  /** Smallest `det(F)` seen during the solve. */
+  /** Smallest `det(F)` at the end of the frame. */
   float min_volume_ratio = 1.0f;
   int3 grid_dims = int3(0);
   bool cfl_limited = false;
@@ -198,6 +217,12 @@ struct Stats {
   bool collider_sdf_failed = false;
   bool has_particles = false;
   double milliseconds = 0.0;
+  /** Per pass breakdown, accumulated over all substeps of the frame. */
+  double milliseconds_clear = 0.0;
+  double milliseconds_particle_to_grid = 0.0;
+  double milliseconds_update_grid = 0.0;
+  double milliseconds_grid_to_particle = 0.0;
+  double milliseconds_advect = 0.0;
 };
 
 /**

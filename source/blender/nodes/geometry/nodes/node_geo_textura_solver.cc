@@ -280,6 +280,8 @@ void read_component(GeometryComponent &component,
       attributes, geometry::textura::attribute_names::viscosity, domain, 0.2f, count);
   const VArray<float> tension = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::tension, domain, 0.0f, count);
+  const VArray<float> surface_tension = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::surface_tension, domain, 0.0f, count);
   const VArray<float> friction = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::friction, domain, 0.0f, count);
   const VArray<float> cohesion = lookup_or_default<float>(
@@ -311,6 +313,7 @@ void read_component(GeometryComponent &component,
     r_particles.lame_lambda[p] = lambda[i];
     r_particles.viscosity[p] = viscosity[i];
     r_particles.tension[p] = tension[i];
+    r_particles.surface_tension[p] = surface_tension[i];
     r_particles.friction[p] = friction[i];
     r_particles.cohesion[p] = cohesion[i];
     r_particles.damage[p] = damage[i];
@@ -478,6 +481,14 @@ BundlePtr stats_to_bundle(const geometry::textura::Stats &stats)
   bundle.add(*BundleKey::from_str("grid_limited"), stats.grid_limited);
   bundle.add(*BundleKey::from_str("collider_sdf_failed"), stats.collider_sdf_failed);
   bundle.add(*BundleKey::from_str("milliseconds"), float(stats.milliseconds));
+  bundle.add(*BundleKey::from_str("milliseconds_clear"), float(stats.milliseconds_clear));
+  bundle.add(*BundleKey::from_str("milliseconds_particle_to_grid"),
+             float(stats.milliseconds_particle_to_grid));
+  bundle.add(*BundleKey::from_str("milliseconds_update_grid"),
+             float(stats.milliseconds_update_grid));
+  bundle.add(*BundleKey::from_str("milliseconds_grid_to_particle"),
+             float(stats.milliseconds_grid_to_particle));
+  bundle.add(*BundleKey::from_str("milliseconds_advect"), float(stats.milliseconds_advect));
   return bundle_ptr;
 }
 
@@ -570,6 +581,22 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   params.set_output("World"_ustr, std::move(world_ptr));
   params.set_output("Stats"_ustr, stats_to_bundle(stats));
+
+  if (getenv("BLENDER_TEXTURA_PROFILE") != nullptr) {
+    fprintf(stderr,
+            "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d total=%.2f "
+            "clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
+            stats.particles,
+            stats.grid_cells,
+            stats.active_cells,
+            stats.substeps,
+            stats.milliseconds,
+            stats.milliseconds_clear,
+            stats.milliseconds_particle_to_grid,
+            stats.milliseconds_update_grid,
+            stats.milliseconds_grid_to_particle,
+            stats.milliseconds_advect);
+  }
 
   if (stats.cfl_limited) {
     params.error_message_add(

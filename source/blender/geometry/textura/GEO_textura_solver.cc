@@ -43,6 +43,16 @@ namespace {
 
 constexpr float EPSILON = 1e-12f;
 
+/** Fixed number of particle slices for the parallel particle to grid pass. */
+constexpr int P2G_SLICE_COUNT = 8;
+/** Upper bound for the slice scratch grids; above this the scattering falls back to one pass. */
+constexpr int64_t P2G_SLICE_BUDGET = 64ll << 20;
+
+inline double elapsed_ms(const std::chrono::steady_clock::time_point &start)
+{
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 /* -------------------------------------------------------------------- */
 /** \name Small 3x3 helpers
  * \{ */
@@ -138,27 +148,28 @@ inline void polar_rotation(const float f[3][3], float r[3][3])
     float inverse_transposed[3][3];
     transpose3(inverse, inverse_transposed);
     float next[3][3];
+    bool converged = true;
     for (int row = 0; row < 3; row++) {
       for (int col = 0; col < 3; col++) {
         next[row][col] = 0.5f * (r[row][col] + inverse_transposed[row][col]);
-      }
-    }
-    bool finite = true;
-    for (int row = 0; row < 3; row++) {
-      for (int col = 0; col < 3; col++) {
+        /* A deformed `F` is already close to a rotation, so two or three iterations are usually
+         * enough; stop as soon as the update is below float noise. */
+        if (std::fabs(next[row][col] - r[row][col]) > 1e-6f) {
+          converged = false;
+        }
         if (!std::isfinite(next[row][col])) {
-          finite = false;
+          identity3(r);
+          return;
         }
       }
-    }
-    if (!finite) {
-      identity3(r);
-      return;
     }
     for (int row = 0; row < 3; row++) {
       for (int col = 0; col < 3; col++) {
         r[row][col] = next[row][col];
       }
+    }
+    if (converged) {
+      return;
     }
   }
 }
@@ -173,9 +184,14 @@ void jacobi_eigen3(const float input[3][3], float eigen_values[3], float vec[3][
     }
   }
   identity3(vec);
-  for (int sweep = 0; sweep < 32; sweep++) {
+  /* `off` is a sum of squares, so it cannot reach 1e-20 in float32 when the diagonal is order 1;
+   * the old absolute threshold made every particle run all 32 sweeps. Use a relative bound and a
+   * smaller cap: the rotation only has to be accurate at the plastic-projection level. */
+  const float diag = std::fabs(a[0][0]) + std::fabs(a[1][1]) + std::fabs(a[2][2]) + 1e-6f;
+  const float tolerance = 1e-12f * diag * diag;
+  for (int sweep = 0; sweep < 12; sweep++) {
     const float off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
-    if (off < 1e-20f) {
+    if (off <= tolerance) {
       break;
     }
     const int pairs[3][2] = {{0, 1}, {0, 2}, {1, 2}};
@@ -216,17 +232,15 @@ void jacobi_eigen3(const float input[3][3], float eigen_values[3], float vec[3][
 }
 
 /**
- * SVD of a 3x3 matrix: `a = U diag(s) V^T`.
+ * SVD of a 3x3 matrix: `a = U diag(s) V^T`, reduced to `s` and `V`.
  *
- * Only used by the sand return mapping. The decomposition goes through the eigen decomposition of
- * `a^T a`, so `U` is derived (`u_i = a v_i / s_i`) instead of computed separately.
+ * Only used by the sand return mapping, which rebuilds `F` as `F V diag(scale) V^T`, so `U` is not
+ * needed. Dropping it saves a matrix vector product per column per particle per substep.
  */
 struct Svd3 {
   float s[3] = {0.0f, 0.0f, 0.0f};
   /** Eigenvectors of `a^T a`, columns. */
   float v[3][3];
-  /** `u_i = a v_i / s_i`, columns. */
-  float u[3][3];
 };
 
 bool svd3(const float a[3][3], Svd3 &r)
@@ -256,13 +270,6 @@ bool svd3(const float a[3][3], Svd3 &r)
         std::swap(r.v[row][i], r.v[row][best]);
       }
     }
-  }
-  for (int i = 0; i < 3; i++) {
-    const float3 v_column = float3(r.v[0][i], r.v[1][i], r.v[2][i]);
-    const float3 u_column = r.s[i] > 1e-8f ? multiply3(a, v_column) / r.s[i] : v_column;
-    r.u[0][i] = u_column.x;
-    r.u[1][i] = u_column.y;
-    r.u[2][i] = u_column.z;
   }
   return std::isfinite(r.s[0]) && std::isfinite(r.s[1]) && std::isfinite(r.s[2]);
 }
@@ -561,22 +568,36 @@ SolidSample sample_solids(const float3 &position,
     }
   }
   if (sdf != nullptr && sdf->is_valid()) {
-    const float distance = ha::ha_sdf_sample(*sdf, position);
-    if (distance < best.distance) {
-      best.distance = distance;
-      /* Beyond a few cells the gradient cannot matter: no node or particle is close enough for a
-       * contact, so the six extra trilinear samples are skipped. */
-      if (distance <= gradient_epsilon * 4.0f) {
-        const float3 dx = float3(gradient_epsilon, 0.0f, 0.0f);
-        const float3 dy = float3(0.0f, gradient_epsilon, 0.0f);
-        const float3 dz = float3(0.0f, 0.0f, gradient_epsilon);
-        const float3 gradient = float3(
-            ha::ha_sdf_sample(*sdf, position + dx) - ha::ha_sdf_sample(*sdf, position - dx),
-            ha::ha_sdf_sample(*sdf, position + dy) - ha::ha_sdf_sample(*sdf, position - dy),
-            ha::ha_sdf_sample(*sdf, position + dz) - ha::ha_sdf_sample(*sdf, position - dz));
-        const float length = math::length(gradient);
-        if (length > 1e-8f) {
-          best.normal = gradient / length;
+    /* Fast reject: the surface is inside the grid box, so a point well outside it cannot be in
+     * contact. Without this every active cell pays a trilinear sample (and often the six extra
+     * ones for the gradient) even in a scene where the collider is only at the floor. */
+    const float3 box_min = sdf->origin;
+    const float3 box_max = sdf->origin +
+                           float3(float(sdf->dims.x - 1), float(sdf->dims.y - 1),
+                                  float(sdf->dims.z - 1)) *
+                               sdf->spacing;
+    const float skip_margin = 8.0f * sdf->spacing;
+    if (position.x >= box_min.x - skip_margin && position.x <= box_max.x + skip_margin &&
+        position.y >= box_min.y - skip_margin && position.y <= box_max.y + skip_margin &&
+        position.z >= box_min.z - skip_margin && position.z <= box_max.z + skip_margin)
+    {
+      const float distance = ha::ha_sdf_sample(*sdf, position);
+      if (distance < best.distance) {
+        best.distance = distance;
+        /* Beyond a few cells the gradient cannot matter: no node or particle is close enough for a
+         * contact, so the six extra trilinear samples are skipped. */
+        if (distance <= gradient_epsilon * 4.0f) {
+          const float3 dx = float3(gradient_epsilon, 0.0f, 0.0f);
+          const float3 dy = float3(0.0f, gradient_epsilon, 0.0f);
+          const float3 dz = float3(0.0f, 0.0f, gradient_epsilon);
+          const float3 gradient = float3(
+              ha::ha_sdf_sample(*sdf, position + dx) - ha::ha_sdf_sample(*sdf, position - dx),
+              ha::ha_sdf_sample(*sdf, position + dy) - ha::ha_sdf_sample(*sdf, position - dy),
+              ha::ha_sdf_sample(*sdf, position + dz) - ha::ha_sdf_sample(*sdf, position - dz));
+          const float length = math::length(gradient);
+          if (length > 1e-8f) {
+            best.normal = gradient / length;
+          }
         }
       }
     }
@@ -593,6 +614,8 @@ SolidSample sample_solids(const float3 &position,
 void make_domain(const ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
+                 const float delta_time,
+                 const float max_speed,
                  GridData &grid,
                  Stats &r_stats)
 {
@@ -615,7 +638,17 @@ void make_domain(const ParticleData &particles,
   }
   spacing = std::max(spacing, 1e-4f);
 
-  const float margin = 3.0f * spacing;
+  /**
+   * The domain has hard walls (velocity is zeroed on the outer node layer and positions are
+   * clamped), so it has to cover everything the particles move through during the frame. The box
+   * is rebuilt from the positions at the start of the frame, so with a fixed three cell margin a
+   * free falling cloud moves further than the margin in one frame (0.2 m at 24 fps after half a
+   * second, vs 0.15 m at dx 0.05): the lowest layer then hits the bottom wall, the bounding box
+   * never grows downwards, and the material looks like it lands on an invisible ledge. Add the
+   * distance the fastest particle travels this frame.
+   */
+  const float travel = math::clamp(max_speed * delta_time, 0.0f, 8.0f);
+  const float margin = 3.0f * spacing + travel;
   if (settings.use_bounds) {
     min = settings.bounds_min;
     max = settings.bounds_max;
@@ -623,19 +656,21 @@ void make_domain(const ParticleData &particles,
   else {
     min -= float3(margin);
     max += float3(margin);
-    /* Keep the surface of a nearby collider inside the field, without letting a 20 m ground plane
-     * blow the box up: only the part within two metres of the particles is added. */
+    /* Pull a nearby collider surface into the field, but only by a few cells: a 20 m ground plane
+     * used to blow the box up to its own size (a 6 m floor around a 1 m puddle is ~15x the cells,
+     * almost all of them empty). The box follows the particles, so the floor enters it as soon as
+     * a particle is within a few cells of it. */
     for (const Collider &collider : colliders) {
       if (collider.mesh == nullptr) {
         continue;
       }
+      const float reach = margin + 2.0f * spacing;
       float3 collider_min = float3(std::numeric_limits<float>::max());
       float3 collider_max = float3(-std::numeric_limits<float>::max());
       for (const float3 &position : collider.mesh->vert_positions()) {
         collider_min = math::min(collider_min, position);
         collider_max = math::max(collider_max, position);
       }
-      const float reach = 2.0f;
       collider_min = math::max(collider_min, min - float3(reach));
       collider_max = math::min(collider_max, max + float3(reach));
       if (collider_min.x > collider_max.x || collider_min.y > collider_max.y ||
@@ -675,14 +710,7 @@ void make_domain(const ParticleData &particles,
 
 void clear_grid(GridData &grid)
 {
-  const int cells = grid.cell_count();
-  threading::parallel_for(IndexRange(cells), 4096, [&](const IndexRange range) {
-    for (const int i : range) {
-      grid.mass[i] = 0.0f;
-      grid.momentum[i] = float3(0.0f);
-      grid.velocity[i] = float3(0.0f);
-    }
-  });
+  grid.clear_active();
 }
 
 /** Quadratic B-spline weights `w[0..2]`, the base node index and the local coordinate `fx`. */
@@ -710,11 +738,17 @@ inline void quadratic_weights(const float position,
 
 void particle_to_grid(const ParticleData &particles,
                       const float dt,
-                      GridData &grid,
-                      const Span<int> particle_order)
+                      const GridData &grid,
+                      const Span<int> particle_order,
+                      float *mass_out,
+                      float3 *momentum_out,
+                      float *color_out,
+                      Vector<int> &r_active)
 {
   const float inv_dx = 1.0f / grid.dx;
   const float stress_scale = -dt * 4.0f * inv_dx * inv_dx;
+  /* The colour field is the volume fraction: a lattice with spacing == voxel size gives 1. */
+  const float color_scale = 1.0f / (grid.dx * grid.dx * grid.dx);
   for (const int particle : particle_order) {
     const float3 position = particles.positions[particle];
     float f[3][3];
@@ -761,35 +795,196 @@ void particle_to_grid(const ParticleData &particles,
     quadratic_weights(position.y, grid.origin.y, grid.dx, base_y, fy, weight_y);
     quadratic_weights(position.z, grid.origin.z, grid.dx, base_z, fz, weight_z);
 
-    for (int i = 0; i < 3; i++) {
-      for (int j = 0; j < 3; j++) {
-        for (int k = 0; k < 3; k++) {
-          const int x = base_x + i;
-          const int y = base_y + j;
-          const int z = base_z + k;
-          if (!grid.contains(x, y, z)) {
-            continue;
+    /* The stencil is inside the box for every particle that the domain was built around (it starts
+     * one margin away from the border). Bail out to the guarded path only if that is not the case,
+     * e.g. after a particle was clamped onto the domain face. */
+    const int dims_x = grid.dims.x;
+    const int dims_y = grid.dims.y;
+    const int dims_z = grid.dims.z;
+    const int stride_y = dims_x;
+    const int stride_z = dims_x * dims_y;
+    const float3 velocity = particles.velocities[particle];
+    const float3 momentum_base = velocity * mass - affine_column[0] * (fx * grid.dx) -
+                                 affine_column[1] * (fy * grid.dx) -
+                                 affine_column[2] * (fz * grid.dx);
+    /* `momentum = momentum_base + mx[i] + my[j] + mz[k]`, so the inner node only adds vectors. */
+    float3 mx[3];
+    float3 my[3];
+    float3 mz[3];
+    for (int a = 0; a < 3; a++) {
+      mx[a] = affine_column[0] * (float(a) * grid.dx);
+      my[a] = affine_column[1] * (float(a) * grid.dx);
+      mz[a] = affine_column[2] * (float(a) * grid.dx);
+    }
+
+    if (base_x < 0 || base_y < 0 || base_z < 0 || base_x + 2 >= dims_x || base_y + 2 >= dims_y ||
+        base_z + 2 >= dims_z)
+    {
+      for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+          for (int k = 0; k < 3; k++) {
+            const float weight = weight_x[i] * weight_y[j] * weight_z[k];
+            if (weight <= 0.0f) {
+              continue;
+            }
+            if (!grid.contains(base_x + i, base_y + j, base_z + k)) {
+              continue;
+            }
+            const int index = grid.index(base_x + i, base_y + j, base_z + k);
+            if (mass_out[index] == 0.0f) {
+              r_active.append(index);
+            }
+            mass_out[index] += weight * mass;
+            momentum_out[index] += (momentum_base + mx[i] + my[j] + mz[k]) * weight;
+            if (color_out != nullptr) {
+              color_out[index] += weight * volume * color_scale;
+            }
           }
-          const float weight = weight_x[i] * weight_y[j] * weight_z[k];
+        }
+      }
+      continue;
+    }
+
+    const int base_index = (base_z * dims_y + base_y) * dims_x + base_x;
+    for (int k = 0; k < 3; k++) {
+      const float wz = weight_z[k];
+      if (wz <= 0.0f) {
+        continue;
+      }
+      const int kz = base_index + k * stride_z;
+      const float3 mz_k = mz[k];
+      for (int j = 0; j < 3; j++) {
+        const float wzy = wz * weight_y[j];
+        if (wzy <= 0.0f) {
+          continue;
+        }
+        const int jz = kz + j * stride_y;
+        const float3 my_j = my[j];
+        for (int i = 0; i < 3; i++) {
+          const float weight = wzy * weight_x[i];
           if (weight <= 0.0f) {
             continue;
           }
-          const float3 dpos = float3(float(i) - fx, float(j) - fy, float(k) - fz) * grid.dx;
-          const float3 momentum = particles.velocities[particle] * mass +
-                                  affine_column[0] * dpos.x + affine_column[1] * dpos.y +
-                                  affine_column[2] * dpos.z;
-          const int index = grid.index(x, y, z);
-          grid.mass[index] += weight * mass;
-          grid.momentum[index] += momentum * weight;
+          const int index = jz + i;
+          if (mass_out[index] == 0.0f) {
+            r_active.append(index);
+          }
+          mass_out[index] += weight * mass;
+          momentum_out[index] += (momentum_base + mx[i] + my_j + mz_k) * weight;
+          if (color_out != nullptr) {
+            color_out[index] += weight * volume * color_scale;
+          }
         }
       }
     }
   }
 }
 
+/**
+ * Per slice scratch buffers for the parallel particle to grid pass.
+ *
+ * A scattering write cannot be parallelized directly without atomics, and atomics would make the
+ * result depend on the thread schedule (this solver is expected to be bit deterministic). Instead
+ * the particle list is cut into a *fixed* number of slices by index, every slice accumulates into
+ * its own dense grid, and the slices are merged in slice order afterwards. The slice count does not
+ * depend on the thread count, so `-t 1` and all cores produce the same bits.
+ */
+struct P2gSlices {
+  int count = 0;
+  int cells = 0;
+  Vector<Vector<float>> mass;
+  Vector<Vector<float3>> momentum;
+  Vector<Vector<float>> color;
+  Vector<Vector<int>> active;
+
+  bool ensure(const int slice_count, const int cell_count)
+  {
+    if (slice_count <= 1 || cell_count <= 0) {
+      return false;
+    }
+    count = slice_count;
+    if (int(mass.size()) == slice_count && cells == cell_count) {
+      return true;
+    }
+    cells = cell_count;
+    mass.clear();
+    momentum.clear();
+    color.clear();
+    active.clear();
+    mass.reserve(slice_count);
+    momentum.reserve(slice_count);
+    color.reserve(slice_count);
+    active.reserve(slice_count);
+    for (int i = 0; i < slice_count; i++) {
+      mass.append(Vector<float>(cell_count, 0.0f));
+      momentum.append(Vector<float3>(cell_count, float3(0.0f)));
+      color.append(Vector<float>(cell_count, 0.0f));
+      active.append(Vector<int>());
+    }
+    return true;
+  }
+
+  /** Sums the slices into `grid` in slice order and zeroes them again. */
+  void merge_into(GridData &grid)
+  {
+    for (const int slice : IndexRange(count)) {
+      for (const int index : active[slice]) {
+        if (grid.mass[index] == 0.0f) {
+          grid.active.append(index);
+        }
+        grid.mass[index] += mass[slice][index];
+        grid.momentum[index] += momentum[slice][index];
+        grid.color[index] += color[slice][index];
+      }
+    }
+    for (const int slice : IndexRange(count)) {
+      for (const int index : active[slice]) {
+        mass[slice][index] = 0.0f;
+        momentum[slice][index] = float3(0.0f);
+        color[slice][index] = 0.0f;
+      }
+      active[slice].clear();
+    }
+  }
+};
+
+/** Scatters all particles, in parallel slices when the scratch grids fit in memory. */
+void particle_to_grid_all(const ParticleData &particles,
+                          const float dt,
+                          GridData &grid,
+                          const Span<int> particle_order,
+                          const bool need_color,
+                          P2gSlices *slices)
+{
+  float *color_out = need_color ? grid.color.data() : nullptr;
+  if (slices == nullptr || slices->count <= 1) {
+    particle_to_grid(particles, dt, grid, particle_order, grid.mass.data(),
+                     grid.momentum.data(), color_out, grid.active);
+    return;
+  }
+  const int count = slices->count;
+  const int particles_num = particle_order.size();
+  threading::parallel_for(IndexRange(count), 1, [&](const IndexRange range) {
+    for (const int slice : range) {
+      const int begin = int(int64_t(slice) * particles_num / count);
+      const int end = int(int64_t(slice + 1) * particles_num / count);
+      particle_to_grid(particles,
+                       dt,
+                       grid,
+                       particle_order.slice(begin, end - begin),
+                       slices->mass[slice].data(),
+                       slices->momentum[slice].data(),
+                       need_color ? slices->color[slice].data() : nullptr,
+                       slices->active[slice]);
+    }
+  });
+  slices->merge_into(grid);
+}
+
 void update_grid(GridData &grid,
                  const Settings &settings,
                  const float dt,
+                 const float surface_tension,
                  const Span<const Collider> colliders,
                  const Span<float3> box_min,
                  const Span<float3> box_max,
@@ -798,10 +993,21 @@ void update_grid(GridData &grid,
 {
   const float damping = std::max(0.0f, 1.0f - settings.velocity_damping * dt);
   const float contact_range = 1.5f * grid.dx;
-  const int cells = grid.cell_count();
+  const Span<const int> active(grid.active.data(), grid.active.size());
+  /* Continuum surface force (Brackbill): `f = sigma * kappa * grad(c)`, with the curvature from the
+   * divergence of the *normalised* gradient (`kappa = -div(grad(c) / |grad(c)|)`). The bare
+   * `laplacian(c)` form is not equivalent on a diffuse interface: it has opposite signs on the two
+   * halves of the transition and sharpens the interface instead of pulling the surface in, which
+   * makes a blob grow instead of round off. The colour is a volume fraction (1 inside, 0 outside),
+   * so `grad(c)` points inwards and a positive kappa pushes inwards. */
+  const bool has_surface_tension = surface_tension > 0.0f && !grid.color.is_empty();
+  const float inv_2dx = 0.5f / grid.dx;
+  const float cell_volume = grid.dx * grid.dx * grid.dx;
+  constexpr float MAX_TENSION_ACCELERATION = 300.0f;
 
-  threading::parallel_for(IndexRange(cells), 4096, [&](const IndexRange range) {
-    for (const int i : range) {
+  threading::parallel_for(active.index_range(), 256, [&](const IndexRange range) {
+    for (const int range_i : range) {
+      const int i = active[range_i];
       const float mass = grid.mass[i];
       if (mass <= 1e-12f) {
         grid.velocity[i] = float3(0.0f);
@@ -814,6 +1020,43 @@ void update_grid(GridData &grid,
       const int x = i % grid.dims.x;
       const int y = (i / grid.dims.x) % grid.dims.y;
       const int z = i / (grid.dims.x * grid.dims.y);
+
+      if (has_surface_tension) {
+        auto color_at = [&](const int cx, const int cy, const int cz) -> float {
+          return grid.contains(cx, cy, cz) ? grid.color[grid.index(cx, cy, cz)] : 0.0f;
+        };
+        const float gx = (color_at(x + 1, y, z) - color_at(x - 1, y, z)) * inv_2dx;
+        const float gy = (color_at(x, y + 1, z) - color_at(x, y - 1, z)) * inv_2dx;
+        const float gz = (color_at(x, y, z + 1) - color_at(x, y, z - 1)) * inv_2dx;
+        const float3 grad = float3(gx, gy, gz);
+        const float grad_len = math::length(grad);
+        /* Only the interface has a gradient; inside the fluid and far outside it is ~0. */
+        if (grad_len > 1e-3f) {
+          auto normal_at = [&](const int nx, const int ny, const int nz) -> float3 {
+            const float3 local = float3(
+                color_at(nx + 1, ny, nz) - color_at(nx - 1, ny, nz),
+                color_at(nx, ny + 1, nz) - color_at(nx, ny - 1, nz),
+                color_at(nx, ny, nz + 1) - color_at(nx, ny, nz - 1));
+            const float local_len = math::length(local);
+            return local_len > 1e-6f ? local / local_len : float3(0.0f);
+          };
+          const float3 n_xp = normal_at(x + 1, y, z);
+          const float3 n_xm = normal_at(x - 1, y, z);
+          const float3 n_yp = normal_at(x, y + 1, z);
+          const float3 n_ym = normal_at(x, y - 1, z);
+          const float3 n_zp = normal_at(x, y, z + 1);
+          const float3 n_zm = normal_at(x, y, z - 1);
+          const float divergence = (n_xp.x - n_xm.x + n_yp.y - n_ym.y + n_zp.z - n_zm.z) *
+                                   inv_2dx;
+          const float kappa = -divergence;
+          const float3 accel = grad * (surface_tension * kappa * cell_volume / mass);
+          const float magnitude = math::length(accel);
+          velocity += (magnitude > MAX_TENSION_ACCELERATION ?
+                           accel * (MAX_TENSION_ACCELERATION / magnitude) :
+                           accel) *
+                      dt;
+        }
+      }
       if ((x == 0 && velocity.x < 0.0f) || (x == grid.dims.x - 1 && velocity.x > 0.0f)) {
         velocity.x = 0.0f;
       }
@@ -838,19 +1081,12 @@ void update_grid(GridData &grid,
     }
   });
 
-  int active = 0;
-  for (const int i : IndexRange(cells)) {
-    if (grid.mass[i] > 1e-12f) {
-      active++;
-    }
-  }
-  r_stats.active_cells = active;
+  r_stats.active_cells = int(active.size());
 }
 
 void grid_to_particle(ParticleData &particles,
                       const GridData &grid,
-                      const float dt,
-                      Stats &r_stats)
+                      const float dt)
 {
   const float inv_dx = 1.0f / grid.dx;
   threading::parallel_for(IndexRange(particles.size()), 256, [&](const IndexRange range) {
@@ -968,21 +1204,8 @@ void grid_to_particle(ParticleData &particles,
     }
   });
 
-  /* Stats are collected serially so the numbers are independent of the thread count. */
-  float max_speed = 0.0f;
-  float max_j = 1.0f;
-  float min_j = 1.0f;
-  for (const int particle : IndexRange(particles.size())) {
-    max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
-    const float j = determinant3_data(&particles.deformation[particle * 9]);
-    if (std::isfinite(j)) {
-      max_j = std::max(max_j, j);
-      min_j = std::min(min_j, j);
-    }
-  }
-  r_stats.max_speed = max_speed;
-  r_stats.max_volume_ratio = std::max(r_stats.max_volume_ratio, max_j);
-  r_stats.min_volume_ratio = std::min(r_stats.min_volume_ratio, min_j);
+  /* Stats are collected once per frame (see `collect_stats`): doing it per substep was a serial
+   * pass with a 3x3 determinant per particle, which is pure overhead for a diagnostic. */
 }
 
 void advect_and_collide(ParticleData &particles,
@@ -999,21 +1222,42 @@ void advect_and_collide(ParticleData &particles,
                             float3(float(grid.dims.x - 1), float(grid.dims.y - 1),
                                    float(grid.dims.z - 1)) *
                                 grid.dx;
-  for (const int particle : IndexRange(particles.size())) {
-    float3 position = particles.positions[particle] + particles.velocities[particle] * dt;
-    float3 velocity = particles.velocities[particle];
-    const SolidSample sample = sample_solids(
-        position, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
-    if (sample.distance < particles.radius[particle]) {
-      position += sample.normal * (particles.radius[particle] - sample.distance);
-      apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
+  threading::parallel_for(IndexRange(particles.size()), 256, [&](const IndexRange range) {
+    for (const int particle : range) {
+      float3 position = particles.positions[particle] + particles.velocities[particle] * dt;
+      float3 velocity = particles.velocities[particle];
+      const SolidSample sample = sample_solids(
+          position, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
+      if (sample.distance < particles.radius[particle]) {
+        position += sample.normal * (particles.radius[particle] - sample.distance);
+        apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
+      }
+      position.x = math::clamp(position.x, domain_min.x, domain_max.x);
+      position.y = math::clamp(position.y, domain_min.y, domain_max.y);
+      position.z = math::clamp(position.z, domain_min.z, domain_max.z);
+      particles.positions[particle] = position;
+      particles.velocities[particle] = velocity;
     }
-    position.x = math::clamp(position.x, domain_min.x, domain_max.x);
-    position.y = math::clamp(position.y, domain_min.y, domain_max.y);
-    position.z = math::clamp(position.z, domain_min.z, domain_max.z);
-    particles.positions[particle] = position;
-    particles.velocities[particle] = velocity;
+  });
+}
+
+/** Particle diagnostics, once per frame (serial, so the numbers do not depend on the threads). */
+void collect_stats(const ParticleData &particles, Stats &r_stats)
+{
+  float max_speed = 0.0f;
+  float max_j = 1.0f;
+  float min_j = 1.0f;
+  for (const int particle : IndexRange(particles.size())) {
+    max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
+    const float j = determinant3_data(&particles.deformation[particle * 9]);
+    if (std::isfinite(j)) {
+      max_j = std::max(max_j, j);
+      min_j = std::min(min_j, j);
+    }
   }
+  r_stats.max_speed = max_speed;
+  r_stats.max_volume_ratio = max_j;
+  r_stats.min_volume_ratio = min_j;
 }
 
 /** \} */
@@ -1022,16 +1266,33 @@ void advect_and_collide(ParticleData &particles,
 /** \name Substep
  * \{ */
 
+float maximum_surface_tension(const ParticleData &particles)
+{
+  float sigma = 0.0f;
+  for (const int particle : IndexRange(particles.size())) {
+    sigma = std::max(sigma, particles.surface_tension[particle]);
+  }
+  return sigma;
+}
+
+float maximum_speed(const ParticleData &particles)
+{
+  float max_speed = 0.0f;
+  for (const int particle : IndexRange(particles.size())) {
+    max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
+  }
+  return max_speed;
+}
+
 int choose_substeps(const ParticleData &particles,
                     const Settings &settings,
                     const float spacing,
                     const float dt,
+                    const float max_speed,
                     int &r_required)
 {
-  float max_speed = 0.0f;
   float max_wave_speed = 0.0f;
   for (const int particle : IndexRange(particles.size())) {
-    max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
     const float density = std::max(particles.density[particle], 1e-3f);
     float wave_speed = 0.0f;
     if (particles.material[particle] == int(MaterialType::Fluid)) {
@@ -1065,13 +1326,25 @@ void substep(ParticleData &particles,
              const Span<float3> box_min,
              const Span<float3> box_max,
              const ha::HaSdfGrid *sdf,
+             const float surface_tension,
+             P2gSlices *slices,
              Stats &r_stats)
 {
+  auto mark = std::chrono::steady_clock::now();
   clear_grid(grid);
-  particle_to_grid(particles, dt, grid, particle_order);
-  update_grid(grid, settings, dt, colliders, box_min, box_max, sdf, r_stats);
-  grid_to_particle(particles, grid, dt, r_stats);
+  r_stats.milliseconds_clear += elapsed_ms(mark);
+  mark = std::chrono::steady_clock::now();
+  particle_to_grid_all(particles, dt, grid, particle_order, surface_tension > 0.0f, slices);
+  r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
+  mark = std::chrono::steady_clock::now();
+  update_grid(grid, settings, dt, surface_tension, colliders, box_min, box_max, sdf, r_stats);
+  r_stats.milliseconds_update_grid += elapsed_ms(mark);
+  mark = std::chrono::steady_clock::now();
+  grid_to_particle(particles, grid, dt);
+  r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
+  mark = std::chrono::steady_clock::now();
   advect_and_collide(particles, settings, dt, grid, colliders, box_min, box_max, sdf);
+  r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
 /** \} */
@@ -1093,6 +1366,7 @@ void ParticleData::resize(const int count)
   lame_lambda.resize(count);
   viscosity.resize(count);
   tension.resize(count);
+  surface_tension.resize(count);
   friction.resize(count);
   cohesion.resize(count);
   damage.resize(count);
@@ -1122,6 +1396,7 @@ void ParticleData::resize(const int count)
     lame_lambda[i] = 0.0f;
     viscosity[i] = 0.2f;
     tension[i] = 0.0f;
+    surface_tension[i] = 0.0f;
     friction[i] = 0.0f;
     cohesion[i] = 0.0f;
     damage[i] = 0.0f;
@@ -1156,6 +1431,9 @@ void ParticleData::fill_defaults()
     if (!std::isfinite(tension[i])) {
       tension[i] = 0.0f;
     }
+    if (!std::isfinite(surface_tension[i]) || surface_tension[i] < 0.0f) {
+      surface_tension[i] = 0.0f;
+    }
     if (!std::isfinite(damage[i])) {
       damage[i] = 0.0f;
     }
@@ -1174,9 +1452,23 @@ void GridData::clear()
   mass.resize(cells);
   momentum.resize(cells);
   velocity.resize(cells);
+  color.resize(cells);
   std::fill(mass.begin(), mass.end(), 0.0f);
   std::fill(momentum.begin(), momentum.end(), float3(0.0f));
   std::fill(velocity.begin(), velocity.end(), float3(0.0f));
+  std::fill(color.begin(), color.end(), 0.0f);
+  active.clear();
+}
+
+void GridData::clear_active()
+{
+  for (const int index : active) {
+    mass[index] = 0.0f;
+    momentum[index] = float3(0.0f);
+    velocity[index] = float3(0.0f);
+    color[index] = 0.0f;
+  }
+  active.clear();
 }
 
 void solve_frame(ParticleData &particles,
@@ -1196,7 +1488,9 @@ void solve_frame(ParticleData &particles,
   particles.fill_defaults();
 
   GridData grid;
-  make_domain(particles, colliders, settings, grid, r_stats);
+  const float max_speed = maximum_speed(particles);
+  const float surface_tension = maximum_surface_tension(particles);
+  make_domain(particles, colliders, settings, delta_time, max_speed, grid, r_stats);
 
   /* Box bounds are resolved once: a box collider is analytic, only meshes need a field. */
   Vector<float3> box_min(colliders.size(), float3(0.0f));
@@ -1262,12 +1556,29 @@ void solve_frame(ParticleData &particles,
     }
   }
 
-  /* A stable order makes the serial scattering deterministic. */
+  /* A stable particle order makes the scattering (and the slice merge) deterministic. */
   Vector<int> order(particles.size());
   std::iota(order.begin(), order.end(), 0);
 
+  /* Parallel particle to grid: fixed slices, each with its own scratch grid, merged in order.
+   * The slice count only depends on the grid size, never on the thread count, so the result is the
+   * same with `-t 1` and with all cores. Falls back to one serial pass when even two slices do not
+   * fit in the budget. */
+  P2gSlices slices;
+  const int64_t slice_bytes = int64_t(grid.cell_count()) *
+                              int64_t(sizeof(float) + sizeof(float3));
+  int slice_count = 1;
+  if (particles.size() >= 512 && slice_bytes > 0) {
+    slice_count = int(std::min<int64_t>(P2G_SLICE_COUNT, P2G_SLICE_BUDGET / slice_bytes));
+    if (slice_count < 2) {
+      slice_count = 1;
+    }
+  }
+  const bool use_slices = slice_count >= 2 && slices.ensure(slice_count, grid.cell_count());
+
   int required_substeps = 0;
-  const int substeps = choose_substeps(particles, settings, grid.dx, delta_time, required_substeps);
+  const int substeps = choose_substeps(
+      particles, settings, grid.dx, delta_time, max_speed, required_substeps);
   r_stats.substeps = substeps;
   r_stats.cfl_limited = required_substeps > std::max(settings.max_substeps, 1);
   const float dt = delta_time / std::max(substeps, 1);
@@ -1282,8 +1593,12 @@ void solve_frame(ParticleData &particles,
             box_min.as_span(),
             box_max.as_span(),
             sdf_valid ? &sdf : nullptr,
+            surface_tension,
+            use_slices ? &slices : nullptr,
             r_stats);
   }
+
+  collect_stats(particles, r_stats);
 
   /* The CFL request is only known before the frame; the chosen substeps may have been clamped. */
   const auto end = std::chrono::steady_clock::now();
