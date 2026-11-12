@@ -21,6 +21,7 @@
 #include "BKE_mesh_sample.hh"
 #include "BKE_pointcloud.hh"
 
+#include "BLI_kdopbvh.hh"
 #include "BLI_math_bits.h"
 #include "BLI_math_geom.h"
 #include "BLI_set.hh"
@@ -4843,6 +4844,29 @@ class XpbdSolverStep {
   }
 
   /**
+   * Collects the triangle indices whose bounding boxes overlap \a bounds_min / \a bounds_max.
+   * The BVH range query is a sphere around the box; the caller still runs the exact triangle test,
+   * so a slightly larger candidate set is fine. This is what keeps the boundary sampling of a large
+   * collider proportional to the fluid's neighbourhood instead of the whole mesh.
+   */
+  static void collect_triangles_in_bounds(const BVHTree &tree,
+                                          const float3 &bounds_min,
+                                          const float3 &bounds_max,
+                                          Vector<int> &r_indices)
+  {
+    r_indices.clear();
+    const float3 center = (bounds_min + bounds_max) * 0.5f;
+    const float radius = math::length(bounds_max - bounds_min) * 0.5f;
+    BLI_bvhtree_range_query_cpp(
+        tree, center, radius, [&](const int index, const float3 & /*co*/, const float /*dist_sq*/) {
+          r_indices.append(index);
+        });
+    /* Process the triangles in mesh order, like the old loop over every triangle did. This keeps
+     * the boundary particle order (and therefore the floating point summation order) stable. */
+    std::sort(r_indices.begin(), r_indices.end());
+  }
+
+  /**
    * Appends one boundary particle per sub triangle, recursively splitting until the triangles are
    * smaller than the particle spacing. Triangles outside the bounds are skipped early, so the cost
    * is proportional to the area that the fluid can reach instead of the whole collider.
@@ -4987,7 +5011,39 @@ class XpbdSolverStep {
       const Span<int> corner_verts = mesh->corner_verts();
       const Span<float3> vert_positions = mesh->vert_positions();
 
-      for (const int3 &tri : corner_tris) {
+      /* Only visit the triangles whose BVH bounds overlap the fluid. Looping over every triangle
+       * of a large collider (a 20 m ground plane subdivided into thousands of faces) made the CPU
+       * path stall before the fluid even touched it. */
+      const BVHTree *collider_tree = nullptr;
+      if (std::holds_alternative<StaticMeshInfo>(collider.mesh)) {
+        collider_tree = std::get<StaticMeshInfo>(collider.mesh).corner_tris_bvh.tree;
+      }
+      else if (std::holds_alternative<DeformingMeshInfo>(collider.mesh)) {
+        const auto &deforming = std::get<DeformingMeshInfo>(collider.mesh);
+        if (!deforming.substep_corner_tris_bvh_trees.is_empty()) {
+          collider_tree = deforming.substep_corner_tris_bvh_trees.last().tree;
+        }
+      }
+      Vector<int> candidate_tris;
+      if (collider_tree != nullptr) {
+        /* The BVH stores the mesh-space triangles; the fluid bounds are in simulation space. */
+        const float4x4 local_to_mesh = math::invert(mesh_to_local);
+        float3 local_bounds_min(FLT_MAX);
+        float3 local_bounds_max(-FLT_MAX);
+        for (const int corner_i : IndexRange(8)) {
+          const float3 corner((corner_i & 1) ? bounds_max.x : bounds_min.x,
+                              (corner_i & 2) ? bounds_max.y : bounds_min.y,
+                              (corner_i & 4) ? bounds_max.z : bounds_min.z);
+          const float3 local_corner = math::transform_point(local_to_mesh, corner);
+          local_bounds_min = math::min(local_bounds_min, local_corner);
+          local_bounds_max = math::max(local_bounds_max, local_corner);
+        }
+        collect_triangles_in_bounds(
+            *collider_tree, local_bounds_min, local_bounds_max, candidate_tris);
+      }
+
+      const auto add_triangle = [&](const int tri_i) {
+        const int3 &tri = corner_tris[tri_i];
         const float3 v0 = math::transform_point(mesh_to_local,
                                                 vert_positions[corner_verts[tri[0]]]);
         const float3 v1 = math::transform_point(mesh_to_local,
@@ -4995,13 +5051,13 @@ class XpbdSolverStep {
         const float3 v2 = math::transform_point(mesh_to_local,
                                                 vert_positions[corner_verts[tri[2]]]);
         if (!bounds_overlap(v0, v1, v2, bounds_min, bounds_max)) {
-          continue;
+          return;
         }
         positions.clear();
         areas.clear();
         sample_boundary_triangle(v0, v1, v2, spacing, bounds_min, bounds_max, positions, areas, 0);
         if (positions.is_empty()) {
-          continue;
+          return;
         }
         float area_sum = 0.0f;
         for (const float area : areas) {
@@ -5019,6 +5075,17 @@ class XpbdSolverStep {
         for (const int i : positions.index_range()) {
           fluid.boundary_positions.append(positions[i]);
           fluid.boundary_masses.append(point_mass);
+        }
+      };
+
+      if (collider_tree != nullptr) {
+        for (const int tri_i : candidate_tris) {
+          add_triangle(tri_i);
+        }
+      }
+      else {
+        for (const int tri_i : IndexRange(corner_tris.size())) {
+          add_triangle(tri_i);
         }
       }
     }
@@ -5088,15 +5155,22 @@ class XpbdSolverStep {
       const Span<int3> corner_tris = mesh != nullptr ? mesh->corner_tris() : Span<int3>();
 
       if (!corner_tris.is_empty()) {
-        /* A surface: sample it, so the resolution of the solid does not matter. */
+        /* A surface: sample it, so the resolution of the solid does not matter. Only visit the
+         * triangles whose BVH bounds overlap the fluid, like the collider sampling above. */
         const Span<int> corner_verts = mesh->corner_verts();
-        for (const int3 &tri : corner_tris) {
+        const bke::BVHTreeFromMesh &mesh_bvh = mesh->bvh_corner_tris();
+        Vector<int> candidate_tris;
+        if (mesh_bvh.tree != nullptr) {
+          collect_triangles_in_bounds(*mesh_bvh.tree, bounds_min, bounds_max, candidate_tris);
+        }
+        const auto add_triangle = [&](const int tri_i) {
+          const int3 &tri = corner_tris[tri_i];
           const int3 verts(corner_verts[tri[0]], corner_verts[tri[1]], corner_verts[tri[2]]);
           const float3 v0 = positions[verts[0]];
           const float3 v1 = positions[verts[1]];
           const float3 v2 = positions[verts[2]];
           if (!bounds_overlap(v0, v1, v2, bounds_min, bounds_max)) {
-            continue;
+            return;
           }
           samples.clear();
           areas.clear();
@@ -5113,6 +5187,16 @@ class XpbdSolverStep {
             fluid.coupled_vertices.append(verts);
             fluid.coupled_weights.append(weights);
             coupled_num += 1;
+          }
+        };
+        if (mesh_bvh.tree != nullptr) {
+          for (const int tri_i : candidate_tris) {
+            add_triangle(tri_i);
+          }
+        }
+        else {
+          for (const int tri_i : IndexRange(corner_tris.size())) {
+            add_triangle(tri_i);
           }
         }
         continue;
