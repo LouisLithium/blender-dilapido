@@ -128,6 +128,8 @@ constexpr StringRefNull contact_thickness = "puncliga_contact_thickness";
 constexpr StringRefNull hair_self_collision = "puncliga_hair_self_collision";
 constexpr StringRefNull hair_contact_thickness = "puncliga_hair_contact_thickness";
 constexpr StringRefNull same_strand_collision = "puncliga_same_strand_collision";
+constexpr StringRefNull guide_tether = "puncliga_guide_tether";
+constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
 }  // namespace attribute_names
 
 /** The socket declares its options per type, see `.usage_by_menu()` below. */
@@ -379,6 +381,22 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(false)
         .usage_by_menu("Type"_ustr, hair)
         .description("Also collide segments of the same strand; curly hair may want this on");
+    panel.add_input<decl::Bool>("Guide Tether"_ustr)
+        .default_value(false)
+        .usage_by_menu("Type"_ustr, hair)
+        .description(
+            "Attach every child curve to the guide named by its `guide_curve_index`. Enable this "
+            "only on the child geometry: curves with the tether switched off are the guides (give "
+            "the guides their own `Init Puncliga Data` node). The attachment is compliant and two "
+            "way: the guide drives the child, and a collision that moves the child also moves the "
+            "guide");
+    panel.add_input<decl::Float>("Tether Compliance"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, hair)
+        .description(
+            "Softness of the guide tether (XPBD compliance in m/N). Zero keeps the rest offset "
+            "rigidly; a small value (1e-5 to 1e-3) lets collisions and motion stretch it");
     panel.add_input<decl::Float>("Hair Thickness"_ustr)
         .default_value(0.002f)
         .min(0.0f)
@@ -757,6 +775,14 @@ static void node_geo_exec(GeoNodeExecParams params)
                           attribute_names::same_strand_collision,
                           bke::AttrDomain::Point,
                           params.get_input<bool>("Same Strand Collision"_ustr));
+      write_uniform<bool>(geometry,
+                          attribute_names::guide_tether,
+                          bke::AttrDomain::Point,
+                          params.get_input<bool>("Guide Tether"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::tether_compliance,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Tether Compliance"_ustr));
       write_hair_inertia(geometry, mass);
       write_pin_curves(geometry,
                        params.extract_input<Field<float>>("Hair Pin"_ustr),

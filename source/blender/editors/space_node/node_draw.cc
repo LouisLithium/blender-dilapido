@@ -1084,6 +1084,25 @@ static void tag_final_panel(bNode &node, const Span<FlatNodeItem> items)
   }
 }
 
+/* Nodes that support panels draw their body buttons from the declaration's default layout item.
+ * Only nodes whose declaration has no default layout (e.g. a native node with `draw_buttons` but
+ * no `add_default_layout()` call) need the explicit fallback below. Calling both would draw the
+ * buttons twice. */
+static bool declaration_has_default_layout(const bNode &node)
+{
+  const nodes::NodeDeclaration *declaration = node.declaration();
+  if (declaration == nullptr) {
+    return false;
+  }
+  for (const nodes::ItemDeclaration *item : declaration->root_items) {
+    const auto *layout_decl = dynamic_cast<const nodes::LayoutDeclaration *>(item);
+    if (layout_decl != nullptr && layout_decl->is_default) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* Advanced drawing with panels and arbitrary input/output ordering. */
 static void node_update_basis_from_declaration(TreeDrawContext &tree_draw_ctx,
                                                const bContext &C,
@@ -1109,10 +1128,13 @@ static void node_update_basis_from_declaration(TreeDrawContext &tree_draw_ctx,
     socket->flag &= ~SOCK_PANEL_COLLAPSED;
   }
 
-  /* Body buttons. Nodes that support panels are drawn from their declaration, which used to skip
-   * `draw_buttons` entirely: a property that belongs on the node itself (the `Backend` of an
-   * `HW Accelerate` zone) was then only reachable through the sidebar. */
-  node_update_basis_buttons(C, ntree, node, node.typeinfo->draw_buttons, block, locy);
+  /* Body buttons. Most nodes with panels put `draw_buttons` into the declaration via
+   * `add_default_layout()`, so the flat item list below already draws them. Native nodes that
+   * declare a custom socket order without a default layout (e.g. `HW Accelerate`) still need this
+   * fallback, otherwise their buttons would only be reachable through the sidebar. */
+  if (!declaration_has_default_layout(node)) {
+    node_update_basis_buttons(C, ntree, node, node.typeinfo->draw_buttons, block, locy);
+  }
 
   /* Gather flattened list of items in the node. */
   const Vector<FlatNodeItem> flat_items = make_flat_node_items(node);

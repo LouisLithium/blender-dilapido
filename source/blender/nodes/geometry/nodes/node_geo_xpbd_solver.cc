@@ -39,6 +39,7 @@
 #include "GEO_xpbd_constraint_distance.hh"
 #include "GEO_xpbd_constraint_friction_edge.hh"
 #include "GEO_xpbd_constraint_friction_face.hh"
+#include "GEO_xpbd_constraint_guide_tether.hh"
 #include "GEO_xpbd_constraint_pin_position.hh"
 #include "GEO_xpbd_constraint_pin_rotation.hh"
 #include "GEO_xpbd_constraint_point_contact.hh"
@@ -90,6 +91,8 @@ constexpr StringRefNull contact_thickness = "puncliga_contact_thickness";
 constexpr StringRefNull hair_self_collision = "puncliga_hair_self_collision";
 constexpr StringRefNull hair_contact_thickness = "puncliga_hair_contact_thickness";
 constexpr StringRefNull same_strand_collision = "puncliga_same_strand_collision";
+constexpr StringRefNull guide_tether = "puncliga_guide_tether";
+constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
 
 }  // namespace attribute_names
 
@@ -790,6 +793,35 @@ struct HairSolidContacts {
   bool is_empty() const
   {
     return segment_point_a.is_empty() || triangle_points.is_empty();
+  }
+};
+
+/**
+ * Compliant attachments between the simulated child hair points and the points of their guides.
+ *
+ * The guide of a child curve comes from the standard `guide_curve_index` attribute (curve domain);
+ * curves without that attribute are guides. Every child point is attached to the guide point at the
+ * same normalized parameter. The constraint is two way, so a child that a collision moves drags the
+ * guide with it, and the guide drags the child.
+ */
+struct GuideTetherContacts {
+  /** Global point space: all points of the participating hair geometries. */
+  Vector<int> point_geo;
+  Vector<int> point_local;
+  Vector<float> point_inv_mass;
+
+  /** Child point index and guide point index (global) per tether. */
+  Vector<int2> point_pairs;
+  Vector<float3> rest_offsets;
+  Vector<float> compliances;
+  Array<float3> lambdas;
+  xpbd::ConstraintColoring coloring;
+  std::optional<xpbd::GuideTetherConstraintSet> constraint_set;
+  Vector<int> affected_geo_indices;
+
+  bool is_empty() const
+  {
+    return point_pairs.is_empty();
   }
 };
 
@@ -1544,6 +1576,11 @@ class XpbdSolverStep {
   bool hair_solid_active_ = false;
   std::unique_ptr<ResourceScope> hair_solid_memory_;
 
+  /** Compliant guide/child attachments (two way). */
+  GuideTetherContacts guide_tether_contacts_;
+  bool guide_tether_active_ = false;
+  std::unique_ptr<ResourceScope> guide_tether_memory_;
+
   /** Point to point contacts of the solids with themselves (empty when disabled). */
   SelfContacts self_contacts_;
   /** Whether at least one geometry enabled `Self Collision` for this frame. */
@@ -1656,6 +1693,7 @@ class XpbdSolverStep {
     this->prepare_self_contacts();
     this->prepare_hair_contacts();
     this->prepare_hair_solid_contacts();
+    this->prepare_guide_tethers();
     this->prepare_fluid_gpu();
 
     if (profile) {
@@ -4308,6 +4346,10 @@ class XpbdSolverStep {
     if (hair_solid_active_) {
       return false;
     }
+    /* The guide tethers attach child curves to guide curves, also across data keys. */
+    if (guide_tether_active_) {
+      return false;
+    }
     for (const int data_key_i : geometries_.data_keys.index_range()) {
       const GeometryData &geo_data = *geometries_.data[data_key_i];
       if (!geo_data.static_constraints.is_empty()) {
@@ -6084,6 +6126,168 @@ class XpbdSolverStep {
     /* Build the pairs once per frame; `simulate__update_hair_contacts` only mirrors the positions
      * (they are used for debugging), the contact solver reads the live solver positions. */
     this->build_hair_contact_pairs(contacts);
+  }
+
+  /**
+   * Builds the compliant guide/child attachments.
+   *
+   * `Init Puncliga Data > Hair > Guide Tether` enables the pass for a geometry and
+   * `Tether Compliance` is its softness. The guide of every child curve comes from the standard
+   * `guide_curve_index` attribute: curves without a valid index are the guides of that geometry, and
+   * the index selects one of them. Every child point is attached to the guide point at the same
+   * normalized parameter, with the rest offset stored once per frame.
+   *
+   * The constraint is solved after the contacts, so a collision that moves a child also moves its
+   * guide (the correction is split by inverse mass).
+   */
+  void prepare_guide_tethers()
+  {
+    GuideTetherContacts &contacts = guide_tether_contacts_;
+    contacts = {};
+    guide_tether_active_ = false;
+
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.curves == nullptr || geo_data.domain != AttrDomain::Point) {
+        continue;
+      }
+      if (geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size) {
+        continue;
+      }
+
+      bool enabled = false;
+      if (const VArray<bool> values = *geo_data.attributes.lookup<bool>(
+              attribute_names::guide_tether, AttrDomain::Point))
+      {
+        for (const int point_i : IndexRange(values.size())) {
+          if (values[point_i]) {
+            enabled = true;
+            break;
+          }
+        }
+      }
+      if (!enabled) {
+        continue;
+      }
+
+      Array<float> compliances;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::tether_compliance,
+                                    0.0f,
+                                    0.0f,
+                                    1.0e9f,
+                                    compliances);
+      Array<bool> tether_values;
+      this->materialize_bool_param(
+          data_key_i, attribute_names::guide_tether, false, tether_values);
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+
+      const bke::CurvesGeometry &curves = *geo_data.curves;
+      const OffsetIndices<int> points_by_curve = curves.points_by_curve();
+      const VArray<int> guide_indices =
+          geo_data.attributes
+              .lookup_or_default<int>("guide_curve_index", AttrDomain::Curve, -1)
+              .varray;
+      const VArray<float3> rest_attr = this->lookup_rest_positions(data_key_i);
+      const VArraySpan<float3> rest_positions = rest_attr;
+      const Span<float3> positions = geo_data.position_attr.span;
+      const bool has_rest_positions = rest_positions.size() == geo_data.size;
+
+      /**
+       * The curves that have `Guide Tether` on are the children, the others are the guides. A
+       * separate `Init Puncliga Data` node per role is the intended setup: one for the guides with
+       * the tether off, one for the children with it on. Every child curve then names its guide
+       * with `guide_curve_index`, indexing the guide curves of the same geometry in curve order.
+       */
+      const auto curve_is_child = [&](const int curve_i) {
+        const IndexRange points = points_by_curve[curve_i];
+        return !points.is_empty() && tether_values[points[0]];
+      };
+      Vector<int> guide_curves;
+      for (const int curve_i : points_by_curve.index_range()) {
+        if (!curve_is_child(curve_i)) {
+          guide_curves.append(curve_i);
+        }
+      }
+      if (guide_curves.is_empty()) {
+        this->report(NodeWarningType::Warning,
+                     fmt::format("Guide Tether is enabled on \"{}\", but the geometry has no guide "
+                                 "curves (a guide is a curve with the tether switched off, usually "
+                                 "from a separate `Init Puncliga Data` node)",
+                                 geo_set_data.path));
+        continue;
+      }
+
+      const int offset = contacts.point_geo.size();
+      for (const int point_i : IndexRange(geo_data.size)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(point_i);
+        contacts.point_inv_mass.append(geo_data.is_hard_pinned[point_i] ?
+                                           0.0f :
+                                           geo_data.inv_masses[point_i]);
+      }
+
+      constexpr int MAX_TETHERS = 1 << 20;
+      for (const int curve_i : points_by_curve.index_range()) {
+        if (contacts.point_pairs.size() >= MAX_TETHERS) {
+          break;
+        }
+        if (!curve_is_child(curve_i)) {
+          continue;
+        }
+        const int guide_i = guide_indices[curve_i];
+        if (guide_i < 0 || guide_i >= guide_curves.size()) {
+          continue;
+        }
+        const IndexRange child_points = points_by_curve[curve_i];
+        const IndexRange guide_points = points_by_curve[guide_curves[guide_i]];
+        if (child_points.is_empty() || guide_points.is_empty()) {
+          continue;
+        }
+        const int child_num = child_points.size();
+        const int guide_num = guide_points.size();
+        for (const int child_k : IndexRange(child_num)) {
+          if (contacts.point_pairs.size() >= MAX_TETHERS) {
+            break;
+          }
+          const float f = child_num > 1 ? float(child_k) / float(child_num - 1) : 0.0f;
+          const int guide_k = int(std::floor(f * float(guide_num - 1) + 0.5f));
+          const int child_point = child_points[child_k];
+          const int guide_point = guide_points[std::min(guide_k, guide_num - 1)];
+          contacts.point_pairs.append(int2(offset + child_point, offset + guide_point));
+          const float3 rest_offset =
+              has_rest_positions ?
+                  rest_positions[child_point] - rest_positions[guide_point] :
+                  positions[child_point] - positions[guide_point];
+          contacts.rest_offsets.append(rest_offset);
+          contacts.compliances.append(compliances[child_point]);
+        }
+      }
+      contacts.affected_geo_indices.append(data_key_i);
+    }
+
+    if (contacts.point_pairs.is_empty()) {
+      contacts = {};
+      return;
+    }
+
+    const int tethers_num = contacts.point_pairs.size();
+    contacts.lambdas.reinitialize(tethers_num);
+    contacts.lambdas.fill(float3(0.0f));
+    guide_tether_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    contacts.coloring = xpbd::color_constraints__binary(contacts.point_pairs.as_span(),
+                                                        guide_tether_memory_->allocator());
+    contacts.constraint_set.emplace(contacts.affected_geo_indices,
+                                    contacts.point_pairs.as_span(),
+                                    contacts.rest_offsets.as_span(),
+                                    contacts.compliances.as_span(),
+                                    contacts.point_geo.as_span(),
+                                    contacts.point_local.as_span(),
+                                    contacts.point_inv_mass.as_span(),
+                                    error_scale_from_threshold(0.01f),
+                                    contacts.lambdas.as_mutable_span());
+    guide_tether_active_ = true;
   }
 
   /**
@@ -8232,6 +8436,9 @@ class XpbdSolverStep {
     if (hair_contacts_.constraint_set.has_value()) {
       hair_contacts_.constraint_set->reset_forces();
     }
+    if (guide_tether_contacts_.constraint_set.has_value()) {
+      guide_tether_contacts_.constraint_set->reset_forces();
+    }
   }
 
   void simulate__reset_forces__chunk(const int chunk_i)
@@ -8356,6 +8563,22 @@ class XpbdSolverStep {
           *hair_solid_contacts_.constraint_set;
       for (const int color_i : hair_solid_contacts_.coloring.colors.index_range()) {
         const IndexMask &mask = hair_solid_contacts_.coloring.colors[color_i];
+        threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
+          const IndexMask sliced_mask = mask.slice(range);
+          xpbd::GaussSeidelUpdater updater{solver_refs};
+          constraint.solve_sequential(solve_params, updater, sliced_mask);
+          error_tls.local().total_error_squared += updater.total_error_squared();
+          error_tls.local().total_error_count += updater.total_error_count();
+        });
+      }
+    }
+
+    if (guide_tether_contacts_.constraint_set.has_value()) {
+      /* The guide tethers are solved after the contacts: a child that a contact moved now pulls its
+       * guide with it (the correction is split by inverse mass, so the effect is two way). */
+      xpbd::GuideTetherConstraintSet &constraint = *guide_tether_contacts_.constraint_set;
+      for (const int color_i : guide_tether_contacts_.coloring.colors.index_range()) {
+        const IndexMask &mask = guide_tether_contacts_.coloring.colors[color_i];
         threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
           const IndexMask sliced_mask = mask.slice(range);
           xpbd::GaussSeidelUpdater updater{solver_refs};
