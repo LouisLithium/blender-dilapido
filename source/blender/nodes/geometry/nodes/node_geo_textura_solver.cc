@@ -69,6 +69,8 @@ const FlatBundleTypePtr &TexturaSettingsBundle::get_bundle_type()
     b.add<decl::Vector>("gravity"_ustr);
     b.add<decl::Float>("velocity_damping"_ustr).min(0.0f);
     b.add<decl::Float>("boundary_friction"_ustr).min(0.0f);
+    b.add<decl::Bool>("two_phase"_ustr);
+    b.add<decl::Float>("inter_phase_drag"_ustr).min(0.0f);
     const FlatBundleTypePtr bundle_type = b.build();
     BundleTypeRegistry::register_type(bundle_type);
     return bundle_type;
@@ -153,6 +155,9 @@ geometry::textura::Settings read_settings(const Bundle &world)
                                        read_float(s, "velocity_damping", settings.velocity_damping));
   settings.boundary_friction = std::max(
       0.0f, read_float(s, "boundary_friction", settings.boundary_friction));
+  settings.two_phase = read_bool(s, "two_phase", settings.two_phase);
+  settings.inter_phase_drag = std::max(
+      0.0f, read_float(s, "inter_phase_drag", settings.inter_phase_drag));
   return settings;
 }
 
@@ -480,6 +485,7 @@ BundlePtr stats_to_bundle(const geometry::textura::Stats &stats)
   bundle.add(*BundleKey::from_str("cfl_limited"), stats.cfl_limited);
   bundle.add(*BundleKey::from_str("grid_limited"), stats.grid_limited);
   bundle.add(*BundleKey::from_str("collider_sdf_failed"), stats.collider_sdf_failed);
+  bundle.add(*BundleKey::from_str("two_phase"), stats.two_phase);
   bundle.add(*BundleKey::from_str("milliseconds"), float(stats.milliseconds));
   bundle.add(*BundleKey::from_str("milliseconds_clear"), float(stats.milliseconds_clear));
   bundle.add(*BundleKey::from_str("milliseconds_particle_to_grid"),
@@ -584,12 +590,13 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   if (getenv("BLENDER_TEXTURA_PROFILE") != nullptr) {
     fprintf(stderr,
-            "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d total=%.2f "
-            "clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
+            "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d two_phase=%d "
+            "total=%.2f clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
             stats.particles,
             stats.grid_cells,
             stats.active_cells,
             stats.substeps,
+            stats.two_phase ? 1 : 0,
             stats.milliseconds,
             stats.milliseconds_clear,
             stats.milliseconds_particle_to_grid,

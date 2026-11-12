@@ -86,6 +86,14 @@ struct Settings {
    * dimensionless: 0 slips freely, 1 removes the tangential velocity within a few frames. It is
    * applied as a rate (per second), not per substep, so the result does not depend on `Substeps`. */
   float boundary_friction = 0.5f;
+  /**
+   * Give fluids and sand their own velocity grid and exchange momentum between them. Without this
+   * both materials share one grid velocity, so they cannot slide past each other and a fluid in
+   * contact with sand looks viscous.
+   */
+  bool two_phase = false;
+  /** Momentum exchange rate between the two phase grids, in 1/s. 0 lets them move independently. */
+  float inter_phase_drag = 20.0f;
   /** Safety cap. When the box needs more cells the spacing is increased instead. */
   int max_grid_cells = 4 << 20;
 };
@@ -216,6 +224,8 @@ struct Stats {
   bool grid_limited = false;
   bool collider_sdf_failed = false;
   bool has_particles = false;
+  /** Fluids and sand used separate velocity grids for this frame. */
+  bool two_phase = false;
   double milliseconds = 0.0;
   /** Per pass breakdown, accumulated over all substeps of the frame. */
   double milliseconds_clear = 0.0;

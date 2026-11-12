@@ -1084,13 +1084,53 @@ void update_grid(GridData &grid,
   r_stats.active_cells = int(active.size());
 }
 
+/**
+ * Momentum exchange between the fluid and sand velocity grids.
+ *
+ * Each material keeps its own grid, so they would slide through each other without any coupling.
+ * This relaxes the two grid velocities towards each other in every cell that holds both phases,
+ * exactly conserving momentum: `m_a * dv_a + m_b * dv_b = 0`. The rate is exponential in `dt`, so
+ * the result stays stable for any `drag` (a per substep multiplier would inject energy or depend on
+ * the substep count, like the old wall friction bug).
+ */
+void apply_inter_phase_drag(GridData &fluid_grid,
+                            GridData &sand_grid,
+                            const float drag,
+                            const float dt)
+{
+  if (drag <= 0.0f || fluid_grid.active.is_empty()) {
+    return;
+  }
+  const float rate = 1.0f - std::exp(-drag * dt);
+  const Span<const int> active(fluid_grid.active.data(), fluid_grid.active.size());
+  threading::parallel_for(active.index_range(), 256, [&](const IndexRange range) {
+    for (const int range_i : range) {
+      const int index = active[range_i];
+      const float fluid_mass = fluid_grid.mass[index];
+      const float sand_mass = sand_grid.mass[index];
+      if (fluid_mass <= 1e-12f || sand_mass <= 1e-12f) {
+        continue;
+      }
+      const float3 fluid_velocity = fluid_grid.velocity[index];
+      const float3 sand_velocity = sand_grid.velocity[index];
+      const float3 difference = (sand_velocity - fluid_velocity) * rate;
+      const float total = fluid_mass + sand_mass;
+      /* The lighter phase follows the heavier one; both changes cancel in momentum. */
+      fluid_grid.velocity[index] = fluid_velocity + difference * (sand_mass / total);
+      sand_grid.velocity[index] = sand_velocity - difference * (fluid_mass / total);
+    }
+  });
+}
+
 void grid_to_particle(ParticleData &particles,
                       const GridData &grid,
-                      const float dt)
+                      const float dt,
+                      const Span<int> particle_order)
 {
   const float inv_dx = 1.0f / grid.dx;
-  threading::parallel_for(IndexRange(particles.size()), 256, [&](const IndexRange range) {
-    for (const int particle : range) {
+  threading::parallel_for(particle_order.index_range(), 256, [&](const IndexRange range) {
+    for (const int range_i : range) {
+      const int particle = particle_order[range_i];
       const float3 position = particles.positions[particle];
       int base_x;
       int base_y;
@@ -1340,10 +1380,69 @@ void substep(ParticleData &particles,
   update_grid(grid, settings, dt, surface_tension, colliders, box_min, box_max, sdf, r_stats);
   r_stats.milliseconds_update_grid += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
-  grid_to_particle(particles, grid, dt);
+  grid_to_particle(particles, grid, dt, particle_order);
   r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
   advect_and_collide(particles, settings, dt, grid, colliders, box_min, box_max, sdf);
+  r_stats.milliseconds_advect += elapsed_ms(mark);
+}
+
+/**
+ * One substep with separate fluid and sand velocity grids.
+ *
+ * The two P2G passes reuse the same slice scratch sequentially (`merge_into` zeroes it), so the
+ * extra memory is the second dense grid, not a second set of slices. Grid updates run per phase,
+ * then the drag pass couples them, and G2P writes each particle from its own phase grid. Material
+ * updates happen inside G2P, so every particle is updated exactly once.
+ */
+void substep_two_phase(ParticleData &particles,
+                       const Settings &settings,
+                       const float dt,
+                       GridData &fluid_grid,
+                       GridData &sand_grid,
+                       const Span<int> fluid_order,
+                       const Span<int> sand_order,
+                       const Span<const Collider> colliders,
+                       const Span<float3> box_min,
+                       const Span<float3> box_max,
+                       const ha::HaSdfGrid *sdf,
+                       const float surface_tension,
+                       P2gSlices *slices,
+                       Stats &r_stats)
+{
+  auto mark = std::chrono::steady_clock::now();
+  clear_grid(fluid_grid);
+  clear_grid(sand_grid);
+  r_stats.milliseconds_clear += elapsed_ms(mark);
+
+  mark = std::chrono::steady_clock::now();
+  particle_to_grid_all(particles, dt, fluid_grid, fluid_order, surface_tension > 0.0f, slices);
+  particle_to_grid_all(particles, dt, sand_grid, sand_order, false, slices);
+  r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
+
+  mark = std::chrono::steady_clock::now();
+  update_grid(fluid_grid,
+              settings,
+              dt,
+              surface_tension,
+              colliders,
+              box_min,
+              box_max,
+              sdf,
+              r_stats);
+  update_grid(sand_grid, settings, dt, 0.0f, colliders, box_min, box_max, sdf, r_stats);
+  apply_inter_phase_drag(fluid_grid, sand_grid, settings.inter_phase_drag, dt);
+  /* `update_grid` records the active cells of its own phase; report the union here. */
+  r_stats.active_cells = int(fluid_grid.active.size() + sand_grid.active.size());
+  r_stats.milliseconds_update_grid += elapsed_ms(mark);
+
+  mark = std::chrono::steady_clock::now();
+  grid_to_particle(particles, fluid_grid, dt, fluid_order);
+  grid_to_particle(particles, sand_grid, dt, sand_order);
+  r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
+
+  mark = std::chrono::steady_clock::now();
+  advect_and_collide(particles, settings, dt, fluid_grid, colliders, box_min, box_max, sdf);
   r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
@@ -1492,6 +1591,32 @@ void solve_frame(ParticleData &particles,
   const float surface_tension = maximum_surface_tension(particles);
   make_domain(particles, colliders, settings, delta_time, max_speed, grid, r_stats);
 
+  /* Two-phase mode gives fluids and sand their own velocity grid. It is only meaningful when both
+   * materials are present; otherwise the single grid path runs unchanged (and bit identical). */
+  bool has_fluid = false;
+  bool has_sand = false;
+  for (const int material : particles.material) {
+    if (material == int(MaterialType::Fluid)) {
+      has_fluid = true;
+    }
+    else {
+      has_sand = true;
+    }
+    if (has_fluid && has_sand) {
+      break;
+    }
+  }
+  const bool two_phase = settings.two_phase && has_fluid && has_sand;
+  r_stats.two_phase = two_phase;
+
+  GridData sand_grid;
+  if (two_phase) {
+    sand_grid.dims = grid.dims;
+    sand_grid.origin = grid.origin;
+    sand_grid.dx = grid.dx;
+    sand_grid.clear();
+  }
+
   /* Box bounds are resolved once: a box collider is analytic, only meshes need a field. */
   Vector<float3> box_min(colliders.size(), float3(0.0f));
   Vector<float3> box_max(colliders.size(), float3(-1.0f));
@@ -1559,6 +1684,20 @@ void solve_frame(ParticleData &particles,
   /* A stable particle order makes the scattering (and the slice merge) deterministic. */
   Vector<int> order(particles.size());
   std::iota(order.begin(), order.end(), 0);
+  Vector<int> fluid_order;
+  Vector<int> sand_order;
+  if (two_phase) {
+    fluid_order.reserve(particles.size());
+    sand_order.reserve(particles.size());
+    for (const int particle : order) {
+      if (particles.material[particle] == int(MaterialType::Fluid)) {
+        fluid_order.append(particle);
+      }
+      else {
+        sand_order.append(particle);
+      }
+    }
+  }
 
   /* Parallel particle to grid: fixed slices, each with its own scratch grid, merged in order.
    * The slice count only depends on the grid size, never on the thread count, so the result is the
@@ -1584,18 +1723,36 @@ void solve_frame(ParticleData &particles,
   const float dt = delta_time / std::max(substeps, 1);
 
   for (int step = 0; step < substeps; step++) {
-    substep(particles,
-            settings,
-            dt,
-            grid,
-            order,
-            colliders,
-            box_min.as_span(),
-            box_max.as_span(),
-            sdf_valid ? &sdf : nullptr,
-            surface_tension,
-            use_slices ? &slices : nullptr,
-            r_stats);
+    if (two_phase) {
+      substep_two_phase(particles,
+                        settings,
+                        dt,
+                        grid,
+                        sand_grid,
+                        fluid_order.as_span(),
+                        sand_order.as_span(),
+                        colliders,
+                        box_min.as_span(),
+                        box_max.as_span(),
+                        sdf_valid ? &sdf : nullptr,
+                        surface_tension,
+                        use_slices ? &slices : nullptr,
+                        r_stats);
+    }
+    else {
+      substep(particles,
+              settings,
+              dt,
+              grid,
+              order,
+              colliders,
+              box_min.as_span(),
+              box_max.as_span(),
+              sdf_valid ? &sdf : nullptr,
+              surface_tension,
+              use_slices ? &slices : nullptr,
+              r_stats);
+    }
   }
 
   collect_stats(particles, r_stats);
