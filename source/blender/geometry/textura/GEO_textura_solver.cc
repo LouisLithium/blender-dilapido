@@ -1549,6 +1549,27 @@ void grid_to_particle(ParticleData &particles,
    * pass with a 3x3 determinant per particle, which is pure overhead for a diagnostic. */
 }
 
+/**
+ * Smoothed grid mass around \a position, or zero when the point is outside the domain.
+ *
+ * `Contact Skin` needs to know whether a particle is the single layer that MPM's grid contact
+ * leaves hovering above a collider or the upper part of a stack. Sampling the P2G mass one cell
+ * towards the surface answers that: a puddle has material between its upper layers and the floor,
+ * a lone sheet does not. The caller normalises by the mass in the particle's own cell, because P2G
+ * smears a particle's own mass into the neighbouring nodes (quadratic B-spline, ~12% one cell away).
+ */
+float grid_mass_at(const GridData &grid, const float3 &position)
+{
+  const float3 local = (position - grid.origin) / grid.dx;
+  const int x = int(std::floor(local.x));
+  const int y = int(std::floor(local.y));
+  const int z = int(std::floor(local.z));
+  if (!grid.contains(x, y, z)) {
+    return 0.0f;
+  }
+  return grid.mass[grid.index(x, y, z)];
+}
+
 void advect_and_collide(ParticleData &particles,
                         const Settings &settings,
                         const float dt,
@@ -1569,16 +1590,28 @@ void advect_and_collide(ParticleData &particles,
       /* MPM contact lives on the grid, so a particle can settle a full cell above a collider even
        * though its own radius is much smaller. Project it down to its radius when it is close to
        * the surface (`Contact Skin` in the solver panel, in grid cells). This is a position-only
-       * correction: the grid still computes the contact velocity. */
+       * correction: the grid still computes the contact velocity.
+       *
+       * Only particles that have nothing between them and the surface are projected: a shallow
+       * puddle's upper layers are also within the skin distance, and pulling them down flattens the
+       * whole puddle into a single layer that then looks frozen (and is compressed by ~3x). */
       const float contact_skin = std::max(settings.contact_skin, 0.0f) * grid.dx;
       const float contact_friction = math::clamp(settings.boundary_friction * 2.0f * sample.friction,
                                                  0.0f,
                                                  1.0f);
       if (sample.distance < particles.radius[particle] + contact_skin) {
         const bool touching = sample.distance < particles.radius[particle];
-        position += sample.normal * (particles.radius[particle] - sample.distance);
-        if (touching) {
-          apply_wall_contact(velocity, sample.normal, contact_friction, dt);
+        bool supported = false;
+        if (!touching && contact_skin > 0.0f) {
+          const float own_mass = grid_mass_at(grid, position);
+          const float below_mass = grid_mass_at(grid, position - sample.normal * grid.dx);
+          supported = own_mass > 0.0f && below_mass > 0.35f * own_mass;
+        }
+        if (touching || !supported) {
+          position += sample.normal * (particles.radius[particle] - sample.distance);
+          if (touching) {
+            apply_wall_contact(velocity, sample.normal, contact_friction, dt);
+          }
         }
       }
       const float wall_friction = particles.wall_friction[particle];

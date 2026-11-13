@@ -755,8 +755,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   else {
     params.error_message_add(
         NodeWarningType::Info,
-        TIP_("Textura: the world holds no particle geometry. Connect the output of `Init Textura "
-             "Data` to the `Geometry` input of `Textura Dynamics`"));
+        TIP_("Textura: the world holds no particles. Connect the output of `Init Textura Data` to "
+             "the `Geometry` input of `Textura Dynamics`, and check that the upstream geometry is "
+             "not empty"));
   }
 
   for (GeometryEntry &entry : entries) {

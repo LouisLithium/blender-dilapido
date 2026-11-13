@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "BLI_math_vector.hh"
 #include "BLI_string_ref.hh"
 
+#include "GPU_context.hh"
 #include "GPU_init_exit.hh"
 #include "GPU_shader.hh"
 #include "GPU_state.hh"
@@ -563,8 +565,29 @@ const char *KERNEL_ADVECT =
     "  float contact_friction = clamp(params[P_BOUNDARY_FRICTION] * 2.0 * friction, 0.0, 1.0);\n"
     "  if (distance < radius + skin) {\n"
     "    bool touching = distance < radius;\n"
-    "    position += normal * (radius - distance);\n"
-    "    if (touching) { velocity = ha_wall_contact(velocity, normal, contact_friction, dt); }\n"
+    "    bool supported = false;\n"
+    "    if (!touching && skin > 0.0) {\n"
+    "      /* Same test as the CPU reference: only close the gap for particles that have nothing\n"
+    "       * between them and the surface, so a shallow puddle is not flattened into one layer. */\n"
+    "      ivec3 dims = ivec3(int(params[P_DIM_X]), int(params[P_DIM_Y]), int(params[P_DIM_Z]));\n"
+    "      vec3 probe = position - normal * dx;\n"
+    "      ivec3 own = ivec3(floor((position - origin) / dx));\n"
+    "      ivec3 below = ivec3(floor((probe - origin) / dx));\n"
+    "      float own_mass = 0.0;\n"
+    "      float below_mass = 0.0;\n"
+    "      if (all(greaterThanEqual(own, ivec3(0))) && all(lessThan(own, dims))) {\n"
+    "        own_mass = float(gmass[(own.z * dims.y + own.y) * dims.x + own.x]) * HA_INV_FIXED;\n"
+    "      }\n"
+    "      if (all(greaterThanEqual(below, ivec3(0))) && all(lessThan(below, dims))) {\n"
+    "        below_mass = float(gmass[(below.z * dims.y + below.y) * dims.x + below.x]) *\n"
+    "                     HA_INV_FIXED;\n"
+    "      }\n"
+    "      supported = own_mass > 0.0 && below_mass > 0.35 * own_mass;\n"
+    "    }\n"
+    "    if (touching || !supported) {\n"
+    "      position += normal * (radius - distance);\n"
+    "      if (touching) { velocity = ha_wall_contact(velocity, normal, contact_friction, dt); }\n"
+    "    }\n"
     "  }\n"
     "  position = clamp(position, origin, domain_max);\n"
     "  pos[p * 3 + 0] = position.x;\n"
@@ -628,13 +651,14 @@ const std::array<HaShaderResource, 7> G2P_RESOURCES{{
     {6, HaShaderQualifier::Read, "float", "gvel[]"},
 }};
 
-const std::array<HaShaderResource, 6> ADVECT_RESOURCES{{
+const std::array<HaShaderResource, 7> ADVECT_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
     {1, HaShaderQualifier::ReadWrite, "float", "pos[]"},
     {2, HaShaderQualifier::ReadWrite, "float", "vel[]"},
     {3, HaShaderQualifier::Read, "float", "props[]"},
     {4, HaShaderQualifier::Read, "float", "box_data[]"},
     {5, HaShaderQualifier::Read, "float", "sdf_data[]"},
+    {6, HaShaderQualifier::Read, "int", "gmass[]"},
 }};
 
 /** \} */
@@ -661,9 +685,21 @@ struct DeviceState {
 
   int particle_count = 0;
   int cell_count = 0;
+  /**
+   * The GPU context the buffers belong to. Geometry evaluation alternates between the window
+   * context (main thread) and the draw manager's shared viewport context (worker threads), and GPU
+   * allocations are not meant to cross that boundary. Rebuilding on a switch costs one frame of
+   * allocations and prevents the "dispatches run but the simulation never moves" failure mode.
+   */
+  GPUContext *context = nullptr;
 
   bool ensure(const int particles, const int cells, std::string &r_reason)
   {
+    GPUContext *active = GPU_context_active_get();
+    if (context != active) {
+      this->release();
+      context = active;
+    }
     if (particle_count != particles || cell_count != cells) {
       particle_count = particles;
       cell_count = cells;
@@ -673,6 +709,10 @@ struct DeviceState {
           !grid_mass.ensure(cells) || !grid_momentum.ensure(int64_t(cells) * 3) ||
           !grid_velocity.ensure(int64_t(cells) * 3))
       {
+        /* Forget the counts as well, otherwise the next frame with the same particle and cell
+         * counts would report success and dispatch with half the buffers unbound (which reads and
+         * writes nothing, i.e. a simulation that silently stops moving). */
+        this->release();
         r_reason = "storage buffer allocation failed";
         return false;
       }
@@ -696,6 +736,7 @@ struct DeviceState {
     clear = p2g = grid = g2p = advect = nullptr;
     particle_count = 0;
     cell_count = 0;
+    context = nullptr;
   }
 };
 
@@ -703,6 +744,18 @@ DeviceState &device_state()
 {
   static DeviceState state;
   return state;
+}
+
+/**
+ * Every Textura solver shares one buffer set (the grid can be hundreds of megabytes), so the
+ * device path is serialized. Blender may evaluate two objects on two threads at once, and letting
+ * both write the same storage buffers would produce exactly the "the timeline advances but nothing
+ * moves" behaviour this guards against.
+ */
+std::mutex &device_mutex()
+{
+  static std::mutex mutex;
+  return mutex;
 }
 
 /**
@@ -821,6 +874,11 @@ bool device_solve(ParticleData &particles,
       }
     }
   }
+
+  /* One buffer set for every Textura solver (the grid can be hundreds of megabytes), so the device
+   * path is serialized. Blender may evaluate two objects concurrently, and two threads writing the
+   * same storage buffers would freeze the simulation without any error. */
+  std::lock_guard<std::mutex> lock(device_mutex());
 
   HaContextGuard guard;
   if (!guard.is_valid()) {
@@ -988,9 +1046,25 @@ bool device_solve(ParticleData &particles,
   std::array<gpu::StorageBuf *, 7> g2p_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
       state.deform.buf(), state.props.buf(), state.grid_velocity.buf()};
-  std::array<gpu::StorageBuf *, 6> advect_buffers{
+  std::array<gpu::StorageBuf *, 7> advect_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.props.buf(),
-      state.box_data.buf(), state.sdf_data.buf()};
+      state.box_data.buf(), state.sdf_data.buf(), state.grid_mass.buf()};
+
+  /* Never dispatch with an unbound slot: Vulkan reads whatever the binding cache had and the
+   * simulation stops updating without any error. */
+  for (const Span<gpu::StorageBuf *> buffers : {buffer_span(clear_buffers),
+                                                buffer_span(p2g_buffers),
+                                                buffer_span(grid_buffers),
+                                                buffer_span(g2p_buffers),
+                                                buffer_span(advect_buffers)})
+  {
+    for (const gpu::StorageBuf *buffer : buffers) {
+      if (buffer == nullptr) {
+        r_reason = "a storage buffer is not allocated";
+        return false;
+      }
+    }
+  }
 
   /* ---- substeps ---- */
   for (int step = 0; step < substeps; step++) {

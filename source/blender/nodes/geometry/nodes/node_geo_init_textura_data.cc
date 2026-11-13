@@ -552,6 +552,26 @@ static void node_geo_exec(GeoNodeExecParams params)
     write_component(component, material, velocity_field);
   }
 
+  /* An empty input is the most common reason a Textura setup looks frozen: the material data is
+   * written to nothing and the solver has no particles to move. Say so on the node instead of
+   * leaving the user with a timeline that advances over a static object. */
+  int point_count = 0;
+  for (const GeometryComponent::Type type : {GeometryComponent::Type::Mesh,
+                                             GeometryComponent::Type::PointCloud,
+                                             GeometryComponent::Type::Curve})
+  {
+    if (geometry.has(type)) {
+      point_count += geometry.get_component(type)->attribute_domain_size(AttrDomain::Point);
+    }
+  }
+  if (point_count == 0) {
+    params.error_message_add(
+        NodeWarningType::Info,
+        TIP_("Init Textura Data: the input geometry holds no points, so there is nothing to "
+             "simulate. Connect a mesh or point source (a `Bounding Box` of an empty object gives "
+             "an empty point cloud)"));
+  }
+
   params.set_output("Geometry"_ustr, std::move(geometry));
 }
 
