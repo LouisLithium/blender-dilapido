@@ -313,6 +313,9 @@ void solve_frame(ParticleData &particles,
                  Span<const Collider> colliders,
                  const Settings &settings,
                  float delta_time,
-                 Stats &r_stats);
+                 Stats &r_stats,
+                 bool device_requested = false,
+                 bool *r_device_used = nullptr,
+                 std::string *r_device_reason = nullptr);
 
 }  // namespace blender::geometry::textura

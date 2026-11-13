@@ -41,6 +41,7 @@
 #include "GPU_init_exit.hh"
 
 #include "GEO_ha_sdf.hh"
+#include "GEO_textura_device.hh"
 
 namespace blender::geometry::textura {
 
@@ -2103,7 +2104,10 @@ void solve_frame(ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
                  const float delta_time,
-                 Stats &r_stats)
+                 Stats &r_stats,
+                 const bool device_requested,
+                 bool *r_device_used,
+                 std::string *r_device_reason)
 {
   const auto start = std::chrono::steady_clock::now();
   r_stats = Stats();
@@ -2390,6 +2394,38 @@ void solve_frame(ParticleData &particles,
   r_stats.substeps = substeps;
   r_stats.cfl_limited = required_substeps > std::max(settings.max_substeps, 1);
   const float dt = delta_time / std::max(substeps, 1);
+
+  /* Device path: single grid, fluid only (see `GEO_textura_device.hh`). It either runs the whole
+   * frame or reports why not; the CPU path below is always the fallback and the reference. */
+  if (device_requested) {
+    std::string reason;
+    if (!device_supported(particles, settings, reason)) {
+      if (r_device_reason != nullptr) {
+        *r_device_reason = reason;
+      }
+    }
+    else if (device_solve(particles,
+                          Span<const Collider>(resolved.data(), resolved.size()),
+                          settings,
+                          grid,
+                          sdf_valid ? sdf.get() : nullptr,
+                          dt,
+                          substeps,
+                          r_stats,
+                          reason))
+    {
+      collect_stats(particles, r_stats);
+      const auto end = std::chrono::steady_clock::now();
+      r_stats.milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
+      if (r_device_used != nullptr) {
+        *r_device_used = true;
+      }
+      return;
+    }
+    else if (r_device_reason != nullptr) {
+      *r_device_reason = reason;
+    }
+  }
 
   for (int step = 0; step < substeps; step++) {
     if (two_phase) {

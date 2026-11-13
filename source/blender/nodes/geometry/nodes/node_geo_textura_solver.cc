@@ -20,6 +20,8 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 #include "BLI_array.hh"
 #include "BLI_math_matrix.hh"
@@ -37,6 +39,8 @@
 
 #include "node_geometry_util.hh"
 
+#include "GEO_ha_context.hh"
+#include "GEO_ha_status.hh"
 #include "GEO_textura_solver.hh"
 
 namespace blender::nodes::node_geo_textura_solver_cc {
@@ -697,9 +701,53 @@ static void node_geo_exec(GeoNodeExecParams params)
         read_component(component, range.offset, particles);
       }
     }
+    /* `HW Accelerate` zone request (0 = outside a zone, 1 = Auto, 2 = Strict, 3 = Force CPU).
+     * `BLENDER_TEXTURA_GPU=1` forces the device attempt for tests and A/B comparisons. */
+    const GeoNodesUserData &user_data = *static_cast<const GeoNodesUserData *>(params.user_data());
+    const int backend_request = user_data.ha_backend_request ? *user_data.ha_backend_request : 0;
+    const char *env = std::getenv("BLENDER_TEXTURA_GPU");
+    const bool force_gpu = env != nullptr && StringRef(env) == "1";
+    const bool force_cpu = env != nullptr && StringRef(env) == "0";
+    const bool device_requested = force_cpu ? false :
+                                  (force_gpu ? true : (backend_request == 1 ||
+                                                       backend_request == 2));
+    bool device_used = false;
+    std::string device_reason;
     const Span<const geometry::textura::Collider> collider_span(colliders.data(),
                                                                 colliders.size());
-    geometry::textura::solve_frame(particles, collider_span, settings, delta_time, stats);
+    geometry::textura::solve_frame(particles,
+                                   collider_span,
+                                   settings,
+                                   delta_time,
+                                   stats,
+                                   device_requested,
+                                   &device_used,
+                                   &device_reason);
+    if (device_requested && !device_used && !device_reason.empty()) {
+      params.error_message_add(backend_request == 2 ? NodeWarningType::Warning :
+                                                      NodeWarningType::Info,
+                               fmt::format("Textura: the frame was solved on the CPU ({})",
+                                           device_reason));
+    }
+    if (backend_request != 0) {
+      geometry::ha::HaNodeStatus status;
+      status.backend = geometry::ha::ha_gpu_backend_name();
+      status.state = device_used ? geometry::ha::HaNodeState::Device :
+                                   geometry::ha::HaNodeState::Fallback;
+      status.reason = device_used ? std::string() : device_reason;
+      status.elements = stats.particles;
+      geometry::ha::ha_status_set(params.node().owner_tree(), params.node(), status);
+    }
+    else {
+      geometry::ha::ha_status_clear(params.node().owner_tree(), params.node());
+    }
+    if (device_used && std::getenv("BLENDER_TEXTURA_GPU_LOG") != nullptr) {
+      fprintf(stderr,
+              "TEXTURA_GPU probe backend=device particles=%d cells=%d substeps=%d\n",
+              stats.particles,
+              stats.grid_cells,
+              stats.substeps);
+    }
     for (GeometryEntry &entry : entries) {
       write_geometry(entry.geometry, entry.ranges, particles);
     }

@@ -84,10 +84,12 @@ set(SRC
   rigid_body/GEO_rigid_body_solver.cc
 
   textura/GEO_textura_solver.cc
+  textura/GEO_textura_device.cc
 
   xpbd/intern/xpbd_constraint_coloring.cc
 
   textura/GEO_textura_solver.hh
+  textura/GEO_textura_device.hh
 
   GEO_add_curves_on_mesh.hh
   GEO_curve_constraints.hh
