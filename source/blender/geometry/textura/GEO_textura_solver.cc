@@ -719,6 +719,18 @@ inline void apply_wall_contact(float3 &velocity,
   velocity = normal * math::dot(velocity, normal) + tangent * (1.0f - decay);
 }
 
+/** Tangential-only damping, used for a per-material wall friction slightly above the surface. */
+inline void apply_tangential_friction(float3 &velocity,
+                                      const float3 &normal,
+                                      const float friction,
+                                      const float dt)
+{
+  const float decay = math::clamp(friction * 25.0f * dt, 0.0f, 1.0f);
+  const float normal_speed = math::dot(velocity, normal);
+  const float3 tangent = velocity - normal * normal_speed;
+  velocity = normal * normal_speed + tangent * (1.0f - decay);
+}
+
 /* -------------------------------------------------------------------- */
 /** \name Colliders
  * \{ */
@@ -1520,6 +1532,13 @@ void advect_and_collide(ParticleData &particles,
         position += sample.normal * (particles.radius[particle] - sample.distance);
         apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
       }
+      const float wall_friction = particles.wall_friction[particle];
+      if (wall_friction > 0.0f &&
+          sample.distance < particles.radius[particle] + grid.dx &&
+          sample.distance > -0.5f * particles.radius[particle])
+      {
+        apply_tangential_friction(velocity, sample.normal, wall_friction, dt);
+      }
       position.x = math::clamp(position.x, domain_min.x, domain_max.x);
       position.y = math::clamp(position.y, domain_min.y, domain_max.y);
       position.z = math::clamp(position.z, domain_min.z, domain_max.z);
@@ -1727,6 +1746,7 @@ void ParticleData::resize(const int count)
   surface_tension.resize(count);
   friction.resize(count);
   cohesion.resize(count);
+  wall_friction.resize(count);
   tensile_strength.resize(count);
   compression_limit.resize(count);
   stretch_limit.resize(count);
@@ -1767,6 +1787,7 @@ void ParticleData::resize(const int count)
     surface_tension[i] = 0.0f;
     friction[i] = 0.0f;
     cohesion[i] = 0.0f;
+    wall_friction[i] = 0.0f;
     tensile_strength[i] = 0.0f;
     compression_limit[i] = 0.05f;
     stretch_limit[i] = 0.01f;
@@ -1814,6 +1835,10 @@ void ParticleData::fill_defaults()
     if (!std::isfinite(damage_rate[i]) || damage_rate[i] < 0.0f) {
       damage_rate[i] = 0.0f;
     }
+    if (!std::isfinite(wall_friction[i]) || wall_friction[i] < 0.0f) {
+      wall_friction[i] = 0.0f;
+    }
+    wall_friction[i] = std::min(wall_friction[i], 1.0f);
     if (!std::isfinite(tensile_strength[i]) || tensile_strength[i] < 0.0f) {
       tensile_strength[i] = 0.0f;
     }
