@@ -1528,7 +1528,13 @@ void advect_and_collide(ParticleData &particles,
       float3 velocity = particles.velocities[particle];
       const SolidSample sample = sample_solids(
           position, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
-      if (sample.distance < particles.radius[particle]) {
+      /* MPM contact lives on the grid, so a particle can settle a full cell above a collider even
+       * though its own radius is much smaller. Snow should visually touch the surface, so snap it
+       * down to its radius whenever it is within one cell. Fluids and sand keep the old grid-only
+       * contact (and stay bit identical). */
+      const float contact_skin = particles.material[particle] == int(MaterialType::Snow) ? grid.dx :
+                                                                                           0.0f;
+      if (sample.distance < particles.radius[particle] + contact_skin) {
         position += sample.normal * (particles.radius[particle] - sample.distance);
         apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
       }
