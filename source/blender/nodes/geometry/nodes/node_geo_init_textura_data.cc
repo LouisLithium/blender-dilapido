@@ -80,6 +80,7 @@ struct MaterialParameters {
   float stretch_limit = 0.01f;
   float hardening_rate = 0.0f;
   float wall_friction = 0.0f;
+  float adhesion = 0.0f;
 };
 
 void compute_lame(const MaterialParameters &params, float &r_mu, float &r_lambda)
@@ -182,6 +183,7 @@ void write_component(GeometryComponent &component,
     write_scalar(geometry::textura::attribute_names::rest_density, mass / volume);
     write_scalar(geometry::textura::attribute_names::hardening_rate, hardening_rate);
     write_scalar(geometry::textura::attribute_names::wall_friction, params.wall_friction);
+    write_scalar(geometry::textura::attribute_names::adhesion, params.adhesion);
     /* Keep an authored hardening field (for restarted states); otherwise start at zero. */
     if (!attributes.contains(geometry::textura::attribute_names::hardening)) {
       write_scalar(geometry::textura::attribute_names::hardening, 0.0f);
@@ -434,6 +436,13 @@ static void node_declare(NodeDeclarationBuilder &b)
         .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
         .description("Extra tangential friction between snow particles and colliders (0..1). Snow "
                      "usually sticks to a roof or a shovel much more than water does");
+    panel.add_input<decl::Float>("Adhesion"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(50.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Adhesion acceleration toward a nearby collider, in m/s^2. 0 disables it; "
+                     "values above 9.81 can hold snow under a ceiling or ledge");
     panel.add_input<decl::Float>("Tensile Strength"_ustr)
         .default_value(2.0e3f)
         .min(0.0f)
@@ -524,6 +533,7 @@ static void node_geo_exec(GeoNodeExecParams params)
                                        100.0f);
     material.wall_friction = math::clamp(
         params.extract_input<float>("Snow Wall Friction"_ustr), 0.0f, 1.0f);
+    material.adhesion = math::clamp(params.extract_input<float>("Adhesion"_ustr), 0.0f, 50.0f);
   }
   const fn::Field<float3> velocity_field = params.extract_input<fn::Field<float3>>(
       "Initial Velocity"_ustr);

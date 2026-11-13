@@ -293,6 +293,8 @@ void read_component(GeometryComponent &component,
       attributes, geometry::textura::attribute_names::cohesion, domain, 0.0f, count);
   const VArray<float> wall_friction = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::wall_friction, domain, 0.0f, count);
+  const VArray<float> adhesion = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::adhesion, domain, 0.0f, count);
   const VArray<float> tensile_strength = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::tensile_strength, domain, 0.0f, count);
   const VArray<float> compression_limit = lookup_or_default<float>(
@@ -342,6 +344,7 @@ void read_component(GeometryComponent &component,
     r_particles.friction[p] = friction[i];
     r_particles.cohesion[p] = cohesion[i];
     r_particles.wall_friction[p] = wall_friction[i];
+    r_particles.adhesion[p] = adhesion[i];
     r_particles.tensile_strength[p] = tensile_strength[i];
     r_particles.compression_limit[p] = compression_limit[i];
     r_particles.stretch_limit[p] = stretch_limit[i];

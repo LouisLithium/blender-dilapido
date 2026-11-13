@@ -60,6 +60,8 @@ constexpr StringRefNull cohesion = "textura_cohesion";
 constexpr StringRefNull tensile_strength = "textura_tensile_strength";
 /** Extra tangential friction against colliders (0..1), applied per particle. */
 constexpr StringRefNull wall_friction = "textura_wall_friction";
+/** Adhesion acceleration toward a nearby collider, in m/s^2. 0 disables it. */
+constexpr StringRefNull adhesion = "textura_adhesion";
 /** Maximum plastic compression, as a logarithmic volume strain (0.05 = 5%). */
 constexpr StringRefNull compression_limit = "textura_compression_limit";
 /** Maximum plastic stretch, as a logarithmic volume strain. */
@@ -163,6 +165,8 @@ struct ParticleData {
   Vector<float> cohesion;
   /** Snow: extra collider friction (0..1). */
   Vector<float> wall_friction;
+  /** Snow: adhesion acceleration toward a collider, in m/s^2. */
+  Vector<float> adhesion;
   /** Snow: tensile strength in pascal. */
   Vector<float> tensile_strength;
   /** Snow: plastic limits on the logarithmic volume strain. */

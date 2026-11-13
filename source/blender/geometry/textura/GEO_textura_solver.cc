@@ -1539,6 +1539,15 @@ void advect_and_collide(ParticleData &particles,
       {
         apply_tangential_friction(velocity, sample.normal, wall_friction, dt);
       }
+      /* Adhesion: pull the particle toward a surface it is close to but not penetrating. This is
+       * what lets snow cling to a ledge or a shovel. It is disabled inside the collider, where the
+       * contact projection already takes over. */
+      const float adhesion = particles.adhesion[particle];
+      if (adhesion > 0.0f && sample.distance > 0.0f &&
+          sample.distance < particles.radius[particle] + 3.0f * grid.dx)
+      {
+        velocity -= sample.normal * (adhesion * dt);
+      }
       position.x = math::clamp(position.x, domain_min.x, domain_max.x);
       position.y = math::clamp(position.y, domain_min.y, domain_max.y);
       position.z = math::clamp(position.z, domain_min.z, domain_max.z);
@@ -1747,6 +1756,7 @@ void ParticleData::resize(const int count)
   friction.resize(count);
   cohesion.resize(count);
   wall_friction.resize(count);
+  adhesion.resize(count);
   tensile_strength.resize(count);
   compression_limit.resize(count);
   stretch_limit.resize(count);
@@ -1788,6 +1798,7 @@ void ParticleData::resize(const int count)
     friction[i] = 0.0f;
     cohesion[i] = 0.0f;
     wall_friction[i] = 0.0f;
+    adhesion[i] = 0.0f;
     tensile_strength[i] = 0.0f;
     compression_limit[i] = 0.05f;
     stretch_limit[i] = 0.01f;
@@ -1839,6 +1850,9 @@ void ParticleData::fill_defaults()
       wall_friction[i] = 0.0f;
     }
     wall_friction[i] = std::min(wall_friction[i], 1.0f);
+    if (!std::isfinite(adhesion[i]) || adhesion[i] < 0.0f) {
+      adhesion[i] = 0.0f;
+    }
     if (!std::isfinite(tensile_strength[i]) || tensile_strength[i] < 0.0f) {
       tensile_strength[i] = 0.0f;
     }
