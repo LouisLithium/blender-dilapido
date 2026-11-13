@@ -291,6 +291,18 @@ void read_component(GeometryComponent &component,
       attributes, geometry::textura::attribute_names::friction, domain, 0.0f, count);
   const VArray<float> cohesion = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::cohesion, domain, 0.0f, count);
+  const VArray<float> tensile_strength = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::tensile_strength, domain, 0.0f, count);
+  const VArray<float> compression_limit = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::compression_limit, domain, 0.05f, count);
+  const VArray<float> stretch_limit = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::stretch_limit, domain, 0.01f, count);
+  const VArray<float> rest_density = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::rest_density, domain, 0.0f, count);
+  const VArray<float> hardening_rate = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::hardening_rate, domain, 0.0f, count);
+  const VArray<float> hardening = lookup_or_default<float>(
+      attributes, geometry::textura::attribute_names::hardening, domain, 0.0f, count);
   const VArray<float> damage = lookup_or_default<float>(
       attributes, geometry::textura::attribute_names::damage, domain, 0.0f, count);
   const VArray<float> damage_rate = lookup_or_default<float>(
@@ -321,6 +333,12 @@ void read_component(GeometryComponent &component,
     r_particles.surface_tension[p] = surface_tension[i];
     r_particles.friction[p] = friction[i];
     r_particles.cohesion[p] = cohesion[i];
+    r_particles.tensile_strength[p] = tensile_strength[i];
+    r_particles.compression_limit[p] = compression_limit[i];
+    r_particles.stretch_limit[p] = stretch_limit[i];
+    r_particles.rest_density[p] = rest_density[i];
+    r_particles.hardening_rate[p] = hardening_rate[i];
+    r_particles.hardening[p] = hardening[i];
     r_particles.damage[p] = damage[i];
     r_particles.damage_rate[p] = damage_rate[i];
     r_particles.damping[p] = damping[i];
@@ -396,6 +414,24 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
       geometry::textura::attribute_names::deformation_z, domain);
   bke::SpanAttributeWriter<float> damage = attributes.lookup_or_add_for_write_span<float>(
       geometry::textura::attribute_names::damage, domain);
+  bool has_snow = false;
+  for (const int i : IndexRange(count)) {
+    if (particles.material[range.offset + i] == int(geometry::textura::MaterialType::Snow)) {
+      has_snow = true;
+      break;
+    }
+  }
+  bke::SpanAttributeWriter<float> snow_volume;
+  bke::SpanAttributeWriter<float> snow_density;
+  bke::SpanAttributeWriter<float> snow_hardening;
+  if (has_snow) {
+    snow_volume = attributes.lookup_or_add_for_write_span<float>(
+        geometry::textura::attribute_names::volume, domain);
+    snow_density = attributes.lookup_or_add_for_write_span<float>(
+        geometry::textura::attribute_names::density, domain);
+    snow_hardening = attributes.lookup_or_add_for_write_span<float>(
+        geometry::textura::attribute_names::hardening, domain);
+  }
   if (!positions || !velocities || !f_x || !f_y || !f_z) {
     if (positions) {
       positions.finish();
@@ -433,6 +469,15 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
     if (damage) {
       damage.span[i] = particles.damage[p];
     }
+    if (snow_volume) {
+      snow_volume.span[i] = particles.volume[p];
+    }
+    if (snow_density) {
+      snow_density.span[i] = particles.density[p];
+    }
+    if (snow_hardening) {
+      snow_hardening.span[i] = particles.hardening[p];
+    }
   }
   positions.finish();
   velocities.finish();
@@ -441,6 +486,15 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
   f_z.finish();
   if (damage) {
     damage.finish();
+  }
+  if (snow_volume) {
+    snow_volume.finish();
+  }
+  if (snow_density) {
+    snow_density.finish();
+  }
+  if (snow_hardening) {
+    snow_hardening.finish();
   }
 }
 

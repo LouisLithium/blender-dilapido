@@ -50,6 +50,12 @@ static const EnumPropertyItem textura_type_items[] = {
      N_("Sand"),
      N_("A granular material: elastic until the Drucker-Prager yield surface is reached, then it "
         "flows. Friction angle and cohesion control how steep a pile it can hold")},
+    {int(MaterialType::Snow),
+     "SNOW",
+     0,
+     N_("Snow"),
+     N_("A compressible cohesive granular material with a small tensile strength. It compacts "
+        "permanently under pressure, hardens as it compacts and breaks under tension or impact")},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -69,6 +75,10 @@ struct MaterialParameters {
   float friction_angle = 30.0f;
   float cohesion = 0.0f;
   float damage_rate = 0.0f;
+  float tensile_strength = 0.0f;
+  float compression_limit = 0.05f;
+  float stretch_limit = 0.01f;
+  float hardening_rate = 0.0f;
 };
 
 void compute_lame(const MaterialParameters &params, float &r_mu, float &r_lambda)
@@ -107,6 +117,10 @@ void write_component(GeometryComponent &component,
   float friction = 0.0f;
   float cohesion = 0.0f;
   float damage_rate = 0.0f;
+  float tensile_strength = 0.0f;
+  float compression_limit = 0.05f;
+  float stretch_limit = 0.01f;
+  float hardening_rate = 0.0f;
   if (params.type == int(MaterialType::Sand)) {
     compute_lame(params, mu, lambda);
     bulk = 0.0f;
@@ -116,6 +130,20 @@ void write_component(GeometryComponent &component,
     friction = std::tan(std::max(params.friction_angle, 0.0f) * PI / 180.0f);
     cohesion = std::max(params.cohesion, 0.0f);
     damage_rate = std::max(params.damage_rate, 0.0f);
+  }
+  else if (params.type == int(MaterialType::Snow)) {
+    compute_lame(params, mu, lambda);
+    bulk = 0.0f;
+    viscosity = 0.0f;
+    tension = 0.0f;
+    surface_tension = 0.0f;
+    friction = std::tan(std::max(params.friction_angle, 0.0f) * PI / 180.0f);
+    cohesion = std::max(params.cohesion, 0.0f);
+    damage_rate = std::max(params.damage_rate, 0.0f);
+    tensile_strength = std::max(params.tensile_strength, 0.0f);
+    compression_limit = std::max(params.compression_limit, 0.0f);
+    stretch_limit = std::max(params.stretch_limit, 0.0f);
+    hardening_rate = std::max(params.hardening_rate, 0.0f);
   }
 
   auto write_scalar = [&](const StringRef name, const float value) {
@@ -146,6 +174,17 @@ void write_component(GeometryComponent &component,
   write_scalar(geometry::textura::attribute_names::surface_tension, surface_tension);
   write_scalar(geometry::textura::attribute_names::friction, friction);
   write_scalar(geometry::textura::attribute_names::cohesion, cohesion);
+  if (params.type == int(MaterialType::Snow)) {
+    write_scalar(geometry::textura::attribute_names::tensile_strength, tensile_strength);
+    write_scalar(geometry::textura::attribute_names::compression_limit, compression_limit);
+    write_scalar(geometry::textura::attribute_names::stretch_limit, stretch_limit);
+    write_scalar(geometry::textura::attribute_names::rest_density, params.density);
+    write_scalar(geometry::textura::attribute_names::hardening_rate, hardening_rate);
+    /* Keep an authored hardening field (for restarted states); otherwise start at zero. */
+    if (!attributes.contains(geometry::textura::attribute_names::hardening)) {
+      write_scalar(geometry::textura::attribute_names::hardening, 0.0f);
+    }
+  }
   /* An existing damage attribute is authored (weak planes / pre-cracked regions), so keep it. */
   if (!attributes.contains(geometry::textura::attribute_names::damage)) {
     write_scalar(geometry::textura::attribute_names::damage, 0.0f);
@@ -340,6 +379,79 @@ static void node_declare(NodeDeclarationBuilder &b)
                      "and the block breaks apart. 0 disables damage; 1 to 3 breaks a block on impact");
   }
 
+  {
+    auto &panel = b.add_panel("Snow"_ustr).default_closed(false);
+    panel.add_input<decl::Float>("Snow Density"_ustr)
+        .default_value(300.0f)
+        .min(1.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Rest density of fresh snow in kg/m^3. It is much lighter than water (100 to "
+                     "400 is typical); compaction raises it up to about four times this value");
+    panel.add_input<decl::Float>("Snow Young's Modulus"_ustr)
+        .default_value(5.0e4f)
+        .min(1.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Elastic stiffness of fresh snow before it yields, in pascal. Snow is softer "
+                     "than sand (5e4 to 1e6) and hardens as it compacts");
+    panel.add_input<decl::Float>("Snow Poisson Ratio"_ustr)
+        .default_value(0.2f)
+        .min(0.0f)
+        .max(0.49f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Lateral expansion of snow under compression. Snow is more compressible than "
+                     "dry sand, so a lower Poisson ratio is typical");
+    panel.add_input<decl::Float>("Snow Friction Angle"_ustr)
+        .default_value(30.0f)
+        .min(0.0f)
+        .max(60.0f)
+        .subtype(PROP_ANGLE)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Internal friction angle of snow; 25 to 30 is fresh snow");
+    panel.add_input<decl::Float>("Snow Cohesion"_ustr)
+        .default_value(2.0e3f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Pressure independent shear strength of snow, in pascal. This is what holds a "
+                     "snowball or a snowman together; 1e3 to 1e4 is a useful range");
+    panel.add_input<decl::Float>("Tensile Strength"_ustr)
+        .default_value(2.0e3f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Largest tensile stress a snow particle transmits, in pascal. Fresh snow is "
+                     "weak in tension (order 1e3 Pa), but it is what lets a snowball or a cornice "
+                     "hold together. 0 makes it behave like dry sand");
+    panel.add_input<decl::Float>("Compression Limit"_ustr)
+        .default_value(0.05f)
+        .min(0.001f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Elastic logarithmic volume strain before snow compacts permanently. 0.05 "
+                     "means it can compress 5% elastically; beyond that the particle gets denser "
+                     "and harder");
+    panel.add_input<decl::Float>("Stretch Limit"_ustr)
+        .default_value(0.01f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("Elastic logarithmic volume strain before snow fails in tension. Small values "
+                     "make snow break instead of stretching like rubber");
+    panel.add_input<decl::Float>("Hardening"_ustr)
+        .default_value(10.0f)
+        .min(0.0f)
+        .max(100.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("How much the stiffness and cohesion grow per unit of accumulated plastic "
+                     "strain. This is what makes compacted snow firmer; 0 disables hardening");
+    panel.add_input<decl::Float>("Snow Damage Rate"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(100.0f)
+        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
+        .description("How much damage one unit of plastic strain adds. Damaged snow loses its "
+                     "shear modulus, friction, cohesion and tensile strength, so impact bands turn "
+                     "into loose snow and the block breaks apart. 0 keeps it intact");
+  }
+
   b.add_output<decl::Geometry>("Geometry"_ustr)
       .description("The same geometry with the MPM material attributes, ready for `Textura "
                    "Dynamics`");
@@ -370,6 +482,27 @@ static void node_geo_exec(GeoNodeExecParams params)
                                         60.0f);
   material.cohesion = std::max(params.extract_input<float>("Cohesion"_ustr), 0.0f);
   material.damage_rate = math::clamp(params.extract_input<float>("Damage Rate"_ustr), 0.0f, 100.0f);
+  material.tensile_strength = std::max(params.extract_input<float>("Tensile Strength"_ustr), 0.0f);
+  material.compression_limit = math::clamp(params.extract_input<float>("Compression Limit"_ustr),
+                                           0.001f,
+                                           1.0f);
+  material.stretch_limit = math::clamp(params.extract_input<float>("Stretch Limit"_ustr),
+                                       0.0f,
+                                       1.0f);
+  material.hardening_rate = math::clamp(params.extract_input<float>("Hardening"_ustr), 0.0f, 100.0f);
+  if (material.type == int(MaterialType::Snow)) {
+    material.density = std::max(params.extract_input<float>("Snow Density"_ustr), 1e-3f);
+    material.young_modulus = std::max(params.extract_input<float>("Snow Young's Modulus"_ustr),
+                                      1.0f);
+    material.poisson_ratio = math::clamp(
+        params.extract_input<float>("Snow Poisson Ratio"_ustr), 0.0f, 0.49f);
+    material.friction_angle = math::clamp(
+        params.extract_input<float>("Snow Friction Angle"_ustr), 0.0f, 60.0f);
+    material.cohesion = std::max(params.extract_input<float>("Snow Cohesion"_ustr), 0.0f);
+    material.damage_rate = math::clamp(params.extract_input<float>("Snow Damage Rate"_ustr),
+                                       0.0f,
+                                       100.0f);
+  }
   const fn::Field<float3> velocity_field = params.extract_input<fn::Field<float3>>(
       "Initial Velocity"_ustr);
 
@@ -397,8 +530,8 @@ static void node_register()
   geo_node_type_base(&ntype, "GeometryNodeInitTexturaData"_ustr);
   ntype.ui_name = "Init Textura Data";
   ntype.ui_description =
-      "Mark geometry as an MPM fluid or sand and store the density, stiffness, friction and rest "
-      "deformation that `Textura Dynamics` needs";
+      "Mark geometry as an MPM fluid, sand or snow and store the density, stiffness, friction, "
+      "tensile strength and rest deformation that `Textura Dynamics` needs";
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.declare = node_declare;

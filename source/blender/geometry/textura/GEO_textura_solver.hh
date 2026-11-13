@@ -40,6 +40,7 @@ namespace blender::geometry::textura {
 enum class MaterialType : int {
   Fluid = 0,
   Sand = 1,
+  Snow = 2,
 };
 
 namespace attribute_names {
@@ -55,6 +56,18 @@ constexpr StringRefNull tension = "textura_tension";
 constexpr StringRefNull surface_tension = "textura_surface_tension";
 constexpr StringRefNull friction = "textura_friction";
 constexpr StringRefNull cohesion = "textura_cohesion";
+/** Maximum tensile stress a snow particle transmits, in pascal. */
+constexpr StringRefNull tensile_strength = "textura_tensile_strength";
+/** Maximum plastic compression, as a logarithmic volume strain (0.05 = 5%). */
+constexpr StringRefNull compression_limit = "textura_compression_limit";
+/** Maximum plastic stretch, as a logarithmic volume strain. */
+constexpr StringRefNull stretch_limit = "textura_stretch_limit";
+/** Rest density of a snow particle; used to cap how far it can compact. */
+constexpr StringRefNull rest_density = "textura_rest_density";
+/** How much the stiffness grows per unit of accumulated plastic strain. */
+constexpr StringRefNull hardening_rate = "textura_hardening_rate";
+/** Accumulated plastic strain of a snow particle (read only state). */
+constexpr StringRefNull hardening = "textura_hardening";
 /** Accumulated damage, 0 = intact, 1 = no shear strength left. Grows with plastic strain. */
 constexpr StringRefNull damage = "textura_damage";
 /** How much damage one unit of plastic strain adds. 0 disables damage. */
@@ -140,6 +153,17 @@ struct ParticleData {
   Vector<float> surface_tension;
   Vector<float> friction;
   Vector<float> cohesion;
+  /** Snow: tensile strength in pascal. */
+  Vector<float> tensile_strength;
+  /** Snow: plastic limits on the logarithmic volume strain. */
+  Vector<float> compression_limit;
+  Vector<float> stretch_limit;
+  /** Snow: rest density, used to cap the plastic compaction. */
+  Vector<float> rest_density;
+  /** Snow: stiffness growth per unit of accumulated plastic strain. */
+  Vector<float> hardening_rate;
+  /** Snow: accumulated plastic strain (state, written back to the geometry). */
+  Vector<float> hardening;
   /**
    * Damage in 0..1. Plastic strain accumulates it and it removes the shear modulus, the cohesion
    * and the internal friction, so a loaded sand block softens along its shear bands and breaks

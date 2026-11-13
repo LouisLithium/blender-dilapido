@@ -477,6 +477,190 @@ void sand_stress(const float f[3][3],
   }
 }
 
+/**
+ * Cauchy stress of snow: fixed corotated elasticity with a small tensile strength.
+ *
+ * Like sand it resists compression with `lambda * (J - 1)`, but unlike dry sand snow can carry a
+ * little tension before it fails. Clamping the positive volumetric stress at `tensile_strength`
+ * keeps a snowball or a cornice together while still letting thin overhangs break off.
+ */
+void snow_stress(const float f[3][3],
+                 const float mu,
+                 const float lambda,
+                 const float tensile_strength,
+                 float stress[3][3])
+{
+  float rotation[3][3];
+  polar_rotation(f, rotation);
+  float elastic[3][3];
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      elastic[i][j] = f[i][j] - rotation[i][j];
+    }
+  }
+  float f_transposed[3][3];
+  transpose3(f, f_transposed);
+  float shear[3][3];
+  multiply3(elastic, f_transposed, shear);
+
+  const float j = std::isfinite(determinant3(f)) ? determinant3(f) : 1.0f;
+  const float inv_j = 1.0f / std::max(j, 0.1f);
+  const float volume = std::min(lambda * (j - 1.0f), std::max(tensile_strength, 0.0f));
+  for (int i = 0; i < 3; i++) {
+    for (int j_col = 0; j_col < 3; j_col++) {
+      stress[i][j_col] = 2.0f * mu * shear[i][j_col] * inv_j;
+    }
+    stress[i][i] += volume;
+  }
+}
+
+struct SnowStrength {
+  float mu;
+  float lambda;
+  float friction;
+  float cohesion;
+  float tensile;
+};
+
+/* The explicit solver's stability budget scales with the wave speed, so cap how far hardening can
+ * stiffen the material. This keeps the default substep budget usable; raise `Max Substeps` on the
+ * asset if you need a stiffer snow. */
+constexpr float MAX_HARDENING_SCALE = 4.0f;
+
+/** Damage and plastic hardening scale the snow's stiffness and cohesive strength. */
+inline SnowStrength snow_strength(const ParticleData &particles, const int particle)
+{
+  const float intact = 1.0f - math::clamp(particles.damage[particle], 0.0f, 1.0f);
+  const float accumulated = std::max(particles.hardening[particle], 0.0f);
+  const float scale = std::min(1.0f + std::max(particles.hardening_rate[particle], 0.0f) *
+                                         accumulated,
+                               MAX_HARDENING_SCALE);
+  SnowStrength strength;
+  strength.mu = particles.shear_modulus[particle] * scale * intact;
+  /* Keep the bulk stiffness under damage: compacted snow still supports compression after it
+   * breaks, it just loses its cohesion and shear strength. */
+  strength.lambda = particles.lame_lambda[particle] * scale;
+  strength.friction = std::max(particles.friction[particle], 0.0f) * intact;
+  strength.cohesion = std::max(particles.cohesion[particle], 0.0f) * intact;
+  strength.tensile = std::max(particles.tensile_strength[particle], 0.0f) * intact;
+  return strength;
+}
+
+/**
+ * Snow return mapping: plastic volume limits plus the usual deviatoric Drucker-Prager yield.
+ *
+ * Unlike sand, snow collapses permanently under compression. The singular values of `F` are first
+ * clamped to the elastic log-volume interval `[-compression_limit, +stretch_limit]`: the excess
+ * compression shrinks the particle's `volume` (mass stays constant, so `density` grows) and adds
+ * to the hardening variable `q`; tensile excess is treated as failure and feeds `damage`. The
+ * remaining deviatoric part is then projected onto the friction/cohesion yield surface with the
+ * hardened stiffness.
+ */
+void return_map_snow(const int particle,
+                     ParticleData &particles,
+                     const float *f_in,
+                     float *f_out,
+                     const float strain_increment)
+{
+  float f[3][3];
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      f[i][j] = f_in[i * 3 + j];
+    }
+  }
+  Svd3 svd;
+  if (!svd3(f, svd)) {
+    for (int i = 0; i < 9; i++) {
+      f_out[i] = f_in[i];
+    }
+    return;
+  }
+  float epsilon[3];
+  float trace = 0.0f;
+  for (int i = 0; i < 3; i++) {
+    epsilon[i] = std::log(std::max(svd.s[i], 1e-6f));
+    trace += epsilon[i];
+  }
+  float deviatoric[3];
+  float deviatoric_norm = 0.0f;
+  for (int i = 0; i < 3; i++) {
+    deviatoric[i] = epsilon[i] - trace / 3.0f;
+    deviatoric_norm += deviatoric[i] * deviatoric[i];
+  }
+  deviatoric_norm = std::sqrt(deviatoric_norm);
+  if (!std::isfinite(trace) || !std::isfinite(deviatoric_norm)) {
+    for (int i = 0; i < 9; i++) {
+      f_out[i] = f_in[i];
+    }
+    return;
+  }
+
+  const float compression = std::max(particles.compression_limit[particle], 1e-4f);
+  const float stretch = std::max(particles.stretch_limit[particle], 0.0f);
+  const float trace_clamped = math::clamp(trace, -compression, stretch);
+  /* Negative while compacting beyond the elastic limit: the plastic volume ratio is exp(excess). */
+  const float plastic_volume = trace - trace_clamped;
+
+  const SnowStrength strength = snow_strength(particles, particle);
+  const float pressure_coefficient = strength.mu > EPSILON ?
+                                         (3.0f * strength.lambda + 2.0f * strength.mu) /
+                                             (4.0f * strength.mu * std::sqrt(1.5f)) :
+                                         0.0f;
+  const float yield_strain =
+      std::max(0.0f, -trace_clamped) * strength.friction * pressure_coefficient +
+      (strength.mu > EPSILON ? strength.cohesion / (2.0f * strength.mu) : 0.0f);
+  const float keep = deviatoric_norm > std::max(yield_strain, 1e-7f) ?
+                         yield_strain / deviatoric_norm :
+                         1.0f;
+
+  float scale[3];
+  for (int i = 0; i < 3; i++) {
+    const float new_epsilon = deviatoric[i] * keep + trace_clamped / 3.0f;
+    scale[i] = std::exp(new_epsilon) / std::max(svd.s[i], 1e-6f);
+  }
+  if (keep < 1.0f || std::fabs(plastic_volume) > 1e-9f) {
+    apply_singular_scale(f, svd, scale, &f_out[0]);
+  }
+  else {
+    for (int i = 0; i < 9; i++) {
+      f_out[i] = f_in[i];
+    }
+  }
+
+  /* Permanent compaction: the particle volume shrinks, the mass is constant. Snow can compact to
+   * roughly four times its rest density (ice is 917 kg/m^3); without that cap a soft parameter set
+   * would shrink the particles without bound. */
+  if (plastic_volume < 0.0f) {
+    float new_volume = particles.volume[particle] * std::exp(plastic_volume);
+    const float rest_density = particles.rest_density[particle];
+    if (rest_density > 0.0f) {
+      const float min_volume = particles.mass[particle] / (rest_density * 4.0f);
+      new_volume = std::max(new_volume, min_volume);
+    }
+    if (std::isfinite(new_volume) && new_volume > 1e-12f) {
+      particles.volume[particle] = new_volume;
+      particles.density[particle] = particles.mass[particle] / new_volume;
+    }
+  }
+
+  /* Hardening from deviatoric plastic flow and compaction; tension does not harden, it damages. */
+  const float hardening_increment = std::max(0.0f, deviatoric_norm - yield_strain) +
+                                    std::max(0.0f, -plastic_volume);
+  if (hardening_increment > 0.0f) {
+    particles.hardening[particle] = std::min(
+        particles.hardening[particle] + hardening_increment, 10.0f);
+  }
+
+  const float rate = std::max(particles.damage_rate[particle], 0.0f);
+  if (rate > 0.0f) {
+    const float increment = strain_increment + std::max(0.0f, plastic_volume);
+    if (increment > 0.0f) {
+      particles.damage[particle] = math::clamp(
+          particles.damage[particle] + rate * increment, 0.0f, 1.0f);
+    }
+  }
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -763,6 +947,10 @@ void particle_to_grid(const ParticleData &particles,
                    particles.bulk_modulus[particle],
                    particles.tension[particle],
                    stress);
+    }
+    else if (particles.material[particle] == int(MaterialType::Snow)) {
+      const SnowStrength strength = snow_strength(particles, particle);
+      snow_stress(f, strength.mu, strength.lambda, strength.tensile, stress);
     }
     else {
       const SandStrength strength = sand_strength(particles, particle);
@@ -1206,7 +1394,8 @@ void grid_to_particle(ParticleData &particles,
           new_f[i][j] += dt * (c[i][0] * f[0][j] + c[i][1] * f[1][j] + c[i][2] * f[2][j]);
         }
       }
-      if (particles.material[particle] == int(MaterialType::Sand)) {
+      const int material = particles.material[particle];
+      if (material == int(MaterialType::Sand) || material == int(MaterialType::Snow)) {
         /* Impact damage is driven by the strain rate `|C|`; a block in free fall or at rest is
          * almost rigid, an impact has tens per second. */
         float strain_increment = 0.0f;
@@ -1219,11 +1408,20 @@ void grid_to_particle(ParticleData &particles,
           }
           strain_increment = std::max(0.0f, std::sqrt(c_norm_sq) - DAMAGE_STRAIN_RATE) * dt;
         }
-        return_map_sand(particle,
-                        particles,
-                        &new_f[0][0],
-                        &particles.deformation[particle * 9],
-                        strain_increment);
+        if (material == int(MaterialType::Sand)) {
+          return_map_sand(particle,
+                          particles,
+                          &new_f[0][0],
+                          &particles.deformation[particle * 9],
+                          strain_increment);
+        }
+        else {
+          return_map_snow(particle,
+                          particles,
+                          &new_f[0][0],
+                          &particles.deformation[particle * 9],
+                          strain_increment);
+        }
       }
       else {
         /* Keep a fluid's `F` bounded. The stress only depends on `det(F)`, so the volume is the
@@ -1337,6 +1535,16 @@ int choose_substeps(const ParticleData &particles,
     float wave_speed = 0.0f;
     if (particles.material[particle] == int(MaterialType::Fluid)) {
       wave_speed = std::sqrt(std::max(particles.bulk_modulus[particle], 0.0f) / density);
+    }
+    else if (particles.material[particle] == int(MaterialType::Snow)) {
+      const float scale = std::min(1.0f + std::max(particles.hardening_rate[particle], 0.0f) *
+                                             std::max(particles.hardening[particle], 0.0f),
+                                   MAX_HARDENING_SCALE);
+      wave_speed = std::sqrt(std::max((particles.lame_lambda[particle] +
+                                       2.0f * particles.shear_modulus[particle]) *
+                                          scale,
+                                      0.0f) /
+                             density);
     }
     else {
       wave_speed = std::sqrt(std::max(particles.lame_lambda[particle] +
@@ -1468,6 +1676,12 @@ void ParticleData::resize(const int count)
   surface_tension.resize(count);
   friction.resize(count);
   cohesion.resize(count);
+  tensile_strength.resize(count);
+  compression_limit.resize(count);
+  stretch_limit.resize(count);
+  rest_density.resize(count);
+  hardening_rate.resize(count);
+  hardening.resize(count);
   damage.resize(count);
   damage_rate.resize(count);
   damping.resize(count);
@@ -1498,6 +1712,12 @@ void ParticleData::resize(const int count)
     surface_tension[i] = 0.0f;
     friction[i] = 0.0f;
     cohesion[i] = 0.0f;
+    tensile_strength[i] = 0.0f;
+    compression_limit[i] = 0.05f;
+    stretch_limit[i] = 0.01f;
+    rest_density[i] = 0.0f;
+    hardening_rate[i] = 0.0f;
+    hardening[i] = 0.0f;
     damage[i] = 0.0f;
     damage_rate[i] = 0.0f;
     damping[i] = 0.1f;
@@ -1538,6 +1758,24 @@ void ParticleData::fill_defaults()
     }
     if (!std::isfinite(damage_rate[i]) || damage_rate[i] < 0.0f) {
       damage_rate[i] = 0.0f;
+    }
+    if (!std::isfinite(tensile_strength[i]) || tensile_strength[i] < 0.0f) {
+      tensile_strength[i] = 0.0f;
+    }
+    if (!std::isfinite(compression_limit[i]) || compression_limit[i] < 0.0f) {
+      compression_limit[i] = 0.05f;
+    }
+    if (!std::isfinite(stretch_limit[i]) || stretch_limit[i] < 0.0f) {
+      stretch_limit[i] = 0.01f;
+    }
+    if (!std::isfinite(rest_density[i]) || rest_density[i] < 0.0f) {
+      rest_density[i] = 0.0f;
+    }
+    if (!std::isfinite(hardening_rate[i]) || hardening_rate[i] < 0.0f) {
+      hardening_rate[i] = 0.0f;
+    }
+    if (!std::isfinite(hardening[i]) || hardening[i] < 0.0f) {
+      hardening[i] = 0.0f;
     }
     if (!std::isfinite(damping[i])) {
       damping[i] = 0.0f;
