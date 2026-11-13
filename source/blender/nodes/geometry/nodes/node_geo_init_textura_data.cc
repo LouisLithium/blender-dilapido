@@ -297,7 +297,8 @@ static void node_declare(NodeDeclarationBuilder &b)
     panel.add_input<decl::Float>("Density"_ustr)
         .default_value(1000.0f)
         .min(1e-3f)
-        .description("Rest density of the material in kg/m^3. Water is 1000, dry sand about 1600");
+        .description("Rest density of the material in kg/m^3. Water is 1000, dry sand about 1600 "
+                     "and fresh snow 100 to 400");
     panel.add_input<decl::Float>("Particle Radius"_ustr)
         .default_value(0.05f)
         .min(1e-5f)
@@ -400,12 +401,6 @@ static void node_declare(NodeDeclarationBuilder &b)
 
   {
     auto &panel = b.add_panel("Snow"_ustr).default_closed(false);
-    panel.add_input<decl::Float>("Snow Density"_ustr)
-        .default_value(300.0f)
-        .min(1.0f)
-        .usage_by_menu("Type"_ustr, int(MaterialType::Snow))
-        .description("Rest density of fresh snow in kg/m^3. It is much lighter than water (100 to "
-                     "400 is typical); compaction raises it up to about four times this value");
     panel.add_input<decl::Float>("Snow Young's Modulus"_ustr)
         .default_value(5.0e4f)
         .min(1.0f)
@@ -517,7 +512,6 @@ static void node_geo_exec(GeoNodeExecParams params)
                                        1.0f);
   material.hardening_rate = math::clamp(params.extract_input<float>("Hardening"_ustr), 0.0f, 100.0f);
   if (material.type == int(MaterialType::Snow)) {
-    material.density = std::max(params.extract_input<float>("Snow Density"_ustr), 1e-3f);
     material.young_modulus = std::max(params.extract_input<float>("Snow Young's Modulus"_ustr),
                                       1.0f);
     material.poisson_ratio = math::clamp(
