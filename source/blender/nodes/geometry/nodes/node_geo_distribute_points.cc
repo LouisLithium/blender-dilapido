@@ -421,6 +421,11 @@ static void node_declare(NodeDeclarationBuilder &b)
 {
   b.use_custom_socket_order();
 
+  /* Match the native `Distribute Points on Faces`: the output sits above the inputs, even though
+   * this node uses a custom socket order for its panels. */
+  b.add_output<decl::Geometry>("Points"_ustr)
+      .description("A point cloud with the distributed points and their `id`");
+
   b.add_input<decl::Geometry>("Geometry"_ustr)
       .supported_type(GeometryComponent::Type::Mesh)
       .is_default_link_socket()
@@ -483,9 +488,6 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0)
         .description("Random seed of the surface scattering and of the jitter");
   }
-
-  b.add_output<decl::Geometry>("Points"_ustr)
-      .description("A point cloud with the distributed points and their `id`");
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
