@@ -801,6 +801,14 @@ SolidSample sample_solids(const float3 &position,
     SolidSample box = sample_box(local, collider.box_local_min, collider.box_local_max);
     box.distance *= collider.box_scale;
     box.normal = math::normalize(math::transform_direction(collider.box_transform, box.normal));
+    if (collider.invert) {
+      /* A hollow box: the surface is a wall on both sides. Inside, the sample normal points at the
+       * nearest face (outward from the particle), so both the distance and the normal flip. */
+      if (box.distance < 0.0f) {
+        box.distance = -box.distance;
+        box.normal = -box.normal;
+      }
+    }
     box.friction = collider.friction;
     if (box.distance < best.distance) {
       best = box;
@@ -820,7 +828,10 @@ SolidSample sample_solids(const float3 &position,
         position.y >= box_min.y - skip_margin && position.y <= box_max.y + skip_margin &&
         position.z >= box_min.z - skip_margin && position.z <= box_max.z + skip_margin)
     {
-      const float distance = ha::ha_sdf_sample(*sdf, position);
+      /* For a hollow container the stored field is still signed (negative inside the original
+       * solid) and the contact distance is its absolute value. */
+      const float signed_distance = ha::ha_sdf_sample(*sdf, position);
+      const float distance = sdf->inverted ? std::fabs(signed_distance) : signed_distance;
       if (distance < best.distance) {
         best.distance = distance;
         /* The level set is a union of every mesh collider, so there is no single surface. Use the
@@ -844,7 +855,13 @@ SolidSample sample_solids(const float3 &position,
               ha::ha_sdf_sample(*sdf, position + dz) - ha::ha_sdf_sample(*sdf, position - dz));
           const float length = math::length(gradient);
           if (length > 1e-8f) {
+            /* The normal has to point away from the wall on the particle's side. For a hollow
+             * container that is `sign(d) * grad(d)`; the gradient of `|d|` would be degenerate
+             * right at the wall (a V shape) and let particles slip through to the outside. */
             best.normal = gradient / length;
+            if (sdf->inverted && signed_distance < 0.0f) {
+              best.normal = -best.normal;
+            }
           }
         }
       }
@@ -2006,6 +2023,7 @@ struct ColliderSdfCache {
   int3 dims = int3(0);
   float3 origin = float3(0.0f);
   float spacing = 0.0f;
+  bool inverted = false;
   /** Plain `std::vector` on purpose: Blender's guarded allocator is already torn down when the
    * static cache is destroyed at exit, and a `HaSdfGrid` here would leak (or crash) in headless
    * runs where `GPU_exit` never runs. The copy into a temporary grid costs a fraction of a
@@ -2019,7 +2037,8 @@ static uint64_t hash_collider_geometry(const Span<float3> positions,
                                        const Span<int3> tris,
                                        const float voxel_size,
                                        const float band_width,
-                                       const bool all_closed)
+                                       const bool all_closed,
+                                       const uint64_t invert_mask)
 {
   uint64_t hash = 1469598103934665603ull;
   const auto mix = [&hash](const void *data, const size_t size) {
@@ -2035,6 +2054,7 @@ static uint64_t hash_collider_geometry(const Span<float3> positions,
   mix(&band_width, sizeof(band_width));
   const uint8_t closed = all_closed ? 1 : 0;
   mix(&closed, 1);
+  mix(&invert_mask, sizeof(invert_mask));
   return hash;
 }
 
@@ -2054,6 +2074,7 @@ static bool collider_sdf_cache_copy(const uint64_t hash,
   r_grid.dims = collider_sdf_cache.dims;
   r_grid.origin = collider_sdf_cache.origin;
   r_grid.spacing = collider_sdf_cache.spacing;
+  r_grid.inverted = collider_sdf_cache.inverted;
   r_grid.data.reinitialize(collider_sdf_cache.data.size());
   std::copy(collider_sdf_cache.data.begin(), collider_sdf_cache.data.end(),
             r_grid.data.begin());
@@ -2072,6 +2093,7 @@ static void collider_sdf_cache_put(const uint64_t hash,
   collider_sdf_cache.dims = grid.dims;
   collider_sdf_cache.origin = grid.origin;
   collider_sdf_cache.spacing = grid.spacing;
+  collider_sdf_cache.inverted = grid.inverted;
   collider_sdf_cache.data.assign(grid.data.begin(), grid.data.end());
 }
 
@@ -2166,6 +2188,8 @@ void solve_frame(ParticleData &particles,
   Vector<int3> sdf_corner_tris;
   /** Triangle range of every mesh collider inside #sdf_corner_tris, for the per-shell union. */
   Vector<int2> sdf_mesh_tris;
+  /** Parallel to #sdf_mesh_tris: the shell is a hollow container (`Invert`). */
+  Vector<bool> sdf_mesh_invert;
   float max_radius = 0.0f;
   /* Closed meshes are exact solids, so a level set is both correct and free of the phantom bump a
    * one-sided splat creates around sharp thin wedges. They also need their winding fixed first: an
@@ -2174,6 +2198,8 @@ void solve_frame(ParticleData &particles,
    * one-sided field (unchanged behavior for planes and cloth surfaces). */
   bool all_closed = true;
   bool has_mesh_collider = false;
+  bool all_mesh_inverted = true;
+  bool any_mesh_inverted = false;
   float3 mesh_min = float3(std::numeric_limits<float>::max());
   float3 mesh_max = float3(-std::numeric_limits<float>::max());
   for (const int i : resolved.index_range()) {
@@ -2182,6 +2208,10 @@ void solve_frame(ParticleData &particles,
       continue;
     }
     has_mesh_collider = true;
+    any_mesh_inverted |= collider.invert;
+    if (!collider.invert) {
+      all_mesh_inverted = false;
+    }
     for (const float3 &position : collider.mesh->vert_positions()) {
       mesh_min = math::min(mesh_min, position);
       mesh_max = math::max(mesh_max, position);
@@ -2207,6 +2237,7 @@ void solve_frame(ParticleData &particles,
       sdf_corner_tris.append(oriented + int3(corner_offset));
     }
     sdf_mesh_tris.append(int2(tri_begin, sdf_corner_tris.size()));
+    sdf_mesh_invert.append(collider.invert);
   }
   for (const float radius : particles.radius) {
     max_radius = std::max(max_radius, radius);
@@ -2221,8 +2252,18 @@ void solve_frame(ParticleData &particles,
     const float3 region_min = mesh_min;
     const float3 region_max = mesh_max;
     const float band = std::max(2.0f * grid.dx, 2.0f * max_radius + grid.dx);
-    const uint64_t hash = hash_collider_geometry(
-        sdf_positions.as_span(), sdf_corner_tris.as_span(), grid.dx, band, all_closed);
+    uint64_t invert_mask = 0;
+    for (const int shell : sdf_mesh_invert.index_range()) {
+      if (sdf_mesh_invert[shell] && shell < 64) {
+        invert_mask |= 1ull << shell;
+      }
+    }
+    const uint64_t hash = hash_collider_geometry(sdf_positions.as_span(),
+                                                 sdf_corner_tris.as_span(),
+                                                 grid.dx,
+                                                 band,
+                                                 all_closed,
+                                                 invert_mask);
     auto built = std::make_shared<ha::HaSdfGrid>();
     if (collider_sdf_cache_copy(hash, grid.dx, band, *built)) {
       sdf_valid = built->is_valid();
@@ -2249,12 +2290,20 @@ void solve_frame(ParticleData &particles,
          * a floor shares a coplanar face pair, and a single level set bake of the two shells can
          * leave holes there: a particle that reaches one falls straight through. */
         ha::HaSdfGrid part;
-        for (const int2 &range : sdf_mesh_tris) {
+        for (const int shell : sdf_mesh_tris.index_range()) {
+          const int2 range = sdf_mesh_tris[shell];
           if (!build_part(range, false, part)) {
             /* Safety net: a shell that OpenVDB cannot bake still gets a one sided field. The
              * winding has already been corrected, so the sign is right. */
             if (!build_part(range, true, part)) {
               continue;
+            }
+          }
+          if (sdf_mesh_invert[shell] && !all_mesh_inverted) {
+            /* Mixed solid and hollow shells: a single field cannot be both, so fall back to the
+             * unsigned version for the hollow ones (the normal at the wall is then less accurate). */
+            for (float &value : part.data) {
+              value = std::fabs(value);
             }
           }
           if (!sdf_valid) {
@@ -2282,8 +2331,16 @@ void solve_frame(ParticleData &particles,
                                      !all_closed,
                                      !all_closed,
                                      *built);
+        if (sdf_valid && sdf_mesh_invert.size() == 1 && sdf_mesh_invert[0] && !all_mesh_inverted) {
+          for (float &value : built->data) {
+            value = std::fabs(value);
+          }
+        }
       }
       if (sdf_valid) {
+        /* A single hollow shell keeps its signed data and is sampled as `|d|` with a signed normal
+         * (see `sample_solids`); that keeps the normal well defined right at the wall. */
+        built->inverted = any_mesh_inverted && all_mesh_inverted;
         collider_sdf_cache_put(hash, grid.dx, band, *built);
       }
     }

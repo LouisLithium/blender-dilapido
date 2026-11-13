@@ -118,6 +118,13 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(false)
         .description(
             "Invert the collider: points are kept *inside* it instead of being pushed out");
+    panel.add_input<decl::Bool>("Invert"_ustr)
+        .default_value(false)
+        .description(
+            "Treat a closed collider as a hollow container: the interior becomes empty space the "
+            "material can occupy, and the surface acts as a wall on both sides. Used by the MPM "
+            "solver (`Textura Dynamics`); the boundary particles of the XPBD solver use the "
+            "Boundary option instead");
     panel.add_input<decl::Bool>("Edge Contacts"_ustr)
         .default_value(false)
         .description(
@@ -164,6 +171,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const bool sweep = params.extract_input<bool>("Sweep"_ustr);
   const bool deforming = params.extract_input<bool>("Deforming"_ustr);
   const bool is_boundary = params.extract_input<bool>("Boundary"_ustr);
+  const bool invert = params.extract_input<bool>("Invert"_ustr);
   const bool use_edge_contacts = params.extract_input<bool>("Edge Contacts"_ustr);
   const float margin = std::max(0.0f, params.extract_input<float>("Margin"_ustr));
   const float softness = std::clamp(params.extract_input<float>("Softness"_ustr), 0.0f, 1.0f);
@@ -191,6 +199,7 @@ static void node_geo_exec(GeoNodeExecParams params)
    * can switch between the two without rewiring. */
   bundle.add(*BundleKey::from_str("deforming"), deforming);
   bundle.add(*BundleKey::from_str("is_boundary"), is_boundary);
+  bundle.add(*BundleKey::from_str("invert"), invert);
   bundle.add(*BundleKey::from_str("use_edge_contacts"), use_edge_contacts);
   bundle.add(*BundleKey::from_str("margin"), margin);
   /* Same mapping as the `Softness to Compliance` asset group. */

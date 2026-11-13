@@ -186,6 +186,7 @@ void append_collider(const Bundle &bundle, Vector<geometry::textura::Collider> &
   collider.mesh = mesh;
   collider.box = bundle.type().has_value() && *bundle.type() == COLLIDER_BOX_TYPE;
   collider.convex = read_bool(bundle, "convex", false);
+  collider.invert = read_bool(bundle, "invert", false);
   collider.friction = std::clamp(read_float(bundle, "friction", 0.5f), 0.0f, 1.0f);
   /* The collider node bakes `Transform` into the geometry. Keep the matrix around as well so a box
    * can be rebuilt in the object's local space (an oriented box) instead of its world AABB. */

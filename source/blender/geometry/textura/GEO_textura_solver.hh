@@ -140,6 +140,12 @@ struct Collider {
   bool box = false;
   /** True for `Dilapido Collider > Type = Convex Hull`; the mesh is used as the hull surface. */
   bool convex = false;
+  /**
+   * Treat a closed collider as a hollow container: the field becomes `|distance|`, so the surface
+   * is a wall on both sides and the interior is free space. Ignored for open sheets, which are
+   * already membranes.
+   */
+  bool invert = false;
   /** Coulomb friction of the surface (0..1), from the `Dilapido Collider` node. */
   float friction = 0.5f;
   /**

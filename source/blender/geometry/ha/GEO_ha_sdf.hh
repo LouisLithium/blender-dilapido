@@ -37,6 +37,13 @@ struct HaSdfGrid {
   float spacing = 0.0f;
   /** `dims.x * dims.y * dims.z` distances in world units, negative inside the collider. */
   Vector<float> data;
+  /**
+   * The field is a hollow container: the surface is a wall on both sides and `data` keeps its sign
+   * (negative inside the original solid). Sampling takes `fabs(distance)` and picks the normal from
+   * the signed gradient, which keeps the normal well defined right at the wall (the gradient of an
+   * `abs` field is degenerate there).
+   */
+  bool inverted = false;
 
   int64_t voxels_num() const
   {
@@ -55,6 +62,7 @@ struct HaSdfGrid {
     origin = float3(0.0f);
     spacing = 0.0f;
     data.clear();
+    inverted = false;
   }
 };
 
