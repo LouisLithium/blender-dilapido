@@ -59,8 +59,33 @@ static const EnumPropertyItem textura_type_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
+static const EnumPropertyItem textura_emission_items[] = {
+    {0,
+     "NONE",
+     0,
+     N_("None"),
+     N_("The particles are only the initial state: they are simulated once and never injected "
+        "again")},
+    {1,
+     "PER_FRAME",
+     0,
+     N_("Per Frame"),
+     N_("Inject the emitter's particles once per frame, at its pose of this frame. Use it for a "
+        "nozzle/object that keeps pouring new material into the pool")},
+    {2,
+     "PER_SUBSTEP",
+     0,
+     N_("Per Substep"),
+     N_("Inject several copies per frame, spread along the distance the particles travel, so a "
+        "fast stream is continuous instead of one lump per frame")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 struct MaterialParameters {
   int type = int(MaterialType::Fluid);
+  int emission = 0;
+  float emission_spacing = 0.0f;
+  float emission_velocity_jitter = 0.0f;
   float density = 1000.0f;
   float radius = 0.05f;
   float volume = 0.0f;
@@ -195,6 +220,10 @@ void write_component(GeometryComponent &component,
   }
   write_scalar(geometry::textura::attribute_names::damage_rate, damage_rate);
   write_scalar(geometry::textura::attribute_names::damping, params.damping);
+  write_int(geometry::textura::attribute_names::emission, params.emission);
+  write_scalar(geometry::textura::attribute_names::emission_spacing, params.emission_spacing);
+  write_scalar(geometry::textura::attribute_names::emission_velocity_jitter,
+               params.emission_velocity_jitter);
   write_scalar("radius", radius);
   write_scalar("mass", mass);
 
@@ -327,6 +356,25 @@ static void node_declare(NodeDeclarationBuilder &b)
         .structure_type(StructureType::Field)
         .description("Velocity the particles start with. Use a field to give different parts of "
                      "the geometry different velocities");
+    panel.add_input<decl::Menu>("Emission"_ustr)
+        .static_items(textura_emission_items)
+        .default_value(MenuValue(0))
+        .description("Inject this geometry into `Textura Dynamics` every frame instead of only "
+                     "seeding the first frame. `Per Substep` spreads the copies along the distance "
+                     "they travel, so a fast stream stays continuous");
+    panel.add_input<decl::Float>("Emission Spacing"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .description("New particles closer than this to the existing pool are skipped, in metres. "
+                     "0 injects every copy (a static emitter then piles them up); about one "
+                     "particle spacing keeps a stream at a stable density");
+    panel.add_input<decl::Float>("Emission Velocity Jitter"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .description("Random multiplier spread for the emitted velocity (0 = identical, 0.3 = "
+                     "±30%). It turns the per frame batches into a more continuous jet");
   }
 
   {
@@ -520,6 +568,10 @@ static void node_geo_exec(GeoNodeExecParams params)
                                        0.0f,
                                        1.0f);
   material.hardening_rate = math::clamp(params.extract_input<float>("Hardening"_ustr), 0.0f, 100.0f);
+  material.emission = params.extract_input<int>("Emission"_ustr);
+  material.emission_spacing = std::max(params.extract_input<float>("Emission Spacing"_ustr), 0.0f);
+  material.emission_velocity_jitter = math::clamp(
+      params.extract_input<float>("Emission Velocity Jitter"_ustr), 0.0f, 1.0f);
   if (material.type == int(MaterialType::Snow)) {
     material.young_modulus = std::max(params.extract_input<float>("Snow Young's Modulus"_ustr),
                                       1.0f);

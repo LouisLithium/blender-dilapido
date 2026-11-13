@@ -78,6 +78,14 @@ constexpr StringRefNull damage = "textura_damage";
 /** How much damage one unit of plastic strain adds. 0 disables damage. */
 constexpr StringRefNull damage_rate = "textura_damage_rate";
 constexpr StringRefNull damping = "textura_damping";
+/** Emission mode written by `Init Textura Data`: 0 none, 1 per frame, 2 per substep. The asset
+ * re-injects the emitter's particles while this is not 0. */
+constexpr StringRefNull emission = "textura_emission";
+/** Minimum distance between a newly emitted particle and the existing pool, in metres. 0 emits
+ * everything, which lets a static emitter stack copies on top of each other. */
+constexpr StringRefNull emission_spacing = "textura_emission_spacing";
+/** Relative random variation of the emitted velocity (0..1). */
+constexpr StringRefNull emission_velocity_jitter = "textura_emission_velocity_jitter";
 constexpr StringRefNull deformation_x = "textura_F_x";
 constexpr StringRefNull deformation_y = "textura_F_y";
 constexpr StringRefNull deformation_z = "textura_F_z";
