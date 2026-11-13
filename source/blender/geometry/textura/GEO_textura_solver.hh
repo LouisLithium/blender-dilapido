@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "BLI_math_matrix_types.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
 #include "BLI_string_ref.hh"
@@ -137,7 +138,22 @@ struct Settings {
 struct Collider {
   const Mesh *mesh = nullptr;
   bool box = false;
+  /** True for `Dilapido Collider > Type = Convex Hull`; the mesh is used as the hull surface. */
+  bool convex = false;
+  /** Coulomb friction of the surface (0..1), from the `Dilapido Collider` node. */
   float friction = 0.5f;
+  /**
+   * Oriented box frame. `Dilapido Collider` bakes its `Transform` into the geometry, so a box is
+   * rebuilt in the object's local space: the world vertices are mapped back with
+   * `box_transform_inverse`, the local extent becomes `box_local_min/max`, and the analytic box is
+   * sampled there. Without a transform the matrix is the identity and this is the world AABB.
+   */
+  float4x4 box_transform = float4x4::identity();
+  float4x4 box_transform_inverse = float4x4::identity();
+  /** Average world scale of #box_transform, so a local box distance becomes world units. */
+  float box_scale = 1.0f;
+  float3 box_local_min = float3(0.0f);
+  float3 box_local_max = float3(-1.0f);
 };
 
 /**

@@ -26,7 +26,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
 
 #include "BLI_math_matrix.hh"
@@ -34,6 +37,8 @@
 #include "BLI_task.hh"
 
 #include "BKE_mesh.hh"
+
+#include "GPU_init_exit.hh"
 
 #include "GEO_ha_sdf.hh"
 
@@ -739,6 +744,8 @@ struct SolidSample {
   /** Signed distance in world units, negative inside. */
   float distance = std::numeric_limits<float>::max();
   float3 normal = float3(0.0f, 0.0f, 1.0f);
+  /** Coulomb friction of the surface that produced the sample (0..1). */
+  float friction = 0.5f;
 };
 
 SolidSample sample_box(const float3 &position, const float3 &min, const float3 &max)
@@ -776,20 +783,25 @@ SolidSample sample_box(const float3 &position, const float3 &min, const float3 &
 
 SolidSample sample_solids(const float3 &position,
                           const Span<const Collider> colliders,
-                          const Span<float3> box_min,
-                          const Span<float3> box_max,
                           const ha::HaSdfGrid *sdf,
                           const float gradient_epsilon)
 {
   SolidSample best;
   for (const int i : colliders.index_range()) {
-    if (!colliders[i].box) {
+    const Collider &collider = colliders[i];
+    if (!collider.box) {
       continue;
     }
-    if (box_min[i].x > box_max[i].x) {
+    if (collider.box_local_min.x > collider.box_local_max.x) {
       continue;
     }
-    const SolidSample box = sample_box(position, box_min[i], box_max[i]);
+    /* Oriented box: the point is mapped into the object's local space, sampled there, and the
+     * normal is mapped back. With an identity transform this is exactly the world AABB. */
+    const float3 local = math::transform_point(collider.box_transform_inverse, position);
+    SolidSample box = sample_box(local, collider.box_local_min, collider.box_local_max);
+    box.distance *= collider.box_scale;
+    box.normal = math::normalize(math::transform_direction(collider.box_transform, box.normal));
+    box.friction = collider.friction;
     if (box.distance < best.distance) {
       best = box;
     }
@@ -811,6 +823,15 @@ SolidSample sample_solids(const float3 &position,
       const float distance = ha::ha_sdf_sample(*sdf, position);
       if (distance < best.distance) {
         best.distance = distance;
+        /* The level set is a union of every mesh collider, so there is no single surface. Use the
+         * roughest friction of the shells that built it. */
+        float sdf_friction = 0.0f;
+        for (const Collider &collider : colliders) {
+          if (!collider.box) {
+            sdf_friction = std::max(sdf_friction, collider.friction);
+          }
+        }
+        best.friction = sdf_friction;
         /* Beyond a few cells the gradient cannot matter: no node or particle is close enough for a
          * contact, so the six extra trilinear samples are skipped. */
         if (distance <= gradient_epsilon * 4.0f) {
@@ -1236,8 +1257,6 @@ void update_grid(GridData &grid,
                  const float dt,
                  const float surface_tension,
                  const Span<const Collider> colliders,
-                 const Span<float3> box_min,
-                 const Span<float3> box_max,
                  const ha::HaSdfGrid *sdf,
                  Stats &r_stats)
 {
@@ -1319,13 +1338,17 @@ void update_grid(GridData &grid,
 
       const float3 world = grid.origin +
                            float3(float(x), float(y), float(z)) * grid.dx;
-      const SolidSample sample = sample_solids(
-          world, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
+      const SolidSample sample = sample_solids(world, colliders, sdf, grid.dx * 0.5f);
       if (sample.distance < 0.0f) {
         velocity = float3(0.0f);
       }
       else if (sample.distance < contact_range) {
-        apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
+        /* `Boundary Friction` is the solver wide knob; the collider's own `Friction` scales it.
+         * Normalised so the default (0.5 / 0.5) keeps the previous behavior. */
+        const float friction = math::clamp(settings.boundary_friction * 2.0f * sample.friction,
+                                           0.0f,
+                                           1.0f);
+        apply_wall_contact(velocity, sample.normal, friction, dt);
       }
       grid.velocity[i] = velocity;
     }
@@ -1513,8 +1536,6 @@ void advect_and_collide(ParticleData &particles,
                         const float dt,
                         const GridData &grid,
                         const Span<const Collider> colliders,
-                        const Span<float3> box_min,
-                        const Span<float3> box_max,
                         const ha::HaSdfGrid *sdf)
 {
   const float3 domain_min = grid.origin;
@@ -1526,18 +1547,20 @@ void advect_and_collide(ParticleData &particles,
     for (const int particle : range) {
       float3 position = particles.positions[particle] + particles.velocities[particle] * dt;
       float3 velocity = particles.velocities[particle];
-      const SolidSample sample = sample_solids(
-          position, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
+      const SolidSample sample = sample_solids(position, colliders, sdf, grid.dx * 0.5f);
       /* MPM contact lives on the grid, so a particle can settle a full cell above a collider even
        * though its own radius is much smaller. Project it down to its radius when it is close to
        * the surface (`Contact Skin` in the solver panel, in grid cells). This is a position-only
        * correction: the grid still computes the contact velocity. */
       const float contact_skin = std::max(settings.contact_skin, 0.0f) * grid.dx;
+      const float contact_friction = math::clamp(settings.boundary_friction * 2.0f * sample.friction,
+                                                 0.0f,
+                                                 1.0f);
       if (sample.distance < particles.radius[particle] + contact_skin) {
         const bool touching = sample.distance < particles.radius[particle];
         position += sample.normal * (particles.radius[particle] - sample.distance);
         if (touching) {
-          apply_wall_contact(velocity, sample.normal, settings.boundary_friction, dt);
+          apply_wall_contact(velocity, sample.normal, contact_friction, dt);
         }
       }
       const float wall_friction = particles.wall_friction[particle];
@@ -1657,8 +1680,6 @@ void substep(ParticleData &particles,
              GridData &grid,
              const Span<int> particle_order,
              const Span<const Collider> colliders,
-             const Span<float3> box_min,
-             const Span<float3> box_max,
              const ha::HaSdfGrid *sdf,
              const float surface_tension,
              P2gSlices *slices,
@@ -1671,13 +1692,13 @@ void substep(ParticleData &particles,
   particle_to_grid_all(particles, dt, grid, particle_order, surface_tension > 0.0f, slices);
   r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
-  update_grid(grid, settings, dt, surface_tension, colliders, box_min, box_max, sdf, r_stats);
+  update_grid(grid, settings, dt, surface_tension, colliders, sdf, r_stats);
   r_stats.milliseconds_update_grid += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
   grid_to_particle(particles, grid, dt, particle_order);
   r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
-  advect_and_collide(particles, settings, dt, grid, colliders, box_min, box_max, sdf);
+  advect_and_collide(particles, settings, dt, grid, colliders, sdf);
   r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
@@ -1697,8 +1718,6 @@ void substep_two_phase(ParticleData &particles,
                        const Span<int> fluid_order,
                        const Span<int> sand_order,
                        const Span<const Collider> colliders,
-                       const Span<float3> box_min,
-                       const Span<float3> box_max,
                        const ha::HaSdfGrid *sdf,
                        const float surface_tension,
                        P2gSlices *slices,
@@ -1720,11 +1739,9 @@ void substep_two_phase(ParticleData &particles,
               dt,
               surface_tension,
               colliders,
-              box_min,
-              box_max,
               sdf,
               r_stats);
-  update_grid(sand_grid, settings, dt, 0.0f, colliders, box_min, box_max, sdf, r_stats);
+  update_grid(sand_grid, settings, dt, 0.0f, colliders, sdf, r_stats);
   apply_inter_phase_drag(fluid_grid, sand_grid, settings.inter_phase_drag, dt);
   /* `update_grid` records the active cells of its own phase; report the union here. */
   r_stats.active_cells = int(fluid_grid.active.size() + sand_grid.active.size());
@@ -1736,7 +1753,7 @@ void substep_two_phase(ParticleData &particles,
   r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
 
   mark = std::chrono::steady_clock::now();
-  advect_and_collide(particles, settings, dt, fluid_grid, colliders, box_min, box_max, sdf);
+  advect_and_collide(particles, settings, dt, fluid_grid, colliders, sdf);
   r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
@@ -1972,6 +1989,94 @@ static float mesh_signed_volume(const Mesh &mesh)
   return volume / 6.0f;
 }
 
+/* -------------------------------------------------------------------- */
+/** \name Collider SDF cache
+ *
+ * The field is built from the collider geometry alone (not from the simulation box), so a static
+ * collider produces the same bytes every frame. Baking a level set and sampling it into a dense
+ * grid is by far the most expensive part of a frame with a mesh collider, so the result is cached
+ * by a content hash: a moving or deforming collider changes the hash and rebakes.
+ * \{ */
+
+struct ColliderSdfCache {
+  std::mutex mutex;
+  uint64_t hash = 0;
+  float voxel_size = 0.0f;
+  float band_width = 0.0f;
+  int3 dims = int3(0);
+  float3 origin = float3(0.0f);
+  float spacing = 0.0f;
+  /** Plain `std::vector` on purpose: Blender's guarded allocator is already torn down when the
+   * static cache is destroyed at exit, and a `HaSdfGrid` here would leak (or crash) in headless
+   * runs where `GPU_exit` never runs. The copy into a temporary grid costs a fraction of a
+   * millisecond for a floor sized field. */
+  std::vector<float> data;
+};
+
+static ColliderSdfCache collider_sdf_cache;
+
+static uint64_t hash_collider_geometry(const Span<float3> positions,
+                                       const Span<int3> tris,
+                                       const float voxel_size,
+                                       const float band_width,
+                                       const bool all_closed)
+{
+  uint64_t hash = 1469598103934665603ull;
+  const auto mix = [&hash](const void *data, const size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= 1099511628211ull;
+    }
+  };
+  mix(positions.data(), size_t(positions.size()) * sizeof(float3));
+  mix(tris.data(), size_t(tris.size()) * sizeof(int3));
+  mix(&voxel_size, sizeof(voxel_size));
+  mix(&band_width, sizeof(band_width));
+  const uint8_t closed = all_closed ? 1 : 0;
+  mix(&closed, 1);
+  return hash;
+}
+
+/** Copies the cached field into `r_grid`. Returns false when the cache does not match. */
+static bool collider_sdf_cache_copy(const uint64_t hash,
+                                    const float voxel_size,
+                                    const float band_width,
+                                    ha::HaSdfGrid &r_grid)
+{
+  std::lock_guard<std::mutex> lock(collider_sdf_cache.mutex);
+  if (collider_sdf_cache.data.empty() || collider_sdf_cache.hash != hash ||
+      collider_sdf_cache.voxel_size != voxel_size ||
+      collider_sdf_cache.band_width != band_width)
+  {
+    return false;
+  }
+  r_grid.dims = collider_sdf_cache.dims;
+  r_grid.origin = collider_sdf_cache.origin;
+  r_grid.spacing = collider_sdf_cache.spacing;
+  r_grid.data.reinitialize(collider_sdf_cache.data.size());
+  std::copy(collider_sdf_cache.data.begin(), collider_sdf_cache.data.end(),
+            r_grid.data.begin());
+  return true;
+}
+
+static void collider_sdf_cache_put(const uint64_t hash,
+                                   const float voxel_size,
+                                   const float band_width,
+                                   const ha::HaSdfGrid &grid)
+{
+  std::lock_guard<std::mutex> lock(collider_sdf_cache.mutex);
+  collider_sdf_cache.hash = hash;
+  collider_sdf_cache.voxel_size = voxel_size;
+  collider_sdf_cache.band_width = band_width;
+  collider_sdf_cache.dims = grid.dims;
+  collider_sdf_cache.origin = grid.origin;
+  collider_sdf_cache.spacing = grid.spacing;
+  collider_sdf_cache.data.assign(grid.data.begin(), grid.data.end());
+}
+
+/** \} */
+
 void solve_frame(ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
@@ -2019,9 +2124,43 @@ void solve_frame(ParticleData &particles,
     sand_grid.clear();
   }
 
-  /* Box bounds are resolved once: a box collider is analytic, only meshes need a field. */
-  Vector<float3> box_min(colliders.size(), float3(0.0f));
-  Vector<float3> box_max(colliders.size(), float3(-1.0f));
+  /* Resolve the analytic box colliders into their object's local frame once per frame. With no
+   * `Transform` the matrix is the identity, so this is exactly the previous world AABB. */
+  Vector<Collider> resolved;
+  resolved.reserve(colliders.size());
+  for (const Collider &collider : colliders) {
+    resolved.append(collider);
+  }
+  for (Collider &collider : resolved) {
+    if (!collider.box || collider.mesh == nullptr) {
+      continue;
+    }
+    const float3 axis_x(collider.box_transform[0].x,
+                        collider.box_transform[0].y,
+                        collider.box_transform[0].z);
+    const float3 axis_y(collider.box_transform[1].x,
+                        collider.box_transform[1].y,
+                        collider.box_transform[1].z);
+    const float3 axis_z(collider.box_transform[2].x,
+                        collider.box_transform[2].y,
+                        collider.box_transform[2].z);
+    collider.box_scale = (math::length(axis_x) + math::length(axis_y) + math::length(axis_z)) /
+                         3.0f;
+    if (!(collider.box_scale > 1e-6f)) {
+      collider.box_scale = 1.0f;
+    }
+    float3 local_min = float3(std::numeric_limits<float>::max());
+    float3 local_max = float3(-std::numeric_limits<float>::max());
+    for (const float3 &position : collider.mesh->vert_positions()) {
+      const float3 local = math::transform_point(collider.box_transform_inverse, position);
+      local_min = math::min(local_min, local);
+      local_max = math::max(local_max, local);
+    }
+    collider.box_local_min = local_min;
+    collider.box_local_max = local_max;
+    collider.mesh = nullptr; /* Only the mesh colliders below need their triangles. */
+  }
+
   Vector<float3> sdf_positions;
   Vector<int> sdf_corner_verts;
   Vector<int3> sdf_corner_tris;
@@ -2034,21 +2173,18 @@ void solve_frame(ParticleData &particles,
    * sheet is present the combined field has no reliable sign, so the whole set falls back to the
    * one-sided field (unchanged behavior for planes and cloth surfaces). */
   bool all_closed = true;
-  for (const int i : colliders.index_range()) {
-    const Collider &collider = colliders[i];
+  bool has_mesh_collider = false;
+  float3 mesh_min = float3(std::numeric_limits<float>::max());
+  float3 mesh_max = float3(-std::numeric_limits<float>::max());
+  for (const int i : resolved.index_range()) {
+    const Collider &collider = resolved[i];
     if (collider.mesh == nullptr) {
       continue;
     }
-    float3 min = float3(std::numeric_limits<float>::max());
-    float3 max = float3(-std::numeric_limits<float>::max());
+    has_mesh_collider = true;
     for (const float3 &position : collider.mesh->vert_positions()) {
-      min = math::min(min, position);
-      max = math::max(max, position);
-    }
-    if (collider.box) {
-      box_min[i] = min;
-      box_max[i] = max;
-      continue;
+      mesh_min = math::min(mesh_min, position);
+      mesh_max = math::max(mesh_max, position);
     }
     const bool closed = mesh_is_closed(*collider.mesh);
     const bool reversed = closed && mesh_signed_volume(*collider.mesh) < 0.0f;
@@ -2076,70 +2212,82 @@ void solve_frame(ParticleData &particles,
     max_radius = std::max(max_radius, radius);
   }
 
-  ha::HaSdfGrid sdf;
+  std::shared_ptr<ha::HaSdfGrid> sdf;
   bool sdf_valid = false;
-  if (!sdf_positions.is_empty()) {
-    const float3 region_min = grid.origin;
-    const float3 region_max = grid.origin +
-                              float3(float(grid.dims.x - 1), float(grid.dims.y - 1),
-                                     float(grid.dims.z - 1)) *
-                                  grid.dx;
+  if (has_mesh_collider) {
+    /* The field only has to cover the collider itself: anything farther than the band is outside,
+     * so a smaller box is enough and, more importantly, it does not move when the particles move.
+     * A static collider therefore bakes once and is reused from the cache. */
+    const float3 region_min = mesh_min;
+    const float3 region_max = mesh_max;
     const float band = std::max(2.0f * grid.dx, 2.0f * max_radius + grid.dx);
-    const auto build_part = [&](const int2 tri_range,
-                                const bool one_sided,
-                                ha::HaSdfGrid &r_part) {
-      return ha::ha_sdf_build(sdf_positions.as_span(),
-                              sdf_corner_verts.as_span(),
-                              sdf_corner_tris.as_span().slice(tri_range.x,
-                                                              tri_range.y - tri_range.x),
-                              grid.dx,
-                              band,
-                              region_min,
-                              region_max,
-                              (region_min + region_max) * 0.5f,
-                              one_sided,
-                              false,
-                              r_part);
-    };
-    if (all_closed && sdf_mesh_tris.size() > 1) {
-      /* Closed shells are baked one at a time and unioned with `min()`. A box resting exactly on a
-       * floor shares a coplanar face pair, and a single level set bake of the two shells can leave
-       * holes there: a particle that reaches one falls straight through. */
-      ha::HaSdfGrid part;
-      for (const int2 &range : sdf_mesh_tris) {
-        if (!build_part(range, false, part)) {
-          /* Safety net: a shell that OpenVDB cannot bake still gets a one sided field. The winding
-           * has already been corrected, so the sign is right. */
-          if (!build_part(range, true, part)) {
-            continue;
+    const uint64_t hash = hash_collider_geometry(
+        sdf_positions.as_span(), sdf_corner_tris.as_span(), grid.dx, band, all_closed);
+    auto built = std::make_shared<ha::HaSdfGrid>();
+    if (collider_sdf_cache_copy(hash, grid.dx, band, *built)) {
+      sdf_valid = built->is_valid();
+    }
+    else {
+      const auto build_part = [&](const int2 tri_range,
+                                  const bool one_sided,
+                                  ha::HaSdfGrid &r_part) {
+        return ha::ha_sdf_build(sdf_positions.as_span(),
+                                sdf_corner_verts.as_span(),
+                                sdf_corner_tris.as_span().slice(tri_range.x,
+                                                                tri_range.y - tri_range.x),
+                                grid.dx,
+                                band,
+                                region_min,
+                                region_max,
+                                (region_min + region_max) * 0.5f,
+                                one_sided,
+                                false,
+                                r_part);
+      };
+      if (all_closed && sdf_mesh_tris.size() > 1) {
+        /* Closed shells are baked one at a time and unioned with `min()`. A box resting exactly on
+         * a floor shares a coplanar face pair, and a single level set bake of the two shells can
+         * leave holes there: a particle that reaches one falls straight through. */
+        ha::HaSdfGrid part;
+        for (const int2 &range : sdf_mesh_tris) {
+          if (!build_part(range, false, part)) {
+            /* Safety net: a shell that OpenVDB cannot bake still gets a one sided field. The
+             * winding has already been corrected, so the sign is right. */
+            if (!build_part(range, true, part)) {
+              continue;
+            }
           }
-        }
-        if (!sdf_valid) {
-          sdf = std::move(part);
-          sdf_valid = sdf.is_valid();
-        }
-        else if (part.dims == sdf.dims && part.origin == sdf.origin &&
-                 part.spacing == sdf.spacing)
-        {
-          for (const int i : sdf.data.index_range()) {
-            sdf.data[i] = std::min(sdf.data[i], part.data[i]);
+          if (!sdf_valid) {
+            *built = std::move(part);
+            sdf_valid = built->is_valid();
+          }
+          else if (part.dims == built->dims && part.origin == built->origin &&
+                   part.spacing == built->spacing)
+          {
+            for (const int i : built->data.index_range()) {
+              built->data[i] = std::min(built->data[i], part.data[i]);
+            }
           }
         }
       }
+      else {
+        sdf_valid = ha::ha_sdf_build(sdf_positions.as_span(),
+                                     sdf_corner_verts.as_span(),
+                                     sdf_corner_tris.as_span(),
+                                     grid.dx,
+                                     band,
+                                     region_min,
+                                     region_max,
+                                     (region_min + region_max) * 0.5f,
+                                     !all_closed,
+                                     !all_closed,
+                                     *built);
+      }
+      if (sdf_valid) {
+        collider_sdf_cache_put(hash, grid.dx, band, *built);
+      }
     }
-    else {
-      sdf_valid = ha::ha_sdf_build(sdf_positions.as_span(),
-                                   sdf_corner_verts.as_span(),
-                                   sdf_corner_tris.as_span(),
-                                   grid.dx,
-                                   band,
-                                   region_min,
-                                   region_max,
-                                   (region_min + region_max) * 0.5f,
-                                   !all_closed,
-                                   !all_closed,
-                                   sdf);
-    }
+    sdf = std::move(built);
     if (!sdf_valid) {
       r_stats.collider_sdf_failed = true;
     }
@@ -2195,10 +2343,8 @@ void solve_frame(ParticleData &particles,
                         sand_grid,
                         fluid_order.as_span(),
                         sand_order.as_span(),
-                        colliders,
-                        box_min.as_span(),
-                        box_max.as_span(),
-                        sdf_valid ? &sdf : nullptr,
+                        Span<const Collider>(resolved.data(), resolved.size()),
+                        sdf_valid ? sdf.get() : nullptr,
                         surface_tension,
                         use_slices ? &slices : nullptr,
                         r_stats);
@@ -2209,10 +2355,8 @@ void solve_frame(ParticleData &particles,
               dt,
               grid,
               order,
-              colliders,
-              box_min.as_span(),
-              box_max.as_span(),
-              sdf_valid ? &sdf : nullptr,
+              Span<const Collider>(resolved.data(), resolved.size()),
+              sdf_valid ? sdf.get() : nullptr,
               surface_tension,
               use_slices ? &slices : nullptr,
               r_stats);

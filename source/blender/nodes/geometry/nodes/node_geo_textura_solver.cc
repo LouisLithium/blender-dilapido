@@ -22,6 +22,7 @@
 #include <algorithm>
 
 #include "BLI_array.hh"
+#include "BLI_math_matrix.hh"
 #include "BLI_math_vector.hh"
 
 #include "BKE_attribute.hh"
@@ -130,6 +131,14 @@ float3 read_vector(const Bundle &bundle, const StringRef key, const float3 &fall
   return fallback;
 }
 
+float4x4 read_matrix(const Bundle &bundle, const StringRef key, const float4x4 &fallback)
+{
+  if (const float4x4 *value = bundle.lookup_ptr<float4x4>(*BundleKey::from_str(key))) {
+    return *value;
+  }
+  return fallback;
+}
+
 const GeometrySet *lookup_geometry(const Bundle &bundle, const StringRef key)
 {
   return bundle.lookup_ptr<GeometrySet>(*BundleKey::from_str(key));
@@ -176,7 +185,12 @@ void append_collider(const Bundle &bundle, Vector<geometry::textura::Collider> &
   geometry::textura::Collider collider;
   collider.mesh = mesh;
   collider.box = bundle.type().has_value() && *bundle.type() == COLLIDER_BOX_TYPE;
+  collider.convex = read_bool(bundle, "convex", false);
   collider.friction = std::clamp(read_float(bundle, "friction", 0.5f), 0.0f, 1.0f);
+  /* The collider node bakes `Transform` into the geometry. Keep the matrix around as well so a box
+   * can be rebuilt in the object's local space (an oriented box) instead of its world AABB. */
+  collider.box_transform = read_matrix(bundle, "transform", float4x4::identity());
+  collider.box_transform_inverse = math::invert(collider.box_transform);
   r_colliders.append(collider);
 }
 
