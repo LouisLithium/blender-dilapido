@@ -7,10 +7,11 @@
  *
  * Compute backend (device) version of the Textura MPM substep.
  *
- * The CPU solver in `GEO_textura_solver.cc` is the reference implementation. This file starts the
- * port with the case that is both common and easy to verify: a single velocity grid holding fluid
- * particles. Sand/snow plasticity (3x3 SVD per particle and substep), two-phase grids and the
- * continuum surface force are still CPU only and are reported as fallback reasons.
+ * The CPU solver in `GEO_textura_solver.cc` is the reference implementation. This file covers a
+ * single velocity grid holding fluid, sand or snow particles: the Drucker-Prager sand return
+ * mapping, the snow compaction (`F = F_e F_p`) and the per material wall friction/adhesion are
+ * ported to the kernels. Two-phase grids and the continuum surface force are still CPU only and
+ * are reported as fallback reasons.
  *
  * All state lives in flat storage buffers while a frame is solved; the host uploads the particle
  * arrays once, runs every substep on the device and downloads the result at the end. The dense grid

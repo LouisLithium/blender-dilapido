@@ -81,16 +81,32 @@ enum PropIndex : int {
   PROP_TENSION,
   PROP_DAMPING,
   PROP_VISCOSITY,
+  /** 0 fluid, 1 sand, 2 snow (`MaterialType` of the solver). */
+  PROP_TYPE,
+  PROP_SHEAR,
+  PROP_LAMBDA,
+  PROP_FRICTION,
+  PROP_COHESION,
+  PROP_TENSILE,
+  PROP_COMPRESSION,
+  PROP_STRETCH,
+  PROP_HARDENING_RATE,
+  PROP_HARDENING,
+  PROP_DAMAGE,
+  PROP_DAMAGE_RATE,
+  PROP_REST_DENSITY,
+  PROP_WALL_FRICTION,
+  PROP_ADHESION,
   PROP_COUNT,
 };
 
 /**
  * Floats per particle in the `props[]` buffer. Kept separate from #PROP_COUNT (and padded to
- * a power of two) so the host packing and the GLSL `props[p * HA_PROP_STRIDE + ...]` addressing
- * can never drift apart again; they must be equal.
+ * eight) so the host packing and the GLSL `props[p * HA_PROP_STRIDE + ...]` addressing can never
+ * drift apart again; they must be equal.
  */
-constexpr int PROP_STRIDE = 8;
-static_assert(PROP_STRIDE == 8, "HA_PROP_STRIDE in GLSL_PRELUDE must match PROP_STRIDE");
+constexpr int PROP_STRIDE = 24;
+static_assert(PROP_STRIDE == 24, "HA_PROP_STRIDE in GLSL_PRELUDE must match PROP_STRIDE");
 static_assert(PROP_STRIDE >= PROP_COUNT, "PROP_STRIDE has to hold every PropIndex");
 
 /** Floats per box collider: matrix, inverse, local bounds, friction, invert, scale. */
@@ -138,9 +154,30 @@ const char *GLSL_PRELUDE =
     "#define PROP_TENSION 4\n"
     "#define PROP_DAMPING 5\n"
     "#define PROP_VISCOSITY 6\n"
-    "#define HA_PROP_STRIDE 8\n"
+    "#define PROP_TYPE 7\n"
+    "#define PROP_SHEAR 8\n"
+    "#define PROP_LAMBDA 9\n"
+    "#define PROP_FRICTION 10\n"
+    "#define PROP_COHESION 11\n"
+    "#define PROP_TENSILE 12\n"
+    "#define PROP_COMPRESSION 13\n"
+    "#define PROP_STRETCH 14\n"
+    "#define PROP_HARDENING_RATE 15\n"
+    "#define PROP_HARDENING 16\n"
+    "#define PROP_DAMAGE 17\n"
+    "#define PROP_DAMAGE_RATE 18\n"
+    "#define PROP_REST_DENSITY 19\n"
+    "#define PROP_WALL_FRICTION 20\n"
+    "#define PROP_ADHESION 21\n"
+    "#define HA_PROP_STRIDE 24\n"
     "#define HA_FIXED 262144.0\n"
     "#define HA_INV_FIXED (1.0 / 262144.0)\n"
+    "#define HA_MATERIAL_FLUID 0\n"
+    "#define HA_MATERIAL_SAND 1\n"
+    "#define HA_MATERIAL_SNOW 2\n"
+    "#define HA_DAMAGE_STRAIN_RATE 10.0\n"
+    "#define HA_DAMAGE_CRUSH_DEADBAND 0.03\n"
+    "#define HA_MAX_HARDENING_SCALE 4.0\n"
     "\n"
     "vec3 ha_gravity()\n"
     "{\n"
@@ -283,8 +320,8 @@ const char *GLSL_PRELUDE =
     "    {\n"
     "      float signed_d = ha_sdf_sample(p);\n"
     "      float eps = params[P_DX] * 0.5;\n"
-    "      /* A hollow container is a membrane in the level set, so give its wall half a cell of\n"
-    "       * thickness (same as the CPU reference); nodes inside the shell become solid. */\n"
+    "      // A hollow container is a membrane in the level set: give its wall half a cell of\n"
+    "      // thickness (same as the CPU reference); nodes inside the shell become solid.\n"
     "      float wall = params[P_SDF_INVERTED] > 0.5 ? eps : 0.0;\n"
     "      float sd_abs = (params[P_SDF_INVERTED] > 0.5 ? abs(signed_d) : signed_d) - wall;\n"
     "      if (sd_abs < distance) {\n"
@@ -303,6 +340,449 @@ const char *GLSL_PRELUDE =
     "        }\n"
     "      }\n"
     "    }\n"
+    "  }\n"
+    "}\n"
+    "\n";
+
+const char *GLSL_MATERIAL =
+    "float ha_det3(float m[3][3])\n"
+    "{\n"
+    "  return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -\n"
+    "         m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +\n"
+    "         m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);\n"
+    "}\n"
+    "\n"
+    "bool ha_inv3(float m[3][3], out float r[3][3])\n"
+    "{\n"
+    "  float det = ha_det3(m);\n"
+    "  if (!(abs(det) > 1e-12)) { return false; }\n"
+    "  float inv_det = 1.0 / det;\n"
+    "  r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;\n"
+    "  r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;\n"
+    "  r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;\n"
+    "  r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;\n"
+    "  r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;\n"
+    "  r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;\n"
+    "  r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;\n"
+    "  r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;\n"
+    "  r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;\n"
+    "  return true;\n"
+    "}\n"
+    "\n"
+    "void ha_mul3(float a[3][3], float b[3][3], out float r[3][3])\n"
+    "{\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) {\n"
+    "      r[row][col] = a[row][0] * b[0][col] + a[row][1] * b[1][col] + a[row][2] * b[2][col];\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_transpose3(float m[3][3], out float r[3][3])\n"
+    "{\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { r[row][col] = m[col][row]; }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_polar_rotation(float f[3][3], out float r[3][3])\n"
+    "{\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { r[row][col] = f[row][col]; }\n"
+    "  }\n"
+    "  for (int iteration = 0; iteration < 8; iteration++) {\n"
+    "    float inverse[3][3];\n"
+    "    if (!ha_inv3(r, inverse)) {\n"
+    "      for (int a = 0; a < 3; a++) {\n"
+    "        for (int b = 0; b < 3; b++) { r[a][b] = a == b ? 1.0 : 0.0; }\n"
+    "      }\n"
+    "      return;\n"
+    "    }\n"
+    "    float next[3][3];\n"
+    "    bool converged = true;\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) {\n"
+    "        next[row][col] = 0.5 * (r[row][col] + inverse[col][row]);\n"
+    "        if (abs(next[row][col] - r[row][col]) > 1e-6) { converged = false; }\n"
+    "      }\n"
+    "    }\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { r[row][col] = next[row][col]; }\n"
+    "    }\n"
+    "    if (converged) { break; }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_jacobi3(float input_m[3][3], out float values[3], out float vec[3][3])\n"
+    "{\n"
+    "  float a[3][3];\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) {\n"
+    "      a[row][col] = input_m[row][col];\n"
+    "      vec[row][col] = row == col ? 1.0 : 0.0;\n"
+    "    }\n"
+    "  }\n"
+    "  float diag = abs(a[0][0]) + abs(a[1][1]) + abs(a[2][2]) + 1e-6;\n"
+    "  float tolerance = 1e-12 * diag * diag;\n"
+    "  for (int sweep = 0; sweep < 12; sweep++) {\n"
+    "    float off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];\n"
+    "    if (off <= tolerance) { break; }\n"
+    "    for (int pair = 0; pair < 3; pair++) {\n"
+    "      int p = pair == 0 ? 0 : (pair == 1 ? 0 : 1);\n"
+    "      int q = pair == 0 ? 1 : 2;\n"
+    "      if (abs(a[p][q]) < 1e-12) { continue; }\n"
+    "      float theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);\n"
+    "      float sgn = theta >= 0.0 ? 1.0 : -1.0;\n"
+    "      float t = sgn / (abs(theta) + sqrt(theta * theta + 1.0));\n"
+    "      float c = 1.0 / sqrt(t * t + 1.0);\n"
+    "      float s = t * c;\n"
+    "      for (int k = 0; k < 3; k++) {\n"
+    "        float a_pk = a[p][k];\n"
+    "        float a_qk = a[q][k];\n"
+    "        a[p][k] = c * a_pk - s * a_qk;\n"
+    "        a[q][k] = s * a_pk + c * a_qk;\n"
+    "      }\n"
+    "      for (int k = 0; k < 3; k++) {\n"
+    "        float a_kp = a[k][p];\n"
+    "        float a_kq = a[k][q];\n"
+    "        a[k][p] = c * a_kp - s * a_kq;\n"
+    "        a[k][q] = s * a_kp + c * a_kq;\n"
+    "      }\n"
+    "      for (int k = 0; k < 3; k++) {\n"
+    "        float v_kp = vec[k][p];\n"
+    "        float v_kq = vec[k][q];\n"
+    "        vec[k][p] = c * v_kp - s * v_kq;\n"
+    "        vec[k][q] = s * v_kp + c * v_kq;\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  values[0] = a[0][0];\n"
+    "  values[1] = a[1][1];\n"
+    "  values[2] = a[2][2];\n"
+    "}\n"
+    "\n"
+    "bool ha_svd3(float a[3][3], out float s[3], out float v[3][3])\n"
+    "{\n"
+    "  float ata[3][3];\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) {\n"
+    "      ata[row][col] = a[0][row] * a[0][col] + a[1][row] * a[1][col] + a[2][row] * a[2][col];\n"
+    "    }\n"
+    "  }\n"
+    "  float eigen_values[3];\n"
+    "  ha_jacobi3(ata, eigen_values, v);\n"
+    "  for (int i = 0; i < 3; i++) { s[i] = sqrt(max(eigen_values[i], 0.0)); }\n"
+    "  for (int i = 0; i < 2; i++) {\n"
+    "    int best = i;\n"
+    "    for (int j = i + 1; j < 3; j++) {\n"
+    "      if (s[j] > s[best]) { best = j; }\n"
+    "    }\n"
+    "    if (best != i) {\n"
+    "      float tmp = s[i];\n"
+    "      s[i] = s[best];\n"
+    "      s[best] = tmp;\n"
+    "      for (int row = 0; row < 3; row++) {\n"
+    "        float tmp_v = v[row][i];\n"
+    "        v[row][i] = v[row][best];\n"
+    "        v[row][best] = tmp_v;\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  return s[0] == s[0] && s[1] == s[1] && s[2] == s[2] &&\n"
+    "         abs(s[0]) < 1e30 && abs(s[1]) < 1e30 && abs(s[2]) < 1e30;\n"
+    "}\n"
+    "\n"
+    "void ha_apply_singular_scale(float f[3][3], float v[3][3], float scale[3],\n"
+    "                             out float r[3][3])\n"
+    "{\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) {\n"
+    "      float sum = 0.0;\n"
+    "      for (int i = 0; i < 3; i++) {\n"
+    "        float row_term = 0.0;\n"
+    "        for (int j = 0; j < 3; j++) { row_term += f[row][j] * v[j][i]; }\n"
+    "        sum += row_term * scale[i] * v[col][i];\n"
+    "      }\n"
+    "      r[row][col] = sum;\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "float ha_prop(int p, int index) { return props[p * HA_PROP_STRIDE + index]; }\n"
+    "\n"
+    "void ha_sand_strength(int p, out float mu, out float friction, out float cohesion)\n"
+    "{\n"
+    "  float intact = 1.0 - clamp(ha_prop(p, PROP_DAMAGE), 0.0, 1.0);\n"
+    "  mu = ha_prop(p, PROP_SHEAR) * intact;\n"
+    "  friction = max(ha_prop(p, PROP_FRICTION), 0.0) * intact;\n"
+    "  cohesion = max(ha_prop(p, PROP_COHESION), 0.0) * intact;\n"
+    "}\n"
+    "\n"
+    "void ha_snow_strength(int p, out float mu, out float lambda, out float friction,\n"
+    "                      out float cohesion, out float tensile)\n"
+    "{\n"
+    "  float intact = 1.0 - clamp(ha_prop(p, PROP_DAMAGE), 0.0, 1.0);\n"
+    "  float accumulated = max(ha_prop(p, PROP_HARDENING), 0.0);\n"
+    "  float scale = min(1.0 + max(ha_prop(p, PROP_HARDENING_RATE), 0.0) * accumulated,\n"
+    "                    HA_MAX_HARDENING_SCALE);\n"
+    "  mu = ha_prop(p, PROP_SHEAR) * scale * intact;\n"
+    "  lambda = ha_prop(p, PROP_LAMBDA) * scale;\n"
+    "  friction = max(ha_prop(p, PROP_FRICTION), 0.0) * intact;\n"
+    "  cohesion = max(ha_prop(p, PROP_COHESION), 0.0) * intact;\n"
+    "  tensile = max(ha_prop(p, PROP_TENSILE), 0.0) * intact;\n"
+    "}\n"
+    "\n"
+    "void ha_fluid_stress(float f[3][3], float bulk, float tension, out float stress[3][3])\n"
+    "{\n"
+    "  float j = ha_det3(f);\n"
+    "  if (!(abs(j) > 1e-8)) { j = 1.0; }\n"
+    "  float pressure = bulk * (j - 1.0);\n"
+    "  if (pressure > 0.0) { pressure *= clamp(tension, 0.0, 1.0); }\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { stress[row][col] = row == col ? pressure : 0.0; }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_sand_stress(float f[3][3], float mu, float lambda, out float stress[3][3])\n"
+    "{\n"
+    "  float rotation[3][3];\n"
+    "  ha_polar_rotation(f, rotation);\n"
+    "  float elastic[3][3];\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { elastic[row][col] = f[row][col] - rotation[row][col]; }\n"
+    "  }\n"
+    "  float f_transposed[3][3];\n"
+    "  ha_transpose3(f, f_transposed);\n"
+    "  float shear[3][3];\n"
+    "  ha_mul3(elastic, f_transposed, shear);\n"
+    "  float j = ha_det3(f);\n"
+    "  if (!(abs(j) >= 0.1)) { j = 0.1; }\n"
+    "  float inv_j = 1.0 / max(j, 0.1);\n"
+    "  float volume = lambda * min(j - 1.0, 0.0);\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { stress[row][col] = 2.0 * mu * shear[row][col] * inv_j; }\n"
+    "    stress[row][row] += volume;\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_snow_stress(float f[3][3], float mu, float lambda, float tensile,\n"
+    "                    out float stress[3][3])\n"
+    "{\n"
+    "  float rotation[3][3];\n"
+    "  ha_polar_rotation(f, rotation);\n"
+    "  float elastic[3][3];\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { elastic[row][col] = f[row][col] - rotation[row][col]; }\n"
+    "  }\n"
+    "  float f_transposed[3][3];\n"
+    "  ha_transpose3(f, f_transposed);\n"
+    "  float shear[3][3];\n"
+    "  ha_mul3(elastic, f_transposed, shear);\n"
+    "  float j = ha_det3(f);\n"
+    "  if (!(abs(j) >= 0.1)) { j = 0.1; }\n"
+    "  float inv_j = 1.0 / max(j, 0.1);\n"
+    "  float volume = min(lambda * (j - 1.0), max(tensile, 0.0));\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { stress[row][col] = 2.0 * mu * shear[row][col] * inv_j; }\n"
+    "    stress[row][row] += volume;\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "void ha_stress(int p, float f[3][3], out float stress[3][3])\n"
+    "{\n"
+    "  int type = int(ha_prop(p, PROP_TYPE));\n"
+    "  if (type == HA_MATERIAL_FLUID) {\n"
+    "    ha_fluid_stress(f, ha_prop(p, PROP_BULK), ha_prop(p, PROP_TENSION), stress);\n"
+    "  }\n"
+    "  else if (type == HA_MATERIAL_SNOW) {\n"
+    "    float fp[3][3];\n"
+    "    float fp_inverse[3][3];\n"
+    "    float fe[3][3];\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) {\n"
+    "        fp[row][col] = plastic[p * 9 + row * 3 + col];\n"
+    "        fe[row][col] = f[row][col];\n"
+    "      }\n"
+    "    }\n"
+    "    if (ha_inv3(fp, fp_inverse)) { ha_mul3(f, fp_inverse, fe); }\n"
+    "    float mu;\n"
+    "    float lambda;\n"
+    "    float friction;\n"
+    "    float cohesion;\n"
+    "    float tensile;\n"
+    "    ha_snow_strength(p, mu, lambda, friction, cohesion, tensile);\n"
+    "    ha_snow_stress(fe, mu, lambda, tensile, stress);\n"
+    "  }\n"
+    "  else {\n"
+    "    float mu;\n"
+    "    float friction;\n"
+    "    float cohesion;\n"
+    "    ha_sand_strength(p, mu, friction, cohesion);\n"
+    "    ha_sand_stress(f, mu, ha_prop(p, PROP_LAMBDA), stress);\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "float ha_damage_increment(int p, float c[3][3], float dt)\n"
+    "{\n"
+    "  if (!(ha_prop(p, PROP_DAMAGE_RATE) > 0.0)) { return 0.0; }\n"
+    "  float c_norm_sq = 0.0;\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { c_norm_sq += c[row][col] * c[row][col]; }\n"
+    "  }\n"
+    "  return max(0.0, sqrt(c_norm_sq) - HA_DAMAGE_STRAIN_RATE) * dt;\n"
+    "}\n"
+    "\n"
+    "float ha_return_map_sand(int p, float f_in[3][3], float strain_increment,\n"
+    "                         out float f_out[3][3])\n"
+    "{\n"
+    "  float s[3];\n"
+    "  float v[3][3];\n"
+    "  if (!ha_svd3(f_in, s, v)) {\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { f_out[row][col] = f_in[row][col]; }\n"
+    "    }\n"
+    "    return ha_prop(p, PROP_DAMAGE);\n"
+    "  }\n"
+    "  float epsilon[3];\n"
+    "  float trace = 0.0;\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    epsilon[i] = log(max(s[i], 1e-6));\n"
+    "    trace += epsilon[i];\n"
+    "  }\n"
+    "  float deviatoric[3];\n"
+    "  float deviatoric_norm = 0.0;\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    deviatoric[i] = epsilon[i] - trace / 3.0;\n"
+    "    deviatoric_norm += deviatoric[i] * deviatoric[i];\n"
+    "  }\n"
+    "  deviatoric_norm = sqrt(deviatoric_norm);\n"
+    "  float lambda = ha_prop(p, PROP_LAMBDA);\n"
+    "  float mu;\n"
+    "  float friction;\n"
+    "  float cohesion;\n"
+    "  ha_sand_strength(p, mu, friction, cohesion);\n"
+    "  float pressure_coefficient = mu > 1e-6 ? (3.0 * lambda + 2.0 * mu) /\n"
+    "                                              (4.0 * mu * sqrt(1.5)) :\n"
+    "                                          0.0;\n"
+    "  float yield_strain = max(0.0, -trace) * friction * pressure_coefficient +\n"
+    "                       (mu > 1e-6 ? cohesion / (2.0 * mu) : 0.0);\n"
+    "  if (deviatoric_norm > max(yield_strain, 1e-7)) {\n"
+    "    float keep = yield_strain / deviatoric_norm;\n"
+    "    float scale[3];\n"
+    "    for (int i = 0; i < 3; i++) {\n"
+    "      float new_epsilon = deviatoric[i] * keep + trace / 3.0;\n"
+    "      scale[i] = exp(new_epsilon) / max(s[i], 1e-6);\n"
+    "    }\n"
+    "    ha_apply_singular_scale(f_in, v, scale, f_out);\n"
+    "  }\n"
+    "  else {\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { f_out[row][col] = f_in[row][col]; }\n"
+    "    }\n"
+    "  }\n"
+    "  float damage = ha_prop(p, PROP_DAMAGE);\n"
+    "  float rate = max(ha_prop(p, PROP_DAMAGE_RATE), 0.0);\n"
+    "  if (rate > 0.0) {\n"
+    "    float increment = strain_increment + max(0.0, -trace - HA_DAMAGE_CRUSH_DEADBAND);\n"
+    "    if (increment > 0.0) { damage = clamp(damage + rate * increment, 0.0, 1.0); }\n"
+    "  }\n"
+    "  return damage;\n"
+    "}\n"
+    "\n"
+    "void ha_return_map_snow(int p, float f_in[3][3], float fp_in[3][3],\n"
+    "                        float strain_increment, out float fp_out[3][3],\n"
+    "                        out float volume_out, out float hardening_out,\n"
+    "                        out float damage_out)\n"
+    "{\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { fp_out[row][col] = fp_in[row][col]; }\n"
+    "  }\n"
+    "  volume_out = ha_prop(p, PROP_VOLUME);\n"
+    "  hardening_out = ha_prop(p, PROP_HARDENING);\n"
+    "  damage_out = ha_prop(p, PROP_DAMAGE);\n"
+    "  float fp_inverse[3][3];\n"
+    "  if (!ha_inv3(fp_in, fp_inverse)) { return; }\n"
+    "  float fe[3][3];\n"
+    "  ha_mul3(f_in, fp_inverse, fe);\n"
+    "  float s[3];\n"
+    "  float v[3][3];\n"
+    "  if (!ha_svd3(fe, s, v)) { return; }\n"
+    "  float epsilon[3];\n"
+    "  float trace = 0.0;\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    epsilon[i] = log(max(s[i], 1e-6));\n"
+    "    trace += epsilon[i];\n"
+    "  }\n"
+    "  float deviatoric[3];\n"
+    "  float deviatoric_norm = 0.0;\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    deviatoric[i] = epsilon[i] - trace / 3.0;\n"
+    "    deviatoric_norm += deviatoric[i] * deviatoric[i];\n"
+    "  }\n"
+    "  deviatoric_norm = sqrt(deviatoric_norm);\n"
+    "  float compression = max(ha_prop(p, PROP_COMPRESSION), 1e-4);\n"
+    "  float stretch = max(ha_prop(p, PROP_STRETCH), 0.0);\n"
+    "  float trace_clamped = clamp(trace, -compression, stretch);\n"
+    "  float plastic_volume = trace - trace_clamped;\n"
+    "  float mu;\n"
+    "  float lambda;\n"
+    "  float friction;\n"
+    "  float cohesion;\n"
+    "  float tensile;\n"
+    "  ha_snow_strength(p, mu, lambda, friction, cohesion, tensile);\n"
+    "  float pressure_coefficient = mu > 1e-6 ? (3.0 * lambda + 2.0 * mu) /\n"
+    "                                              (4.0 * mu * sqrt(1.5)) :\n"
+    "                                          0.0;\n"
+    "  float yield_strain = max(0.0, -trace_clamped) * friction * pressure_coefficient +\n"
+    "                       (mu > 1e-6 ? cohesion / (2.0 * mu) : 0.0);\n"
+    "  float keep = deviatoric_norm > max(yield_strain, 1e-7) ? yield_strain / deviatoric_norm :\n"
+    "                                                           1.0;\n"
+    "  float scale[3];\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    float new_epsilon = deviatoric[i] * keep + trace_clamped / 3.0;\n"
+    "    scale[i] = exp(new_epsilon) / max(s[i], 1e-6);\n"
+    "  }\n"
+    "  float fe_new[3][3];\n"
+    "  if (keep < 1.0 || abs(plastic_volume) > 1e-9) {\n"
+    "    ha_apply_singular_scale(fe, v, scale, fe_new);\n"
+    "  }\n"
+    "  else {\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { fe_new[row][col] = fe[row][col]; }\n"
+    "    }\n"
+    "  }\n"
+    "  float fe_new_inverse[3][3];\n"
+    "  if (ha_inv3(fe_new, fe_new_inverse)) {\n"
+    "    float fp_new[3][3];\n"
+    "    ha_mul3(fe_new_inverse, f_in, fp_new);\n"
+    "    float jp = ha_det3(fp_new);\n"
+    "    if (jp == jp && jp > 1e-8) {\n"
+    "      float clamped_jp = clamp(jp, 0.25, 1.0);\n"
+    "      if (abs(clamped_jp - jp) > 1e-8) {\n"
+    "        float volume_scale = pow(clamped_jp / jp, 1.0 / 3.0);\n"
+    "        for (int row = 0; row < 3; row++) {\n"
+    "          for (int col = 0; col < 3; col++) { fp_new[row][col] *= volume_scale; }\n"
+    "        }\n"
+    "        jp = clamped_jp;\n"
+    "      }\n"
+    "      for (int row = 0; row < 3; row++) {\n"
+    "        for (int col = 0; col < 3; col++) { fp_out[row][col] = fp_new[row][col]; }\n"
+    "      }\n"
+    "      float rest_density = max(ha_prop(p, PROP_REST_DENSITY), 1e-6);\n"
+    "      float rest_volume = ha_prop(p, PROP_MASS) / rest_density;\n"
+    "      float new_volume = rest_volume * jp;\n"
+    "      if (new_volume == new_volume && new_volume > 1e-12) { volume_out = new_volume; }\n"
+    "    }\n"
+    "  }\n"
+    "  float hardening_increment = max(0.0, deviatoric_norm - yield_strain) +\n"
+    "                              max(0.0, -plastic_volume);\n"
+    "  if (hardening_increment > 0.0) {\n"
+    "    hardening_out = min(hardening_out + hardening_increment, 10.0);\n"
+    "  }\n"
+    "  float rate = max(ha_prop(p, PROP_DAMAGE_RATE), 0.0);\n"
+    "  if (rate > 0.0) {\n"
+    "    float increment = strain_increment + max(0.0, plastic_volume);\n"
+    "    if (increment > 0.0) { damage_out = clamp(damage_out + rate * increment, 0.0, 1.0); }\n"
     "  }\n"
     "}\n"
     "\n";
@@ -335,22 +815,26 @@ const char *KERNEL_P2G =
     "  vec3 x = vec3(pos[p * 3 + 0], pos[p * 3 + 1], pos[p * 3 + 2]);\n"
     "  float mass = props[p * HA_PROP_STRIDE + PROP_MASS];\n"
     "  float volume = props[p * HA_PROP_STRIDE + PROP_VOLUME];\n"
-    "  float bulk = props[p * HA_PROP_STRIDE + PROP_BULK];\n"
-    "  float tension = props[p * HA_PROP_STRIDE + PROP_TENSION];\n"
     "  mat3 f = mat3(vec3(deform[p * 9 + 0], deform[p * 9 + 3], deform[p * 9 + 6]),\n"
     "                vec3(deform[p * 9 + 1], deform[p * 9 + 4], deform[p * 9 + 7]),\n"
     "                vec3(deform[p * 9 + 2], deform[p * 9 + 5], deform[p * 9 + 8]));\n"
     "  mat3 c = mat3(vec3(affine[p * 9 + 0], affine[p * 9 + 3], affine[p * 9 + 6]),\n"
     "                vec3(affine[p * 9 + 1], affine[p * 9 + 4], affine[p * 9 + 7]),\n"
     "                vec3(affine[p * 9 + 2], affine[p * 9 + 5], affine[p * 9 + 8]));\n"
-    "  float j = determinant(f);\n"
-    "  if (!(abs(j) > 1e-8)) { j = 1.0; }\n"
-    "  float pressure = bulk * (j - 1.0);\n"
-    "  if (pressure > 0.0) { pressure *= clamp(tension, 0.0, 1.0); }\n"
+    "  // Material stress: fluid, Drucker-Prager sand or compacting snow, same models as the CPU.\n"
+    "  float f_arr[3][3];\n"
+    "  for (int row = 0; row < 3; row++) {\n"
+    "    for (int col = 0; col < 3; col++) { f_arr[row][col] = f[col][row]; }\n"
+    "  }\n"
+    "  float stress[3][3];\n"
+    "  ha_stress(p, f_arr, stress);\n"
     "  float stress_scale = -dt * 4.0 / (dx * dx);\n"
-    "  vec3 a0 = vec3(pressure, 0.0, 0.0) * (stress_scale * volume) + c[0] * mass;\n"
-    "  vec3 a1 = vec3(0.0, pressure, 0.0) * (stress_scale * volume) + c[1] * mass;\n"
-    "  vec3 a2 = vec3(0.0, 0.0, pressure) * (stress_scale * volume) + c[2] * mass;\n"
+    "  vec3 a0 = vec3(stress[0][0], stress[1][0], stress[2][0]) * (stress_scale * volume) +\n"
+    "            c[0] * mass;\n"
+    "  vec3 a1 = vec3(stress[0][1], stress[1][1], stress[2][1]) * (stress_scale * volume) +\n"
+    "            c[1] * mass;\n"
+    "  vec3 a2 = vec3(stress[0][2], stress[1][2], stress[2][2]) * (stress_scale * volume) +\n"
+    "            c[2] * mass;\n"
     "  vec3 velocity = vec3(vel[p * 3 + 0], vel[p * 3 + 1], vel[p * 3 + 2]);\n"
     "  int bx;\n"
     "  int by;\n"
@@ -525,13 +1009,57 @@ const char *KERNEL_G2P =
     "                vec3(deform[p * 9 + 1], deform[p * 9 + 4], deform[p * 9 + 7]),\n"
     "                vec3(deform[p * 9 + 2], deform[p * 9 + 5], deform[p * 9 + 8]));\n"
     "  mat3 new_f = f + dt * (c * f);\n"
-    "  float j = determinant(new_f);\n"
-    "  if (!(abs(j) > 1e-8)) {\n"
-    "    new_f = mat3(1.0);\n"
-    "    j = 1.0;\n"
+    "  int type = int(props[p * HA_PROP_STRIDE + PROP_TYPE]);\n"
+    "  if (type == HA_MATERIAL_FLUID) {\n"
+    "    float j = determinant(new_f);\n"
+    "    if (!(abs(j) > 1e-8)) {\n"
+    "      new_f = mat3(1.0);\n"
+    "      j = 1.0;\n"
+    "    }\n"
+    "    float target = clamp(j, 0.25, 4.0);\n"
+    "    new_f *= pow(target / j, 1.0 / 3.0);\n"
     "  }\n"
-    "  float target = clamp(j, 0.25, 4.0);\n"
-    "  new_f *= pow(target / j, 1.0 / 3.0);\n"
+    "  else {\n"
+    "    float c_arr[3][3];\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { c_arr[row][col] = c[col][row]; }\n"
+    "    }\n"
+    "    float strain_increment = ha_damage_increment(p, c_arr, dt);\n"
+    "    float f_in[3][3];\n"
+    "    for (int row = 0; row < 3; row++) {\n"
+    "      for (int col = 0; col < 3; col++) { f_in[row][col] = new_f[col][row]; }\n"
+    "    }\n"
+    "    if (type == HA_MATERIAL_SAND) {\n"
+    "      float f_out[3][3];\n"
+    "      props[p * HA_PROP_STRIDE + PROP_DAMAGE] = ha_return_map_sand(p, f_in,\n"
+    "                                                                 strain_increment, f_out);\n"
+    "      for (int row = 0; row < 3; row++) {\n"
+    "        for (int col = 0; col < 3; col++) { new_f[col][row] = f_out[row][col]; }\n"
+    "      }\n"
+    "    }\n"
+    "    else {\n"
+    "      float fp_in[3][3];\n"
+    "      for (int row = 0; row < 3; row++) {\n"
+    "        for (int col = 0; col < 3; col++) {\n"
+    "          fp_in[row][col] = plastic[p * 9 + row * 3 + col];\n"
+    "        }\n"
+    "      }\n"
+    "      float fp_out[3][3];\n"
+    "      float volume_out;\n"
+    "      float hardening_out;\n"
+    "      float damage_out;\n"
+    "      ha_return_map_snow(p, f_in, fp_in, strain_increment, fp_out, volume_out,\n"
+    "                         hardening_out, damage_out);\n"
+    "      for (int row = 0; row < 3; row++) {\n"
+    "        for (int col = 0; col < 3; col++) {\n"
+    "          plastic[p * 9 + row * 3 + col] = fp_out[row][col];\n"
+    "        }\n"
+    "      }\n"
+    "      props[p * HA_PROP_STRIDE + PROP_VOLUME] = volume_out;\n"
+    "      props[p * HA_PROP_STRIDE + PROP_HARDENING] = hardening_out;\n"
+    "      props[p * HA_PROP_STRIDE + PROP_DAMAGE] = damage_out;\n"
+    "    }\n"
+    "  }\n"
     "  deform[p * 9 + 0] = new_f[0].x;\n"
     "  deform[p * 9 + 1] = new_f[1].x;\n"
     "  deform[p * 9 + 2] = new_f[2].x;\n"
@@ -570,8 +1098,8 @@ const char *KERNEL_ADVECT =
     "    bool touching = distance < radius;\n"
     "    bool supported = false;\n"
     "    if (!touching && skin > 0.0) {\n"
-    "      /* Same test as the CPU reference: only close the gap for particles that have nothing\n"
-    "       * between them and the surface, so a shallow puddle is not flattened into one layer. */\n"
+    "      // Same test as the CPU reference: only close the gap for particles that have nothing\n"
+    "      // between them and the surface, so a shallow puddle is not flattened into one layer.\n"
     "      ivec3 dims = ivec3(int(params[P_DIM_X]), int(params[P_DIM_Y]), int(params[P_DIM_Z]));\n"
     "      vec3 probe = position - normal * dx;\n"
     "      ivec3 own = ivec3(floor((position - origin) / dx));\n"
@@ -591,6 +1119,18 @@ const char *KERNEL_ADVECT =
     "      position += normal * (radius - distance);\n"
     "      if (touching) { velocity = ha_wall_contact(velocity, normal, contact_friction, dt); }\n"
     "    }\n"
+    "  }\n"
+    "  // wall friction and adhesion\n"
+    "  float wall_friction = props[p * HA_PROP_STRIDE + PROP_WALL_FRICTION];\n"
+    "  if (wall_friction > 0.0 && distance < radius + dx && distance > -0.5 * radius) {\n"
+    "    float decay = clamp(wall_friction * 25.0 * dt, 0.0, 1.0);\n"
+    "    float normal_speed = dot(velocity, normal);\n"
+    "    vec3 tangent = velocity - normal * normal_speed;\n"
+    "    velocity = normal * normal_speed + tangent * (1.0 - decay);\n"
+    "  }\n"
+    "  float adhesion = props[p * HA_PROP_STRIDE + PROP_ADHESION];\n"
+    "  if (adhesion > 0.0 && distance > 0.0 && distance < radius + 3.0 * dx) {\n"
+    "    velocity -= normal * (adhesion * dt);\n"
     "  }\n"
     "  position = clamp(position, origin, domain_max);\n"
     "  pos[p * 3 + 0] = position.x;\n"
@@ -624,15 +1164,16 @@ const std::array<HaShaderResource, 4> CLEAR_RESOURCES{{
     {3, HaShaderQualifier::ReadWrite, "float", "gvel[]"},
 }};
 
-const std::array<HaShaderResource, 8> P2G_RESOURCES{{
+const std::array<HaShaderResource, 9> P2G_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
     {1, HaShaderQualifier::Read, "float", "pos[]"},
     {2, HaShaderQualifier::Read, "float", "vel[]"},
     {3, HaShaderQualifier::Read, "float", "affine[]"},
     {4, HaShaderQualifier::Read, "float", "deform[]"},
     {5, HaShaderQualifier::Read, "float", "props[]"},
-    {6, HaShaderQualifier::ReadWrite, "int", "gmass[]"},
-    {7, HaShaderQualifier::ReadWrite, "int", "gmom[]"},
+    {6, HaShaderQualifier::Read, "float", "plastic[]"},
+    {7, HaShaderQualifier::ReadWrite, "int", "gmass[]"},
+    {8, HaShaderQualifier::ReadWrite, "int", "gmom[]"},
 }};
 
 const std::array<HaShaderResource, 6> GRID_RESOURCES{{
@@ -644,14 +1185,15 @@ const std::array<HaShaderResource, 6> GRID_RESOURCES{{
     {5, HaShaderQualifier::Read, "float", "sdf_data[]"},
 }};
 
-const std::array<HaShaderResource, 7> G2P_RESOURCES{{
+const std::array<HaShaderResource, 8> G2P_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
     {1, HaShaderQualifier::Read, "float", "pos[]"},
     {2, HaShaderQualifier::ReadWrite, "float", "vel[]"},
     {3, HaShaderQualifier::ReadWrite, "float", "affine[]"},
     {4, HaShaderQualifier::ReadWrite, "float", "deform[]"},
-    {5, HaShaderQualifier::Read, "float", "props[]"},
-    {6, HaShaderQualifier::Read, "float", "gvel[]"},
+    {5, HaShaderQualifier::ReadWrite, "float", "props[]"},
+    {6, HaShaderQualifier::ReadWrite, "float", "plastic[]"},
+    {7, HaShaderQualifier::Read, "float", "gvel[]"},
 }};
 
 const std::array<HaShaderResource, 7> ADVECT_RESOURCES{{
@@ -674,6 +1216,8 @@ struct DeviceState {
   HaBuffer affine;
   HaBuffer deform;
   HaBuffer props;
+  /** Plastic part of the deformation gradient, snow only. */
+  HaBuffer plastic;
   HaBufferInt grid_mass;
   HaBufferInt grid_momentum;
   HaBuffer grid_velocity;
@@ -709,6 +1253,7 @@ struct DeviceState {
       if (!params.ensure(P_PARAM_COUNT) || !positions.ensure(int64_t(particles) * 3) ||
           !velocities.ensure(int64_t(particles) * 3) || !affine.ensure(int64_t(particles) * 9) ||
           !deform.ensure(int64_t(particles) * 9) || !props.ensure(int64_t(particles) * PROP_STRIDE) ||
+          !plastic.ensure(int64_t(particles) * 9) ||
           !grid_mass.ensure(cells) || !grid_momentum.ensure(int64_t(cells) * 3) ||
           !grid_velocity.ensure(int64_t(cells) * 3))
       {
@@ -731,6 +1276,7 @@ struct DeviceState {
     affine.free();
     deform.free();
     props.free();
+    plastic.free();
     grid_mass.free();
     grid_momentum.free();
     grid_velocity.free();
@@ -810,8 +1356,10 @@ bool device_supported(const ParticleData &particles,
     return false;
   }
   for (const int material : particles.material) {
-    if (material != int(MaterialType::Fluid)) {
-      r_reason = "sand and snow material updates are still CPU only";
+    if (material != int(MaterialType::Fluid) && material != int(MaterialType::Sand) &&
+        material != int(MaterialType::Snow))
+    {
+      r_reason = "unsupported material type";
       return false;
     }
   }
@@ -822,18 +1370,6 @@ bool device_supported(const ParticleData &particles,
   for (const float value : particles.surface_tension) {
     if (value > 0.0f) {
       r_reason = "surface tension is still CPU only";
-      return false;
-    }
-  }
-  for (const float value : particles.wall_friction) {
-    if (value > 0.0f) {
-      r_reason = "per material wall friction is still CPU only";
-      return false;
-    }
-  }
-  for (const float value : particles.adhesion) {
-    if (value > 0.0f) {
-      r_reason = "adhesion is still CPU only";
       return false;
     }
   }
@@ -948,6 +1484,9 @@ bool device_solve(ParticleData &particles,
   state.deform.upload(
       Span<float>(const_cast<float *>(reinterpret_cast<const float *>(particles.deformation.data())),
                   int64_t(particle_count) * 9));
+  state.plastic.upload(
+      Span<float>(const_cast<float *>(reinterpret_cast<const float *>(particles.plastic.data())),
+                  int64_t(particle_count) * 9));
   {
     std::vector<float> props(size_t(particle_count) * PROP_STRIDE, 0.0f);
     for (int i = 0; i < particle_count; i++) {
@@ -959,6 +1498,21 @@ bool device_solve(ParticleData &particles,
       dst[PROP_TENSION] = particles.tension[i];
       dst[PROP_DAMPING] = particles.damping[i];
       dst[PROP_VISCOSITY] = particles.viscosity[i];
+      dst[PROP_TYPE] = float(particles.material[i]);
+      dst[PROP_SHEAR] = particles.shear_modulus[i];
+      dst[PROP_LAMBDA] = particles.lame_lambda[i];
+      dst[PROP_FRICTION] = particles.friction[i];
+      dst[PROP_COHESION] = particles.cohesion[i];
+      dst[PROP_TENSILE] = particles.tensile_strength[i];
+      dst[PROP_COMPRESSION] = particles.compression_limit[i];
+      dst[PROP_STRETCH] = particles.stretch_limit[i];
+      dst[PROP_HARDENING_RATE] = particles.hardening_rate[i];
+      dst[PROP_HARDENING] = particles.hardening[i];
+      dst[PROP_DAMAGE] = particles.damage[i];
+      dst[PROP_DAMAGE_RATE] = particles.damage_rate[i];
+      dst[PROP_REST_DENSITY] = particles.rest_density[i];
+      dst[PROP_WALL_FRICTION] = particles.wall_friction[i];
+      dst[PROP_ADHESION] = particles.adhesion[i];
     }
     state.props.upload(props);
   }
@@ -1014,7 +1568,7 @@ bool device_solve(ParticleData &particles,
                                      as_span(CLEAR_RESOURCES),
                                      LOCAL_GROUP_SIZE);
   state.p2g = ha_shader_get_source("textura|p2g",
-                                   std::string(GLSL_PRELUDE) + KERNEL_P2G,
+                                   std::string(GLSL_PRELUDE) + GLSL_MATERIAL + KERNEL_P2G,
                                    as_span(P2G_RESOURCES),
                                    LOCAL_GROUP_SIZE);
   state.grid = ha_shader_get_source("textura|grid",
@@ -1022,7 +1576,7 @@ bool device_solve(ParticleData &particles,
                                     as_span(GRID_RESOURCES),
                                     LOCAL_GROUP_SIZE);
   state.g2p = ha_shader_get_source("textura|g2p",
-                                   std::string(GLSL_PRELUDE) + KERNEL_G2P,
+                                   std::string(GLSL_PRELUDE) + GLSL_MATERIAL + KERNEL_G2P,
                                    as_span(G2P_RESOURCES),
                                    LOCAL_GROUP_SIZE);
   state.advect = ha_shader_get_source("textura|advect",
@@ -1039,16 +1593,16 @@ bool device_solve(ParticleData &particles,
   std::array<gpu::StorageBuf *, 4> clear_buffers{
       state.params.buf(), state.grid_mass.buf(), state.grid_momentum.buf(),
       state.grid_velocity.buf()};
-  std::array<gpu::StorageBuf *, 8> p2g_buffers{
+  std::array<gpu::StorageBuf *, 9> p2g_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
-      state.deform.buf(), state.props.buf(), state.grid_mass.buf(),
+      state.deform.buf(), state.props.buf(), state.plastic.buf(), state.grid_mass.buf(),
       state.grid_momentum.buf()};
   std::array<gpu::StorageBuf *, 6> grid_buffers{
       state.params.buf(), state.grid_mass.buf(), state.grid_momentum.buf(),
       state.grid_velocity.buf(), state.box_data.buf(), state.sdf_data.buf()};
-  std::array<gpu::StorageBuf *, 7> g2p_buffers{
+  std::array<gpu::StorageBuf *, 8> g2p_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
-      state.deform.buf(), state.props.buf(), state.grid_velocity.buf()};
+      state.deform.buf(), state.props.buf(), state.plastic.buf(), state.grid_velocity.buf()};
   std::array<gpu::StorageBuf *, 7> advect_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.props.buf(),
       state.box_data.buf(), state.sdf_data.buf(), state.grid_mass.buf()};
@@ -1092,6 +1646,25 @@ bool device_solve(ParticleData &particles,
   state.deform.download(
       MutableSpan<float>(reinterpret_cast<float *>(particles.deformation.data()),
                          int64_t(particle_count) * 9));
+  state.plastic.download(
+      MutableSpan<float>(reinterpret_cast<float *>(particles.plastic.data()),
+                         int64_t(particle_count) * 9));
+  {
+    /* Snow compaction and damage are part of the particle state: bring them back so the next frame
+     * (substeps, stiffness, rendering) sees what the device computed. */
+    std::vector<float> props(size_t(particle_count) * PROP_STRIDE);
+    state.props.download(props);
+    for (int i = 0; i < particle_count; i++) {
+      const float *src = &props[size_t(i) * PROP_STRIDE];
+      const float volume = src[PROP_VOLUME];
+      if (volume > 1e-12f && std::isfinite(volume)) {
+        particles.volume[i] = volume;
+        particles.density[i] = particles.mass[i] / volume;
+      }
+      particles.hardening[i] = src[PROP_HARDENING];
+      particles.damage[i] = src[PROP_DAMAGE];
+    }
+  }
 
   r_stats.grid_cells = cell_count;
   r_stats.grid_dims = grid.dims;
