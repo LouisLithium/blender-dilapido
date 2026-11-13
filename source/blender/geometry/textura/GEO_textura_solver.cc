@@ -830,9 +830,14 @@ SolidSample sample_solids(const float3 &position,
         position.z >= box_min.z - skip_margin && position.z <= box_max.z + skip_margin)
     {
       /* For a hollow container the stored field is still signed (negative inside the original
-       * solid) and the contact distance is its absolute value. */
+       * solid) and the contact distance is its absolute value. The level set describes a membrane
+       * with no thickness, i.e. no cell where the grid can put a solid boundary, so fluid under
+       * pressure eventually pushes straight through it. Give the wall half a grid cell of
+       * thickness: nodes inside the shell then behave like a solid wall (`distance < 0`), and the
+       * particle projection keeps material `wall + radius` away from the mid surface. */
       const float signed_distance = ha::ha_sdf_sample(*sdf, position);
-      const float distance = sdf->inverted ? std::fabs(signed_distance) : signed_distance;
+      const float wall = sdf->inverted ? gradient_epsilon : 0.0f;
+      const float distance = (sdf->inverted ? std::fabs(signed_distance) : signed_distance) - wall;
       if (distance < best.distance) {
         best.distance = distance;
         /* The level set is a union of every mesh collider, so there is no single surface. Use the
@@ -846,7 +851,7 @@ SolidSample sample_solids(const float3 &position,
         best.friction = sdf_friction;
         /* Beyond a few cells the gradient cannot matter: no node or particle is close enough for a
          * contact, so the six extra trilinear samples are skipped. */
-        if (distance <= gradient_epsilon * 4.0f) {
+        if (distance + wall <= gradient_epsilon * 4.0f) {
           const float3 dx = float3(gradient_epsilon, 0.0f, 0.0f);
           const float3 dy = float3(0.0f, gradient_epsilon, 0.0f);
           const float3 dz = float3(0.0f, 0.0f, gradient_epsilon);
