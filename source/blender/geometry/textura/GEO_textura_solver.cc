@@ -1529,10 +1529,10 @@ void advect_and_collide(ParticleData &particles,
       const SolidSample sample = sample_solids(
           position, colliders, box_min, box_max, sdf, grid.dx * 0.5f);
       /* MPM contact lives on the grid, so a particle can settle a full cell above a collider even
-       * though its own radius is much smaller. Project it down to its radius whenever it is within
-       * one cell of the surface, so every material visually touches the collider. This is a
-       * position-only correction: the grid still computes the contact velocity. */
-      const float contact_skin = grid.dx;
+       * though its own radius is much smaller. Project it down to its radius when it is close to
+       * the surface (`Contact Skin` in the solver panel, in grid cells). This is a position-only
+       * correction: the grid still computes the contact velocity. */
+      const float contact_skin = std::max(settings.contact_skin, 0.0f) * grid.dx;
       if (sample.distance < particles.radius[particle] + contact_skin) {
         const bool touching = sample.distance < particles.radius[particle];
         position += sample.normal * (particles.radius[particle] - sample.distance);
@@ -2025,6 +2025,8 @@ void solve_frame(ParticleData &particles,
   Vector<float3> sdf_positions;
   Vector<int> sdf_corner_verts;
   Vector<int3> sdf_corner_tris;
+  /** Triangle range of every mesh collider inside #sdf_corner_tris, for the per-shell union. */
+  Vector<int2> sdf_mesh_tris;
   float max_radius = 0.0f;
   /* Closed meshes are exact solids, so a level set is both correct and free of the phantom bump a
    * one-sided splat creates around sharp thin wedges. They also need their winding fixed first: an
@@ -2058,6 +2060,7 @@ void solve_frame(ParticleData &particles,
     const Span<int> corner_verts = collider.mesh->corner_verts();
     const Span<int3> corner_tris = collider.mesh->corner_tris();
     const int corner_offset = sdf_corner_verts.size();
+    const int tri_begin = sdf_corner_tris.size();
     sdf_corner_verts.reserve(corner_offset + corner_verts.size());
     for (const int index : corner_verts) {
       sdf_corner_verts.append(index + vertex_offset);
@@ -2067,6 +2070,7 @@ void solve_frame(ParticleData &particles,
       const int3 oriented = reversed ? int3(tri.x, tri.z, tri.y) : tri;
       sdf_corner_tris.append(oriented + int3(corner_offset));
     }
+    sdf_mesh_tris.append(int2(tri_begin, sdf_corner_tris.size()));
   }
   for (const float radius : particles.radius) {
     max_radius = std::max(max_radius, radius);
@@ -2081,17 +2085,61 @@ void solve_frame(ParticleData &particles,
                                      float(grid.dims.z - 1)) *
                                   grid.dx;
     const float band = std::max(2.0f * grid.dx, 2.0f * max_radius + grid.dx);
-    sdf_valid = ha::ha_sdf_build(sdf_positions.as_span(),
-                                 sdf_corner_verts.as_span(),
-                                 sdf_corner_tris.as_span(),
-                                 grid.dx,
-                                 band,
-                                 region_min,
-                                 region_max,
-                                 (region_min + region_max) * 0.5f,
-                                 !all_closed,
-                                 !all_closed,
-                                 sdf);
+    const auto build_part = [&](const int2 tri_range,
+                                const bool one_sided,
+                                ha::HaSdfGrid &r_part) {
+      return ha::ha_sdf_build(sdf_positions.as_span(),
+                              sdf_corner_verts.as_span(),
+                              sdf_corner_tris.as_span().slice(tri_range.x,
+                                                              tri_range.y - tri_range.x),
+                              grid.dx,
+                              band,
+                              region_min,
+                              region_max,
+                              (region_min + region_max) * 0.5f,
+                              one_sided,
+                              false,
+                              r_part);
+    };
+    if (all_closed && sdf_mesh_tris.size() > 1) {
+      /* Closed shells are baked one at a time and unioned with `min()`. A box resting exactly on a
+       * floor shares a coplanar face pair, and a single level set bake of the two shells can leave
+       * holes there: a particle that reaches one falls straight through. */
+      ha::HaSdfGrid part;
+      for (const int2 &range : sdf_mesh_tris) {
+        if (!build_part(range, false, part)) {
+          /* Safety net: a shell that OpenVDB cannot bake still gets a one sided field. The winding
+           * has already been corrected, so the sign is right. */
+          if (!build_part(range, true, part)) {
+            continue;
+          }
+        }
+        if (!sdf_valid) {
+          sdf = std::move(part);
+          sdf_valid = sdf.is_valid();
+        }
+        else if (part.dims == sdf.dims && part.origin == sdf.origin &&
+                 part.spacing == sdf.spacing)
+        {
+          for (const int i : sdf.data.index_range()) {
+            sdf.data[i] = std::min(sdf.data[i], part.data[i]);
+          }
+        }
+      }
+    }
+    else {
+      sdf_valid = ha::ha_sdf_build(sdf_positions.as_span(),
+                                   sdf_corner_verts.as_span(),
+                                   sdf_corner_tris.as_span(),
+                                   grid.dx,
+                                   band,
+                                   region_min,
+                                   region_max,
+                                   (region_min + region_max) * 0.5f,
+                                   !all_closed,
+                                   !all_closed,
+                                   sdf);
+    }
     if (!sdf_valid) {
       r_stats.collider_sdf_failed = true;
     }

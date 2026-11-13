@@ -69,6 +69,7 @@ const FlatBundleTypePtr &TexturaSettingsBundle::get_bundle_type()
     b.add<decl::Vector>("gravity"_ustr);
     b.add<decl::Float>("velocity_damping"_ustr).min(0.0f);
     b.add<decl::Float>("boundary_friction"_ustr).min(0.0f);
+    b.add<decl::Float>("contact_skin"_ustr).min(0.0f);
     b.add<decl::Bool>("two_phase"_ustr);
     b.add<decl::Float>("inter_phase_drag"_ustr).min(0.0f);
     const FlatBundleTypePtr bundle_type = b.build();
@@ -155,6 +156,7 @@ geometry::textura::Settings read_settings(const Bundle &world)
                                        read_float(s, "velocity_damping", settings.velocity_damping));
   settings.boundary_friction = std::max(
       0.0f, read_float(s, "boundary_friction", settings.boundary_friction));
+  settings.contact_skin = std::max(0.0f, read_float(s, "contact_skin", settings.contact_skin));
   settings.two_phase = read_bool(s, "two_phase", settings.two_phase);
   settings.inter_phase_drag = std::max(
       0.0f, read_float(s, "inter_phase_drag", settings.inter_phase_drag));

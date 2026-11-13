@@ -108,6 +108,14 @@ struct Settings {
    * applied as a rate (per second), not per substep, so the result does not depend on `Substeps`. */
   float boundary_friction = 0.5f;
   /**
+   * Width of the particle level contact projection, in grid cells. The MPM grid holds the lowest
+   * layer about one to one and a half cells above a collider; the solver projects particles within
+   * `radius + contact_skin * dx` down to their radius so the material visually touches the surface.
+   * A cohesive sheet (snow) can hover a bit higher than that band, so raise this to 1.5 or 2 to
+   * close the remaining gap (at the cost of pulling a second layer down as well).
+   */
+  float contact_skin = 1.0f;
+  /**
    * Give fluids and sand their own velocity grid and exchange momentum between them. Without this
    * both materials share one grid velocity, so they cannot slide past each other and a fluid in
    * contact with sand looks viscous.
