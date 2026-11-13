@@ -178,7 +178,7 @@ void write_component(GeometryComponent &component,
     write_scalar(geometry::textura::attribute_names::tensile_strength, tensile_strength);
     write_scalar(geometry::textura::attribute_names::compression_limit, compression_limit);
     write_scalar(geometry::textura::attribute_names::stretch_limit, stretch_limit);
-    write_scalar(geometry::textura::attribute_names::rest_density, params.density);
+    write_scalar(geometry::textura::attribute_names::rest_density, mass / volume);
     write_scalar(geometry::textura::attribute_names::hardening_rate, hardening_rate);
     /* Keep an authored hardening field (for restarted states); otherwise start at zero. */
     if (!attributes.contains(geometry::textura::attribute_names::hardening)) {
@@ -232,6 +232,23 @@ void write_component(GeometryComponent &component,
   if (f_z) {
     f_z.span.fill(float3(0.0f, 0.0f, 1.0f));
     f_z.finish();
+  }
+
+  if (params.type == int(MaterialType::Snow)) {
+    bke::SpanAttributeWriter<float3> fp_x = attributes.lookup_or_add_for_write_only_span<float3>(
+        geometry::textura::attribute_names::plastic_x, domain);
+    bke::SpanAttributeWriter<float3> fp_y = attributes.lookup_or_add_for_write_only_span<float3>(
+        geometry::textura::attribute_names::plastic_y, domain);
+    bke::SpanAttributeWriter<float3> fp_z = attributes.lookup_or_add_for_write_only_span<float3>(
+        geometry::textura::attribute_names::plastic_z, domain);
+    if (fp_x && fp_y && fp_z) {
+      fp_x.span.fill(float3(1.0f, 0.0f, 0.0f));
+      fp_y.span.fill(float3(0.0f, 1.0f, 0.0f));
+      fp_z.span.fill(float3(0.0f, 0.0f, 1.0f));
+      fp_x.finish();
+      fp_y.finish();
+      fp_z.finish();
+    }
   }
 
   /* Evaluate the initial velocity field. A field that is zero everywhere does not write the

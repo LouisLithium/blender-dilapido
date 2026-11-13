@@ -316,6 +316,12 @@ void read_component(GeometryComponent &component,
       attributes, geometry::textura::attribute_names::deformation_y, domain, float3(0, 1, 0), count);
   const VArray<float3> f_z = lookup_or_default<float3>(
       attributes, geometry::textura::attribute_names::deformation_z, domain, float3(0, 0, 1), count);
+  const VArray<float3> fp_x = lookup_or_default<float3>(
+      attributes, geometry::textura::attribute_names::plastic_x, domain, float3(1, 0, 0), count);
+  const VArray<float3> fp_y = lookup_or_default<float3>(
+      attributes, geometry::textura::attribute_names::plastic_y, domain, float3(0, 1, 0), count);
+  const VArray<float3> fp_z = lookup_or_default<float3>(
+      attributes, geometry::textura::attribute_names::plastic_z, domain, float3(0, 0, 1), count);
 
   for (const int i : IndexRange(count)) {
     const int p = offset + i;
@@ -352,6 +358,15 @@ void read_component(GeometryComponent &component,
     r_particles.deformation[p * 9 + 6] = f_x[i].z;
     r_particles.deformation[p * 9 + 7] = f_y[i].z;
     r_particles.deformation[p * 9 + 8] = f_z[i].z;
+    r_particles.plastic[p * 9 + 0] = fp_x[i].x;
+    r_particles.plastic[p * 9 + 1] = fp_y[i].x;
+    r_particles.plastic[p * 9 + 2] = fp_z[i].x;
+    r_particles.plastic[p * 9 + 3] = fp_x[i].y;
+    r_particles.plastic[p * 9 + 4] = fp_y[i].y;
+    r_particles.plastic[p * 9 + 5] = fp_z[i].y;
+    r_particles.plastic[p * 9 + 6] = fp_x[i].z;
+    r_particles.plastic[p * 9 + 7] = fp_y[i].z;
+    r_particles.plastic[p * 9 + 8] = fp_z[i].z;
   }
 }
 
@@ -424,6 +439,10 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
   bke::SpanAttributeWriter<float> snow_volume;
   bke::SpanAttributeWriter<float> snow_density;
   bke::SpanAttributeWriter<float> snow_hardening;
+  bke::SpanAttributeWriter<float> snow_rest_density;
+  bke::SpanAttributeWriter<float3> snow_fp_x;
+  bke::SpanAttributeWriter<float3> snow_fp_y;
+  bke::SpanAttributeWriter<float3> snow_fp_z;
   if (has_snow) {
     snow_volume = attributes.lookup_or_add_for_write_span<float>(
         geometry::textura::attribute_names::volume, domain);
@@ -431,6 +450,14 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
         geometry::textura::attribute_names::density, domain);
     snow_hardening = attributes.lookup_or_add_for_write_span<float>(
         geometry::textura::attribute_names::hardening, domain);
+    snow_rest_density = attributes.lookup_or_add_for_write_span<float>(
+        geometry::textura::attribute_names::rest_density, domain);
+    snow_fp_x = attributes.lookup_or_add_for_write_span<float3>(
+        geometry::textura::attribute_names::plastic_x, domain);
+    snow_fp_y = attributes.lookup_or_add_for_write_span<float3>(
+        geometry::textura::attribute_names::plastic_y, domain);
+    snow_fp_z = attributes.lookup_or_add_for_write_span<float3>(
+        geometry::textura::attribute_names::plastic_z, domain);
   }
   if (!positions || !velocities || !f_x || !f_y || !f_z) {
     if (positions) {
@@ -478,6 +505,20 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
     if (snow_hardening) {
       snow_hardening.span[i] = particles.hardening[p];
     }
+    if (snow_rest_density) {
+      snow_rest_density.span[i] = particles.rest_density[p];
+    }
+    if (snow_fp_x && snow_fp_y && snow_fp_z) {
+      snow_fp_x.span[i] = float3(particles.plastic[p * 9 + 0],
+                                 particles.plastic[p * 9 + 3],
+                                 particles.plastic[p * 9 + 6]);
+      snow_fp_y.span[i] = float3(particles.plastic[p * 9 + 1],
+                                 particles.plastic[p * 9 + 4],
+                                 particles.plastic[p * 9 + 7]);
+      snow_fp_z.span[i] = float3(particles.plastic[p * 9 + 2],
+                                 particles.plastic[p * 9 + 5],
+                                 particles.plastic[p * 9 + 8]);
+    }
   }
   positions.finish();
   velocities.finish();
@@ -495,6 +536,18 @@ void write_component(GeometryComponent &component, const ComponentRange &range,
   }
   if (snow_hardening) {
     snow_hardening.finish();
+  }
+  if (snow_rest_density) {
+    snow_rest_density.finish();
+  }
+  if (snow_fp_x) {
+    snow_fp_x.finish();
+  }
+  if (snow_fp_y) {
+    snow_fp_y.finish();
+  }
+  if (snow_fp_z) {
+    snow_fp_z.finish();
   }
 }
 

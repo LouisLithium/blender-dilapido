@@ -547,14 +547,15 @@ inline SnowStrength snow_strength(const ParticleData &particles, const int parti
 }
 
 /**
- * Snow return mapping: plastic volume limits plus the usual deviatoric Drucker-Prager yield.
+ * Snow return mapping with an explicit plastic deformation gradient.
  *
- * Unlike sand, snow collapses permanently under compression. The singular values of `F` are first
- * clamped to the elastic log-volume interval `[-compression_limit, +stretch_limit]`: the excess
- * compression shrinks the particle's `volume` (mass stays constant, so `density` grows) and adds
- * to the hardening variable `q`; tensile excess is treated as failure and feeds `damage`. The
- * remaining deviatoric part is then projected onto the friction/cohesion yield surface with the
- * hardened stiffness.
+ * `F = F_e F_p` (Stomakhin et al. 2013). The particle stores the total `F` and the plastic `F_p`;
+ * the elastic part is `F_e = F F_p^-1`. The singular values of `F_e` are clamped to the elastic
+ * log-volume interval `[-compression_limit, +stretch_limit]` and then projected onto the
+ * friction/cohesion yield surface. The clamped elastic part reconstructs the new plastic part
+ * (`F_p = F_e_new^-1 F`), so the total deformation is unchanged; compaction shrinks `F_p`'s
+ * determinant, which raises the density (capped at four times the rest density). The removed
+ * strain feeds `hardening` (and tension/impact feeds `damage`).
  */
 void return_map_snow(const int particle,
                      ParticleData &particles,
@@ -562,17 +563,28 @@ void return_map_snow(const int particle,
                      float *f_out,
                      const float strain_increment)
 {
+  /* The total deformation is not changed by the plastic flow (F = F_e F_p in both states). */
+  for (int i = 0; i < 9; i++) {
+    f_out[i] = f_in[i];
+  }
+
   float f[3][3];
-  for (int i = 0; i < 3; i++) {
-    for (int j = 0; j < 3; j++) {
-      f[i][j] = f_in[i * 3 + j];
+  float fp[3][3];
+  float fp_inverse[3][3];
+  for (int row = 0; row < 3; row++) {
+    for (int col = 0; col < 3; col++) {
+      f[row][col] = f_in[row * 3 + col];
+      fp[row][col] = particles.plastic[particle * 9 + row * 3 + col];
     }
   }
+  if (!invert3(fp, fp_inverse)) {
+    return;
+  }
+  float fe[3][3];
+  multiply3(f, fp_inverse, fe);
+
   Svd3 svd;
-  if (!svd3(f, svd)) {
-    for (int i = 0; i < 9; i++) {
-      f_out[i] = f_in[i];
-    }
+  if (!svd3(fe, svd)) {
     return;
   }
   float epsilon[3];
@@ -589,9 +601,6 @@ void return_map_snow(const int particle,
   }
   deviatoric_norm = std::sqrt(deviatoric_norm);
   if (!std::isfinite(trace) || !std::isfinite(deviatoric_norm)) {
-    for (int i = 0; i < 9; i++) {
-      f_out[i] = f_in[i];
-    }
     return;
   }
 
@@ -618,28 +627,50 @@ void return_map_snow(const int particle,
     const float new_epsilon = deviatoric[i] * keep + trace_clamped / 3.0f;
     scale[i] = std::exp(new_epsilon) / std::max(svd.s[i], 1e-6f);
   }
+
+  float fe_new[3][3];
   if (keep < 1.0f || std::fabs(plastic_volume) > 1e-9f) {
-    apply_singular_scale(f, svd, scale, &f_out[0]);
+    apply_singular_scale(fe, svd, scale, &fe_new[0][0]);
   }
   else {
-    for (int i = 0; i < 9; i++) {
-      f_out[i] = f_in[i];
+    for (int row = 0; row < 3; row++) {
+      for (int col = 0; col < 3; col++) {
+        fe_new[row][col] = fe[row][col];
+      }
     }
   }
 
-  /* Permanent compaction: the particle volume shrinks, the mass is constant. Snow can compact to
-   * roughly four times its rest density (ice is 917 kg/m^3); without that cap a soft parameter set
-   * would shrink the particles without bound. */
-  if (plastic_volume < 0.0f) {
-    float new_volume = particles.volume[particle] * std::exp(plastic_volume);
-    const float rest_density = particles.rest_density[particle];
-    if (rest_density > 0.0f) {
-      const float min_volume = particles.mass[particle] / (rest_density * 4.0f);
-      new_volume = std::max(new_volume, min_volume);
-    }
-    if (std::isfinite(new_volume) && new_volume > 1e-12f) {
-      particles.volume[particle] = new_volume;
-      particles.density[particle] = particles.mass[particle] / new_volume;
+  float fe_new_inverse[3][3];
+  if (invert3(fe_new, fe_new_inverse)) {
+    float fp_new[3][3];
+    multiply3(fe_new_inverse, f, fp_new);
+    float jp = determinant3(fp_new);
+    if (std::isfinite(jp) && jp > 1e-8f) {
+      /* `J_p` is the plastic volume ratio. It cannot expand (no plastic swelling) and cannot
+       * shrink past four times the rest density. Scale the whole plastic gradient uniformly, so
+       * `F_e = F F_p^-1` stays consistent. */
+      const float clamped_jp = math::clamp(jp, 0.25f, 1.0f);
+      if (std::fabs(clamped_jp - jp) > 1e-8f) {
+        const float volume_scale = std::cbrt(clamped_jp / jp);
+        for (int row = 0; row < 3; row++) {
+          for (int col = 0; col < 3; col++) {
+            fp_new[row][col] *= volume_scale;
+          }
+        }
+        jp = clamped_jp;
+      }
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          particles.plastic[particle * 9 + row * 3 + col] = fp_new[row][col];
+        }
+      }
+      const float rest_density = std::max(particles.rest_density[particle], 1e-6f);
+      const float rest_volume = particles.mass[particle] / rest_density;
+      const float new_volume = rest_volume * jp;
+      if (std::isfinite(new_volume) && new_volume > 1e-12f) {
+        particles.volume[particle] = new_volume;
+        particles.density[particle] = particles.mass[particle] / new_volume;
+      }
     }
   }
 
@@ -949,8 +980,27 @@ void particle_to_grid(const ParticleData &particles,
                    stress);
     }
     else if (particles.material[particle] == int(MaterialType::Snow)) {
+      float fp[3][3];
+      float fp_inverse[3][3];
+      float fe[3][3];
+      const float *plastic = &particles.plastic[particle * 9];
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          fp[row][col] = plastic[row * 3 + col];
+        }
+      }
+      if (invert3(fp, fp_inverse)) {
+        multiply3(f, fp_inverse, fe);
+      }
+      else {
+        for (int row = 0; row < 3; row++) {
+          for (int col = 0; col < 3; col++) {
+            fe[row][col] = f[row][col];
+          }
+        }
+      }
       const SnowStrength strength = snow_strength(particles, particle);
-      snow_stress(f, strength.mu, strength.lambda, strength.tensile, stress);
+      snow_stress(fe, strength.mu, strength.lambda, strength.tensile, stress);
     }
     else {
       const SandStrength strength = sand_strength(particles, particle);
@@ -1664,6 +1714,7 @@ void ParticleData::resize(const int count)
   velocities.resize(count);
   affine.resize(count * 9);
   deformation.resize(count * 9);
+  plastic.resize(count * 9);
   material.resize(count);
   density.resize(count);
   volume.resize(count);
@@ -1689,8 +1740,12 @@ void ParticleData::resize(const int count)
 
   std::fill(velocities.begin(), velocities.end(), float3(0.0f));
   std::fill(affine.begin(), affine.end(), 0.0f);
+  std::fill(plastic.begin(), plastic.end(), 0.0f);
   for (int i = 0; i < count; i++) {
     positions[i] = float3(0.0f);
+    plastic[i * 9 + 0] = 1.0f;
+    plastic[i * 9 + 4] = 1.0f;
+    plastic[i * 9 + 8] = 1.0f;
     deformation[i * 9 + 0] = 1.0f;
     deformation[i * 9 + 1] = 0.0f;
     deformation[i * 9 + 2] = 0.0f;
@@ -1779,6 +1834,25 @@ void ParticleData::fill_defaults()
     }
     if (!std::isfinite(damping[i])) {
       damping[i] = 0.0f;
+    }
+    if (material[i] == int(MaterialType::Snow)) {
+      if (!std::isfinite(rest_density[i]) || rest_density[i] <= 0.0f) {
+        rest_density[i] = density[i];
+      }
+      float fp[3][3];
+      bool valid = true;
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          fp[row][col] = plastic[i * 9 + row * 3 + col];
+          valid = valid && std::isfinite(fp[row][col]);
+        }
+      }
+      const float det = valid ? determinant3(fp) : 0.0f;
+      if (!valid || !std::isfinite(det) || std::fabs(det) < 1e-8f) {
+        for (int k = 0; k < 9; k++) {
+          plastic[i * 9 + k] = (k % 4 == 0) ? 1.0f : 0.0f;
+        }
+      }
     }
   }
 }

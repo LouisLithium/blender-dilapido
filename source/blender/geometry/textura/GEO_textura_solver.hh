@@ -76,6 +76,10 @@ constexpr StringRefNull damping = "textura_damping";
 constexpr StringRefNull deformation_x = "textura_F_x";
 constexpr StringRefNull deformation_y = "textura_F_y";
 constexpr StringRefNull deformation_z = "textura_F_z";
+/** Plastic part of the deformation gradient, snow only. `F = F_elastic * F_plastic`. */
+constexpr StringRefNull plastic_x = "textura_Fp_x";
+constexpr StringRefNull plastic_y = "textura_Fp_y";
+constexpr StringRefNull plastic_z = "textura_Fp_z";
 constexpr StringRefNull rest_position = "textura_rest_position";
 }  // namespace attribute_names
 
@@ -138,6 +142,8 @@ struct ParticleData {
   Vector<float> affine;
   /** Deformation gradient `F`, row-major, nine floats per particle. */
   Vector<float> deformation;
+  /** Snow: plastic part `F_p` of `F = F_e F_p`, row-major. Identity for other materials. */
+  Vector<float> plastic;
 
   Vector<int> material;
   Vector<float> density;
