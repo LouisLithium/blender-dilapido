@@ -209,6 +209,7 @@ bool ha_sdf_build(const Span<float3> positions,
                   const float3 &region_max,
                   const float3 &reference_point,
                   const bool one_sided,
+                  const bool flip_to_reference,
                   HaSdfGrid &r_grid)
 {
   if (positions.is_empty() || corner_tris.is_empty() || voxel_size <= 0.0f || band_width <= 0.0f) {
@@ -317,8 +318,10 @@ bool ha_sdf_build(const Span<float3> positions,
   /* The sign of a level set built from an *open* mesh (a single plane, the common floor) is
    * ambiguous: OpenVDB picks a side from the winding, which can put the "outside" below the floor.
    * The fluid is always outside the solid collider, so if the field says the reference point is
-   * inside, flip the whole grid. That flips the gradient the contact uses as well. */
-  if (ha_sdf_sample(r_grid, reference_point) < 0.0f) {
+   * inside, flip the whole grid. That flips the gradient the contact uses as well. This is skipped
+   * for a closed mesh with corrected winding: the reference point may legitimately be inside a
+   * hollow collider, and flipping there would turn the solid inside out. */
+  if (flip_to_reference && ha_sdf_sample(r_grid, reference_point) < 0.0f) {
     for (float &value : r_grid.data) {
       value = -value;
     }

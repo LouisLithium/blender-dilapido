@@ -158,6 +158,7 @@ static bool mesh_nearest(const bke::BVHTreeFromMesh &bvh,
  */
 static bool mesh_contains(const bke::BVHTreeFromMesh &bvh,
                           const float3 &position,
+                          const float orientation,
                           float *r_distance)
 {
   BVHTreeNearest nearest;
@@ -175,7 +176,7 @@ static bool mesh_contains(const bke::BVHTreeFromMesh &bvh,
   const float3 a = bvh.vert_positions[bvh.corner_verts[tri[0]]];
   const float3 b = bvh.vert_positions[bvh.corner_verts[tri[1]]];
   const float3 c = bvh.vert_positions[bvh.corner_verts[tri[2]]];
-  return math::dot(delta, math::cross(b - a, c - a)) < 0.0f;
+  return orientation * math::dot(delta, math::cross(b - a, c - a)) < 0.0f;
 }
 
 /** True when every edge is used by exactly two face corners. */
@@ -195,6 +196,25 @@ static bool mesh_is_closed(const Mesh &mesh)
     }
   }
   return true;
+}
+
+/**
+ * Signed volume of a closed triangle mesh. It is positive when the normals point outwards; a
+ * negative value means the winding is reversed, so the inside test has to be flipped. This is what
+ * makes Volume mode work on meshes that were mirrored or generated with inward faces.
+ */
+static float mesh_signed_volume(const Mesh &mesh)
+{
+  const Span<float3> verts = mesh.vert_positions();
+  const Span<int> corner_verts = mesh.corner_verts();
+  float volume = 0.0f;
+  for (const int3 &tri : mesh.corner_tris()) {
+    const float3 &a = verts[corner_verts[tri[0]]];
+    const float3 &b = verts[corner_verts[tri[1]]];
+    const float3 &c = verts[corner_verts[tri[2]]];
+    volume += math::dot(a, math::cross(b, c));
+  }
+  return volume / 6.0f;
 }
 
 /** \} */
@@ -324,6 +344,7 @@ static void jitter_surface_points(const bke::BVHTreeFromMesh &bvh,
 static bool distribute_in_volume(const Mesh &mesh,
                                  const LatticeType lattice,
                                  const float spacing,
+                                 const float orientation,
                                  Vector<float3> &r_positions,
                                  Vector<float> &r_surface_distance)
 {
@@ -370,7 +391,7 @@ static bool distribute_in_volume(const Mesh &mesh,
         const float x = min.x + half + float(i) * spacing + row_shift + ox;
         const float3 point(x, y, z);
         float distance = 0.0f;
-        if (!mesh_contains(bvh, point, &distance)) {
+        if (!mesh_contains(bvh, point, orientation, &distance)) {
           continue;
         }
         r_positions.append(point);
@@ -390,6 +411,7 @@ static void jitter_volume_points(const bke::BVHTreeFromMesh &bvh,
                                  const float spacing,
                                  const float jitter,
                                  const JitterLayer layer,
+                                 const float orientation,
                                  const uint32_t seed)
 {
   const float axis = 0.15f * math::clamp(jitter, 0.0f, 1.0f) * spacing;
@@ -408,7 +430,7 @@ static void jitter_volume_points(const bke::BVHTreeFromMesh &bvh,
                           (rng.next_float() - 0.5f) * 2.0f * axis);
       const float3 candidate = positions[i] + offset;
       /* The lattice point is known to be inside, so falling back to it can never leave the mesh. */
-      if (mesh_contains(bvh, candidate, nullptr)) {
+      if (mesh_contains(bvh, candidate, orientation, nullptr)) {
         positions[i] = candidate;
       }
     }
@@ -551,8 +573,9 @@ static void node_geo_exec(GeoNodeExecParams params)
           TIP_("Distribute Points: the mesh is not closed, so the inside test (closest triangle "
                "normal) is not reliable. Seal the mesh for volume distribution"));
     }
+    const float orientation = mesh_signed_volume(*mesh) < 0.0f ? -1.0f : 1.0f;
     const bool lattice_fits = distribute_in_volume(
-        *mesh, lattice, spacing, positions, surface_distance);
+        *mesh, lattice, spacing, orientation, positions, surface_distance);
     if (!lattice_fits) {
       params.error_message_add(
           NodeWarningType::Warning,
@@ -570,7 +593,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     if (jitter > 0.0f && !positions.is_empty()) {
       jitter_volume_points(bvh, positions.as_mutable_span(), surface_distance.as_span(), spacing,
-                           jitter, jitter_layer, seed);
+                           jitter, jitter_layer, orientation, seed);
     }
   }
 

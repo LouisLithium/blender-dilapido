@@ -1929,6 +1929,49 @@ void GridData::clear_active()
   active.clear();
 }
 
+/**
+ * True when every edge is used by exactly two face corners, i.e. the mesh is a watertight shell.
+ * Closed meshes get a proper OpenVDB level set; open sheets (a single ground plane) keep the
+ * one-sided field, because a level set would have no reliable sign for them.
+ */
+static bool mesh_is_closed(const Mesh &mesh)
+{
+  const int edges_num = mesh.edges_num;
+  if (edges_num == 0) {
+    return false;
+  }
+  Vector<int> uses(edges_num, 0);
+  for (const int edge : mesh.corner_edges()) {
+    uses[edge]++;
+  }
+  for (const int use : uses) {
+    if (use != 2) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Signed volume of a closed triangle mesh. Positive means outward facing normals. A negative value
+ * means the winding is reversed (mirrored geometry, flipped normals, some generators), and the SDF
+ * would then put the "inside" outside of the mesh: an invisible solid where the material is, which
+ * is exactly the phantom bump a wrongly oriented collider produces.
+ */
+static float mesh_signed_volume(const Mesh &mesh)
+{
+  const Span<float3> verts = mesh.vert_positions();
+  const Span<int> corner_verts = mesh.corner_verts();
+  float volume = 0.0f;
+  for (const int3 &tri : mesh.corner_tris()) {
+    const float3 &a = verts[corner_verts[tri[0]]];
+    const float3 &b = verts[corner_verts[tri[1]]];
+    const float3 &c = verts[corner_verts[tri[2]]];
+    volume += math::dot(a, math::cross(b, c));
+  }
+  return volume / 6.0f;
+}
+
 void solve_frame(ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
@@ -1983,6 +2026,12 @@ void solve_frame(ParticleData &particles,
   Vector<int> sdf_corner_verts;
   Vector<int3> sdf_corner_tris;
   float max_radius = 0.0f;
+  /* Closed meshes are exact solids, so a level set is both correct and free of the phantom bump a
+   * one-sided splat creates around sharp thin wedges. They also need their winding fixed first: an
+   * inverted mesh would make the level set negative *outside* the collider. As soon as one open
+   * sheet is present the combined field has no reliable sign, so the whole set falls back to the
+   * one-sided field (unchanged behavior for planes and cloth surfaces). */
+  bool all_closed = true;
   for (const int i : colliders.index_range()) {
     const Collider &collider = colliders[i];
     if (collider.mesh == nullptr) {
@@ -1999,6 +2048,11 @@ void solve_frame(ParticleData &particles,
       box_max[i] = max;
       continue;
     }
+    const bool closed = mesh_is_closed(*collider.mesh);
+    const bool reversed = closed && mesh_signed_volume(*collider.mesh) < 0.0f;
+    if (!closed) {
+      all_closed = false;
+    }
     const int vertex_offset = sdf_positions.size();
     sdf_positions.extend(collider.mesh->vert_positions());
     const Span<int> corner_verts = collider.mesh->corner_verts();
@@ -2009,7 +2063,9 @@ void solve_frame(ParticleData &particles,
       sdf_corner_verts.append(index + vertex_offset);
     }
     for (const int3 &tri : corner_tris) {
-      sdf_corner_tris.append(tri + int3(corner_offset));
+      /* Reversing the winding (not the vertex positions) turns inward facing normals outward. */
+      const int3 oriented = reversed ? int3(tri.x, tri.z, tri.y) : tri;
+      sdf_corner_tris.append(oriented + int3(corner_offset));
     }
   }
   for (const float radius : particles.radius) {
@@ -2033,7 +2089,8 @@ void solve_frame(ParticleData &particles,
                                  region_min,
                                  region_max,
                                  (region_min + region_max) * 0.5f,
-                                 true,
+                                 !all_closed,
+                                 !all_closed,
                                  sdf);
     if (!sdf_valid) {
       r_stats.collider_sdf_failed = true;

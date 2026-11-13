@@ -8040,6 +8040,7 @@ class XpbdSolverStep {
                                     region_max,
                                     (fluid_min + fluid_max) * 0.5f,
                                     /*one_sided=*/false,
+                                    /*flip_to_reference=*/true,
                                     *grid))
     {
       fluid.sdf_hash = 0;
@@ -8119,6 +8120,7 @@ class XpbdSolverStep {
                                     region_max,
                                     (fluid_min + fluid_max) * 0.5f,
                                     /*one_sided=*/true,
+                                    /*flip_to_reference=*/false,
                                     *grid))
     {
       return;

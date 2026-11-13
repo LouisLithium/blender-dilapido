@@ -78,6 +78,10 @@ struct HaSdfGrid {
  *   moment the fluid center crosses the sheet. The contact kernel pushes every particle away from
  *   the surface on the side it is already on, which only needs the sign to be consistent with the
  *   triangle winding.
+ * \param flip_to_reference: Flips the level set so that #reference_point is outside. Only meaningful
+ *   when `!one_sided`. Pass false for a closed mesh whose winding is known to be correct: a fluid
+ *   center that legitimately sits inside a solid (a container, a hollow object) must not invert the
+ *   whole field.
  * \param r_grid: Filled on success. Callers usually cache it and only rebuild when the geometry
  *   changes (see the geometry hash in the solver).
  */
@@ -90,6 +94,7 @@ bool ha_sdf_build(Span<float3> positions,
                   const float3 &region_max,
                   const float3 &reference_point,
                   bool one_sided,
+                  bool flip_to_reference,
                   HaSdfGrid &r_grid);
 
 /** Interpolates the field on the host, used by the debug output and the tests. */
