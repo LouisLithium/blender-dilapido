@@ -119,6 +119,13 @@ enum PropIndex : int {
   PROP_REST_DENSITY,
   PROP_WALL_FRICTION,
   PROP_ADHESION,
+  /**
+   * Bit field of the material update, written by G2P and read back by the host:
+   * 1 = `det(F)` entered outside `[0.25, 4]`, 2 = `F` was inverted and got reset,
+   * 4 = `det(F)` left the window again *after* the clamp, 8 = not a fluid (sand or snow).
+   * The host only prints it with `BLENDER_TEXTURA_DEBUG_BBOX`; the store itself is one float.
+   */
+  PROP_DEBUG,
   PROP_COUNT,
 };
 
@@ -201,6 +208,7 @@ const char *GLSL_PRELUDE =
     "#define PROP_REST_DENSITY 19\n"
     "#define PROP_WALL_FRICTION 20\n"
     "#define PROP_ADHESION 21\n"
+    "#define PROP_DEBUG 22\n"
     "#define HA_PROP_STRIDE 24\n"
     "#define HA_MASS_FIXED params[P_MASS_FIXED]\n"
     "#define HA_INV_MASS_FIXED params[P_INV_MASS_FIXED]\n"
@@ -1131,13 +1139,21 @@ const char *KERNEL_G2P =
     "  int type = int(props[p * HA_PROP_STRIDE + PROP_TYPE]);\n"
     "  if (type == HA_MATERIAL_FLUID) {\n"
     "    float j = determinant(new_f);\n"
-    "    // Inverted F: reset, never flip.\n"
-    "    if (!(j > 0.0)) {\n"
+    "    float dbg = 0.0;\n"
+    "    if (!(j > 0.2 && j < 4.1)) { dbg = 1.0; }\n"
+    "    // Inverted F: reset, never flip. Huge F too: its det is numerical noise.\n"
+    "    float magnitude_sq = dot(new_f[0], new_f[0]) + dot(new_f[1], new_f[1]) +\n"
+    "                         dot(new_f[2], new_f[2]);\n"
+    "    if (!(j > 0.0) || !(magnitude_sq < 1.0e6)) {\n"
     "      new_f = mat3(1.0);\n"
     "      j = 1.0;\n"
+    "      dbg += 2.0;\n"
     "    }\n"
     "    float target = clamp(j, 0.25, 4.0);\n"
     "    if (target != j) { new_f *= pow(target / j, 1.0 / 3.0); }\n"
+    "    float j_out = determinant(new_f);\n"
+    "    if (!(j_out > 0.2 && j_out < 4.1)) { dbg += 4.0; }\n"
+    "    props[p * HA_PROP_STRIDE + PROP_DEBUG] = dbg;\n"
     "  }\n"
     "  else {\n"
     "    float c_arr[3][3];\n"
@@ -1158,6 +1174,7 @@ const char *KERNEL_G2P =
     "      }\n"
     "    }\n"
     "    else {\n"
+    "      props[p * HA_PROP_STRIDE + PROP_DEBUG] = 8.0;\n"
     "      float fp_in[3][3];\n"
     "      for (int row = 0; row < 3; row++) {\n"
     "        for (int col = 0; col < 3; col++) {\n"
@@ -1989,8 +2006,23 @@ bool device_solve(ParticleData &particles,
      * (substeps, stiffness, rendering) sees what the device computed. */
     std::vector<float> props(size_t(particle_count) * PROP_STRIDE);
     state.props.download(props);
+    int debug_in = 0;
+    int debug_reset = 0;
+    int debug_out = 0;
+    int debug_other = 0;
+    int debug_type[4] = {0, 0, 0, 0};
+    const bool debug_enabled = std::getenv("BLENDER_TEXTURA_DEBUG_BBOX") != nullptr;
     for (int i = 0; i < particle_count; i++) {
       const float *src = &props[size_t(i) * PROP_STRIDE];
+      if (debug_enabled) {
+        const int flag = int(src[PROP_DEBUG] + 0.5f);
+        debug_in += (flag & 1) != 0 ? 1 : 0;
+        debug_reset += (flag & 2) != 0 ? 1 : 0;
+        debug_out += (flag & 4) != 0 ? 1 : 0;
+        debug_other += (flag & 8) != 0 ? 1 : 0;
+        const int type = int(src[PROP_TYPE] + 0.5f);
+        debug_type[(type >= 0 && type <= 3) ? type : 3]++;
+      }
       const float volume = src[PROP_VOLUME];
       if (volume > 1e-12f && std::isfinite(volume)) {
         particles.volume[i] = volume;
@@ -1998,6 +2030,19 @@ bool device_solve(ParticleData &particles,
       }
       particles.hardening[i] = src[PROP_HARDENING];
       particles.damage[i] = src[PROP_DAMAGE];
+    }
+    if (debug_enabled) {
+      std::fprintf(stderr,
+                   "TEXTURA_DEV in=%d reset=%d out=%d other=%d types=%d/%d/%d/%d\n",
+                   debug_in,
+                   debug_reset,
+                   debug_out,
+                   debug_other,
+                   debug_type[0],
+                   debug_type[1],
+                   debug_type[2],
+                   debug_type[3]);
+      std::fflush(stderr);
     }
   }
 

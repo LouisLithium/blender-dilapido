@@ -1816,11 +1816,20 @@ void grid_to_particle(ParticleData &particles,
          * fluid stays inside the window, so the cube root (a libm call per particle and substep) is
          * only evaluated when the clamp actually kicks in. */
         float j = determinant3(new_f);
-        if (!std::isfinite(j) || j <= 0.0f) {
-          /* An inverted `F` cannot be repaired by scaling: with a negative `j` the factor
-           * `cbrt(clamp(j) / j)` is negative, which *flips* the matrix and reports `det = 0.25`
-           * (tension) on the next substep, pumping energy back in (measured: a single inverted
-           * particle grew into a 40 m/s boil). Reset the volume state instead. */
+        /* An inverted `F` cannot be repaired by scaling: with a negative `j` the factor
+         * `cbrt(clamp(j) / j)` is negative, which *flips* the matrix and reports `det = 0.25`
+         * (tension) on the next substep, pumping energy back in (measured: a single inverted
+         * particle grew into a 40 m/s boil). Reset the volume state instead. The same goes for a
+         * numerically meaningless matrix: a huge `F` can have any determinant it likes because the
+         * float determinant cancels catastrophically (measured: `det = 4.64` for entries of 1e19).
+         * A fluid never legitimately stretches a thousand times, so bound the entries too. */
+        float magnitude_sq = 0.0f;
+        for (int i = 0; i < 3 && std::isfinite(j) && j > 0.0f; i++) {
+          for (int j_col = 0; j_col < 3; j_col++) {
+            magnitude_sq += new_f[i][j_col] * new_f[i][j_col];
+          }
+        }
+        if (!std::isfinite(j) || j <= 0.0f || !(magnitude_sq < 1.0e6f)) {
           identity3(new_f);
           j = 1.0f;
         }
@@ -2727,7 +2736,15 @@ void enforce_fluid_deformation(ParticleData &particles)
         }
       }
       float j = determinant3(f);
-      if (!std::isfinite(j) || j <= 0.0f) {
+      /* Same two guards as `grid_to_particle`: no inverted `F`, and no matrix so large that its
+       * determinant is numerical noise. */
+      float magnitude_sq = 0.0f;
+      for (int row = 0; row < 3 && std::isfinite(j) && j > 0.0f; row++) {
+        for (int col = 0; col < 3; col++) {
+          magnitude_sq += f[row][col] * f[row][col];
+        }
+      }
+      if (!std::isfinite(j) || j <= 0.0f || !(magnitude_sq < 1.0e6f)) {
         identity3(f);
         j = 1.0f;
       }
@@ -2746,6 +2763,26 @@ void enforce_fluid_deformation(ParticleData &particles)
       }
     }
   });
+  if (std::getenv("BLENDER_TEXTURA_DEBUG_BBOX") != nullptr) {
+    int still_bad = 0;
+    int non_fluid = 0;
+    for (const int i : particles.positions.index_range()) {
+      if (particles.material[i] != int(MaterialType::Fluid)) {
+        non_fluid++;
+        continue;
+      }
+      const float j = determinant3_data(&particles.deformation[i * 9]);
+      if (!std::isfinite(j) || !(j > 0.2f && j < 4.1f)) {
+        still_bad++;
+      }
+    }
+    std::fprintf(stderr,
+                 "TEXTURA_ENFORCE n=%d nonfluid=%d still_bad=%d\n",
+                 int(particles.size()),
+                 non_fluid,
+                 still_bad);
+    std::fflush(stderr);
+  }
 }
 
 void solve_frame(ParticleData &particles,
