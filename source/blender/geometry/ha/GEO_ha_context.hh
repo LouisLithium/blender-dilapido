@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
 #include "BLI_span.hh"
 #include "BLI_string_ref.hh"
@@ -148,19 +149,30 @@ class HaMemoryBudget {
   std::atomic<bool> exceeded_{false};
 };
 
+/** Shared owner of a budget: buffers that outlive their evaluation keep it alive. */
+using HaMemoryBudgetRef = std::shared_ptr<HaMemoryBudget>;
+
 class HaMemoryScope {
  public:
-  explicit HaMemoryScope(HaMemoryBudget *budget);
+  explicit HaMemoryScope(HaMemoryBudgetRef budget);
   ~HaMemoryScope();
   HaMemoryScope(const HaMemoryScope &) = delete;
   HaMemoryScope &operator=(const HaMemoryScope &) = delete;
 
  private:
-  HaMemoryBudget *previous_ = nullptr;
+  HaMemoryBudgetRef previous_;
 };
 
 /** Budget of the innermost zone being evaluated on this thread, null outside of zones. */
 HaMemoryBudget *ha_memory_budget_current();
+
+/**
+ * Owning reference to the current budget, null outside of zones. Buffers take a reference so that
+ * one allocated inside a zone and freed in a later frame (the device solvers keep their storage
+ * buffers alive, while the budget of the zone that allocated them is gone) cannot write into a
+ * destroyed stack object, which is exactly the corruption that crashed the scene.
+ */
+HaMemoryBudgetRef ha_memory_budget_current_ref();
 
 /** \} */
 
@@ -198,7 +210,7 @@ HaMemoryBudget *ha_memory_budget_current();
  private:
   gpu::StorageBuf *buf_ = nullptr;
   int64_t elements_ = 0;
-  HaMemoryBudget *budget_ = nullptr;
+  HaMemoryBudgetRef budget_;
   int64_t reserved_bytes_ = 0;
 };
 
@@ -239,7 +251,7 @@ class HaBufferInt {
  private:
   gpu::StorageBuf *buf_ = nullptr;
   int64_t elements_ = 0;
-  HaMemoryBudget *budget_ = nullptr;
+  HaMemoryBudgetRef budget_;
   int64_t reserved_bytes_ = 0;
 };
 

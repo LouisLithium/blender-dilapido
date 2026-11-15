@@ -8,8 +8,10 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include "BKE_global.hh"
 
@@ -41,8 +43,11 @@ namespace {
 
 constexpr int LOCAL_GROUP_SIZE = 64;
 
-/** Innermost zone budget of the current evaluation (GPU work is serialized by the context guard). */
-std::atomic<HaMemoryBudget *> g_memory_budget{nullptr};
+/**
+ * Innermost zone budget of the current evaluation. `thread_local` because a budget belongs to the
+ * evaluation running on this thread; the GPU work itself is serialized by the context guard.
+ */
+thread_local HaMemoryBudgetRef g_memory_budget;
 
 Map<std::string, gpu::Shader *> &shader_cache()
 {
@@ -483,19 +488,25 @@ void HaMemoryBudget::release(const int64_t bytes)
   }
 }
 
-HaMemoryScope::HaMemoryScope(HaMemoryBudget *budget)
-    : previous_(g_memory_budget.exchange(budget, std::memory_order_acq_rel))
+HaMemoryScope::HaMemoryScope(HaMemoryBudgetRef budget)
+    : previous_(std::move(g_memory_budget))
 {
+  g_memory_budget = std::move(budget);
 }
 
 HaMemoryScope::~HaMemoryScope()
 {
-  g_memory_budget.store(previous_, std::memory_order_release);
+  g_memory_budget = std::move(previous_);
 }
 
 HaMemoryBudget *ha_memory_budget_current()
 {
-  return g_memory_budget.load(std::memory_order_acquire);
+  return g_memory_budget.get();
+}
+
+HaMemoryBudgetRef ha_memory_budget_current_ref()
+{
+  return g_memory_budget;
 }
 
 /** \} */
@@ -517,8 +528,8 @@ HaBuffer::~HaBuffer()
     return false;
   }
   const int64_t bytes = elements * int64_t(sizeof(float));
-  HaMemoryBudget *budget = ha_memory_budget_current();
-  if (budget != nullptr && !budget->reserve(bytes)) {
+  HaMemoryBudgetRef budget = ha_memory_budget_current_ref();
+  if (budget && !budget->reserve(bytes)) {
     return false;
   }
   buf_ = GPU_storagebuf_create_ex(size_t(bytes),
@@ -526,7 +537,7 @@ HaBuffer::~HaBuffer()
                                   GPU_USAGE_DYNAMIC,
                                   __func__);
   if (buf_ == nullptr) {
-    if (budget != nullptr) {
+    if (budget) {
       budget->release(bytes);
     }
     return false;
@@ -612,8 +623,8 @@ bool HaBufferInt::ensure(const int64_t elements)
     return false;
   }
   const int64_t bytes = elements * int64_t(sizeof(int));
-  HaMemoryBudget *budget = ha_memory_budget_current();
-  if (budget != nullptr && !budget->reserve(bytes)) {
+  HaMemoryBudgetRef budget = ha_memory_budget_current_ref();
+  if (budget && !budget->reserve(bytes)) {
     return false;
   }
   buf_ = GPU_storagebuf_create_ex(size_t(bytes),
@@ -621,7 +632,7 @@ bool HaBufferInt::ensure(const int64_t elements)
                                   GPU_USAGE_DYNAMIC,
                                   __func__);
   if (buf_ == nullptr) {
-    if (budget != nullptr) {
+    if (budget) {
       budget->release(bytes);
     }
     return false;
@@ -797,6 +808,14 @@ gpu::Shader *ha_shader_get_source(const StringRef cache_key,
       fprintf(stderr, "HA device: shader written to %s\n", path.c_str());
       fflush(stderr);
     }
+  }
+
+  if (ha_debug_enabled()) {
+    fprintf(stderr,
+            "HA device: compiling %s (context %p)\n",
+            info_name.c_str(),
+            static_cast<void *>(GPU_context_active_get()));
+    fflush(stderr);
   }
 
   gpu::Shader *shader = GPU_shader_create_from_info(

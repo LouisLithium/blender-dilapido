@@ -753,6 +753,10 @@ static void node_geo_exec(GeoNodeExecParams params)
     for (GeometryEntry &entry : entries) {
       write_geometry(entry.geometry, entry.ranges, particles);
     }
+    if (std::getenv("BLENDER_TEXTURA_GPU_LOG") != nullptr) {
+      fprintf(stderr, "TEXTURA_GPU node write done\n");
+      fflush(stderr);
+    }
   }
   else {
     params.error_message_add(

@@ -1359,6 +1359,17 @@ struct DeviceState {
       context = active;
     }
     if (particle_count != particles || cell_count != cells || this->two_phase != two_phase) {
+      if (std::getenv("BLENDER_TEXTURA_GPU_LOG") != nullptr) {
+        std::fprintf(stderr,
+                     "TEXTURA_GPU buffers %d/%d -> %d/%d particles/cells, two_phase %d -> %d\n",
+                     particle_count,
+                     cell_count,
+                     particles,
+                     cells,
+                     int(this->two_phase),
+                     int(two_phase));
+        std::fflush(stderr);
+      }
       particle_count = particles;
       cell_count = cells;
       this->two_phase = two_phase;
@@ -1456,6 +1467,15 @@ void dispatch(gpu::Shader *shader, Span<gpu::StorageBuf *> buffers, const int el
   ha_bind_storage_buffers(buffers);
   ha_dispatch(shader, elements);
   GPU_memory_barrier(GPU_BARRIER_SHADER_STORAGE);
+}
+
+/** Trail of the device solve steps, so a crash can be attributed to a phase. */
+void textura_step_log(const char *what)
+{
+  if (std::getenv("BLENDER_TEXTURA_GPU_LOG") != nullptr) {
+    std::fprintf(stderr, "TEXTURA_GPU step %s\n", what);
+    std::fflush(stderr);
+  }
 }
 
 bool debug_log_enabled()
@@ -1572,7 +1592,9 @@ bool device_solve(ParticleData &particles,
   if (!state.ensure(particle_count, cell_count, two_phase, r_reason)) {
     return false;
   }
+  textura_step_log("buffers ready");
 
+  textura_step_log("upload begin");
   /* ---- upload ---- */
   std::vector<float> params(P_PARAM_COUNT, 0.0f);
   {
@@ -1890,6 +1912,7 @@ bool device_solve(ParticleData &particles,
   }
   GPU_finish();
 
+  textura_step_log("substeps done");
   /* ---- download ---- */
   state.positions.download(
       MutableSpan<float>(reinterpret_cast<float *>(particles.positions.data()),
@@ -1928,6 +1951,37 @@ bool device_solve(ParticleData &particles,
     }
   }
 
+  textura_step_log("download done");
+  if (debug_log_enabled()) {
+    float3 lo(std::numeric_limits<float>::max());
+    float3 hi(-std::numeric_limits<float>::max());
+    float speed = 0.0f;
+    int bad = 0;
+    for (int i = 0; i < particle_count; i++) {
+      const float3 p = particles.positions[i];
+      const float3 v = particles.velocities[i];
+      if (!(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+            std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z))) {
+        bad++;
+        continue;
+      }
+      lo = math::min(lo, p);
+      hi = math::max(hi, p);
+      speed = std::max(speed, math::length(v));
+    }
+    std::fprintf(stderr,
+                 "TEXTURA_GPU state bbox=(%.3f %.3f %.3f)..(%.3f %.3f %.3f) nonfinite=%d "
+                 "max_speed=%.3f\n",
+                 double(lo.x),
+                 double(lo.y),
+                 double(lo.z),
+                 double(hi.x),
+                 double(hi.y),
+                 double(hi.z),
+                 bad,
+                 double(speed));
+    std::fflush(stderr);
+  }
   r_stats.grid_cells = cell_count;
   r_stats.grid_dims = grid.dims;
   r_stats.substeps = outer_steps;

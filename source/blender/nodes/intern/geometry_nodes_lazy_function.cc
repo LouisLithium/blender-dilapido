@@ -1904,20 +1904,23 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     const ScopedNodeTimer node_timer{context, output_bnode_};
 
     const geometry::ha::HaScope scope{this->backend_scope()};
-    geometry::ha::HaMemoryBudget memory_budget;
-    memory_budget.set_limit(this->vram_limit_bytes());
-    const geometry::ha::HaMemoryScope memory_scope{&memory_budget};
+    /* Heap allocated and shared: device solvers keep their storage buffers alive across frames, so
+     * a buffer allocated here may be freed (and release its reservation) long after this scope. */
+    geometry::ha::HaMemoryBudgetRef memory_budget =
+        std::make_shared<geometry::ha::HaMemoryBudget>();
+    memory_budget->set_limit(this->vram_limit_bytes());
+    const geometry::ha::HaMemoryScope memory_scope{memory_budget};
 
     std::string fallback_reason;
     int elements = 0;
     if (this->try_execute_on_gpu(params, fallback_reason, elements)) {
-      if (memory_budget.exceeded()) {
-        this->report_memory_limit(context, memory_budget);
+      if (memory_budget->exceeded()) {
+        this->report_memory_limit(context, *memory_budget);
       }
-      this->publish_status(geometry::ha::HaNodeState::Device, {}, elements, &memory_budget);
+      this->publish_status(geometry::ha::HaNodeState::Device, {}, elements, memory_budget.get());
       return;
     }
-    const bool reported_memory = this->report_fallback(context, fallback_reason, &memory_budget);
+    const bool reported_memory = this->report_fallback(context, fallback_reason, memory_budget.get());
 
     /* Every nested graph in Blender gets its own user data and local user data: the local one
      * caches things like the node tree logger (which the node preview uses), so sharing the outer
@@ -1957,10 +1960,10 @@ class LazyFunctionForHwAccelerateZone : public LazyFunction {
     lf::RemappedParams remapped_params{
         fn_, params, input_map_, output_map_, multi_threading_enabled_};
     fn_.execute(remapped_params, body_context);
-    if (!reported_memory && memory_budget.exceeded()) {
-      this->report_memory_limit(body_context, memory_budget);
+    if (!reported_memory && memory_budget->exceeded()) {
+      this->report_memory_limit(body_context, *memory_budget);
     }
-    this->update_status_memory(memory_budget);
+    this->update_status_memory(*memory_budget);
   }
 
   /**

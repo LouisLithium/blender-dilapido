@@ -51,6 +51,12 @@ void Shader::print_log(Span<StringRefNull> sources,
   char warn_col[] = "\033[33;1m";
   char info_col[] = "\033[0;2m";
   char reset_col[] = "\033[0;0m";
+  /* Raw driver log first: the parsing below only reformats it, and it is the parser that used to
+   * crash on a reported line past the end of the combined source. */
+  if (log != nullptr && log[0] != '\0') {
+    fprintf(stderr, "GPU_SHADER_RAW_LOG stage=%s error=%d\n%s\n", stage, int(error), log);
+    fflush(stderr);
+  }
   std::string sources_combined = fmt::to_string(fmt::join(sources, ""));
   DynStr *dynstr = BLI_dynstr_new();
 
@@ -342,11 +348,17 @@ size_t GPULogParser::line_start_get(StringRefNull source_combined, size_t target
     }
     cursor++;
   }
-  return -1;
+  /* Past the last line (the driver reported a line number that the combined source does not have).
+   * Clamp: returning `(size_t)-1` used to reach `rfind` as a position larger than the string, which
+   * is out of contract and crashed on MSVC (read at -1). */
+  return source_combined.size();
 }
 
 StringRef GPULogParser::filename_get(StringRefNull source_combined, size_t pos)
 {
+  if (pos > source_combined.size()) {
+    pos = source_combined.size();
+  }
   StringRef sub_str = source_combined.substr(0, pos);
   StringRefNull directive = "#line 1 \"";
   size_t nearest_line_directive = sub_str.rfind(directive);
@@ -363,6 +375,9 @@ StringRef GPULogParser::filename_get(StringRefNull source_combined, size_t pos)
 /* Original source file line. Found by looking up #line directives. */
 size_t GPULogParser::source_line_get(StringRefNull source_combined, size_t pos)
 {
+  if (pos > source_combined.size()) {
+    pos = source_combined.size();
+  }
   StringRef sub_str = source_combined.substr(0, pos);
   StringRefNull directive = "#line ";
   size_t nearest_line_directive = sub_str.rfind(directive);
