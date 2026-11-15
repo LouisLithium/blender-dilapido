@@ -2701,6 +2701,53 @@ void debug_particle_bbox(const ParticleData &particles, const char *tag)
   std::fflush(stderr);
 }
 
+
+
+/**
+ * Enforces the fluid invariant `0.25 <= det(F) <= 4` once per frame.
+ *
+ * `grid_to_particle` already does this every substep, so it is a no-op on the CPU path. On the device
+ * path one or two particles out of a hundred thousand still end a frame outside the window (`det` as
+ * low as -2 in the probe of M191, with all 156947 particles typed as fluid, so the kernel's own clamp
+ * is somehow bypassed for them). Re-checking at the frame boundary keeps both paths on the same
+ * invariant and turns an inverted `F` into the identity instead of letting it feed a flipped,
+ * tensile stress into the next frame.
+ */
+void enforce_fluid_deformation(ParticleData &particles)
+{
+  threading::parallel_for(particles.positions.index_range(), 4096, [&](const IndexRange range) {
+    for (const int i : range) {
+      if (particles.material[i] != int(MaterialType::Fluid)) {
+        continue;
+      }
+      float f[3][3];
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          f[row][col] = particles.deformation[i * 9 + row * 3 + col];
+        }
+      }
+      float j = determinant3(f);
+      if (!std::isfinite(j) || j <= 0.0f) {
+        identity3(f);
+        j = 1.0f;
+      }
+      if (j < 0.25f || j > 4.0f) {
+        const float scale = std::cbrt(math::clamp(j, 0.25f, 4.0f) / j);
+        for (int row = 0; row < 3; row++) {
+          for (int col = 0; col < 3; col++) {
+            f[row][col] *= scale;
+          }
+        }
+      }
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          particles.deformation[i * 9 + row * 3 + col] = f[row][col];
+        }
+      }
+    }
+  });
+}
+
 void solve_frame(ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
@@ -3031,6 +3078,7 @@ void solve_frame(ParticleData &particles,
                           r_stats,
                           reason))
     {
+      enforce_fluid_deformation(particles);
       collect_stats(particles, r_stats);
       debug_particle_bbox(particles, "device");
       const auto end = std::chrono::steady_clock::now();
@@ -3123,6 +3171,7 @@ void solve_frame(ParticleData &particles,
     permute_particles(particles, restore_order.as_span());
   }
 
+  enforce_fluid_deformation(particles);
   collect_stats(particles, r_stats);
   debug_particle_bbox(particles, "cpu");
 
