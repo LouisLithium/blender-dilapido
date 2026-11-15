@@ -610,6 +610,8 @@ BundlePtr stats_to_bundle(const geometry::textura::Stats &stats)
   bundle.add(*BundleKey::from_str("grid_cells"), stats.grid_cells);
   bundle.add(*BundleKey::from_str("active_cells"), stats.active_cells);
   bundle.add(*BundleKey::from_str("substeps"), stats.substeps);
+  bundle.add(*BundleKey::from_str("fluid_substeps"), stats.fluid_substeps);
+  bundle.add(*BundleKey::from_str("solid_substeps"), stats.solid_substeps);
   bundle.add(*BundleKey::from_str("max_speed"), stats.max_speed);
   bundle.add(*BundleKey::from_str("max_volume_ratio"), stats.max_volume_ratio);
   bundle.add(*BundleKey::from_str("min_volume_ratio"), stats.min_volume_ratio);
@@ -769,12 +771,15 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   if (getenv("BLENDER_TEXTURA_PROFILE") != nullptr) {
     fprintf(stderr,
-            "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d two_phase=%d "
+            "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d fluid_steps=%d "
+            "solid_steps=%d two_phase=%d "
             "total=%.2f clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
             stats.particles,
             stats.grid_cells,
             stats.active_cells,
             stats.substeps,
+            stats.fluid_substeps,
+            stats.solid_substeps,
             stats.two_phase ? 1 : 0,
             stats.milliseconds,
             stats.milliseconds_clear,

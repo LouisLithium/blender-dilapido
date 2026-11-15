@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1579,6 +1580,7 @@ void advect_and_collide(ParticleData &particles,
                         const Settings &settings,
                         const float dt,
                         const GridData &grid,
+                        const Span<int> particle_order,
                         const Span<const Collider> colliders,
                         const ha::HaSdfGrid *sdf)
 {
@@ -1587,8 +1589,11 @@ void advect_and_collide(ParticleData &particles,
                             float3(float(grid.dims.x - 1), float(grid.dims.y - 1),
                                    float(grid.dims.z - 1)) *
                                 grid.dx;
-  threading::parallel_for(IndexRange(particles.size()), 256, [&](const IndexRange range) {
-    for (const int particle : range) {
+  /* An empty order means "every particle"; the two-phase path advects each phase on its own. */
+  const int count = particle_order.is_empty() ? particles.size() : int(particle_order.size());
+  threading::parallel_for(IndexRange(count), 256, [&](const IndexRange range) {
+    for (const int i : range) {
+      const int particle = particle_order.is_empty() ? i : particle_order[i];
       float3 position = particles.positions[particle] + particles.velocities[particle] * dt;
       float3 velocity = particles.velocities[particle];
       const SolidSample sample = sample_solids(position, colliders, sdf, grid.dx * 0.5f);
@@ -1687,6 +1692,37 @@ float maximum_speed(const ParticleData &particles)
   return max_speed;
 }
 
+/** Elastic wave speed of one particle, in m/s. Sets the CFL substep budget. */
+inline float particle_wave_speed(const ParticleData &particles, const int particle)
+{
+  const float density = std::max(particles.density[particle], 1e-3f);
+  if (particles.material[particle] == int(MaterialType::Fluid)) {
+    return std::sqrt(std::max(particles.bulk_modulus[particle], 0.0f) / density);
+  }
+  if (particles.material[particle] == int(MaterialType::Snow)) {
+    const float scale = std::min(1.0f + std::max(particles.hardening_rate[particle], 0.0f) *
+                                           std::max(particles.hardening[particle], 0.0f),
+                                MAX_HARDENING_SCALE);
+    return std::sqrt(std::max((particles.lame_lambda[particle] +
+                               2.0f * particles.shear_modulus[particle]) *
+                                  scale,
+                              0.0f) /
+                     density);
+  }
+  return std::sqrt(std::max(particles.lame_lambda[particle] +
+                                2.0f * particles.shear_modulus[particle],
+                            0.0f) /
+                   density);
+}
+
+/** Clamped substep count for a CFL requirement given as the two ratios `movement` / `wave`. */
+inline int clamp_substeps(const Settings &settings, const float movement, const float wave)
+{
+  int substeps = std::max(settings.min_substeps, 1);
+  substeps = std::max(substeps, int(std::ceil(std::max(movement, wave))));
+  return std::min(substeps, std::max(settings.max_substeps, 1));
+}
+
 int choose_substeps(const ParticleData &particles,
                     const Settings &settings,
                     const float spacing,
@@ -1696,28 +1732,7 @@ int choose_substeps(const ParticleData &particles,
 {
   float max_wave_speed = 0.0f;
   for (const int particle : IndexRange(particles.size())) {
-    const float density = std::max(particles.density[particle], 1e-3f);
-    float wave_speed = 0.0f;
-    if (particles.material[particle] == int(MaterialType::Fluid)) {
-      wave_speed = std::sqrt(std::max(particles.bulk_modulus[particle], 0.0f) / density);
-    }
-    else if (particles.material[particle] == int(MaterialType::Snow)) {
-      const float scale = std::min(1.0f + std::max(particles.hardening_rate[particle], 0.0f) *
-                                             std::max(particles.hardening[particle], 0.0f),
-                                   MAX_HARDENING_SCALE);
-      wave_speed = std::sqrt(std::max((particles.lame_lambda[particle] +
-                                       2.0f * particles.shear_modulus[particle]) *
-                                          scale,
-                                      0.0f) /
-                             density);
-    }
-    else {
-      wave_speed = std::sqrt(std::max(particles.lame_lambda[particle] +
-                                          2.0f * particles.shear_modulus[particle],
-                                      0.0f) /
-                             density);
-    }
-    max_wave_speed = std::max(max_wave_speed, wave_speed);
+    max_wave_speed = std::max(max_wave_speed, particle_wave_speed(particles, particle));
   }
   int substeps = std::max(settings.min_substeps, 1);
   if (dt > 0.0f) {
@@ -1726,8 +1741,40 @@ int choose_substeps(const ParticleData &particles,
     substeps = std::max(substeps, int(std::ceil(std::max(movement, wave))));
   }
   r_required = substeps;
-  substeps = std::min(substeps, std::max(settings.max_substeps, 1));
-  return substeps;
+  return std::min(substeps, std::max(settings.max_substeps, 1));
+}
+
+/**
+ * Substep budget for one phase of a two-phase frame.
+ *
+ * The CFL rule is the same as #choose_substeps, but the maximum only spans that phase's particles.
+ * A fluid is governed by `sqrt(K / rho)` and dry sand by `sqrt((lambda + 2 mu) / rho)`, which is
+ * easily five times faster, so the water is stable with a fraction of the sand's substeps. Running
+ * it at the sand's cadence costs a full particle-to-grid / grid-to-particle round trip per extra
+ * step for no accuracy gain (measured: a translating water block loses exactly the same amount of
+ * speed at 4 and at 49 substeps, once the material's own damping and viscosity are zero).
+ */
+int choose_phase_substeps(const ParticleData &particles,
+                          const Settings &settings,
+                          const float spacing,
+                          const float dt,
+                          const bool fluid_only)
+{
+  float max_speed = 0.0f;
+  float max_wave_speed = 0.0f;
+  for (const int particle : IndexRange(particles.size())) {
+    if ((particles.material[particle] == int(MaterialType::Fluid)) != fluid_only) {
+      continue;
+    }
+    max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
+    max_wave_speed = std::max(max_wave_speed, particle_wave_speed(particles, particle));
+  }
+  if (dt <= 0.0f) {
+    return clamp_substeps(settings, 0.0f, 0.0f);
+  }
+  const float movement = max_speed * dt / (std::max(settings.cfl, 1e-3f) * spacing);
+  const float wave = max_wave_speed * dt / (std::max(settings.cfl, 1e-3f) * spacing);
+  return clamp_substeps(settings, movement, wave);
 }
 
 void substep(ParticleData &particles,
@@ -1754,21 +1801,45 @@ void substep(ParticleData &particles,
   grid_to_particle(particles, grid, dt, particle_order);
   r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
-  advect_and_collide(particles, settings, dt, grid, colliders, sdf);
+  advect_and_collide(particles, settings, dt, grid, particle_order, colliders, sdf);
   r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
 /**
- * One substep with separate fluid and sand velocity grids.
+ * A frame with separate fluid and sand velocity grids, each phase stepping at its own cadence.
  *
- * The two P2G passes reuse the same slice scratch sequentially (`merge_into` zeroes it), so the
- * extra memory is the second dense grid, not a second set of slices. Grid updates run per phase,
- * then the drag pass couples them, and G2P writes each particle from its own phase grid. Material
- * updates happen inside G2P, so every particle is updated exactly once.
+ * The CFL budget of the two phases is very different (a fluid is governed by `sqrt(K/rho)`, dry sand
+ * by `sqrt((lambda + 2 mu)/rho)`, easily five times faster), so running the water at the sand's
+ * substep count spends a full particle-to-grid / grid-to-particle round trip per extra step for no
+ * accuracy gain.
+ *
+ * The outer loop therefore runs `max(fluid_steps, solid_steps)` times and each phase advances when
+ * its own integer schedule says so (`phase_due`). Advection runs every outer step with the outer
+ * step length, so both phases cover exactly the same physical time and their velocities are simply
+ * piecewise constant between their own updates.
+ *
+ * Momentum is exchanged when both phases integrate (the drag rate uses the slower phase's `dt`), so
+ * the drag sees a fresh grid on both sides. Material updates happen inside G2P, so every particle is
+ * updated exactly once per one of its own substeps.
  */
+bool phase_due(const int step, const int count, const int outer)
+{
+  if (count >= outer) {
+    return true;
+  }
+  const int64_t previous = (int64_t(step) * int64_t(count)) / int64_t(outer);
+  const int64_t next = (int64_t(step + 1) * int64_t(count)) / int64_t(outer);
+  return next > previous;
+}
+
 void substep_two_phase(ParticleData &particles,
                        const Settings &settings,
-                       const float dt,
+                       const float dt_outer,
+                       const float dt_fluid,
+                       const float dt_solid,
+                       const int outer_steps,
+                       const int fluid_steps,
+                       const int solid_steps,
                        GridData &fluid_grid,
                        GridData &sand_grid,
                        const Span<int> fluid_order,
@@ -1779,38 +1850,61 @@ void substep_two_phase(ParticleData &particles,
                        P2gSlices *slices,
                        Stats &r_stats)
 {
-  auto mark = std::chrono::steady_clock::now();
-  clear_grid(fluid_grid);
-  clear_grid(sand_grid);
-  r_stats.milliseconds_clear += elapsed_ms(mark);
+  for (int step = 0; step < outer_steps; step++) {
+    const bool solid_step = phase_due(step, solid_steps, outer_steps);
+    const bool fluid_step = phase_due(step, fluid_steps, outer_steps);
 
-  mark = std::chrono::steady_clock::now();
-  particle_to_grid_all(particles, dt, fluid_grid, fluid_order, surface_tension > 0.0f, slices);
-  particle_to_grid_all(particles, dt, sand_grid, sand_order, false, slices);
-  r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
+    if (solid_step) {
+      auto mark = std::chrono::steady_clock::now();
+      clear_grid(sand_grid);
+      r_stats.milliseconds_clear += elapsed_ms(mark);
+      mark = std::chrono::steady_clock::now();
+      particle_to_grid_all(particles, dt_solid, sand_grid, sand_order, false, slices);
+      r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
+      mark = std::chrono::steady_clock::now();
+      update_grid(sand_grid, settings, dt_solid, 0.0f, colliders, sdf, r_stats);
+      r_stats.milliseconds_update_grid += elapsed_ms(mark);
+    }
+    if (fluid_step) {
+      auto mark = std::chrono::steady_clock::now();
+      clear_grid(fluid_grid);
+      r_stats.milliseconds_clear += elapsed_ms(mark);
+      mark = std::chrono::steady_clock::now();
+      particle_to_grid_all(particles, dt_fluid, fluid_grid, fluid_order, surface_tension > 0.0f,
+                           slices);
+      r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
+      mark = std::chrono::steady_clock::now();
+      update_grid(fluid_grid, settings, dt_fluid, surface_tension, colliders, sdf, r_stats);
+      r_stats.milliseconds_update_grid += elapsed_ms(mark);
+    }
+    if (solid_step && fluid_step) {
+      /* Both grids are fresh, so the exchange is symmetric. The rate belongs to the interval since
+       * the previous exchange, which is the slower phase's step. */
+      apply_inter_phase_drag(fluid_grid, sand_grid, settings.inter_phase_drag, dt_fluid);
+    }
+    if (solid_step) {
+      auto mark = std::chrono::steady_clock::now();
+      grid_to_particle(particles, sand_grid, dt_solid, sand_order);
+      r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
+    }
+    if (fluid_step) {
+      auto mark = std::chrono::steady_clock::now();
+      grid_to_particle(particles, fluid_grid, dt_fluid, fluid_order);
+      r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
+    }
 
-  mark = std::chrono::steady_clock::now();
-  update_grid(fluid_grid,
-              settings,
-              dt,
-              surface_tension,
-              colliders,
-              sdf,
-              r_stats);
-  update_grid(sand_grid, settings, dt, 0.0f, colliders, sdf, r_stats);
-  apply_inter_phase_drag(fluid_grid, sand_grid, settings.inter_phase_drag, dt);
+    /* Advection always runs with the outer step length: a phase that did not integrate this step
+     * keeps moving with its last velocity, and both phases cover exactly the same physical time
+     * (the sum of the outer steps is the frame). Integrating with the phase's own `dt` here would
+     * advance that phase by more than the frame. */
+    auto mark = std::chrono::steady_clock::now();
+    advect_and_collide(particles, settings, dt_outer, sand_grid, sand_order, colliders, sdf);
+    advect_and_collide(particles, settings, dt_outer, fluid_grid, fluid_order, colliders, sdf);
+    r_stats.milliseconds_advect += elapsed_ms(mark);
+  }
+
   /* `update_grid` records the active cells of its own phase; report the union here. */
   r_stats.active_cells = int(fluid_grid.active.size() + sand_grid.active.size());
-  r_stats.milliseconds_update_grid += elapsed_ms(mark);
-
-  mark = std::chrono::steady_clock::now();
-  grid_to_particle(particles, fluid_grid, dt, fluid_order);
-  grid_to_particle(particles, sand_grid, dt, sand_order);
-  r_stats.milliseconds_grid_to_particle += elapsed_ms(mark);
-
-  mark = std::chrono::steady_clock::now();
-  advect_and_collide(particles, settings, dt, fluid_grid, colliders, sdf);
-  r_stats.milliseconds_advect += elapsed_ms(mark);
 }
 
 /** \} */
@@ -2430,10 +2524,29 @@ void solve_frame(ParticleData &particles,
   const int substeps = choose_substeps(
       particles, settings, grid.dx, delta_time, max_speed, required_substeps);
   r_stats.substeps = substeps;
+  r_stats.fluid_substeps = substeps;
+  r_stats.solid_substeps = substeps;
   r_stats.cfl_limited = required_substeps > std::max(settings.max_substeps, 1);
-  const float dt = delta_time / std::max(substeps, 1);
 
-  /* Device path: single grid, fluid only (see `GEO_textura_device.hh`). It either runs the whole
+  /* Two-phase frames give each phase its own CFL budget: the fluid's wave speed is far lower than
+   * the sand's, so it needs (and pays for) far fewer substeps. */
+  if (two_phase) {
+    r_stats.fluid_substeps = choose_phase_substeps(
+        particles, settings, grid.dx, delta_time, true);
+    r_stats.solid_substeps = choose_phase_substeps(
+        particles, settings, grid.dx, delta_time, false);
+    /* Escape hatch for A/B measurements: run both phases through the slower cadence. */
+    if (std::getenv("BLENDER_TEXTURA_SAME_PHASE_STEPS") != nullptr) {
+      r_stats.fluid_substeps = r_stats.solid_substeps;
+    }
+    r_stats.substeps = std::max(r_stats.fluid_substeps, r_stats.solid_substeps);
+  }
+  const int outer_steps = std::max(r_stats.substeps, 1);
+  const float dt_outer = delta_time / float(outer_steps);
+  const float dt_fluid = delta_time / float(std::max(r_stats.fluid_substeps, 1));
+  const float dt_solid = delta_time / float(std::max(r_stats.solid_substeps, 1));
+
+  /* Device path: single or two-phase grids (see `GEO_textura_device.hh`). It either runs the whole
    * frame or reports why not; the CPU path below is always the fallback and the reference. */
   if (device_requested) {
     std::string reason;
@@ -2447,8 +2560,9 @@ void solve_frame(ParticleData &particles,
                           settings,
                           grid,
                           sdf_valid ? sdf.get() : nullptr,
-                          dt,
-                          substeps,
+                          delta_time,
+                          r_stats.fluid_substeps,
+                          r_stats.solid_substeps,
                           r_stats,
                           reason))
     {
@@ -2465,25 +2579,30 @@ void solve_frame(ParticleData &particles,
     }
   }
 
-  for (int step = 0; step < substeps; step++) {
-    if (two_phase) {
-      substep_two_phase(particles,
-                        settings,
-                        dt,
-                        grid,
-                        sand_grid,
-                        fluid_order.as_span(),
-                        sand_order.as_span(),
-                        Span<const Collider>(resolved.data(), resolved.size()),
-                        sdf_valid ? sdf.get() : nullptr,
-                        surface_tension,
-                        use_slices ? &slices : nullptr,
-                        r_stats);
-    }
-    else {
+  if (two_phase) {
+    substep_two_phase(particles,
+                      settings,
+                      dt_outer,
+                      dt_fluid,
+                      dt_solid,
+                      outer_steps,
+                      std::max(r_stats.fluid_substeps, 1),
+                      std::max(r_stats.solid_substeps, 1),
+                      grid,
+                      sand_grid,
+                      fluid_order.as_span(),
+                      sand_order.as_span(),
+                      Span<const Collider>(resolved.data(), resolved.size()),
+                      sdf_valid ? sdf.get() : nullptr,
+                      surface_tension,
+                      use_slices ? &slices : nullptr,
+                      r_stats);
+  }
+  else {
+    for (int step = 0; step < outer_steps; step++) {
       substep(particles,
               settings,
-              dt,
+              dt_outer,
               grid,
               order,
               Span<const Collider>(resolved.data(), resolved.size()),

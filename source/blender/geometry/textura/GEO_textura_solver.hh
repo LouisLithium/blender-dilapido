@@ -128,6 +128,9 @@ struct Settings {
    * Give fluids and sand their own velocity grid and exchange momentum between them. Without this
    * both materials share one grid velocity, so they cannot slide past each other and a fluid in
    * contact with sand looks viscous.
+   *
+   * The phases also get their own substep counts (a fluid's CFL budget is far smaller than dry
+   * sand's), see `Stats::fluid_substeps`.
    */
   bool two_phase = false;
   /** Momentum exchange rate between the two phase grids, in 1/s. 0 lets them move independently. */
@@ -290,6 +293,10 @@ struct Stats {
   int grid_cells = 0;
   int active_cells = 0;
   int substeps = 0;
+  /** Substeps the fluid phase got in a two-phase frame (equal to `substeps` otherwise). */
+  int fluid_substeps = 0;
+  /** Substeps the solid phase got in a two-phase frame (equal to `substeps` otherwise). */
+  int solid_substeps = 0;
   float max_speed = 0.0f;
   /** Largest `det(F)` at the end of the frame; a fluid should stay close to 1. */
   float max_volume_ratio = 1.0f;

@@ -17,8 +17,9 @@
  * All state lives in flat storage buffers while a frame is solved; the host uploads the particle
  * arrays once, runs every substep on the device and downloads the result at the end. The dense grids
  * are resident too, so a single-phase substep is five dispatches (clear, particle to grid, grid
- * update, grid to particle, advect) and a two-phase substep is eleven (two grids plus the drag pass,
- * and advect runs per phase so the contact skin support test uses the phase's own mass).
+ * update, grid to particle, advect). A two-phase frame runs `max(fluid_steps, solid_steps)` outer
+ * steps, each phase clearing, scattering, updating and gathering only when its own CFL schedule says
+ * so, with the drag pass whenever both advance and advection every outer step.
  *
  * `deform[]` holds eighteen floats per particle (`F` at 0..8 and `F_p` at 9..17) and the mass buffer
  * holds two ints per cell (mass and the colour field), which keeps every kernel within the eight
@@ -49,9 +50,14 @@ bool device_supported(const ParticleData &particles,
                       std::string &r_reason);
 
 /**
- * Runs `substeps` MPM substeps on the compute backend. The particle arrays are updated in place.
- * Returns false (and leaves the particles untouched) when the device path cannot run; the caller
- * then evaluates the frame on the CPU.
+ * Runs the MPM substeps of one frame on the compute backend. The particle arrays are updated in
+ * place. Returns false (and leaves the particles untouched) when the device path cannot run; the
+ * caller then evaluates the frame on the CPU.
+ *
+ * In a two-phase frame the two phases step at their own cadence: the outer loop runs
+ * `max(fluid_substeps, solid_substeps)` times and each phase advances when its integer schedule says
+ * so, so the water is not forced through the sand's much larger substep count. The drag pass runs
+ * when both phases step, at the slower phase's `dt`.
  *
  * The device path is not bit deterministic with respect to the CPU: the reference accumulates in
  * grid order, the device sums per cell with integer atomics (whose integer rounding differs). The
@@ -63,8 +69,9 @@ bool device_solve(ParticleData &particles,
                   const Settings &settings,
                   const GridData &grid,
                   const ha::HaSdfGrid *sdf,
-                  float dt,
-                  int substeps,
+                  float frame_dt,
+                  int fluid_substeps,
+                  int solid_substeps,
                   Stats &r_stats,
                   std::string &r_reason);
 

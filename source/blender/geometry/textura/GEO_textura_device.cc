@@ -1492,8 +1492,9 @@ bool device_solve(ParticleData &particles,
                   const Settings &settings,
                   const GridData &grid,
                   const ha::HaSdfGrid *sdf,
-                  float dt,
-                  int substeps,
+                  const float frame_dt,
+                  const int fluid_substeps,
+                  const int solid_substeps,
                   Stats &r_stats,
                   std::string &r_reason)
 {
@@ -1518,6 +1519,15 @@ bool device_solve(ParticleData &particles,
     }
   }
   const bool two_phase = settings.two_phase && has_fluid && has_sand;
+
+  /* Per-phase substep counts (chosen by the caller from each phase's own CFL budget). The outer
+   * loop runs the larger count; each phase advances when its integer schedule says so. */
+  const int fluid_steps = std::max(fluid_substeps, 1);
+  const int solid_steps = std::max(solid_substeps, 1);
+  const int outer_steps = two_phase ? std::max(fluid_steps, solid_steps) : fluid_steps;
+  const float dt_fluid = frame_dt / float(fluid_steps);
+  const float dt_solid = frame_dt / float(solid_steps);
+  const float dt_outer = frame_dt / float(std::max(outer_steps, 1));
 
   /* The CPU solver uses one coefficient for the whole set (the maximum), so the device does too. */
   float surface_tension = 0.0f;
@@ -1575,7 +1585,8 @@ bool device_solve(ParticleData &particles,
     params[P_ORIGIN_Y] = grid.origin.y;
     params[P_ORIGIN_Z] = grid.origin.z;
     params[P_DX] = grid.dx;
-    params[P_DT] = dt;
+    /* `dt` and the phase change between dispatch groups; the upload happens through `set_step`. */
+    params[P_DT] = dt_fluid;
     params[P_GRAVITY_X] = settings.gravity.x;
     params[P_GRAVITY_Y] = settings.gravity.y;
     params[P_GRAVITY_Z] = settings.gravity.z;
@@ -1799,35 +1810,77 @@ bool device_solve(ParticleData &particles,
     }
   }
 
-  /* The phase guard lives in the kernels, so switching it between dispatches is an upload of the
-   * small params buffer (no re-compilation, the source hash does not change). */
-  const auto upload_phase = [&](const float phase) {
+  /* The phase guard and the step length live in the kernels, so switching them between dispatches
+   * is an upload of the small params buffer (no re-compilation: the source hash does not change).
+   * The cache keeps the number of uploads down: with equal phase counts the whole frame uploads
+   * once, exactly like the single-phase path. */
+  float uploaded_dt = dt_fluid;
+  float uploaded_phase = 0.0f;
+  const auto set_step = [&](const float phase, const float dt) {
     if (!two_phase) {
       return;
     }
+    if (phase == uploaded_phase && dt == uploaded_dt) {
+      return;
+    }
+    uploaded_phase = phase;
+    uploaded_dt = dt;
     params[P_PHASE] = phase;
+    params[P_DT] = dt;
     state.params.upload(params);
   };
 
+  /* Each phase advances on its own integer schedule (the fluid usually needs far fewer substeps). */
+  const auto phase_due = [](const int step, const int count, const int outer) {
+    if (count >= outer) {
+      return true;
+    }
+    const int64_t previous = (int64_t(step) * int64_t(count)) / int64_t(outer);
+    const int64_t next = (int64_t(step + 1) * int64_t(count)) / int64_t(outer);
+    return next > previous;
+  };
+
   /* ---- substeps ---- */
-  for (int step = 0; step < substeps; step++) {
-    if (two_phase) {
-      upload_phase(0.0f);
-      dispatch(state.clear, buffer_span(clear_buffers), cell_count);
-      dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
-      dispatch(state.grid, buffer_span(grid_buffers), cell_count);
-      upload_phase(1.0f);
-      dispatch(state.clear, buffer_span(sand_clear_buffers), cell_count);
-      dispatch(state.p2g, buffer_span(sand_p2g_buffers), particle_count);
-      dispatch(state.grid, buffer_span(sand_grid_buffers), cell_count);
-      dispatch(state.drag, buffer_span(drag_buffers), cell_count);
-      dispatch(state.g2p, buffer_span(sand_g2p_buffers), particle_count);
+  if (two_phase) {
+    for (int step = 0; step < outer_steps; step++) {
+      const bool solid_step = phase_due(step, solid_steps, outer_steps);
+      const bool fluid_step = phase_due(step, fluid_steps, outer_steps);
+
+      if (solid_step) {
+        set_step(1.0f, dt_solid);
+        dispatch(state.clear, buffer_span(sand_clear_buffers), cell_count);
+        dispatch(state.p2g, buffer_span(sand_p2g_buffers), particle_count);
+        dispatch(state.grid, buffer_span(sand_grid_buffers), cell_count);
+      }
+      if (fluid_step) {
+        set_step(0.0f, dt_fluid);
+        dispatch(state.clear, buffer_span(clear_buffers), cell_count);
+        dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
+        dispatch(state.grid, buffer_span(grid_buffers), cell_count);
+      }
+      if (solid_step && fluid_step) {
+        /* Both grids are fresh; the drag rate uses the interval since the last exchange, which is
+         * the slower phase's step. */
+        set_step(1.0f, dt_fluid);
+        dispatch(state.drag, buffer_span(drag_buffers), cell_count);
+      }
+      if (solid_step) {
+        set_step(1.0f, dt_solid);
+        dispatch(state.g2p, buffer_span(sand_g2p_buffers), particle_count);
+      }
+      /* Advection always uses the outer step, so both phases cover the same physical time. */
+      set_step(1.0f, dt_outer);
       dispatch(state.advect, buffer_span(sand_advect_buffers), particle_count);
-      upload_phase(0.0f);
-      dispatch(state.g2p, buffer_span(g2p_buffers), particle_count);
+      if (fluid_step) {
+        set_step(0.0f, dt_fluid);
+        dispatch(state.g2p, buffer_span(g2p_buffers), particle_count);
+      }
+      set_step(0.0f, dt_outer);
       dispatch(state.advect, buffer_span(advect_buffers), particle_count);
     }
-    else {
+  }
+  else {
+    for (int step = 0; step < outer_steps; step++) {
       dispatch(state.clear, buffer_span(clear_buffers), cell_count);
       dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
       dispatch(state.grid, buffer_span(grid_buffers), cell_count);
@@ -1877,14 +1930,19 @@ bool device_solve(ParticleData &particles,
 
   r_stats.grid_cells = cell_count;
   r_stats.grid_dims = grid.dims;
-  r_stats.substeps = substeps;
+  r_stats.substeps = outer_steps;
+  r_stats.fluid_substeps = fluid_steps;
+  r_stats.solid_substeps = solid_steps;
 
   if (debug_log_enabled()) {
     std::fprintf(stderr,
-                 "TEXTURA_GPU frame backend=device particles=%d cells=%d substeps=%d\n",
+                 "TEXTURA_GPU frame backend=device particles=%d cells=%d substeps=%d "
+                 "fluid_steps=%d solid_steps=%d\n",
                  particle_count,
                  cell_count,
-                 substeps);
+                 outer_steps,
+                 fluid_steps,
+                 solid_steps);
   }
   return true;
 }
