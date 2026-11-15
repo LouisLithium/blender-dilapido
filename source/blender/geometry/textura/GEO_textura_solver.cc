@@ -1870,6 +1870,125 @@ void collect_stats(const ParticleData &particles, Stats &r_stats)
 /** \} */
 
 /* -------------------------------------------------------------------- */
+/** \name Particle order
+ *
+ * Particle to grid scatters into the 27 nodes around a particle and grid to particle gathers them.
+ * With the particle arrays in an arbitrary order (emission appends batches, splashes mix, two
+ * materials are joined) those 27 writes/reads jump all over the dense grid. Walking the particles in
+ * *cell order* instead keeps the grid accesses inside a few cache lines, which is the classic MPM
+ * particle sort.
+ *
+ * The permutation is applied at the start of the frame and undone at the end, so the caller's
+ * particle order (and therefore the mesh vertex order, the emission cache's index correspondence and
+ * every per particle attribute) is unchanged. The sort is a stable counting sort over the cell
+ * index, so the result does not depend on the thread count and the scattering/merge order (and
+ * therefore the floating point result) stays deterministic.
+ * \{ */
+
+/** Cell index of \a position, clamped into the grid. */
+inline int cell_index_of(const GridData &grid, const float3 &position)
+{
+  const float3 local = (position - grid.origin) / grid.dx;
+  const int x = math::clamp(int(std::floor(local.x)), 0, grid.dims.x - 1);
+  const int y = math::clamp(int(std::floor(local.y)), 0, grid.dims.y - 1);
+  const int z = math::clamp(int(std::floor(local.z)), 0, grid.dims.z - 1);
+  return (z * grid.dims.y + y) * grid.dims.x + x;
+}
+
+/** Fills \a r_order with the particle indices sorted by grid cell, stable in particle order. */
+void sort_particles_by_cell(const ParticleData &particles,
+                            const GridData &grid,
+                            Vector<int> &r_order)
+{
+  const int count = particles.size();
+  const int cell_count = int(grid.cell_count());
+  r_order.resize(count);
+  if (count <= 1 || cell_count <= 0) {
+    for (const int i : r_order.index_range()) {
+      r_order[i] = i;
+    }
+    return;
+  }
+  /* Sorting by exact cell would need an offsets array the size of the grid (16 MB for a four million
+   * cell domain, rebuilt every frame). A counting sort over *buckets* of consecutive cells is enough:
+   * the grid is a linear array, so a run of cells is a contiguous slab of memory, and a few
+   * thousand buckets already put every 27 node stencil inside the cache. */
+  const int bucket_count = std::min(cell_count, 4096);
+  const int bucket_scale = std::max(1, cell_count / bucket_count);
+  Vector<int> buckets(count);
+  Vector<int> offsets(bucket_count + 1, 0);
+  for (const int i : IndexRange(count)) {
+    const int bucket = std::min(cell_index_of(grid, particles.positions[i]) / bucket_scale,
+                                bucket_count - 1);
+    buckets[i] = bucket;
+    offsets[bucket + 1]++;
+  }
+  for (const int bucket : IndexRange(bucket_count)) {
+    offsets[bucket + 1] += offsets[bucket];
+  }
+  for (const int i : IndexRange(count)) {
+    r_order[offsets[buckets[i]]++] = i;
+  }
+}
+
+/** `array[i] = array[order[i]]` for one flat array of \a stride elements per particle. */
+template<typename T>
+void permute_flat(Vector<T> &data, const Span<int> order, const int stride)
+{
+  const int count = int(order.size());
+  if (count <= 1 || data.size() != int64_t(count) * int64_t(stride)) {
+    return;
+  }
+  const Vector<T> copy = data;
+  for (const int i : IndexRange(count)) {
+    const T *src = copy.data() + int64_t(order[i]) * int64_t(stride);
+    T *dst = data.data() + int64_t(i) * int64_t(stride);
+    if (stride == 1) {
+      dst[0] = src[0];
+    }
+    else {
+      for (int k = 0; k < stride; k++) {
+        dst[k] = src[k];
+      }
+    }
+  }
+}
+
+/** Applies \a order to every per particle array. */
+void permute_particles(ParticleData &particles, const Span<int> order)
+{
+  permute_flat(particles.positions, order, 1);
+  permute_flat(particles.velocities, order, 1);
+  permute_flat(particles.affine, order, 9);
+  permute_flat(particles.deformation, order, 9);
+  permute_flat(particles.plastic, order, 9);
+  permute_flat(particles.material, order, 1);
+  permute_flat(particles.density, order, 1);
+  permute_flat(particles.volume, order, 1);
+  permute_flat(particles.mass, order, 1);
+  permute_flat(particles.bulk_modulus, order, 1);
+  permute_flat(particles.shear_modulus, order, 1);
+  permute_flat(particles.lame_lambda, order, 1);
+  permute_flat(particles.viscosity, order, 1);
+  permute_flat(particles.tension, order, 1);
+  permute_flat(particles.surface_tension, order, 1);
+  permute_flat(particles.friction, order, 1);
+  permute_flat(particles.cohesion, order, 1);
+  permute_flat(particles.wall_friction, order, 1);
+  permute_flat(particles.adhesion, order, 1);
+  permute_flat(particles.tensile_strength, order, 1);
+  permute_flat(particles.compression_limit, order, 1);
+  permute_flat(particles.stretch_limit, order, 1);
+  permute_flat(particles.rest_density, order, 1);
+  permute_flat(particles.hardening_rate, order, 1);
+  permute_flat(particles.hardening, order, 1);
+  permute_flat(particles.damage, order, 1);
+  permute_flat(particles.damage_rate, order, 1);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Substep
  * \{ */
 
@@ -2694,24 +2813,6 @@ void solve_frame(ParticleData &particles,
   build_grid_contacts(grid, Span<const Collider>(resolved.data(), resolved.size()),
                       sdf_valid ? sdf.get() : nullptr, contacts);
 
-  /* A stable particle order makes the scattering (and the slice merge) deterministic. */
-  Vector<int> order(particles.size());
-  std::iota(order.begin(), order.end(), 0);
-  Vector<int> fluid_order;
-  Vector<int> sand_order;
-  if (two_phase) {
-    fluid_order.reserve(particles.size());
-    sand_order.reserve(particles.size());
-    for (const int particle : order) {
-      if (particles.material[particle] == int(MaterialType::Fluid)) {
-        fluid_order.append(particle);
-      }
-      else {
-        sand_order.append(particle);
-      }
-    }
-  }
-
   /* Parallel particle to grid: fixed slices, each with its own scratch grid, merged in order.
    * The slice count only depends on the grid size, never on the thread count, so the result is the
    * same with `-t 1` and with all cores. Falls back to one serial pass when even two slices do not
@@ -2787,6 +2888,44 @@ void solve_frame(ParticleData &particles,
     }
   }
 
+  /* Cell order for the particle to grid / grid to particle passes (see `sort_particles_by_cell`).
+   * The permutation is undone at the end of the frame, so the caller's order is preserved. Scenes
+   * whose particle order is already close to cell order (a lattice source) skip the copies. */
+  Vector<int> restore_order;
+  if (particles.size() > 1 && std::getenv("BLENDER_TEXTURA_NO_SORT") == nullptr) {
+    Vector<int> cell_order;
+    sort_particles_by_cell(particles, grid, cell_order);
+    int in_place = 0;
+    for (const int i : cell_order.index_range()) {
+      in_place += cell_order[i] == i ? 1 : 0;
+    }
+    if (in_place < int(cell_order.size() * 0.95f)) {
+      restore_order.resize(particles.size());
+      for (const int i : cell_order.index_range()) {
+        restore_order[cell_order[i]] = i;
+      }
+      permute_particles(particles, cell_order.as_span());
+    }
+  }
+
+  /* A stable particle order makes the scattering (and the slice merge) deterministic. */
+  Vector<int> order(particles.size());
+  std::iota(order.begin(), order.end(), 0);
+  Vector<int> fluid_order;
+  Vector<int> sand_order;
+  if (two_phase) {
+    fluid_order.reserve(particles.size());
+    sand_order.reserve(particles.size());
+    for (const int particle : order) {
+      if (particles.material[particle] == int(MaterialType::Fluid)) {
+        fluid_order.append(particle);
+      }
+      else {
+        sand_order.append(particle);
+      }
+    }
+  }
+
   if (two_phase) {
     substep_two_phase(particles,
                       settings,
@@ -2821,6 +2960,10 @@ void solve_frame(ParticleData &particles,
               use_slices ? &slices : nullptr,
               r_stats);
     }
+  }
+
+  if (!restore_order.is_empty()) {
+    permute_particles(particles, restore_order.as_span());
   }
 
   collect_stats(particles, r_stats);
