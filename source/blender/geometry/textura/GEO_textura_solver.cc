@@ -334,6 +334,32 @@ constexpr float DAMAGE_CRUSH_DEADBAND = 3.0e-2f;
  */
 constexpr float DAMAGE_STRAIN_RATE = 10.0f;
 
+/**
+ * Per component tolerance for "this deformation gradient is the identity".
+ *
+ * A rigid translation (free fall, a block at rest) does not change `F` at all, so most of an intact
+ * sand or snow body sits exactly on the identity between impacts. Both the corotated stress and the
+ * return mapping are no-ops there, but they cost a polar decomposition / a 3x3 SVD per particle and
+ * substep. This tolerance is tight enough that the skipped stress (`lambda * (J - 1)`, at most
+ * `3 * epsilon * lambda` = 300 Pa at the default stiffness) stays far below the weight of the
+ * material above it, and any real deformation is well past it.
+ */
+constexpr float RIGID_EPSILON = 1e-4f;
+
+/** True when every component of \a m is within \a epsilon of the identity. */
+inline bool is_near_identity(const float m[3][3], const float epsilon)
+{
+  for (int row = 0; row < 3; row++) {
+    for (int col = 0; col < 3; col++) {
+      const float target = row == col ? 1.0f : 0.0f;
+      if (std::fabs(m[row][col] - target) > epsilon) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 struct SandStrength {
   float mu;
   float friction;
@@ -1038,26 +1064,46 @@ void particle_to_grid(const ParticleData &particles,
     }
     else if (particles.material[particle] == int(MaterialType::Snow)) {
       float fp[3][3];
-      float fp_inverse[3][3];
-      float fe[3][3];
       const float *plastic = &particles.plastic[particle * 9];
       for (int row = 0; row < 3; row++) {
         for (int col = 0; col < 3; col++) {
           fp[row][col] = plastic[row * 3 + col];
         }
       }
-      if (invert3(fp, fp_inverse)) {
-        multiply3(f, fp_inverse, fe);
-      }
-      else {
+      /* An undeformed elastic and plastic part means an undeformed material: both stresses are zero,
+       * and the polar decomposition (Newton iterations with a 3x3 inverse) can be skipped. */
+      if (is_near_identity(f, RIGID_EPSILON) && is_near_identity(fp, RIGID_EPSILON)) {
         for (int row = 0; row < 3; row++) {
           for (int col = 0; col < 3; col++) {
-            fe[row][col] = f[row][col];
+            stress[row][col] = 0.0f;
           }
         }
       }
-      const SnowStrength strength = snow_strength(particles, particle);
-      snow_stress(fe, strength.mu, strength.lambda, strength.tensile, stress);
+      else {
+        float fp_inverse[3][3];
+        float fe[3][3];
+        if (invert3(fp, fp_inverse)) {
+          multiply3(f, fp_inverse, fe);
+        }
+        else {
+          for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+              fe[row][col] = f[row][col];
+            }
+          }
+        }
+        const SnowStrength strength = snow_strength(particles, particle);
+        snow_stress(fe, strength.mu, strength.lambda, strength.tensile, stress);
+      }
+    }
+    else if (is_near_identity(f, RIGID_EPSILON)) {
+      /* Rigid sand: the corotated part is `2 mu (F - R) F^T / J = 0` and the volume part is
+       * `lambda * min(J - 1, 0) = 0`, so the whole stress is zero. */
+      for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+          stress[row][col] = 0.0f;
+        }
+      }
     }
     else {
       const SandStrength strength = sand_strength(particles, particle);
@@ -1276,12 +1322,75 @@ void particle_to_grid_all(const ParticleData &particles,
   slices->merge_into(grid);
 }
 
+/**
+ * Solid contact data for the grid nodes of one frame.
+ *
+ * `sample_solids` is the most expensive per node operation (a mesh collider costs eight trilinear
+ * field samples plus a gradient), and a frame's grid nodes do not move between substeps: the domain
+ * is fixed for the frame and so is the collider. Sampling once and keeping only the nodes within
+ * `1.5 * dx` of a surface turns that from one pass per substep into one pass per frame.
+ */
+struct GridContactEntry {
+  int index;
+  float distance;
+  float3 normal;
+  float friction;
+};
+
+struct GridContacts {
+  Vector<GridContactEntry> entries;
+
+  bool is_empty() const
+  {
+    return entries.is_empty();
+  }
+};
+
+void build_grid_contacts(const GridData &grid,
+                         const Span<const Collider> colliders,
+                         const ha::HaSdfGrid *sdf,
+                         GridContacts &r_contacts)
+{
+  r_contacts.entries.clear();
+  if (colliders.is_empty() && (sdf == nullptr || !sdf->is_valid())) {
+    return;
+  }
+  const int cell_count = int(grid.cell_count());
+  const float contact_range = 1.5f * grid.dx;
+  const int dims_x = grid.dims.x;
+  const int dims_y = grid.dims.y;
+  /* Per chunk output, concatenated in chunk order afterwards: appending from several threads would
+   * need a lock, and a fixed chunk size keeps the order independent of the thread count. */
+  constexpr int CHUNK = 2048;
+  const int chunks = (cell_count + CHUNK - 1) / CHUNK;
+  Vector<Vector<GridContactEntry>> chunk_entries(chunks);
+  threading::parallel_for(IndexRange(chunks), 1, [&](const IndexRange range) {
+    for (const int chunk : range) {
+      Vector<GridContactEntry> &out = chunk_entries[chunk];
+      const int begin = chunk * CHUNK;
+      const int end = std::min(begin + CHUNK, cell_count);
+      for (int index = begin; index < end; index++) {
+        const int x = index % dims_x;
+        const int y = (index / dims_x) % dims_y;
+        const int z = index / (dims_x * dims_y);
+        const float3 world = grid.origin + float3(float(x), float(y), float(z)) * grid.dx;
+        const SolidSample sample = sample_solids(world, colliders, sdf, grid.dx * 0.5f);
+        if (sample.distance < contact_range) {
+          out.append({index, sample.distance, sample.normal, sample.friction});
+        }
+      }
+    }
+  });
+  for (const Vector<GridContactEntry> &chunk : chunk_entries) {
+    r_contacts.entries.extend(chunk);
+  }
+}
+
 void update_grid(GridData &grid,
                  const Settings &settings,
                  const float dt,
                  const float surface_tension,
-                 const Span<const Collider> colliders,
-                 const ha::HaSdfGrid *sdf,
+                 const GridContacts &contacts,
                  Stats &r_stats)
 {
   const float damping = std::max(0.0f, 1.0f - settings.velocity_damping * dt);
@@ -1360,23 +1469,34 @@ void update_grid(GridData &grid,
         velocity.z = 0.0f;
       }
 
-      const float3 world = grid.origin +
-                           float3(float(x), float(y), float(z)) * grid.dx;
-      const SolidSample sample = sample_solids(world, colliders, sdf, grid.dx * 0.5f);
-      if (sample.distance < 0.0f) {
-        velocity = float3(0.0f);
-      }
-      else if (sample.distance < contact_range) {
-        /* `Boundary Friction` is the solver wide knob; the collider's own `Friction` scales it.
-         * Normalised so the default (0.5 / 0.5) keeps the previous behavior. */
-        const float friction = math::clamp(settings.boundary_friction * 2.0f * sample.friction,
-                                           0.0f,
-                                           1.0f);
-        apply_wall_contact(velocity, sample.normal, friction, dt);
-      }
       grid.velocity[i] = velocity;
     }
   });
+
+  /* Colliders: apply the per-node contacts sampled once for this frame (see `build_grid_contacts`).
+   * Each node appears at most once, so this pass needs no atomics. */
+  const Span<const GridContactEntry> contact_entries(contacts.entries.data(),
+                                                     contacts.entries.size());
+  if (!contact_entries.is_empty()) {
+    threading::parallel_for(contact_entries.index_range(), 256, [&](const IndexRange range) {
+      for (const int range_i : range) {
+        const GridContactEntry &entry = contact_entries[range_i];
+        float3 velocity = grid.velocity[entry.index];
+        if (entry.distance < 0.0f) {
+          velocity = float3(0.0f);
+        }
+        else if (entry.distance < contact_range) {
+          /* `Boundary Friction` is the solver wide knob; the collider's own `Friction` scales it.
+           * Normalised so the default (0.5 / 0.5) keeps the previous behavior. */
+          const float friction = math::clamp(settings.boundary_friction * 2.0f * entry.friction,
+                                             0.0f,
+                                             1.0f);
+          apply_wall_contact(velocity, entry.normal, friction, dt);
+        }
+        grid.velocity[entry.index] = velocity;
+      }
+    });
+  }
 
   r_stats.active_cells = int(active.size());
 }
@@ -1443,37 +1563,72 @@ void grid_to_particle(ParticleData &particles,
       quadratic_weights(position.z, grid.origin.z, grid.dx, base_z, fz, weight_z);
 
       float3 velocity = float3(0.0f);
-      float c[3][3] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
-      for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-          for (int k = 0; k < 3; k++) {
-            const int x = base_x + i;
-            const int y = base_y + j;
-            const int z = base_z + k;
-            if (!grid.contains(x, y, z)) {
+      /* The three rows of the APIC matrix `C`, accumulated as vectors so the compiler can use
+       * SIMD: `C[row] += (4 / dx^2) * w * v[row] * (x_i - x_p)`. */
+      float3 c_row_0 = float3(0.0f);
+      float3 c_row_1 = float3(0.0f);
+      float3 c_row_2 = float3(0.0f);
+      const int dims_x = grid.dims.x;
+      const int dims_y = grid.dims.y;
+      const int dims_z = grid.dims.z;
+      /* Same fast/slow split as the particle to grid pass: the domain is built with a margin, so
+       * the stencil is inside the box unless a particle was clamped onto a face. */
+      if (base_x < 0 || base_y < 0 || base_z < 0 || base_x + 2 >= dims_x || base_y + 2 >= dims_y ||
+          base_z + 2 >= dims_z)
+      {
+        for (int i = 0; i < 3; i++) {
+          for (int j = 0; j < 3; j++) {
+            for (int k = 0; k < 3; k++) {
+              if (!grid.contains(base_x + i, base_y + j, base_z + k)) {
+                continue;
+              }
+              const float weight = weight_x[i] * weight_y[j] * weight_z[k];
+              if (weight <= 0.0f) {
+                continue;
+              }
+              const float3 grid_velocity = grid.velocity[grid.index(base_x + i, base_y + j,
+                                                                   base_z + k)];
+              velocity += grid_velocity * weight;
+              const float3 dpos = float3(float(i) - fx, float(j) - fy, float(k) - fz) * grid.dx;
+              const float factor = 4.0f * inv_dx * inv_dx * weight;
+              c_row_0 += dpos * (factor * grid_velocity.x);
+              c_row_1 += dpos * (factor * grid_velocity.y);
+              c_row_2 += dpos * (factor * grid_velocity.z);
+            }
+          }
+        }
+      }
+      else {
+        const int base_index = (base_z * dims_y + base_y) * dims_x + base_x;
+        const int stride_y = dims_x;
+        const int stride_z = dims_x * dims_y;
+        for (int k = 0; k < 3; k++) {
+          const float wz = weight_z[k];
+          if (wz <= 0.0f) {
+            continue;
+          }
+          const int kz = base_index + k * stride_z;
+          const float dz = (float(k) - fz) * grid.dx;
+          for (int j = 0; j < 3; j++) {
+            const float wzy = wz * weight_y[j];
+            if (wzy <= 0.0f) {
               continue;
             }
-            const float weight = weight_x[i] * weight_y[j] * weight_z[k];
-            if (weight <= 0.0f) {
-              continue;
+            const int jz = kz + j * stride_y;
+            const float dy = (float(j) - fy) * grid.dx;
+            for (int i = 0; i < 3; i++) {
+              const float weight = wzy * weight_x[i];
+              if (weight <= 0.0f) {
+                continue;
+              }
+              const float3 grid_velocity = grid.velocity[jz + i];
+              velocity += grid_velocity * weight;
+              const float3 dpos = float3((float(i) - fx) * grid.dx, dy, dz);
+              const float factor = 4.0f * inv_dx * inv_dx * weight;
+              c_row_0 += dpos * (factor * grid_velocity.x);
+              c_row_1 += dpos * (factor * grid_velocity.y);
+              c_row_2 += dpos * (factor * grid_velocity.z);
             }
-            const float3 grid_velocity = grid.velocity[grid.index(x, y, z)];
-            velocity += grid_velocity * weight;
-            const float3 dpos = float3(float(i) - fx, float(j) - fy, float(k) - fz) * grid.dx;
-            /* `C = 4 / dx^2 * sum w * v * (x_i - x_p)` (Hu et al. 2018). `dpos` is in world
-             * units, so the factor needs `inv_dx` twice: with only one the matrix is `dx` times
-             * too small, the affine transfer term vanishes and APIC silently degrades to PIC,
-             * which is very dissipative (fluids look like syrup and grains keep their lattice). */
-            const float factor = 4.0f * inv_dx * inv_dx * weight;
-            c[0][0] += factor * grid_velocity.x * dpos.x;
-            c[0][1] += factor * grid_velocity.x * dpos.y;
-            c[0][2] += factor * grid_velocity.x * dpos.z;
-            c[1][0] += factor * grid_velocity.y * dpos.x;
-            c[1][1] += factor * grid_velocity.y * dpos.y;
-            c[1][2] += factor * grid_velocity.y * dpos.z;
-            c[2][0] += factor * grid_velocity.z * dpos.x;
-            c[2][1] += factor * grid_velocity.z * dpos.y;
-            c[2][2] += factor * grid_velocity.z * dpos.z;
           }
         }
       }
@@ -1483,13 +1638,18 @@ void grid_to_particle(ParticleData &particles,
       velocity *= std::max(0.0f, 1.0f - particles.viscosity[particle] * dt);
 
       particles.velocities[particle] = velocity;
-      for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-          particles.affine[particle * 9 + i * 3 + j] = c[i][j];
-        }
-      }
+      particles.affine[particle * 9 + 0] = c_row_0.x;
+      particles.affine[particle * 9 + 1] = c_row_0.y;
+      particles.affine[particle * 9 + 2] = c_row_0.z;
+      particles.affine[particle * 9 + 3] = c_row_1.x;
+      particles.affine[particle * 9 + 4] = c_row_1.y;
+      particles.affine[particle * 9 + 5] = c_row_1.z;
+      particles.affine[particle * 9 + 6] = c_row_2.x;
+      particles.affine[particle * 9 + 7] = c_row_2.y;
+      particles.affine[particle * 9 + 8] = c_row_2.z;
 
       /* `F <- (I + dt C) F` */
+      const float3 c_rows[3] = {c_row_0, c_row_1, c_row_2};
       float f[3][3];
       float new_f[3][3];
       for (int i = 0; i < 3; i++) {
@@ -1500,7 +1660,8 @@ void grid_to_particle(ParticleData &particles,
       }
       for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
-          new_f[i][j] += dt * (c[i][0] * f[0][j] + c[i][1] * f[1][j] + c[i][2] * f[2][j]);
+          new_f[i][j] += dt * (c_rows[i].x * f[0][j] + c_rows[i].y * f[1][j] +
+                               c_rows[i].z * f[2][j]);
         }
       }
       const int material = particles.material[particle];
@@ -1511,40 +1672,78 @@ void grid_to_particle(ParticleData &particles,
         if (particles.damage_rate[particle] > 0.0f) {
           float c_norm_sq = 0.0f;
           for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-              c_norm_sq += c[i][j] * c[i][j];
-            }
+            c_norm_sq += math::dot(c_rows[i], c_rows[i]);
           }
           strain_increment = std::max(0.0f, std::sqrt(c_norm_sq) - DAMAGE_STRAIN_RATE) * dt;
         }
         if (material == int(MaterialType::Sand)) {
-          return_map_sand(particle,
-                          particles,
-                          &new_f[0][0],
-                          &particles.deformation[particle * 9],
-                          strain_increment);
+          if (is_near_identity(new_f, RIGID_EPSILON) && strain_increment <= 0.0f) {
+            /* Rigid and not yielding: the return mapping would reproduce `F` unchanged and add no
+             * damage, so skip the 3x3 SVD entirely (this is the common case for a block in free
+             * fall or at rest). */
+            for (int i = 0; i < 3; i++) {
+              for (int j_col = 0; j_col < 3; j_col++) {
+                particles.deformation[particle * 9 + i * 3 + j_col] = new_f[i][j_col];
+              }
+            }
+          }
+          else {
+            return_map_sand(particle,
+                            particles,
+                            &new_f[0][0],
+                            &particles.deformation[particle * 9],
+                            strain_increment);
+          }
         }
         else {
-          return_map_snow(particle,
-                          particles,
-                          &new_f[0][0],
-                          &particles.deformation[particle * 9],
-                          strain_increment);
+          const float *plastic = &particles.plastic[particle * 9];
+          float fp[3][3];
+          for (int i = 0; i < 3; i++) {
+            for (int j_col = 0; j_col < 3; j_col++) {
+              fp[i][j_col] = plastic[i * 3 + j_col];
+            }
+          }
+          if (is_near_identity(new_f, RIGID_EPSILON) && is_near_identity(fp, RIGID_EPSILON) &&
+              strain_increment <= 0.0f)
+          {
+            /* Same early out as sand, but the plastic part has to be the identity too: `F_e` is what
+             * the return mapping works on. */
+            for (int i = 0; i < 3; i++) {
+              for (int j_col = 0; j_col < 3; j_col++) {
+                particles.deformation[particle * 9 + i * 3 + j_col] = new_f[i][j_col];
+              }
+            }
+          }
+          else {
+            return_map_snow(particle,
+                            particles,
+                            &new_f[0][0],
+                            &particles.deformation[particle * 9],
+                            strain_increment);
+          }
         }
       }
       else {
         /* Keep a fluid's `F` bounded. The stress only depends on `det(F)`, so the volume is the
-         * only part worth preserving; a runaway shear would otherwise grow without bound. */
+         * only part worth preserving; a runaway shear would otherwise grow without bound. A healthy
+         * fluid stays inside the window, so the cube root (a libm call per particle and substep) is
+         * only evaluated when the clamp actually kicks in. */
         float j = determinant3(new_f);
         if (!std::isfinite(j) || std::fabs(j) < 1e-6f) {
           identity3(new_f);
           j = 1.0f;
         }
-        const float target = math::clamp(j, 0.25f, 4.0f);
-        const float scale = std::cbrt(target / j);
+        if (j < 0.25f || j > 4.0f) {
+          const float scale = std::cbrt(math::clamp(j, 0.25f, 4.0f) / j);
+          for (int i = 0; i < 3; i++) {
+            for (int j_col = 0; j_col < 3; j_col++) {
+              new_f[i][j_col] *= scale;
+            }
+          }
+        }
         for (int i = 0; i < 3; i++) {
           for (int j_col = 0; j_col < 3; j_col++) {
-            particles.deformation[particle * 9 + i * 3 + j_col] = new_f[i][j_col] * scale;
+            particles.deformation[particle * 9 + i * 3 + j_col] = new_f[i][j_col];
           }
         }
       }
@@ -1784,6 +1983,7 @@ void substep(ParticleData &particles,
              const Span<int> particle_order,
              const Span<const Collider> colliders,
              const ha::HaSdfGrid *sdf,
+             const GridContacts &contacts,
              const float surface_tension,
              P2gSlices *slices,
              Stats &r_stats)
@@ -1795,7 +1995,7 @@ void substep(ParticleData &particles,
   particle_to_grid_all(particles, dt, grid, particle_order, surface_tension > 0.0f, slices);
   r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
-  update_grid(grid, settings, dt, surface_tension, colliders, sdf, r_stats);
+  update_grid(grid, settings, dt, surface_tension, contacts, r_stats);
   r_stats.milliseconds_update_grid += elapsed_ms(mark);
   mark = std::chrono::steady_clock::now();
   grid_to_particle(particles, grid, dt, particle_order);
@@ -1846,6 +2046,7 @@ void substep_two_phase(ParticleData &particles,
                        const Span<int> sand_order,
                        const Span<const Collider> colliders,
                        const ha::HaSdfGrid *sdf,
+                       const GridContacts &contacts,
                        const float surface_tension,
                        P2gSlices *slices,
                        Stats &r_stats)
@@ -1862,7 +2063,7 @@ void substep_two_phase(ParticleData &particles,
       particle_to_grid_all(particles, dt_solid, sand_grid, sand_order, false, slices);
       r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
       mark = std::chrono::steady_clock::now();
-      update_grid(sand_grid, settings, dt_solid, 0.0f, colliders, sdf, r_stats);
+      update_grid(sand_grid, settings, dt_solid, 0.0f, contacts, r_stats);
       r_stats.milliseconds_update_grid += elapsed_ms(mark);
     }
     if (fluid_step) {
@@ -1874,7 +2075,7 @@ void substep_two_phase(ParticleData &particles,
                            slices);
       r_stats.milliseconds_particle_to_grid += elapsed_ms(mark);
       mark = std::chrono::steady_clock::now();
-      update_grid(fluid_grid, settings, dt_fluid, surface_tension, colliders, sdf, r_stats);
+      update_grid(fluid_grid, settings, dt_fluid, surface_tension, contacts, r_stats);
       r_stats.milliseconds_update_grid += elapsed_ms(mark);
     }
     if (solid_step && fluid_step) {
@@ -2486,6 +2687,13 @@ void solve_frame(ParticleData &particles,
     }
   }
 
+  /* Collider contacts are sampled once for the whole frame: the grid nodes do not move between
+   * substeps, so resampling the field in every substep was pure overhead (it is eight trilinear
+   * samples per node for a mesh collider). */
+  GridContacts contacts;
+  build_grid_contacts(grid, Span<const Collider>(resolved.data(), resolved.size()),
+                      sdf_valid ? sdf.get() : nullptr, contacts);
+
   /* A stable particle order makes the scattering (and the slice merge) deterministic. */
   Vector<int> order(particles.size());
   std::iota(order.begin(), order.end(), 0);
@@ -2594,6 +2802,7 @@ void solve_frame(ParticleData &particles,
                       sand_order.as_span(),
                       Span<const Collider>(resolved.data(), resolved.size()),
                       sdf_valid ? sdf.get() : nullptr,
+                      contacts,
                       surface_tension,
                       use_slices ? &slices : nullptr,
                       r_stats);
@@ -2607,6 +2816,7 @@ void solve_frame(ParticleData &particles,
               order,
               Span<const Collider>(resolved.data(), resolved.size()),
               sdf_valid ? sdf.get() : nullptr,
+              contacts,
               surface_tension,
               use_slices ? &slices : nullptr,
               r_stats);

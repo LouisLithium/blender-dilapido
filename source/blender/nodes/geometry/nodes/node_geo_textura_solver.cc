@@ -772,15 +772,16 @@ static void node_geo_exec(GeoNodeExecParams params)
   if (getenv("BLENDER_TEXTURA_PROFILE") != nullptr) {
     fprintf(stderr,
             "TEXTURA_PROFILE particles=%d cells=%d active=%d substeps=%d fluid_steps=%d "
-            "solid_steps=%d two_phase=%d "
-            "total=%.2f clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
+            "solid_steps=%d two_phase=%d\n",
             stats.particles,
             stats.grid_cells,
             stats.active_cells,
             stats.substeps,
             stats.fluid_substeps,
             stats.solid_substeps,
-            stats.two_phase ? 1 : 0,
+            stats.two_phase ? 1 : 0);
+    fprintf(stderr,
+            "TEXTURA_PROFILE total=%.2f clear=%.2f p2g=%.2f grid=%.2f g2p=%.2f advect=%.2f ms\n",
             stats.milliseconds,
             stats.milliseconds_clear,
             stats.milliseconds_particle_to_grid,
