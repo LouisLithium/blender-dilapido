@@ -1247,21 +1247,36 @@ struct P2gSlices {
     if (int(mass.size()) == slice_count && cells == cell_count) {
       return true;
     }
-    cells = cell_count;
-    mass.clear();
-    momentum.clear();
-    color.clear();
-    active.clear();
-    mass.reserve(slice_count);
-    momentum.reserve(slice_count);
-    color.reserve(slice_count);
-    active.reserve(slice_count);
-    for (int i = 0; i < slice_count; i++) {
-      mass.append(Vector<float>(cell_count, 0.0f));
-      momentum.append(Vector<float3>(cell_count, float3(0.0f)));
-      color.append(Vector<float>(cell_count, 0.0f));
-      active.append(Vector<int>());
+    if (int(mass.size()) != slice_count) {
+      /* Different slicing: rebuild the buffers (rare, only when the budget or the grid size class
+       * changes). */
+      mass.clear();
+      momentum.clear();
+      color.clear();
+      active.clear();
+      mass.reserve(slice_count);
+      momentum.reserve(slice_count);
+      color.reserve(slice_count);
+      active.reserve(slice_count);
+      for (int i = 0; i < slice_count; i++) {
+        mass.append(Vector<float>(cell_count, 0.0f));
+        momentum.append(Vector<float3>(cell_count, float3(0.0f)));
+        color.append(Vector<float>(cell_count, 0.0f));
+        active.append(Vector<int>());
+      }
     }
+    else if (cells != cell_count) {
+      /* A moving domain changes the cell count almost every frame. Reallocating and zeroing three
+       * dense grids each time is tens of megabytes of memset; growing the existing buffers only
+       * fills the new tail (they are all zero when `ensure` runs, `merge_into` clears them). */
+      for (int i = 0; i < slice_count; i++) {
+        mass[i].resize(cell_count, 0.0f);
+        momentum[i].resize(cell_count, float3(0.0f));
+        color[i].resize(cell_count, 0.0f);
+        active[i].clear();
+      }
+    }
+    cells = cell_count;
     return true;
   }
 
@@ -1355,8 +1370,56 @@ void build_grid_contacts(const GridData &grid,
   if (colliders.is_empty() && (sdf == nullptr || !sdf->is_valid())) {
     return;
   }
-  const int cell_count = int(grid.cell_count());
   const float contact_range = 1.5f * grid.dx;
+  /* Only the cells that can be close to a collider: a large, mostly empty domain would otherwise
+   * be scanned in full every frame (the user's scene has a million cells and a single floor). The
+   * margins match what `sample_solids` itself considers, so the resulting contact set is the same. */
+  float3 region_min = float3(std::numeric_limits<float>::max());
+  float3 region_max = float3(-std::numeric_limits<float>::max());
+  bool any_region = false;
+  if (sdf != nullptr && sdf->is_valid()) {
+    /* The field is sampled up to eight of its own voxels outside its box. */
+    const float margin = std::max(contact_range, 8.0f * sdf->spacing);
+    const float3 field_max = sdf->origin + float3(sdf->dims - int3(1)) * sdf->spacing;
+    region_min = math::min(region_min, sdf->origin - float3(margin));
+    region_max = math::max(region_max, field_max + float3(margin));
+    any_region = true;
+  }
+  for (const Collider &collider : colliders) {
+    if (!collider.box) {
+      continue;
+    }
+    /* Oriented box: the eight transformed corners bound it. */
+    for (int corner = 0; corner < 8; corner++) {
+      const float3 local = float3((corner & 1) != 0 ? collider.box_local_max.x :
+                                                        collider.box_local_min.x,
+                                  (corner & 2) != 0 ? collider.box_local_max.y :
+                                                        collider.box_local_min.y,
+                                  (corner & 4) != 0 ? collider.box_local_max.z :
+                                                        collider.box_local_min.z);
+      const float3 world = math::transform_point(collider.box_transform, local);
+      region_min = math::min(region_min, world - float3(contact_range));
+      region_max = math::max(region_max, world + float3(contact_range));
+      any_region = true;
+    }
+  }
+  if (!any_region) {
+    return;
+  }
+  const int3 lo = int3(math::clamp(int(std::floor((region_min.x - grid.origin.x) / grid.dx)),
+                                   0, grid.dims.x - 1),
+                       math::clamp(int(std::floor((region_min.y - grid.origin.y) / grid.dx)),
+                                   0, grid.dims.y - 1),
+                       math::clamp(int(std::floor((region_min.z - grid.origin.z) / grid.dx)),
+                                   0, grid.dims.z - 1));
+  const int3 hi = int3(math::clamp(int(std::ceil((region_max.x - grid.origin.x) / grid.dx)),
+                                   0, grid.dims.x - 1),
+                       math::clamp(int(std::ceil((region_max.y - grid.origin.y) / grid.dx)),
+                                   0, grid.dims.y - 1),
+                       math::clamp(int(std::ceil((region_max.z - grid.origin.z) / grid.dx)),
+                                   0, grid.dims.z - 1));
+  const int3 span = hi - lo + int3(1);
+  const int cell_count = span.x * span.y * span.z;
   const int dims_x = grid.dims.x;
   const int dims_y = grid.dims.y;
   /* Per chunk output, concatenated in chunk order afterwards: appending from several threads would
@@ -1369,14 +1432,15 @@ void build_grid_contacts(const GridData &grid,
       Vector<GridContactEntry> &out = chunk_entries[chunk];
       const int begin = chunk * CHUNK;
       const int end = std::min(begin + CHUNK, cell_count);
-      for (int index = begin; index < end; index++) {
-        const int x = index % dims_x;
-        const int y = (index / dims_x) % dims_y;
-        const int z = index / (dims_x * dims_y);
+      for (int i = begin; i < end; i++) {
+        const int x = lo.x + i % span.x;
+        const int y = lo.y + (i / span.x) % span.y;
+        const int z = lo.z + i / (span.x * span.y);
         const float3 world = grid.origin + float3(float(x), float(y), float(z)) * grid.dx;
         const SolidSample sample = sample_solids(world, colliders, sdf, grid.dx * 0.5f);
         if (sample.distance < contact_range) {
-          out.append({index, sample.distance, sample.normal, sample.friction});
+          out.append({(z * dims_y + y) * dims_x + x, sample.distance, sample.normal,
+                      sample.friction});
         }
       }
     }
@@ -1481,6 +1545,11 @@ void update_grid(GridData &grid,
     threading::parallel_for(contact_entries.index_range(), 256, [&](const IndexRange range) {
       for (const int range_i : range) {
         const GridContactEntry &entry = contact_entries[range_i];
+        if (grid.mass[entry.index] <= 1e-12f) {
+          /* Nothing was scattered here, so the velocity is zero and a contact would be a no-op.
+           * Keeping the write out of the pass is what lets `clear()` zero only the active set. */
+          continue;
+        }
         float3 velocity = grid.velocity[entry.index];
         if (entry.distance < 0.0f) {
           velocity = float3(0.0f);
@@ -2394,6 +2463,15 @@ void ParticleData::fill_defaults()
 void GridData::clear()
 {
   const int cells = cell_count();
+  if (int(mass.size()) == cells && cleared_dims == dims) {
+    /* Every writer only touches cells in `active` (particle to grid appends them, the grid update
+     * and the drag pass iterate them, and the contact pass skips cells without mass), so zeroing
+     * that list restores the empty state. A full fill of a two million cell box would be tens of
+     * megabytes of memset per frame for nothing. */
+    this->clear_active();
+    return;
+  }
+  cleared_dims = dims;
   mass.resize(cells);
   momentum.resize(cells);
   velocity.resize(cells);

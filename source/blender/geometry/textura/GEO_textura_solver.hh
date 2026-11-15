@@ -266,6 +266,12 @@ struct GridData {
    */
   Vector<int> active;
 
+  /**
+   * Cell dimensions the cell arrays were last cleared for. `clear()` can then zero only the active
+   * cells, because every writer touches exactly those (see the comment in the implementation).
+   */
+  int3 cleared_dims = int3(0);
+
   int cell_count() const
   {
     return dims.x * dims.y * dims.z;
