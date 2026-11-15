@@ -137,6 +137,20 @@ struct Settings {
   float inter_phase_drag = 20.0f;
   /** Safety cap. When the box needs more cells the spacing is increased instead. */
   int max_grid_cells = 4 << 20;
+
+  /**
+   * Largest particle mass of the frame, filled in by `solve_frame`.
+   *
+   * A node that only grazes a particle's stencil carries a mass many orders of magnitude below one
+   * particle, yet the stress term deposits momentum in it with no mass to divide by. Its
+   * `momentum / mass` is the classic MPM free-surface blow-up: measured in a container scene, nodes
+   * with 1e-10 kg reached 10 km/s on impact, the interpolated velocity gradient threw `det(F)` to
+   * -11 and the material was then ejected at 40-60 m/s, which reads as "the fluid is shrinking" from
+   * a fixed camera. Such a node cannot represent material, so it is treated as air (velocity zero).
+   */
+  float reference_particle_mass = 0.0f;
+  /** Largest particle speed before this frame, used to bound the grid velocity. */
+  float max_particle_speed = 0.0f;
 };
 
 /**

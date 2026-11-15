@@ -23,7 +23,9 @@
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
 
+#include "BLI_kdtree.hh"
 #include "BLI_math_vector.hh"
+#include "BLI_task.hh"
 
 #include "node_geometry_util.hh"
 
@@ -116,10 +118,50 @@ void compute_lame(const MaterialParameters &params, float &r_mu, float &r_lambda
   r_lambda = young * poisson / ((1.0f + poisson) * (1.0f - 2.0f * poisson));
 }
 
+/**
+ * Median distance between a point and its nearest neighbour: the spacing the seed was laid out with.
+ *
+ * The MPM rest state is "one particle represents `volume` of material", so a seed that is denser or
+ * looser than `(2 * radius)^3` per point starts the frame away from its rest density. Measured in a
+ * container scene seeded eleven times denser than the radius implies: the material expanded eleven
+ * times, filled the whole container and sloshed for a hundred frames. Deriving the volume from the
+ * measured spacing makes any seed density start at rest; correctly seeded scenes are unchanged
+ * because there the spacing *is* `2 * radius`.
+ */
+float estimate_seed_spacing(const VArray<float3> &positions)
+{
+  const int count = positions.size();
+  if (count < 8) {
+    return 0.0f;
+  }
+  KDTree<float3> *tree = kdtree_new<float3>(uint(count));
+  for (const int i : IndexRange(count)) {
+    kdtree_insert(tree, i, positions[i]);
+  }
+  kdtree_balance(tree);
+  Array<float> distances(count, 0.0f);
+  threading::parallel_for(IndexRange(count), 4096, [&](const IndexRange range) {
+    for (const int i : range) {
+      KDTreeNearest<float3> nearest[2];
+      const int found = kdtree_find_nearest_n(tree, positions[i], nearest, 2);
+      /* The point itself is the closest node, so the neighbour is the second one. Coincident points
+       * give a zero distance; the median ignores a few of those. */
+      /* `kdtree_find_nearest_n` already takes the square root, so `dist` is a distance. */
+      distances[i] = found >= 2 ? std::max(nearest[1].dist, 0.0f) : 0.0f;
+    }
+  });
+  kdtree_free(tree);
+  Array<float> sorted = distances;
+  const int middle = count / 2;
+  std::nth_element(sorted.begin(), sorted.begin() + middle, sorted.end());
+  return sorted[middle];
+}
+
 /** Writes the per point attributes of one component and evaluates the initial velocity field. */
 void write_component(GeometryComponent &component,
                      const MaterialParameters &params,
-                     const fn::Field<float3> &velocity_field)
+                     const fn::Field<float3> &velocity_field,
+                     float *r_seed_spacing)
 {
   const AttrDomain domain = AttrDomain::Point;
   const int count = component.attribute_domain_size(domain);
@@ -131,8 +173,27 @@ void write_component(GeometryComponent &component,
   const bool has_positions = bool(positions);
 
   const float radius = std::max(params.radius, 1e-5f);
-  const float volume = params.volume > 0.0f ? params.volume :
-                                              (2.0f * radius) * (2.0f * radius) * (2.0f * radius);
+  const float radius_volume = (2.0f * radius) * (2.0f * radius) * (2.0f * radius);
+  /* An explicit volume always wins. Otherwise the measured seed spacing decides, and the radius is
+   * only the fallback for inputs too small (or too irregular) to measure. */
+  float seed_spacing = 0.0f;
+  if (params.volume <= 0.0f && has_positions) {
+    seed_spacing = estimate_seed_spacing(positions);
+  }
+  /* A seed that is already within 2% of `2 * radius` keeps the exact `(2 * radius)^3` volume, so
+   * existing scenes are bit identical; only seeds that are clearly too dense or too loose switch to
+   * the measured spacing (the measured value is a few float ulp off `2 * radius` even for a perfect
+   * lattice, and that tiny mass difference is enough to split a chaotic splash between the CPU and
+   * the device). */
+  const bool natural_spacing = seed_spacing <= 0.0f ||
+                               std::fabs(seed_spacing - 2.0f * radius) <= 0.02f * 2.0f * radius;
+  const float volume = params.volume > 0.0f ?
+                           params.volume :
+                           (natural_spacing ? radius_volume :
+                                              seed_spacing * seed_spacing * seed_spacing);
+  if (r_seed_spacing != nullptr) {
+    *r_seed_spacing = seed_spacing;
+  }
   const float mass = params.mass > 0.0f ? params.mass : params.density * volume;
 
   float mu = 0.0f;
@@ -334,13 +395,14 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0.05f)
         .min(1e-5f)
         .subtype(PROP_DISTANCE)
-        .description("Radius of one particle. The particle volume is `(2 * radius)^3` when it is "
-                     "not set explicitly, so the spacing of the input points should be about "
-                     "`2 * radius`");
+        .description("Radius of one particle. The particle volume follows the spacing of the "
+                     "input points when `Particle Volume` is 0, so any seed density starts at the "
+                     "rest density; about `2 * radius` apart is the natural spacing");
     panel.add_input<decl::Float>("Particle Volume"_ustr)
         .default_value(0.0f)
         .min(0.0f)
-        .description("Volume one particle represents in m^3. 0 derives it from the particle radius");
+        .description("Volume one particle represents in m^3. 0 measures the spacing of the input "
+                     "points and uses `spacing^3`, which keeps the material at its rest density");
     panel.add_input<decl::Float>("Mass"_ustr)
         .default_value(0.0f)
         .min(0.0f)
@@ -590,6 +652,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const fn::Field<float3> velocity_field = params.extract_input<fn::Field<float3>>(
       "Initial Velocity"_ustr);
 
+  float seed_spacing = 0.0f;
   for (const GeometryComponent::Type type : {GeometryComponent::Type::Mesh,
                                              GeometryComponent::Type::PointCloud,
                                              GeometryComponent::Type::Curve})
@@ -601,7 +664,27 @@ static void node_geo_exec(GeoNodeExecParams params)
     if (component.attribute_domain_size(AttrDomain::Point) == 0) {
       continue;
     }
-    write_component(component, material, velocity_field);
+    write_component(component, material, velocity_field, &seed_spacing);
+  }
+
+  /* Say when the volume had to follow the seed spacing instead of the radius: the number explains
+   * why the material will not expand (or compress) on the first frames. */
+  if (seed_spacing > 0.0f && material.volume <= 0.0f) {
+    const float radius = std::max(material.radius, 1e-5f);
+    const float radius_volume = (2.0f * radius) * (2.0f * radius) * (2.0f * radius);
+    const float seed_volume = seed_spacing * seed_spacing * seed_spacing;
+    const float ratio = seed_volume / radius_volume;
+    if (ratio < 0.75f || ratio > 1.25f) {
+      params.error_message_add(
+          NodeWarningType::Info,
+          fmt::format("Init Textura Data: the points are seeded {:.4g} m apart, so each "
+                           "particle represents {:.4g} m^3 ({:.2f}x the (2 * radius)^3 volume). "
+                           "The particle volume and mass follow the seed spacing, so the material "
+                       "starts at its rest density instead of expanding",
+                      double(seed_spacing),
+                      double(seed_volume),
+                      double(ratio)));
+    }
   }
 
   /* An empty input is the most common reason a Textura setup looks frozen: the material data is

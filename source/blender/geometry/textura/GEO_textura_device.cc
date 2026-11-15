@@ -77,6 +77,20 @@ enum ParamIndex : int {
   P_TWO_PHASE,
   /** 0 to scatter fluid particles, 1 to scatter everything else (sand and snow). */
   P_PHASE,
+  /** Largest particle mass of the frame; nodes far below it are stencil whiskers, not material. */
+  P_REFERENCE_MASS,
+  /** Upper bound for a grid node velocity (twice the fastest particle of the previous frame). */
+  P_SPEED_LIMIT,
+  /**
+   * Fixed point scales for the `atomicAdd` scatter. Mass and momentum use one, the surface tension
+   * colour field another: the host picks both per frame so a node keeps about twenty significant
+   * bits even when one particle is very light (mass = density * spacing^3 can be 1e-4 kg), while the
+   * sums never overflow an `int`.
+   */
+  P_MASS_FIXED,
+  P_INV_MASS_FIXED,
+  P_COLOR_FIXED,
+  P_INV_COLOR_FIXED,
   P_PARAM_COUNT,
 };
 
@@ -158,6 +172,12 @@ const char *GLSL_PRELUDE =
     "#define P_INTER_PHASE_DRAG 28\n"
     "#define P_TWO_PHASE 29\n"
     "#define P_PHASE 30\n"
+    "#define P_REFERENCE_MASS 31\n"
+    "#define P_SPEED_LIMIT 32\n"
+    "#define P_MASS_FIXED 33\n"
+    "#define P_INV_MASS_FIXED 34\n"
+    "#define P_COLOR_FIXED 35\n"
+    "#define P_INV_COLOR_FIXED 36\n"
     "#define HA_BOX_STRIDE 48\n"
     "#define PROP_MASS 0\n"
     "#define PROP_VOLUME 1\n"
@@ -182,8 +202,10 @@ const char *GLSL_PRELUDE =
     "#define PROP_WALL_FRICTION 20\n"
     "#define PROP_ADHESION 21\n"
     "#define HA_PROP_STRIDE 24\n"
-    "#define HA_FIXED 262144.0\n"
-    "#define HA_INV_FIXED (1.0 / 262144.0)\n"
+    "#define HA_MASS_FIXED params[P_MASS_FIXED]\n"
+    "#define HA_INV_MASS_FIXED params[P_INV_MASS_FIXED]\n"
+    "#define HA_COLOR_FIXED params[P_COLOR_FIXED]\n"
+    "#define HA_INV_COLOR_FIXED params[P_INV_COLOR_FIXED]\n"
     "#define HA_MATERIAL_FLUID 0\n"
     "#define HA_MATERIAL_SAND 1\n"
     "#define HA_MATERIAL_SNOW 2\n"
@@ -363,7 +385,7 @@ const char *GLSL_COLOR =
     "  int dy_n = int(params[P_DIM_Y]);\n"
     "  int dz_n = int(params[P_DIM_Z]);\n"
     "  if (x < 0 || y < 0 || z < 0 || x >= dx_n || y >= dy_n || z >= dz_n) { return 0.0; }\n"
-    "  return float(gmass_color[((z * dy_n + y) * dx_n + x) * 2 + 1]) * HA_INV_FIXED;\n"
+    "  return float(gmass_color[((z * dy_n + y) * dx_n + x) * 2 + 1]) * HA_INV_COLOR_FIXED;\n"
     "}\n"
     "\n"
     "vec3 ha_color_normal_at(int x, int y, int z)\n"
@@ -913,13 +935,13 @@ const char *KERNEL_P2G =
     "        int xx = bx + i;\n"
     "        if (xx < 0 || xx >= dims_x) { continue; }\n"
     "        int index = (z * dims_y + y) * dims_x + xx;\n"
-    "        atomicAdd(gmass_color[index * 2 + 0], int(round(w * mass * HA_FIXED)));\n"
-    "        atomicAdd(gmass_color[index * 2 + 1], int(round(w * color * HA_FIXED)));\n"
+    "        atomicAdd(gmass_color[index * 2 + 0], int(round(w * mass * HA_MASS_FIXED)));\n"
+    "        atomicAdd(gmass_color[index * 2 + 1], int(round(w * color * HA_COLOR_FIXED)));\n"
     "        vec3 m = momentum_base + a0 * (float(i) * dx) + a1 * (float(jj) * dx) +\n"
     "                 a2 * (float(k) * dx);\n"
-    "        atomicAdd(gmom[index * 3 + 0], int(round(m.x * w * HA_FIXED)));\n"
-    "        atomicAdd(gmom[index * 3 + 1], int(round(m.y * w * HA_FIXED)));\n"
-    "        atomicAdd(gmom[index * 3 + 2], int(round(m.z * w * HA_FIXED)));\n"
+    "        atomicAdd(gmom[index * 3 + 0], int(round(m.x * w * HA_MASS_FIXED)));\n"
+    "        atomicAdd(gmom[index * 3 + 1], int(round(m.y * w * HA_MASS_FIXED)));\n"
+    "        atomicAdd(gmom[index * 3 + 2], int(round(m.z * w * HA_MASS_FIXED)));\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -936,8 +958,9 @@ const char *KERNEL_GRID =
     "  float dx = params[P_DX];\n"
     "  float dt = params[P_DT];\n"
     "  vec3 origin = vec3(params[P_ORIGIN_X], params[P_ORIGIN_Y], params[P_ORIGIN_Z]);\n"
-    "  float mass = float(gmass_color[index * 2 + 0]) * HA_INV_FIXED;\n"
-    "  if (mass <= 1e-12) {\n"
+    "  float mass = float(gmass_color[index * 2 + 0]) * HA_INV_MASS_FIXED;\n"
+    "  // Whisker nodes are air, not material.\n"
+    "  if (mass <= max(1e-12, params[P_REFERENCE_MASS] * 1e-3)) {\n"
     "    gvel[index * 3 + 0] = 0.0;\n"
     "    gvel[index * 3 + 1] = 0.0;\n"
     "    gvel[index * 3 + 2] = 0.0;\n"
@@ -945,7 +968,7 @@ const char *KERNEL_GRID =
     "  }\n"
     "  vec3 v = vec3(float(gmom[index * 3 + 0]), float(gmom[index * 3 + 1]),\n"
     "                float(gmom[index * 3 + 2])) *\n"
-    "           HA_INV_FIXED / mass;\n"
+    "           HA_INV_MASS_FIXED / mass;\n"
     "  v += ha_gravity() * dt;\n"
     "  v *= max(0.0, 1.0 - params[P_VELOCITY_DAMPING] * dt);\n"
     "  int x = index % dims_x;\n"
@@ -989,6 +1012,10 @@ const char *KERNEL_GRID =
     "    float f = clamp(params[P_BOUNDARY_FRICTION] * 2.0 * friction, 0.0, 1.0);\n"
     "    v = ha_wall_contact(v, normal, f, dt);\n"
     "  }\n"
+    "  if (mass < params[P_REFERENCE_MASS] * 0.25) {\n"
+    "    float speed = length(v);\n"
+    "    if (speed > params[P_SPEED_LIMIT]) { v *= params[P_SPEED_LIMIT] / speed; }\n"
+    "  }\n"
     "  gvel[index * 3 + 0] = v.x;\n"
     "  gvel[index * 3 + 1] = v.y;\n"
     "  gvel[index * 3 + 2] = v.z;\n"
@@ -999,8 +1026,8 @@ const char *KERNEL_DRAG =
     "{\n"
     "  int index = int(gl_GlobalInvocationID.x);\n"
     "  if (index >= int(params[P_CELLS])) { return; }\n"
-    "  float fluid_mass = float(fluid_mass_color[index * 2]) * HA_INV_FIXED;\n"
-    "  float sand_mass = float(sand_mass_color[index * 2]) * HA_INV_FIXED;\n"
+    "  float fluid_mass = float(fluid_mass_color[index * 2]) * HA_INV_MASS_FIXED;\n"
+    "  float sand_mass = float(sand_mass_color[index * 2]) * HA_INV_MASS_FIXED;\n"
     "  if (fluid_mass <= 1e-12 || sand_mass <= 1e-12) { return; }\n"
     "  vec3 fluid_v = vec3(fluid_velocity[index * 3 + 0], fluid_velocity[index * 3 + 1],\n"
     "                      fluid_velocity[index * 3 + 2]);\n"
@@ -1104,12 +1131,13 @@ const char *KERNEL_G2P =
     "  int type = int(props[p * HA_PROP_STRIDE + PROP_TYPE]);\n"
     "  if (type == HA_MATERIAL_FLUID) {\n"
     "    float j = determinant(new_f);\n"
-    "    if (!(abs(j) > 1e-8)) {\n"
+    "    // Inverted F: reset, never flip.\n"
+    "    if (!(j > 0.0)) {\n"
     "      new_f = mat3(1.0);\n"
     "      j = 1.0;\n"
     "    }\n"
     "    float target = clamp(j, 0.25, 4.0);\n"
-    "    new_f *= pow(target / j, 1.0 / 3.0);\n"
+    "    if (target != j) { new_f *= pow(target / j, 1.0 / 3.0); }\n"
     "  }\n"
     "  else {\n"
     "    float c_arr[3][3];\n"
@@ -1204,12 +1232,12 @@ const char *KERNEL_ADVECT =
     "      float below_mass = 0.0;\n"
     "      if (all(greaterThanEqual(own, ivec3(0))) && all(lessThan(own, dims))) {\n"
     "        own_mass = float(gmass_color[((own.z * dims.y + own.y) * dims.x + own.x) * 2]) *\n"
-    "                    HA_INV_FIXED;\n"
+    "                    HA_INV_MASS_FIXED;\n"
     "      }\n"
     "      if (all(greaterThanEqual(below, ivec3(0))) && all(lessThan(below, dims))) {\n"
     "        below_mass = float(gmass_color[((below.z * dims.y + below.y) * dims.x + below.x) *\n"
     "                                      2]) *\n"
-    "                     HA_INV_FIXED;\n"
+    "                     HA_INV_MASS_FIXED;\n"
     "      }\n"
     "      supported = own_mass > 0.0 && below_mass > 0.35 * own_mass;\n"
     "    }\n"
@@ -1596,6 +1624,22 @@ bool device_solve(ParticleData &particles,
 
   textura_step_log("upload begin");
   /* ---- upload ---- */
+  /* Fixed point scales. The integer budget per node is ~1e8 (well below INT_MAX), split between the
+   * node sums: up to ~64 particles land on one node and the momentum is bounded by mass * speed. */
+  float max_particle_mass = 0.0f;
+  float max_particle_speed = 0.0f;
+  for (int i = 0; i < particle_count; i++) {
+    max_particle_mass = std::max(max_particle_mass, particles.mass[i]);
+    max_particle_speed = std::max(max_particle_speed, math::length(particles.velocities[i]));
+  }
+  constexpr double NODE_INT_BUDGET = 1.0e8;
+  constexpr double NODE_PARTICLES = 64.0;
+  const double node_momentum = std::max(double(max_particle_mass) * NODE_PARTICLES *
+                                            std::max(1.0, double(max_particle_speed)),
+                                        1e-30);
+  const double mass_fixed = std::clamp(NODE_INT_BUDGET / node_momentum, 1.0, 1.0e9);
+  const double color_fixed = std::clamp(NODE_INT_BUDGET / NODE_PARTICLES, 1.0, 1.0e9);
+
   std::vector<float> params(P_PARAM_COUNT, 0.0f);
   {
     params[P_COUNT] = float(particle_count);
@@ -1622,6 +1666,12 @@ bool device_solve(ParticleData &particles,
     params[P_INTER_PHASE_DRAG] = std::max(settings.inter_phase_drag, 0.0f);
     params[P_TWO_PHASE] = two_phase ? 1.0f : 0.0f;
     params[P_PHASE] = 0.0f;
+    params[P_MASS_FIXED] = float(mass_fixed);
+    params[P_INV_MASS_FIXED] = float(1.0 / mass_fixed);
+    params[P_COLOR_FIXED] = float(color_fixed);
+    params[P_INV_COLOR_FIXED] = float(1.0 / color_fixed);
+    params[P_REFERENCE_MASS] = settings.reference_particle_mass;
+    params[P_SPEED_LIMIT] = std::max(4.0f * settings.max_particle_speed, 1.0f);
     float sdf_friction = 0.0f;
     for (const Collider &collider : colliders) {
       if (!collider.box) {

@@ -1470,12 +1470,23 @@ void update_grid(GridData &grid,
   const float inv_2dx = 0.5f / grid.dx;
   const float cell_volume = grid.dx * grid.dx * grid.dx;
   constexpr float MAX_TENSION_ACCELERATION = 300.0f;
+  /* See `Settings::reference_particle_mass`: a node far lighter than one particle is stencil air,
+   * not material. 1e-3 still keeps a node that only sees one corner weight of a particle (1/64th). */
+  static const bool mass_guard = std::getenv("BLENDER_TEXTURA_NO_MASS_GUARD") == nullptr;
+  const float min_node_mass = mass_guard ?
+                                  std::max(1e-12f, settings.reference_particle_mass * 1e-3f) :
+                                  1e-12f;
+  /* Safety net for the whisker nodes that do pass the mass test: a node that is a small fraction of
+   * a particle can never be faster than a few times the fastest particle. Nodes that hold real
+   * material are left untouched, so a splash is not clipped. */
+  const float speed_limit = std::max(4.0f * settings.max_particle_speed, 1.0f);
+  const float whisker_mass = settings.reference_particle_mass * 0.25f;
 
   threading::parallel_for(active.index_range(), 256, [&](const IndexRange range) {
     for (const int range_i : range) {
       const int i = active[range_i];
       const float mass = grid.mass[i];
-      if (mass <= 1e-12f) {
+      if (mass <= min_node_mass) {
         grid.velocity[i] = float3(0.0f);
         continue;
       }
@@ -1531,6 +1542,13 @@ void update_grid(GridData &grid,
       }
       if ((z == 0 && velocity.z < 0.0f) || (z == grid.dims.z - 1 && velocity.z > 0.0f)) {
         velocity.z = 0.0f;
+      }
+
+      if (mass < whisker_mass) {
+        const float node_speed = math::length(velocity);
+        if (node_speed > speed_limit) {
+          velocity *= speed_limit / node_speed;
+        }
       }
 
       grid.velocity[i] = velocity;
@@ -1798,7 +1816,11 @@ void grid_to_particle(ParticleData &particles,
          * fluid stays inside the window, so the cube root (a libm call per particle and substep) is
          * only evaluated when the clamp actually kicks in. */
         float j = determinant3(new_f);
-        if (!std::isfinite(j) || std::fabs(j) < 1e-6f) {
+        if (!std::isfinite(j) || j <= 0.0f) {
+          /* An inverted `F` cannot be repaired by scaling: with a negative `j` the factor
+           * `cbrt(clamp(j) / j)` is negative, which *flips* the matrix and reports `det = 0.25`
+           * (tension) on the next substep, pumping energy back in (measured: a single inverted
+           * particle grew into a 40 m/s boil). Reset the volume state instead. */
           identity3(new_f);
           j = 1.0f;
         }
@@ -2070,11 +2092,16 @@ float maximum_surface_tension(const ParticleData &particles)
   return sigma;
 }
 
-float maximum_speed(const ParticleData &particles)
+float maximum_speed(const ParticleData &particles, float *r_max_mass = nullptr)
 {
   float max_speed = 0.0f;
+  float max_mass = 0.0f;
   for (const int particle : IndexRange(particles.size())) {
     max_speed = std::max(max_speed, math::length(particles.velocities[particle]));
+    max_mass = std::max(max_mass, particles.mass[particle]);
+  }
+  if (r_max_mass != nullptr) {
+    *r_max_mass = max_mass;
   }
   return max_speed;
 }
@@ -2630,6 +2657,50 @@ static void collider_sdf_cache_put(const uint64_t hash,
 
 /** \} */
 
+/**
+ * Per frame particle diagnostics, printed only with `BLENDER_TEXTURA_DEBUG_BBOX=1`. Short lines on
+ * purpose: captured stderr is truncated at about 120 characters. `badj` counts particles whose
+ * `det(F)` left the valid window, which is the fastest way to spot a material update blow-up.
+ */
+void debug_particle_bbox(const ParticleData &particles, const char *tag)
+{
+  if (std::getenv("BLENDER_TEXTURA_DEBUG_BBOX") == nullptr || particles.size() == 0) {
+    return;
+  }
+  float3 lo(std::numeric_limits<float>::max());
+  float3 hi(-std::numeric_limits<float>::max());
+  float max_speed = 0.0f;
+  float min_j = 1.0f;
+  float max_j = 1.0f;
+  int bad = 0;
+  for (const int i : particles.positions.index_range()) {
+    const float3 p = particles.positions[i];
+    lo = math::min(lo, p);
+    hi = math::max(hi, p);
+    max_speed = std::max(max_speed, math::length(particles.velocities[i]));
+    const float j = determinant3_data(&particles.deformation[i * 9]);
+    if (std::isfinite(j)) {
+      min_j = std::min(min_j, j);
+      max_j = std::max(max_j, j);
+      if (!(j > 0.2f && j < 4.1f)) {
+        bad++;
+      }
+    }
+  }
+  std::fprintf(stderr,
+               "TEXTURA_BBOX %s x=%.3f..%.3f y=%.3f..%.3f z=%.3f..%.3f vmax=%.2f\n",
+               tag,
+               lo.x,
+               hi.x,
+               lo.y,
+               hi.y,
+               lo.z,
+               hi.z,
+               double(max_speed));
+  std::fprintf(stderr, "TEXTURA_STATE %s J=%.2f..%.2f badj=%d\n", tag, double(min_j), double(max_j), bad);
+  std::fflush(stderr);
+}
+
 void solve_frame(ParticleData &particles,
                  const Span<const Collider> colliders,
                  const Settings &settings,
@@ -2650,7 +2721,14 @@ void solve_frame(ParticleData &particles,
   particles.fill_defaults();
 
   GridData grid;
-  const float max_speed = maximum_speed(particles);
+  float max_particle_mass = 0.0f;
+  const float max_speed = maximum_speed(particles, &max_particle_mass);
+  /* The grid pass needs both to tell material apart from stencil whiskers; see
+   * `Settings::reference_particle_mass`. */
+  Settings frame_settings = settings;
+  frame_settings.reference_particle_mass =
+      std::getenv("BLENDER_TEXTURA_NO_MASS_GUARD") == nullptr ? max_particle_mass : 0.0f;
+  frame_settings.max_particle_speed = max_speed;
   const float surface_tension = maximum_surface_tension(particles);
   make_domain(particles, colliders, settings, delta_time, max_speed, grid, r_stats);
 
@@ -2944,7 +3022,7 @@ void solve_frame(ParticleData &particles,
     }
     else if (device_solve(particles,
                           Span<const Collider>(resolved.data(), resolved.size()),
-                          settings,
+                          frame_settings,
                           grid,
                           sdf_valid ? sdf.get() : nullptr,
                           delta_time,
@@ -2954,6 +3032,7 @@ void solve_frame(ParticleData &particles,
                           reason))
     {
       collect_stats(particles, r_stats);
+      debug_particle_bbox(particles, "device");
       const auto end = std::chrono::steady_clock::now();
       r_stats.milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
       if (r_device_used != nullptr) {
@@ -3006,7 +3085,7 @@ void solve_frame(ParticleData &particles,
 
   if (two_phase) {
     substep_two_phase(particles,
-                      settings,
+                      frame_settings,
                       dt_outer,
                       dt_fluid,
                       dt_solid,
@@ -3027,7 +3106,7 @@ void solve_frame(ParticleData &particles,
   else {
     for (int step = 0; step < outer_steps; step++) {
       substep(particles,
-              settings,
+              frame_settings,
               dt_outer,
               grid,
               order,
@@ -3045,6 +3124,7 @@ void solve_frame(ParticleData &particles,
   }
 
   collect_stats(particles, r_stats);
+  debug_particle_bbox(particles, "cpu");
 
   /* The CFL request is only known before the frame; the chosen substeps may have been clamped. */
   const auto end = std::chrono::steady_clock::now();
