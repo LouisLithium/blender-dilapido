@@ -69,6 +69,14 @@ enum ParamIndex : int {
   P_SDF_DIM_X,
   P_SDF_DIM_Y,
   P_SDF_DIM_Z,
+  /** Coeffient of the continuum surface force (max over the particles). 0 disables it. */
+  P_SURFACE_TENSION,
+  /** Exponential momentum exchange rate between the two phase grids, in 1/s. */
+  P_INTER_PHASE_DRAG,
+  /** 1 when the frame runs on two velocity grids. */
+  P_TWO_PHASE,
+  /** 0 to scatter fluid particles, 1 to scatter everything else (sand and snow). */
+  P_PHASE,
   P_PARAM_COUNT,
 };
 
@@ -146,6 +154,10 @@ const char *GLSL_PRELUDE =
     "#define P_SDF_DIM_X 24\n"
     "#define P_SDF_DIM_Y 25\n"
     "#define P_SDF_DIM_Z 26\n"
+    "#define P_SURFACE_TENSION 27\n"
+    "#define P_INTER_PHASE_DRAG 28\n"
+    "#define P_TWO_PHASE 29\n"
+    "#define P_PHASE 30\n"
     "#define HA_BOX_STRIDE 48\n"
     "#define PROP_MASS 0\n"
     "#define PROP_VOLUME 1\n"
@@ -341,6 +353,26 @@ const char *GLSL_PRELUDE =
     "      }\n"
     "    }\n"
     "  }\n"
+    "}\n"
+    "\n";
+
+const char *GLSL_COLOR =
+    "float ha_color_at(int x, int y, int z)\n"
+    "{\n"
+    "  int dx_n = int(params[P_DIM_X]);\n"
+    "  int dy_n = int(params[P_DIM_Y]);\n"
+    "  int dz_n = int(params[P_DIM_Z]);\n"
+    "  if (x < 0 || y < 0 || z < 0 || x >= dx_n || y >= dy_n || z >= dz_n) { return 0.0; }\n"
+    "  return float(gmass_color[((z * dy_n + y) * dx_n + x) * 2 + 1]) * HA_INV_FIXED;\n"
+    "}\n"
+    "\n"
+    "vec3 ha_color_normal_at(int x, int y, int z)\n"
+    "{\n"
+    "  vec3 local = vec3(ha_color_at(x + 1, y, z) - ha_color_at(x - 1, y, z),\n"
+    "                    ha_color_at(x, y + 1, z) - ha_color_at(x, y - 1, z),\n"
+    "                    ha_color_at(x, y, z + 1) - ha_color_at(x, y, z - 1));\n"
+    "  float local_len = length(local);\n"
+    "  return local_len > 1e-6 ? local / local_len : vec3(0.0);\n"
     "}\n"
     "\n";
 
@@ -600,7 +632,7 @@ const char *GLSL_MATERIAL =
     "    float fe[3][3];\n"
     "    for (int row = 0; row < 3; row++) {\n"
     "      for (int col = 0; col < 3; col++) {\n"
-    "        fp[row][col] = plastic[p * 9 + row * 3 + col];\n"
+    "        fp[row][col] = deform[p * 18 + 9 + row * 3 + col];\n"
     "        fe[row][col] = f[row][col];\n"
     "      }\n"
     "    }\n"
@@ -792,7 +824,8 @@ const char *KERNEL_CLEAR =
     "{\n"
     "  int i = int(gl_GlobalInvocationID.x);\n"
     "  if (i >= int(params[P_CELLS])) { return; }\n"
-    "  gmass[i] = 0;\n"
+    "  gmass_color[i * 2 + 0] = 0;\n"
+    "  gmass_color[i * 2 + 1] = 0;\n"
     "  gmom[i * 3 + 0] = 0;\n"
     "  gmom[i * 3 + 1] = 0;\n"
     "  gmom[i * 3 + 2] = 0;\n"
@@ -806,6 +839,10 @@ const char *KERNEL_P2G =
     "{\n"
     "  int p = int(gl_GlobalInvocationID.x);\n"
     "  if (p >= int(params[P_COUNT])) { return; }\n"
+    "  // Two-phase: phase 0 scatters fluid, phase 1 scatters sand and snow.\n"
+    "  int type = int(props[p * HA_PROP_STRIDE + PROP_TYPE]);\n"
+    "  bool is_fluid = type == HA_MATERIAL_FLUID;\n"
+    "  if (params[P_TWO_PHASE] > 0.5 && (is_fluid != (params[P_PHASE] < 0.5))) { return; }\n"
     "  int dims_x = int(params[P_DIM_X]);\n"
     "  int dims_y = int(params[P_DIM_Y]);\n"
     "  int dims_z = int(params[P_DIM_Z]);\n"
@@ -815,9 +852,9 @@ const char *KERNEL_P2G =
     "  vec3 x = vec3(pos[p * 3 + 0], pos[p * 3 + 1], pos[p * 3 + 2]);\n"
     "  float mass = props[p * HA_PROP_STRIDE + PROP_MASS];\n"
     "  float volume = props[p * HA_PROP_STRIDE + PROP_VOLUME];\n"
-    "  mat3 f = mat3(vec3(deform[p * 9 + 0], deform[p * 9 + 3], deform[p * 9 + 6]),\n"
-    "                vec3(deform[p * 9 + 1], deform[p * 9 + 4], deform[p * 9 + 7]),\n"
-    "                vec3(deform[p * 9 + 2], deform[p * 9 + 5], deform[p * 9 + 8]));\n"
+    "  mat3 f = mat3(vec3(deform[p * 18 + 0], deform[p * 18 + 3], deform[p * 18 + 6]),\n"
+    "                vec3(deform[p * 18 + 1], deform[p * 18 + 4], deform[p * 18 + 7]),\n"
+    "                vec3(deform[p * 18 + 2], deform[p * 18 + 5], deform[p * 18 + 8]));\n"
     "  mat3 c = mat3(vec3(affine[p * 9 + 0], affine[p * 9 + 3], affine[p * 9 + 6]),\n"
     "                vec3(affine[p * 9 + 1], affine[p * 9 + 4], affine[p * 9 + 7]),\n"
     "                vec3(affine[p * 9 + 2], affine[p * 9 + 5], affine[p * 9 + 8]));\n"
@@ -835,6 +872,8 @@ const char *KERNEL_P2G =
     "            c[1] * mass;\n"
     "  vec3 a2 = vec3(stress[0][2], stress[1][2], stress[2][2]) * (stress_scale * volume) +\n"
     "            c[2] * mass;\n"
+    "  float color = 0.0;\n"
+    "  if (params[P_SURFACE_TENSION] > 0.0 && is_fluid) { color = volume / (dx * dx * dx); }\n"
     "  vec3 velocity = vec3(vel[p * 3 + 0], vel[p * 3 + 1], vel[p * 3 + 2]);\n"
     "  int bx;\n"
     "  int by;\n"
@@ -874,7 +913,8 @@ const char *KERNEL_P2G =
     "        int xx = bx + i;\n"
     "        if (xx < 0 || xx >= dims_x) { continue; }\n"
     "        int index = (z * dims_y + y) * dims_x + xx;\n"
-    "        atomicAdd(gmass[index], int(round(w * mass * HA_FIXED)));\n"
+    "        atomicAdd(gmass_color[index * 2 + 0], int(round(w * mass * HA_FIXED)));\n"
+    "        atomicAdd(gmass_color[index * 2 + 1], int(round(w * color * HA_FIXED)));\n"
     "        vec3 m = momentum_base + a0 * (float(i) * dx) + a1 * (float(jj) * dx) +\n"
     "                 a2 * (float(k) * dx);\n"
     "        atomicAdd(gmom[index * 3 + 0], int(round(m.x * w * HA_FIXED)));\n"
@@ -896,7 +936,7 @@ const char *KERNEL_GRID =
     "  float dx = params[P_DX];\n"
     "  float dt = params[P_DT];\n"
     "  vec3 origin = vec3(params[P_ORIGIN_X], params[P_ORIGIN_Y], params[P_ORIGIN_Z]);\n"
-    "  float mass = float(gmass[index]) * HA_INV_FIXED;\n"
+    "  float mass = float(gmass_color[index * 2 + 0]) * HA_INV_FIXED;\n"
     "  if (mass <= 1e-12) {\n"
     "    gvel[index * 3 + 0] = 0.0;\n"
     "    gvel[index * 3 + 1] = 0.0;\n"
@@ -911,6 +951,29 @@ const char *KERNEL_GRID =
     "  int x = index % dims_x;\n"
     "  int y = (index / dims_x) % dims_y;\n"
     "  int z = index / (dims_x * dims_y);\n"
+    "  // Continuum surface force.\n"
+    "  float sigma = params[P_SURFACE_TENSION];\n"
+    "  if (sigma > 0.0) {\n"
+    "    float grad_x = (ha_color_at(x + 1, y, z) - ha_color_at(x - 1, y, z)) * (0.5 / dx);\n"
+    "    float grad_y = (ha_color_at(x, y + 1, z) - ha_color_at(x, y - 1, z)) * (0.5 / dx);\n"
+    "    float grad_z = (ha_color_at(x, y, z + 1) - ha_color_at(x, y, z - 1)) * (0.5 / dx);\n"
+    "    vec3 grad = vec3(grad_x, grad_y, grad_z);\n"
+    "    if (length(grad) > 1e-3) {\n"
+    "      vec3 n_xp = ha_color_normal_at(x + 1, y, z);\n"
+    "      vec3 n_xm = ha_color_normal_at(x - 1, y, z);\n"
+    "      vec3 n_yp = ha_color_normal_at(x, y + 1, z);\n"
+    "      vec3 n_ym = ha_color_normal_at(x, y - 1, z);\n"
+    "      vec3 n_zp = ha_color_normal_at(x, y, z + 1);\n"
+    "      vec3 n_zm = ha_color_normal_at(x, y, z - 1);\n"
+    "      float divergence = (n_xp.x - n_xm.x + n_yp.y - n_ym.y + n_zp.z - n_zm.z) *\n"
+    "                         (0.5 / dx);\n"
+    "      float kappa = -divergence;\n"
+    "      vec3 accel = grad * (sigma * kappa * (dx * dx * dx) / mass);\n"
+    "      float magnitude = length(accel);\n"
+    "      if (magnitude > 300.0) { accel *= 300.0 / magnitude; }\n"
+    "      v += accel * dt;\n"
+    "    }\n"
+    "  }\n"
     "  if ((x == 0 && v.x < 0.0) || (x == dims_x - 1 && v.x > 0.0)) { v.x = 0.0; }\n"
     "  if ((y == 0 && v.y < 0.0) || (y == dims_y - 1 && v.y > 0.0)) { v.y = 0.0; }\n"
     "  if ((z == 0 && v.z < 0.0) || (z == dims_z - 1 && v.z > 0.0)) { v.z = 0.0; }\n"
@@ -931,11 +994,40 @@ const char *KERNEL_GRID =
     "  gvel[index * 3 + 2] = v.z;\n"
     "}\n";
 
+const char *KERNEL_DRAG =
+    "void main()\n"
+    "{\n"
+    "  int index = int(gl_GlobalInvocationID.x);\n"
+    "  if (index >= int(params[P_CELLS])) { return; }\n"
+    "  float fluid_mass = float(fluid_mass_color[index * 2]) * HA_INV_FIXED;\n"
+    "  float sand_mass = float(sand_mass_color[index * 2]) * HA_INV_FIXED;\n"
+    "  if (fluid_mass <= 1e-12 || sand_mass <= 1e-12) { return; }\n"
+    "  vec3 fluid_v = vec3(fluid_velocity[index * 3 + 0], fluid_velocity[index * 3 + 1],\n"
+    "                      fluid_velocity[index * 3 + 2]);\n"
+    "  vec3 sand_v = vec3(sand_velocity[index * 3 + 0], sand_velocity[index * 3 + 1],\n"
+    "                     sand_velocity[index * 3 + 2]);\n"
+    "  float rate = 1.0 - exp(-params[P_INTER_PHASE_DRAG] * params[P_DT]);\n"
+    "  vec3 difference = (sand_v - fluid_v) * rate;\n"
+    "  float total = fluid_mass + sand_mass;\n"
+    "  fluid_v += difference * (sand_mass / total);\n"
+    "  sand_v -= difference * (fluid_mass / total);\n"
+    "  fluid_velocity[index * 3 + 0] = fluid_v.x;\n"
+    "  fluid_velocity[index * 3 + 1] = fluid_v.y;\n"
+    "  fluid_velocity[index * 3 + 2] = fluid_v.z;\n"
+    "  sand_velocity[index * 3 + 0] = sand_v.x;\n"
+    "  sand_velocity[index * 3 + 1] = sand_v.y;\n"
+    "  sand_velocity[index * 3 + 2] = sand_v.z;\n"
+    "}\n";
+
 const char *KERNEL_G2P =
     "void main()\n"
     "{\n"
     "  int p = int(gl_GlobalInvocationID.x);\n"
     "  if (p >= int(params[P_COUNT])) { return; }\n"
+    "  if (params[P_TWO_PHASE] > 0.5) {\n"
+    "    bool is_fluid = int(props[p * HA_PROP_STRIDE + PROP_TYPE]) == HA_MATERIAL_FLUID;\n"
+    "    if (is_fluid != (params[P_PHASE] < 0.5)) { return; }\n"
+    "  }\n"
     "  int dims_x = int(params[P_DIM_X]);\n"
     "  int dims_y = int(params[P_DIM_Y]);\n"
     "  int dims_z = int(params[P_DIM_Z]);\n"
@@ -1005,9 +1097,9 @@ const char *KERNEL_G2P =
     "  affine[p * 9 + 6] = c[0].z;\n"
     "  affine[p * 9 + 7] = c[1].z;\n"
     "  affine[p * 9 + 8] = c[2].z;\n"
-    "  mat3 f = mat3(vec3(deform[p * 9 + 0], deform[p * 9 + 3], deform[p * 9 + 6]),\n"
-    "                vec3(deform[p * 9 + 1], deform[p * 9 + 4], deform[p * 9 + 7]),\n"
-    "                vec3(deform[p * 9 + 2], deform[p * 9 + 5], deform[p * 9 + 8]));\n"
+    "  mat3 f = mat3(vec3(deform[p * 18 + 0], deform[p * 18 + 3], deform[p * 18 + 6]),\n"
+    "                vec3(deform[p * 18 + 1], deform[p * 18 + 4], deform[p * 18 + 7]),\n"
+    "                vec3(deform[p * 18 + 2], deform[p * 18 + 5], deform[p * 18 + 8]));\n"
     "  mat3 new_f = f + dt * (c * f);\n"
     "  int type = int(props[p * HA_PROP_STRIDE + PROP_TYPE]);\n"
     "  if (type == HA_MATERIAL_FLUID) {\n"
@@ -1041,7 +1133,7 @@ const char *KERNEL_G2P =
     "      float fp_in[3][3];\n"
     "      for (int row = 0; row < 3; row++) {\n"
     "        for (int col = 0; col < 3; col++) {\n"
-    "          fp_in[row][col] = plastic[p * 9 + row * 3 + col];\n"
+    "          fp_in[row][col] = deform[p * 18 + 9 + row * 3 + col];\n"
     "        }\n"
     "      }\n"
     "      float fp_out[3][3];\n"
@@ -1052,7 +1144,7 @@ const char *KERNEL_G2P =
     "                         hardening_out, damage_out);\n"
     "      for (int row = 0; row < 3; row++) {\n"
     "        for (int col = 0; col < 3; col++) {\n"
-    "          plastic[p * 9 + row * 3 + col] = fp_out[row][col];\n"
+    "          deform[p * 18 + 9 + row * 3 + col] = fp_out[row][col];\n"
     "        }\n"
     "      }\n"
     "      props[p * HA_PROP_STRIDE + PROP_VOLUME] = volume_out;\n"
@@ -1060,15 +1152,15 @@ const char *KERNEL_G2P =
     "      props[p * HA_PROP_STRIDE + PROP_DAMAGE] = damage_out;\n"
     "    }\n"
     "  }\n"
-    "  deform[p * 9 + 0] = new_f[0].x;\n"
-    "  deform[p * 9 + 1] = new_f[1].x;\n"
-    "  deform[p * 9 + 2] = new_f[2].x;\n"
-    "  deform[p * 9 + 3] = new_f[0].y;\n"
-    "  deform[p * 9 + 4] = new_f[1].y;\n"
-    "  deform[p * 9 + 5] = new_f[2].y;\n"
-    "  deform[p * 9 + 6] = new_f[0].z;\n"
-    "  deform[p * 9 + 7] = new_f[1].z;\n"
-    "  deform[p * 9 + 8] = new_f[2].z;\n"
+    "  deform[p * 18 + 0] = new_f[0].x;\n"
+    "  deform[p * 18 + 1] = new_f[1].x;\n"
+    "  deform[p * 18 + 2] = new_f[2].x;\n"
+    "  deform[p * 18 + 3] = new_f[0].y;\n"
+    "  deform[p * 18 + 4] = new_f[1].y;\n"
+    "  deform[p * 18 + 5] = new_f[2].y;\n"
+    "  deform[p * 18 + 6] = new_f[0].z;\n"
+    "  deform[p * 18 + 7] = new_f[1].z;\n"
+    "  deform[p * 18 + 8] = new_f[2].z;\n"
     "}\n";
 
 const char *KERNEL_ADVECT =
@@ -1076,6 +1168,10 @@ const char *KERNEL_ADVECT =
     "{\n"
     "  int p = int(gl_GlobalInvocationID.x);\n"
     "  if (p >= int(params[P_COUNT])) { return; }\n"
+    "  if (params[P_TWO_PHASE] > 0.5) {\n"
+    "    bool is_fluid = int(props[p * HA_PROP_STRIDE + PROP_TYPE]) == HA_MATERIAL_FLUID;\n"
+    "    if (is_fluid != (params[P_PHASE] < 0.5)) { return; }\n"
+    "  }\n"
     "  int dims_x = int(params[P_DIM_X]);\n"
     "  int dims_y = int(params[P_DIM_Y]);\n"
     "  int dims_z = int(params[P_DIM_Z]);\n"
@@ -1107,10 +1203,12 @@ const char *KERNEL_ADVECT =
     "      float own_mass = 0.0;\n"
     "      float below_mass = 0.0;\n"
     "      if (all(greaterThanEqual(own, ivec3(0))) && all(lessThan(own, dims))) {\n"
-    "        own_mass = float(gmass[(own.z * dims.y + own.y) * dims.x + own.x]) * HA_INV_FIXED;\n"
+    "        own_mass = float(gmass_color[((own.z * dims.y + own.y) * dims.x + own.x) * 2]) *\n"
+    "                    HA_INV_FIXED;\n"
     "      }\n"
     "      if (all(greaterThanEqual(below, ivec3(0))) && all(lessThan(below, dims))) {\n"
-    "        below_mass = float(gmass[(below.z * dims.y + below.y) * dims.x + below.x]) *\n"
+    "        below_mass = float(gmass_color[((below.z * dims.y + below.y) * dims.x + below.x) *\n"
+    "                                      2]) *\n"
     "                     HA_INV_FIXED;\n"
     "      }\n"
     "      supported = own_mass > 0.0 && below_mass > 0.35 * own_mass;\n"
@@ -1159,41 +1257,39 @@ template<size_t N> Span<gpu::StorageBuf *> buffer_span(std::array<gpu::StorageBu
 
 const std::array<HaShaderResource, 4> CLEAR_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
-    {1, HaShaderQualifier::ReadWrite, "int", "gmass[]"},
+    {1, HaShaderQualifier::ReadWrite, "int", "gmass_color[]"},
     {2, HaShaderQualifier::ReadWrite, "int", "gmom[]"},
     {3, HaShaderQualifier::ReadWrite, "float", "gvel[]"},
 }};
 
-const std::array<HaShaderResource, 9> P2G_RESOURCES{{
+const std::array<HaShaderResource, 8> P2G_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
     {1, HaShaderQualifier::Read, "float", "pos[]"},
     {2, HaShaderQualifier::Read, "float", "vel[]"},
     {3, HaShaderQualifier::Read, "float", "affine[]"},
     {4, HaShaderQualifier::Read, "float", "deform[]"},
     {5, HaShaderQualifier::Read, "float", "props[]"},
-    {6, HaShaderQualifier::Read, "float", "plastic[]"},
-    {7, HaShaderQualifier::ReadWrite, "int", "gmass[]"},
-    {8, HaShaderQualifier::ReadWrite, "int", "gmom[]"},
+    {6, HaShaderQualifier::ReadWrite, "int", "gmass_color[]"},
+    {7, HaShaderQualifier::ReadWrite, "int", "gmom[]"},
 }};
 
 const std::array<HaShaderResource, 6> GRID_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
-    {1, HaShaderQualifier::Read, "int", "gmass[]"},
+    {1, HaShaderQualifier::Read, "int", "gmass_color[]"},
     {2, HaShaderQualifier::Read, "int", "gmom[]"},
     {3, HaShaderQualifier::Write, "float", "gvel[]"},
     {4, HaShaderQualifier::Read, "float", "box_data[]"},
     {5, HaShaderQualifier::Read, "float", "sdf_data[]"},
 }};
 
-const std::array<HaShaderResource, 8> G2P_RESOURCES{{
+const std::array<HaShaderResource, 7> G2P_RESOURCES{{
     {0, HaShaderQualifier::Read, "float", "params[]"},
     {1, HaShaderQualifier::Read, "float", "pos[]"},
     {2, HaShaderQualifier::ReadWrite, "float", "vel[]"},
     {3, HaShaderQualifier::ReadWrite, "float", "affine[]"},
     {4, HaShaderQualifier::ReadWrite, "float", "deform[]"},
     {5, HaShaderQualifier::ReadWrite, "float", "props[]"},
-    {6, HaShaderQualifier::ReadWrite, "float", "plastic[]"},
-    {7, HaShaderQualifier::Read, "float", "gvel[]"},
+    {6, HaShaderQualifier::Read, "float", "gvel[]"},
 }};
 
 const std::array<HaShaderResource, 7> ADVECT_RESOURCES{{
@@ -1203,7 +1299,16 @@ const std::array<HaShaderResource, 7> ADVECT_RESOURCES{{
     {3, HaShaderQualifier::Read, "float", "props[]"},
     {4, HaShaderQualifier::Read, "float", "box_data[]"},
     {5, HaShaderQualifier::Read, "float", "sdf_data[]"},
-    {6, HaShaderQualifier::Read, "int", "gmass[]"},
+    {6, HaShaderQualifier::Read, "int", "gmass_color[]"},
+}};
+
+/** Momentum exchange between the two phase grids: params, fluid velocity/mass, sand velocity/mass. */
+const std::array<HaShaderResource, 5> DRAG_RESOURCES{{
+    {0, HaShaderQualifier::Read, "float", "params[]"},
+    {1, HaShaderQualifier::ReadWrite, "float", "fluid_velocity[]"},
+    {2, HaShaderQualifier::Read, "int", "fluid_mass_color[]"},
+    {3, HaShaderQualifier::ReadWrite, "float", "sand_velocity[]"},
+    {4, HaShaderQualifier::Read, "int", "sand_mass_color[]"},
 }};
 
 /** \} */
@@ -1214,13 +1319,17 @@ struct DeviceState {
   HaBuffer positions;
   HaBuffer velocities;
   HaBuffer affine;
+  /** `F` at 0..8 and `F_p` at 9..18, so the snow return mapping stays inside 8 SSBO slots. */
   HaBuffer deform;
   HaBuffer props;
-  /** Plastic part of the deformation gradient, snow only. */
-  HaBuffer plastic;
-  HaBufferInt grid_mass;
+  /** Mass and the CSF colour field, two ints per cell (fixed point). */
+  HaBufferInt grid_mass_color;
   HaBufferInt grid_momentum;
   HaBuffer grid_velocity;
+  /** Second phase grid (sand and snow). Only allocated for two-phase frames. */
+  HaBufferInt sand_mass_color;
+  HaBufferInt sand_momentum;
+  HaBuffer sand_velocity;
   HaBuffer box_data;
   HaBuffer sdf_data;
 
@@ -1229,9 +1338,11 @@ struct DeviceState {
   gpu::Shader *grid = nullptr;
   gpu::Shader *g2p = nullptr;
   gpu::Shader *advect = nullptr;
+  gpu::Shader *drag = nullptr;
 
   int particle_count = 0;
   int cell_count = 0;
+  bool two_phase = false;
   /**
    * The GPU context the buffers belong to. Geometry evaluation alternates between the window
    * context (main thread) and the draw manager's shared viewport context (worker threads), and GPU
@@ -1240,23 +1351,30 @@ struct DeviceState {
    */
   GPUContext *context = nullptr;
 
-  bool ensure(const int particles, const int cells, std::string &r_reason)
+  bool ensure(const int particles, const int cells, const bool two_phase, std::string &r_reason)
   {
     GPUContext *active = GPU_context_active_get();
     if (context != active) {
       this->release();
       context = active;
     }
-    if (particle_count != particles || cell_count != cells) {
+    if (particle_count != particles || cell_count != cells || this->two_phase != two_phase) {
       particle_count = particles;
       cell_count = cells;
-      if (!params.ensure(P_PARAM_COUNT) || !positions.ensure(int64_t(particles) * 3) ||
-          !velocities.ensure(int64_t(particles) * 3) || !affine.ensure(int64_t(particles) * 9) ||
-          !deform.ensure(int64_t(particles) * 9) || !props.ensure(int64_t(particles) * PROP_STRIDE) ||
-          !plastic.ensure(int64_t(particles) * 9) ||
-          !grid_mass.ensure(cells) || !grid_momentum.ensure(int64_t(cells) * 3) ||
-          !grid_velocity.ensure(int64_t(cells) * 3))
-      {
+      this->two_phase = two_phase;
+      bool ok = params.ensure(P_PARAM_COUNT) && positions.ensure(int64_t(particles) * 3) &&
+                velocities.ensure(int64_t(particles) * 3) &&
+                affine.ensure(int64_t(particles) * 9) && deform.ensure(int64_t(particles) * 18) &&
+                props.ensure(int64_t(particles) * PROP_STRIDE) &&
+                grid_mass_color.ensure(int64_t(cells) * 2) &&
+                grid_momentum.ensure(int64_t(cells) * 3) &&
+                grid_velocity.ensure(int64_t(cells) * 3);
+      if (ok && two_phase) {
+        ok = sand_mass_color.ensure(int64_t(cells) * 2) &&
+             sand_momentum.ensure(int64_t(cells) * 3) &&
+             sand_velocity.ensure(int64_t(cells) * 3);
+      }
+      if (!ok) {
         /* Forget the counts as well, otherwise the next frame with the same particle and cell
          * counts would report success and dispatch with half the buffers unbound (which reads and
          * writes nothing, i.e. a simulation that silently stops moving). */
@@ -1276,15 +1394,18 @@ struct DeviceState {
     affine.free();
     deform.free();
     props.free();
-    plastic.free();
-    grid_mass.free();
+    grid_mass_color.free();
     grid_momentum.free();
     grid_velocity.free();
+    sand_mass_color.free();
+    sand_momentum.free();
+    sand_velocity.free();
     box_data.free();
     sdf_data.free();
-    clear = p2g = grid = g2p = advect = nullptr;
+    clear = p2g = grid = g2p = advect = drag = nullptr;
     particle_count = 0;
     cell_count = 0;
+    two_phase = false;
     context = nullptr;
   }
 };
@@ -1363,16 +1484,6 @@ bool device_supported(const ParticleData &particles,
       return false;
     }
   }
-  if (settings.two_phase) {
-    r_reason = "two-phase grids are still CPU only";
-    return false;
-  }
-  for (const float value : particles.surface_tension) {
-    if (value > 0.0f) {
-      r_reason = "surface tension is still CPU only";
-      return false;
-    }
-  }
   return true;
 }
 
@@ -1391,6 +1502,27 @@ bool device_solve(ParticleData &particles,
   if (particle_count <= 0 || cell_count <= 0) {
     r_reason = "empty grid or particle set";
     return false;
+  }
+
+  bool has_fluid = false;
+  bool has_sand = false;
+  for (const int material : particles.material) {
+    if (material == int(MaterialType::Fluid)) {
+      has_fluid = true;
+    }
+    else {
+      has_sand = true;
+    }
+    if (has_fluid && has_sand) {
+      break;
+    }
+  }
+  const bool two_phase = settings.two_phase && has_fluid && has_sand;
+
+  /* The CPU solver uses one coefficient for the whole set (the maximum), so the device does too. */
+  float surface_tension = 0.0f;
+  for (const float value : particles.surface_tension) {
+    surface_tension = std::max(surface_tension, value);
   }
 
   int box_count = 0;
@@ -1427,13 +1559,13 @@ bool device_solve(ParticleData &particles,
 
   DeviceState &state = device_state();
   ensure_exit_hook();
-  if (!state.ensure(particle_count, cell_count, r_reason)) {
+  if (!state.ensure(particle_count, cell_count, two_phase, r_reason)) {
     return false;
   }
 
   /* ---- upload ---- */
+  std::vector<float> params(P_PARAM_COUNT, 0.0f);
   {
-    std::vector<float> params(P_PARAM_COUNT, 0.0f);
     params[P_COUNT] = float(particle_count);
     params[P_CELLS] = float(cell_count);
     params[P_DIM_X] = float(grid.dims.x);
@@ -1453,6 +1585,10 @@ bool device_solve(ParticleData &particles,
     params[P_BOX_COUNT] = float(box_count);
     params[P_SDF_ENABLED] = sdf_enabled ? 1.0f : 0.0f;
     params[P_SDF_INVERTED] = (sdf_enabled && sdf->inverted) ? 1.0f : 0.0f;
+    params[P_SURFACE_TENSION] = surface_tension;
+    params[P_INTER_PHASE_DRAG] = std::max(settings.inter_phase_drag, 0.0f);
+    params[P_TWO_PHASE] = two_phase ? 1.0f : 0.0f;
+    params[P_PHASE] = 0.0f;
     float sdf_friction = 0.0f;
     for (const Collider &collider : colliders) {
       if (!collider.box) {
@@ -1481,12 +1617,18 @@ bool device_solve(ParticleData &particles,
   state.affine.upload(
       Span<float>(const_cast<float *>(reinterpret_cast<const float *>(particles.affine.data())),
                   int64_t(particle_count) * 9));
-  state.deform.upload(
-      Span<float>(const_cast<float *>(reinterpret_cast<const float *>(particles.deformation.data())),
-                  int64_t(particle_count) * 9));
-  state.plastic.upload(
-      Span<float>(const_cast<float *>(reinterpret_cast<const float *>(particles.plastic.data())),
-                  int64_t(particle_count) * 9));
+  {
+    /* `F` first, then `F_p`: both are row-major 3x3 blocks inside the same buffer. */
+    std::vector<float> deform(size_t(particle_count) * 18, 0.0f);
+    for (int i = 0; i < particle_count; i++) {
+      float *dst = &deform[size_t(i) * 18];
+      for (int k = 0; k < 9; k++) {
+        dst[k] = particles.deformation[i * 9 + k];
+        dst[9 + k] = particles.plastic[i * 9 + k];
+      }
+    }
+    state.deform.upload(deform);
+  }
   {
     std::vector<float> props(size_t(particle_count) * PROP_STRIDE, 0.0f);
     for (int i = 0; i < particle_count; i++) {
@@ -1572,7 +1714,7 @@ bool device_solve(ParticleData &particles,
                                    as_span(P2G_RESOURCES),
                                    LOCAL_GROUP_SIZE);
   state.grid = ha_shader_get_source("textura|grid",
-                                    std::string(GLSL_PRELUDE) + KERNEL_GRID,
+                                    std::string(GLSL_PRELUDE) + GLSL_COLOR + KERNEL_GRID,
                                     as_span(GRID_RESOURCES),
                                     LOCAL_GROUP_SIZE);
   state.g2p = ha_shader_get_source("textura|g2p",
@@ -1583,38 +1725,72 @@ bool device_solve(ParticleData &particles,
                                       std::string(GLSL_PRELUDE) + KERNEL_ADVECT,
                                       as_span(ADVECT_RESOURCES),
                                       LOCAL_GROUP_SIZE);
+  state.drag = ha_shader_get_source("textura|drag",
+                                    std::string(GLSL_PRELUDE) + KERNEL_DRAG,
+                                    as_span(DRAG_RESOURCES),
+                                    LOCAL_GROUP_SIZE);
   if (state.clear == nullptr || state.p2g == nullptr || state.grid == nullptr ||
-      state.g2p == nullptr || state.advect == nullptr)
+      state.g2p == nullptr || state.advect == nullptr || state.drag == nullptr)
   {
     r_reason = "shader creation failed";
     return false;
   }
 
   std::array<gpu::StorageBuf *, 4> clear_buffers{
-      state.params.buf(), state.grid_mass.buf(), state.grid_momentum.buf(),
+      state.params.buf(), state.grid_mass_color.buf(), state.grid_momentum.buf(),
       state.grid_velocity.buf()};
-  std::array<gpu::StorageBuf *, 9> p2g_buffers{
+  std::array<gpu::StorageBuf *, 4> sand_clear_buffers{
+      state.params.buf(), state.sand_mass_color.buf(), state.sand_momentum.buf(),
+      state.sand_velocity.buf()};
+  std::array<gpu::StorageBuf *, 8> p2g_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
-      state.deform.buf(), state.props.buf(), state.plastic.buf(), state.grid_mass.buf(),
+      state.deform.buf(), state.props.buf(), state.grid_mass_color.buf(),
       state.grid_momentum.buf()};
-  std::array<gpu::StorageBuf *, 6> grid_buffers{
-      state.params.buf(), state.grid_mass.buf(), state.grid_momentum.buf(),
-      state.grid_velocity.buf(), state.box_data.buf(), state.sdf_data.buf()};
-  std::array<gpu::StorageBuf *, 8> g2p_buffers{
+  std::array<gpu::StorageBuf *, 8> sand_p2g_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
-      state.deform.buf(), state.props.buf(), state.plastic.buf(), state.grid_velocity.buf()};
+      state.deform.buf(), state.props.buf(), state.sand_mass_color.buf(),
+      state.sand_momentum.buf()};
+  std::array<gpu::StorageBuf *, 6> grid_buffers{
+      state.params.buf(), state.grid_mass_color.buf(), state.grid_momentum.buf(),
+      state.grid_velocity.buf(), state.box_data.buf(), state.sdf_data.buf()};
+  std::array<gpu::StorageBuf *, 6> sand_grid_buffers{
+      state.params.buf(), state.sand_mass_color.buf(), state.sand_momentum.buf(),
+      state.sand_velocity.buf(), state.box_data.buf(), state.sdf_data.buf()};
+  std::array<gpu::StorageBuf *, 7> g2p_buffers{
+      state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
+      state.deform.buf(), state.props.buf(), state.grid_velocity.buf()};
+  std::array<gpu::StorageBuf *, 7> sand_g2p_buffers{
+      state.params.buf(), state.positions.buf(), state.velocities.buf(), state.affine.buf(),
+      state.deform.buf(), state.props.buf(), state.sand_velocity.buf()};
   std::array<gpu::StorageBuf *, 7> advect_buffers{
       state.params.buf(), state.positions.buf(), state.velocities.buf(), state.props.buf(),
-      state.box_data.buf(), state.sdf_data.buf(), state.grid_mass.buf()};
+      state.box_data.buf(), state.sdf_data.buf(), state.grid_mass_color.buf()};
+  std::array<gpu::StorageBuf *, 7> sand_advect_buffers{
+      state.params.buf(), state.positions.buf(), state.velocities.buf(), state.props.buf(),
+      state.box_data.buf(), state.sdf_data.buf(), state.sand_mass_color.buf()};
+  std::array<gpu::StorageBuf *, 5> drag_buffers{
+      state.params.buf(), state.grid_velocity.buf(), state.grid_mass_color.buf(),
+      state.sand_velocity.buf(), state.sand_mass_color.buf()};
 
   /* Never dispatch with an unbound slot: Vulkan reads whatever the binding cache had and the
-   * simulation stops updating without any error. */
-  for (const Span<gpu::StorageBuf *> buffers : {buffer_span(clear_buffers),
-                                                buffer_span(p2g_buffers),
-                                                buffer_span(grid_buffers),
-                                                buffer_span(g2p_buffers),
-                                                buffer_span(advect_buffers)})
-  {
+   * simulation stops updating without any error. The second phase grid only exists when two-phase
+   * mode ran this frame. */
+  std::vector<Span<gpu::StorageBuf *>> buffer_sets{
+      buffer_span(clear_buffers),
+      buffer_span(p2g_buffers),
+      buffer_span(grid_buffers),
+      buffer_span(g2p_buffers),
+      buffer_span(advect_buffers),
+  };
+  if (two_phase) {
+    buffer_sets.push_back(buffer_span(sand_clear_buffers));
+    buffer_sets.push_back(buffer_span(sand_p2g_buffers));
+    buffer_sets.push_back(buffer_span(sand_grid_buffers));
+    buffer_sets.push_back(buffer_span(sand_g2p_buffers));
+    buffer_sets.push_back(buffer_span(sand_advect_buffers));
+    buffer_sets.push_back(buffer_span(drag_buffers));
+  }
+  for (const Span<gpu::StorageBuf *> buffers : buffer_sets) {
     for (const gpu::StorageBuf *buffer : buffers) {
       if (buffer == nullptr) {
         r_reason = "a storage buffer is not allocated";
@@ -1623,13 +1799,41 @@ bool device_solve(ParticleData &particles,
     }
   }
 
+  /* The phase guard lives in the kernels, so switching it between dispatches is an upload of the
+   * small params buffer (no re-compilation, the source hash does not change). */
+  const auto upload_phase = [&](const float phase) {
+    if (!two_phase) {
+      return;
+    }
+    params[P_PHASE] = phase;
+    state.params.upload(params);
+  };
+
   /* ---- substeps ---- */
   for (int step = 0; step < substeps; step++) {
-    dispatch(state.clear, buffer_span(clear_buffers), cell_count);
-    dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
-    dispatch(state.grid, buffer_span(grid_buffers), cell_count);
-    dispatch(state.g2p, buffer_span(g2p_buffers), particle_count);
-    dispatch(state.advect, buffer_span(advect_buffers), particle_count);
+    if (two_phase) {
+      upload_phase(0.0f);
+      dispatch(state.clear, buffer_span(clear_buffers), cell_count);
+      dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
+      dispatch(state.grid, buffer_span(grid_buffers), cell_count);
+      upload_phase(1.0f);
+      dispatch(state.clear, buffer_span(sand_clear_buffers), cell_count);
+      dispatch(state.p2g, buffer_span(sand_p2g_buffers), particle_count);
+      dispatch(state.grid, buffer_span(sand_grid_buffers), cell_count);
+      dispatch(state.drag, buffer_span(drag_buffers), cell_count);
+      dispatch(state.g2p, buffer_span(sand_g2p_buffers), particle_count);
+      dispatch(state.advect, buffer_span(sand_advect_buffers), particle_count);
+      upload_phase(0.0f);
+      dispatch(state.g2p, buffer_span(g2p_buffers), particle_count);
+      dispatch(state.advect, buffer_span(advect_buffers), particle_count);
+    }
+    else {
+      dispatch(state.clear, buffer_span(clear_buffers), cell_count);
+      dispatch(state.p2g, buffer_span(p2g_buffers), particle_count);
+      dispatch(state.grid, buffer_span(grid_buffers), cell_count);
+      dispatch(state.g2p, buffer_span(g2p_buffers), particle_count);
+      dispatch(state.advect, buffer_span(advect_buffers), particle_count);
+    }
   }
   GPU_finish();
 
@@ -1643,12 +1847,17 @@ bool device_solve(ParticleData &particles,
   state.affine.download(
       MutableSpan<float>(reinterpret_cast<float *>(particles.affine.data()),
                          int64_t(particle_count) * 9));
-  state.deform.download(
-      MutableSpan<float>(reinterpret_cast<float *>(particles.deformation.data()),
-                         int64_t(particle_count) * 9));
-  state.plastic.download(
-      MutableSpan<float>(reinterpret_cast<float *>(particles.plastic.data()),
-                         int64_t(particle_count) * 9));
+  {
+    std::vector<float> deform(size_t(particle_count) * 18);
+    state.deform.download(deform);
+    for (int i = 0; i < particle_count; i++) {
+      const float *src = &deform[size_t(i) * 18];
+      for (int k = 0; k < 9; k++) {
+        particles.deformation[i * 9 + k] = src[k];
+        particles.plastic[i * 9 + k] = src[9 + k];
+      }
+    }
+  }
   {
     /* Snow compaction and damage are part of the particle state: bring them back so the next frame
      * (substeps, stiffness, rendering) sees what the device computed. */

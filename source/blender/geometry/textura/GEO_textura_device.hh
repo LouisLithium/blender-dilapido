@@ -7,16 +7,22 @@
  *
  * Compute backend (device) version of the Textura MPM substep.
  *
- * The CPU solver in `GEO_textura_solver.cc` is the reference implementation. This file covers a
- * single velocity grid holding fluid, sand or snow particles: the Drucker-Prager sand return
- * mapping, the snow compaction (`F = F_e F_p`) and the per material wall friction/adhesion are
- * ported to the kernels. Two-phase grids and the continuum surface force are still CPU only and
- * are reported as fallback reasons.
+ * The CPU solver in `GEO_textura_solver.cc` is the reference implementation. This file covers fluid,
+ * sand and snow particles on one velocity grid (the Drucker-Prager sand return mapping, the snow
+ * compaction `F = F_e F_p`, per material wall friction/adhesion) plus the two-phase variant, where
+ * fluids and solids each get their own grid and a drag pass exchanges momentum between them. The
+ * continuum surface force runs on the fluid grid from a colour field accumulated in particle to
+ * grid, exactly like the CPU.
  *
  * All state lives in flat storage buffers while a frame is solved; the host uploads the particle
- * arrays once, runs every substep on the device and downloads the result at the end. The dense grid
- * is resident too, so a substep is five dispatches: clear, particle to grid, grid update, grid to
- * particle, advect.
+ * arrays once, runs every substep on the device and downloads the result at the end. The dense grids
+ * are resident too, so a single-phase substep is five dispatches (clear, particle to grid, grid
+ * update, grid to particle, advect) and a two-phase substep is eleven (two grids plus the drag pass,
+ * and advect runs per phase so the contact skin support test uses the phase's own mass).
+ *
+ * `deform[]` holds eighteen floats per particle (`F` at 0..8 and `F_p` at 9..17) and the mass buffer
+ * holds two ints per cell (mass and the colour field), which keeps every kernel within the eight
+ * storage buffer slots the GL backend guarantees.
  *
  * \note Particle to grid accumulates with `atomicAdd` on **fixed point integers** rather than on
  * floats: `GL_EXT_shader_atomic_float` is not available on the supported backends, and integer
