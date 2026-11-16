@@ -97,6 +97,39 @@ const char *KERNEL_FORCES =
     "  deltas[i * 3 + 2] = delta.z;\n"
     "}\n";
 
+/** Measures the host/device round trip of a buffer of the requested size (MB). */
+void transfer_probe()
+{
+  const char *env = std::getenv("BLENDER_WHITE_WATER_TRANSFER_PROBE");
+  const int megabytes = env != nullptr ? int(std::atoi(env)) : 15;
+  if (megabytes <= 0) {
+    return;
+  }
+  const int count = int((int64_t(megabytes) * 1024 * 1024) / 4);
+  HaBufferInt buffer;
+  if (!buffer.ensure(count)) {
+    fprintf(stderr, "TRANSFER probe: allocation of %d MB failed\n", megabytes);
+    return;
+  }
+  Vector<int> data(count, 1);
+  Vector<int> out(count);
+  const double t0 = BLI_time_now_seconds();
+  buffer.upload(data.as_span());
+  GPU_finish();
+  const double t1 = BLI_time_now_seconds();
+  buffer.download(out.as_mutable_span());
+  const double t2 = BLI_time_now_seconds();
+  buffer.download(out.as_mutable_span());
+  const double t3 = BLI_time_now_seconds();
+  fprintf(stderr,
+          "TRANSFER probe %d MB: upload %.2f ms, download %.2f ms, download again %.2f ms\n",
+          megabytes,
+          (t1 - t0) * 1000.0,
+          (t2 - t1) * 1000.0,
+          (t3 - t2) * 1000.0);
+  fflush(stderr);
+}
+
 void dispatch_pass(gpu::Shader *shader,
                    const Span<gpu::StorageBuf *> buffers,
                    const int element_count,
@@ -242,11 +275,22 @@ bool ha_white_water_forces(const Span<const float3> positions,
                 64);
 
   lap("dispatch");
+  if (profile) {
+    GPU_finish();
+    lap("gpu");
+  }
   Array<float> deltas(int64_t(count) * 3);
   deltas_buf.download(deltas.as_mutable_span());
   lap("download");
   for (const int i : IndexRange(count)) {
     r_velocities[i] += float3(deltas[i * 3], deltas[i * 3 + 1], deltas[i * 3 + 2]);
+  }
+  if (std::getenv("BLENDER_WHITE_WATER_TRANSFER_PROBE") != nullptr) {
+    static bool probed = false;
+    if (!probed) {
+      probed = true;
+      transfer_probe();
+    }
   }
   return true;
 }
