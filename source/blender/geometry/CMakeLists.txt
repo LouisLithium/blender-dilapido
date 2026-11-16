@@ -8,6 +8,7 @@ set(INC
   PUBLIC ignis
   PUBLIC rigid_body
   PUBLIC textura
+  PUBLIC whitewater
   PUBLIC xpbd
   ../makesrna
   ../../../intern/eigen
@@ -86,10 +87,13 @@ set(SRC
   textura/GEO_textura_solver.cc
   textura/GEO_textura_device.cc
 
+  whitewater/GEO_white_water_solver.cc
+
   xpbd/intern/xpbd_constraint_coloring.cc
 
   textura/GEO_textura_solver.hh
   textura/GEO_textura_device.hh
+  whitewater/GEO_white_water_solver.hh
 
   GEO_add_curves_on_mesh.hh
   GEO_curve_constraints.hh

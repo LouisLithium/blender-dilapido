@@ -306,6 +306,7 @@ set(SRC
   nodes/node_geo_tool_set_face_set.cc
   nodes/node_geo_tool_set_selection.cc
   nodes/node_geo_transform_geometry.cc
+  nodes/node_geo_white_water_solver.cc
   nodes/node_geo_translate_instances.cc
   nodes/node_geo_transfer_attributes.cc
   nodes/node_geo_triangulate.cc
