@@ -32,7 +32,6 @@
 #include "BLI_math_base.hh"
 #include "BLI_kdtree.hh"
 #include "BLI_math_vector.hh"
-#include "BLI_task.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
 #include "BLI_task.hh"
@@ -54,11 +53,20 @@
 #  include "BKE_volume_openvdb.hh"
 
 #  include <openvdb/openvdb.h>
+#  include <openvdb/tools/LevelSetFilter.h>
 #endif
 
 namespace blender::nodes::node_geo_fluid_surface_cc {
 
 #ifdef WITH_OPENVDB
+
+/** How the surface is reconstructed. */
+enum class SurfaceMode : int {
+  /** Sum of the particle kernels, extracted at `Iso Level` of the rest density. */
+  Density = 0,
+  /** Kernel weighted average of the per particle sphere distances (a smoothed distance field). */
+  Distance = 1,
+};
 
 /** One fluid particle as far as the surface reconstruction is concerned. */
 struct FluidParticle {
@@ -69,8 +77,15 @@ struct FluidParticle {
   float volume;
 };
 
+/**
+ * Collects the particles of one component.
+ *
+ * `override_radius` (the node's `Particle Radius`) wins when it is not zero: an input that already
+ * carries a `radius` attribute used to ignore the socket entirely, which made the input look dead.
+ * Zero means "use the attribute", and 0.05 m when the geometry has none.
+ */
 static void gather_particles_from_component(const GeometryComponent &component,
-                                            const float fallback_radius,
+                                            const float override_radius,
                                             Vector<FluidParticle> &r_particles)
 {
   if (component.is_empty()) {
@@ -89,7 +104,7 @@ static void gather_particles_from_component(const GeometryComponent &component,
     return;
   }
   const VArray<float> radii =
-      attributes->lookup_or_default<float>("radius", AttrDomain::Point, fallback_radius).varray;
+      attributes->lookup_or_default<float>("radius", AttrDomain::Point, 0.05f).varray;
   /* The fluid stores the physical particle mass and the rest density, so the volume of a particle
    * is `mass / density`. Without them the particle is assumed to fill the lattice cell of the
    * recommended spacing, which is exactly one radius. */
@@ -104,12 +119,14 @@ static void gather_particles_from_component(const GeometryComponent &component,
   r_particles.resize(offset + points_num);
   MutableSpan<FluidParticle> dst = r_particles.as_mutable_span().slice(offset, points_num);
   for (const int i : IndexRange(points_num)) {
-    const float radius = std::max(0.0f, radii[i]);
+    const float radius = override_radius > 0.0f ? override_radius : radii[i];
+    const float safe_radius = std::max(radius, 1e-5f);
     const float mass = masses[i];
     const float density = densities[i];
-    const float volume = (mass > 0.0f && density > 0.0f) ? mass / density :
-                                                           radius * radius * radius;
-    dst[i] = {positions[i], radius, volume};
+    const float volume = (mass > 0.0f && density > 0.0f) ?
+                             mass / density :
+                             safe_radius * safe_radius * safe_radius;
+    dst[i] = {positions[i], safe_radius, volume};
   }
 }
 
@@ -396,6 +413,56 @@ static void splat_particles(const Span<FluidParticle> particles,
   }
 }
 
+/**
+ * Splats one bucket of particles as a union of spheres: `min(|x - p| - r)`.
+ *
+ * The union is the honest signed distance field of the particles, so the grid can be handed to
+ * OpenVDB's level set filter below, which smooths it and re-normalises the gradient. Doing the
+ * smoothing *on a distance field* (instead of on a density) is what makes a sheet come out flat:
+ * the filter moves the surface, it does not just average values that already contain the bumps.
+ */
+static void splat_union_sdf(const Span<FluidParticle> particles,
+                            const float radius_scale,
+                            const float voxel_size,
+                            openvdb::FloatGrid &grid)
+{
+  openvdb::FloatGrid::Accessor accessor = grid.getAccessor();
+  const double voxel_size_sq = double(voxel_size) * double(voxel_size);
+  for (const FluidParticle &particle : particles) {
+    const double h = double(radius_scale) * double(particle.radius);
+    if (h <= 0.0) {
+      continue;
+    }
+    const double h2 = h * h;
+    const openvdb::Vec3d center = grid.transform().worldToIndex(
+        openvdb::Vec3d(particle.position.x, particle.position.y, particle.position.z));
+    const int reach = int(std::ceil(h / double(voxel_size)));
+    const int base_i = int(std::floor(center.x()));
+    const int base_j = int(std::floor(center.y()));
+    const int base_k = int(std::floor(center.z()));
+    for (int k = base_k - reach; k <= base_k + reach; k++) {
+      const double dz = double(k) - center.z();
+      for (int j = base_j - reach; j <= base_j + reach; j++) {
+        const double dy = double(j) - center.y();
+        const double dyz2 = (dy * dy + dz * dz) * voxel_size_sq;
+        if (dyz2 >= h2) {
+          continue;
+        }
+        for (int i = base_i - reach; i <= base_i + reach; i++) {
+          const double dx = double(i) - center.x();
+          const double d2 = dyz2 + dx * dx * voxel_size_sq;
+          if (d2 >= h2) {
+            continue;
+          }
+          const float distance = float(std::sqrt(d2) - double(particle.radius));
+          const openvdb::Coord coord(i, j, k);
+          accessor.setValue(coord, std::min(accessor.getValue(coord), distance));
+        }
+      }
+    }
+  }
+}
+
 /** Taubin λ|μ smoothing: removes the marching cubes noise without shrinking the surface. */
 static void smooth_positions_taubin(Mesh &mesh,
                                     const int iterations,
@@ -469,15 +536,17 @@ static void smooth_density_field(openvdb::FloatGrid &grid,
                                  const int iterations,
                                  const float strength,
                                  const float edge_preserving,
-                                 const float iso_level)
+                                 const float value_scale)
 {
   if (iterations <= 0 || strength <= 0.0f) {
     return;
   }
   /* Bilateral weight on the value difference: a plain average flattens the particle-scale ripple and
-   * a droplet with it, while this only accepts neighbours of similar density, so a thin jet or a
-   * separated droplet keeps its own level. `edge_preserving = 0` reproduces the plain average. */
-  const float range_sigma = std::max(edge_preserving, 0.0f) * std::max(iso_level, 1e-3f);
+   * a droplet with it, while this only accepts neighbours of similar value, so a thin jet or a
+   * separated droplet keeps its own level. `edge_preserving = 0` reproduces the plain average and
+   * `value_scale` is the reference amplitude of the field (iso level for density, one radius for a
+   * distance field). */
+  const float range_sigma = std::max(edge_preserving, 0.0f) * std::max(value_scale, 1e-3f);
   const float inv_range_sigma_sq = range_sigma > 0.0f ? 1.0f / (range_sigma * range_sigma) : 0.0f;
   static const openvdb::Coord offsets[6] = {
       openvdb::Coord(1, 0, 0),
@@ -523,8 +592,29 @@ static void smooth_density_field(openvdb::FloatGrid &grid,
 
 #endif /* WITH_OPENVDB */
 
+static const EnumPropertyItem surface_mode_items[] = {
+    {int(SurfaceMode::Density),
+     "DENSITY",
+     0,
+     N_("Density"),
+     N_("Sum the particle kernels into a density field and extract an iso surface. Compact volumes "
+        "get the smoothest result; thin sheets keep one bump per particle")},
+    {int(SurfaceMode::Distance),
+     "DISTANCE",
+     0,
+     N_("Distance"),
+     N_("Union of the particle spheres, smoothed as a level set. Flattens sheets and keeps "
+        "droplets round; Iso Level 0.5 puts the surface at the particle radius, larger values push "
+        "it outwards. Anisotropic and Edge Preserving do not apply in this mode")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 static void node_declare(NodeDeclarationBuilder &b)
 {
+  b.add_input<decl::Menu>("Mode"_ustr)
+      .static_items(surface_mode_items)
+      .default_value(MenuValue(int(SurfaceMode::Density)))
+      .description("How the surface is reconstructed");
   b.add_input<decl::Geometry>("Points"_ustr)
       .supported_type({GeometryComponent::Type::Mesh,
                        GeometryComponent::Type::PointCloud,
@@ -538,12 +628,13 @@ static void node_declare(NodeDeclarationBuilder &b)
       .subtype(PROP_DISTANCE)
       .description("Resolution of the density field. 0 uses half of the particle radius");
   b.add_input<decl::Float>("Particle Radius"_ustr)
-      .default_value(0.05f)
+      .default_value(0.0f)
       .min(0.0f)
       .subtype(PROP_DISTANCE)
       .description(
-          "Radius of the particles that do not carry a `radius` attribute; the support of the "
-          "kernel is twice this");
+          "Radius of the particles. 0 uses the `radius` attribute of the input (0.05 m when the "
+          "geometry has none); any other value overrides the attribute. The kernel support is this "
+          "times `Kernel Radius`");
   b.add_input<decl::Float>("Iso Level"_ustr)
       .default_value(0.6f)
       .min(0.01f)
@@ -605,7 +696,11 @@ static void node_geo_exec(GeoNodeExecParams params)
 {
 #ifdef WITH_OPENVDB
   const GeometrySet geometry = params.extract_input<GeometrySet>("Points"_ustr);
-  const float fallback_radius = std::max(0.0f,
+  const int mode = params.extract_input<MenuValue>("Mode"_ustr).value;
+  const bool distance_mode = mode == int(SurfaceMode::Distance);
+  /* 0 means "use the `radius` attribute of the input"; a value overrides it, which is what makes the
+   * socket visible in the node instead of being ignored by attribute carrying inputs. */
+  const float radius_override = std::max(0.0f,
                                          params.extract_input<float>("Particle Radius"_ustr));
   const float voxel_size_input = std::max(0.0f, params.extract_input<float>("Voxel Size"_ustr));
   const float iso_level = std::max(0.0f, params.extract_input<float>("Iso Level"_ustr));
@@ -630,7 +725,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     if (component == nullptr) {
       continue;
     }
-    gather_particles_from_component(*component, fallback_radius, particles);
+    gather_particles_from_component(*component, radius_override, particles);
   }
   if (particles.is_empty()) {
     params.set_default_remaining_outputs();
@@ -665,52 +760,105 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   const int bucket_num = std::clamp(BLI_system_thread_count(), 1, 32);
-  Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
-  for (const int i : IndexRange(bucket_num)) {
-    bucket_grids[i] = openvdb::FloatGrid::create(0.0f);
-    bucket_grids[i]->setTransform(
-        openvdb::math::Transform::createLinearTransform(double(voxel_size)));
-  }
   const int64_t particles_num = particles.size();
   const int64_t bucket_size = (particles_num + bucket_num - 1) / bucket_num;
-  threading::parallel_for(IndexRange(bucket_num), 1, [&](const IndexRange range) {
-    for (const int bucket_i : range) {
-      const int64_t start = bucket_i * bucket_size;
-      const int64_t end = std::min(start + bucket_size, particles_num);
-      if (start >= end) {
-        continue;
-      }
-      Span<KernelShape> shapes;
-      if (!kernel_shapes.is_empty()) {
-        shapes = kernel_shapes.as_span().slice(start, end - start);
-      }
-      splat_particles(particles.as_span().slice(start, end - start),
-                      shapes,
-                      radius_scale,
-                      voxel_size,
-                      normalizer,
-                      *bucket_grids[bucket_i]);
-    }
-  });
 
-  openvdb::FloatGrid::Ptr grid = bucket_grids[0];
-  {
-    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-    for (const int bucket_i : IndexRange(1, bucket_num - 1)) {
-      for (auto iter = bucket_grids[bucket_i]->cbeginValueOn(); iter; ++iter) {
-        const openvdb::Coord coord = iter.getCoord();
-        accessor.setValue(coord, accessor.getValue(coord) + iter.getValue());
-      }
-      bucket_grids[bucket_i].reset();
+  openvdb::FloatGrid::Ptr grid;
+  float iso_value = iso_level;
+  if (distance_mode) {
+    /* Distance mode: union of the particle spheres, then OpenVDB's level set filter, which smooths
+     * the field *and* re-normalises it, so the surface is smoothed without collapsing. `Iso Level`
+     * becomes a metric offset: 0.5 puts the surface at the particle radius, larger values push it
+     * outwards like a larger density iso level does. */
+    const float band = radius_scale * mean_radius;
+    Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
+    for (const int i : IndexRange(bucket_num)) {
+      bucket_grids[i] = openvdb::FloatGrid::create(double(band));
+      bucket_grids[i]->setTransform(
+          openvdb::math::Transform::createLinearTransform(double(voxel_size)));
     }
+    threading::parallel_for(IndexRange(bucket_num), 1, [&](const IndexRange range) {
+      for (const int bucket_i : range) {
+        const int64_t start = bucket_i * bucket_size;
+        const int64_t end = std::min(start + bucket_size, particles_num);
+        if (start >= end) {
+          continue;
+        }
+        splat_union_sdf(particles.as_span().slice(start, end - start),
+                        radius_scale,
+                        voxel_size,
+                        *bucket_grids[bucket_i]);
+      }
+    });
+    grid = bucket_grids[0];
+    {
+      openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+      for (const int bucket_i : IndexRange(1, bucket_num - 1)) {
+        for (auto iter = bucket_grids[bucket_i]->cbeginValueOn(); iter; ++iter) {
+          const openvdb::Coord coord = iter.getCoord();
+          accessor.setValue(coord, std::min(accessor.getValue(coord), iter.getValue()));
+        }
+        bucket_grids[bucket_i].reset();
+      }
+    }
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+    grid->tree().prune();
+    if (grid->activeVoxelCount() > 0) {
+      openvdb::tools::LevelSetFilter<openvdb::FloatGrid> filter(*grid);
+      for (const int iteration : IndexRange(density_smoothing)) {
+        UNUSED_VARS(iteration);
+        filter.gaussian(1);
+      }
+    }
+    iso_value = (iso_level - 0.5f) * 2.0f * mean_radius;
   }
-  grid->setGridClass(openvdb::GRID_FOG_VOLUME);
-  grid->tree().prune();
-  smooth_density_field(*grid, density_smoothing, 0.5f, edge_preserving, iso_level);
+  else {
+    Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
+    for (const int i : IndexRange(bucket_num)) {
+      bucket_grids[i] = openvdb::FloatGrid::create(0.0f);
+      bucket_grids[i]->setTransform(
+          openvdb::math::Transform::createLinearTransform(double(voxel_size)));
+    }
+    threading::parallel_for(IndexRange(bucket_num), 1, [&](const IndexRange range) {
+      for (const int bucket_i : range) {
+        const int64_t start = bucket_i * bucket_size;
+        const int64_t end = std::min(start + bucket_size, particles_num);
+        if (start >= end) {
+          continue;
+        }
+        Span<KernelShape> shapes;
+        if (!kernel_shapes.is_empty()) {
+          shapes = kernel_shapes.as_span().slice(start, end - start);
+        }
+        splat_particles(particles.as_span().slice(start, end - start),
+                        shapes,
+                        radius_scale,
+                        voxel_size,
+                        normalizer,
+                        *bucket_grids[bucket_i]);
+      }
+    });
+    grid = bucket_grids[0];
+    {
+      openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+      for (const int bucket_i : IndexRange(1, bucket_num - 1)) {
+        for (auto iter = bucket_grids[bucket_i]->cbeginValueOn(); iter; ++iter) {
+          const openvdb::Coord coord = iter.getCoord();
+          accessor.setValue(coord, accessor.getValue(coord) + iter.getValue());
+        }
+        bucket_grids[bucket_i].reset();
+      }
+    }
+    grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+  }
+  if (!distance_mode) {
+    grid->tree().prune();
+    smooth_density_field(*grid, density_smoothing, 0.5f, edge_preserving, iso_level);
+  }
 
   Mesh *mesh = nullptr;
   if (grid->activeVoxelCount() > 0) {
-    mesh = bke::volume_grid_to_mesh(*grid, iso_level, adaptivity);
+    mesh = bke::volume_grid_to_mesh(*grid, iso_value, adaptivity);
   }
   if (mesh == nullptr) {
     mesh = BKE_mesh_new_nomain(0, 0, 0, 0);
