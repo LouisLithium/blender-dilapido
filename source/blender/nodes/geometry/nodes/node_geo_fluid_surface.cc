@@ -30,7 +30,9 @@
 
 #include "BLI_array.hh"
 #include "BLI_math_base.hh"
+#include "BLI_kdtree.hh"
 #include "BLI_math_vector.hh"
+#include "BLI_task.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
 #include "BLI_task.hh"
@@ -112,13 +114,194 @@ static void gather_particles_from_component(const GeometryComponent &component,
 }
 
 /**
+ * One particle's kernel shape: the unit sphere sheared into the ellipsoid that matches how its
+ * neighbours are distributed (Yu & Turk 2013, "Reconstructing surfaces of particle-based fluids
+ * using anisotropic kernels").
+ *
+ * A spherical kernel that is unrelated to the local particle layout is exactly why a flat sheet of
+ * particles produces a bumpy surface: every particle bulges the field on its own. Fitting an
+ * ellipsoid to the neighbours (flat across a sheet, round inside a droplet) makes the sheet smooth
+ * while a droplet keeps its sphere, which is the "smooth without losing detail" tradeoff that an
+ * isotropic blur cannot make. `rows` holds `S` (symmetric) and the kernel support is
+ * `|S d| < h`, with `det(S) = 1` so the density integral and the meaning of `Iso Level` are
+ * unchanged.
+ */
+struct KernelShape {
+  float3 row_x = float3(1.0f, 0.0f, 0.0f);
+  float3 row_y = float3(0.0f, 1.0f, 0.0f);
+  float3 row_z = float3(0.0f, 0.0f, 1.0f);
+};
+
+/** Jacobi eigen decomposition of a symmetric 3x3 matrix (row major), eigenvalues ascending. */
+static void symmetric_eigen3(const float m[3][3], float r_values[3], float3 r_vectors[3])
+{
+  float a[3][3];
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      a[i][j] = m[i][j];
+    }
+  }
+  float v[3][3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+  for (int sweep = 0; sweep < 12; sweep++) {
+    const float off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
+    const float diag = a[0][0] * a[0][0] + a[1][1] * a[1][1] + a[2][2] * a[2][2];
+    if (off <= 1e-12f * std::max(diag, 1e-12f)) {
+      break;
+    }
+    for (int p_i = 0; p_i < 2; p_i++) {
+      for (int q_i = p_i + 1; q_i < 3; q_i++) {
+        if (std::fabs(a[p_i][q_i]) < 1e-20f) {
+          continue;
+        }
+        const float theta = (a[q_i][q_i] - a[p_i][p_i]) / (2.0f * a[p_i][q_i]);
+        const float sign = theta >= 0.0f ? 1.0f : -1.0f;
+        const float t = sign / (std::fabs(theta) + std::sqrt(theta * theta + 1.0f));
+        const float c = 1.0f / std::sqrt(t * t + 1.0f);
+        const float s = t * c;
+        for (int k = 0; k < 3; k++) {
+          const float akp = a[k][p_i];
+          const float akq = a[k][q_i];
+          a[k][p_i] = c * akp - s * akq;
+          a[k][q_i] = s * akp + c * akq;
+        }
+        for (int k = 0; k < 3; k++) {
+          const float apk = a[p_i][k];
+          const float aqk = a[q_i][k];
+          a[p_i][k] = c * apk - s * aqk;
+          a[q_i][k] = s * apk + c * aqk;
+        }
+        for (int k = 0; k < 3; k++) {
+          const float vkp = v[k][p_i];
+          const float vkq = v[k][q_i];
+          v[k][p_i] = c * vkp - s * vkq;
+          v[k][q_i] = s * vkp + c * vkq;
+        }
+      }
+    }
+  }
+  for (int i = 0; i < 3; i++) {
+    r_values[i] = a[i][i];
+    r_vectors[i] = float3(v[0][i], v[1][i], v[2][i]);
+  }
+}
+
+/**
+ * Builds the kernel of every particle from its neighbourhood. The covariance of the neighbours
+ * describes the local shape: a flat sheet has one tiny eigenvalue (the normal direction), a
+ * droplet has three similar ones. The kernel is the inverse square root of that covariance,
+ * normalised to `det = 1`.
+ */
+static void build_kernel_shapes(const Span<FluidParticle> particles,
+                                const float mean_radius,
+                                Array<KernelShape> &r_shapes)
+{
+  const int count = int(particles.size());
+  r_shapes.reinitialize(count);
+  if (count < 8) {
+    return;
+  }
+  const float search = 3.0f * mean_radius;
+  KDTree<float3> *tree = kdtree_new<float3>(uint(count));
+  for (const int i : IndexRange(count)) {
+    kdtree_insert(tree, i, particles[i].position);
+  }
+  kdtree_balance(tree);
+  static constexpr int MAX_NEIGHBOURS = 32;
+  const float min_lambda = 1e-8f * search * search;
+  threading::parallel_for(IndexRange(count), 256, [&](const IndexRange range) {
+    for (const int i : range) {
+      const float3 center = particles[i].position;
+      KDTreeNearest<float3> nearest[MAX_NEIGHBOURS];
+      const int found = kdtree_find_nearest_n(tree, center, nearest, MAX_NEIGHBOURS);
+      if (found < 6) {
+        continue;
+      }
+      float covariance[3][3] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+      float weight_sum = 0.0f;
+      for (int n = 0; n < found; n++) {
+        const float distance = nearest[n].dist;
+        if (distance > search && n > 0) {
+          break;
+        }
+        const float3 delta = nearest[n].co - center;
+        /* Compact support with a smooth falloff; the nearest node is the particle itself. */
+        const float t = std::max(0.0f, 1.0f - (distance / search) * (distance / search));
+        const float w = t * t;
+        if (w <= 0.0f) {
+          continue;
+        }
+        covariance[0][0] += w * delta.x * delta.x;
+        covariance[0][1] += w * delta.x * delta.y;
+        covariance[0][2] += w * delta.x * delta.z;
+        covariance[1][1] += w * delta.y * delta.y;
+        covariance[1][2] += w * delta.y * delta.z;
+        covariance[2][2] += w * delta.z * delta.z;
+        weight_sum += w;
+      }
+      if (weight_sum <= 0.0f) {
+        continue;
+      }
+      const float inv_weight = 1.0f / weight_sum;
+      covariance[0][0] *= inv_weight;
+      covariance[0][1] *= inv_weight;
+      covariance[0][2] *= inv_weight;
+      covariance[1][1] *= inv_weight;
+      covariance[1][2] *= inv_weight;
+      covariance[2][2] *= inv_weight;
+      covariance[1][0] = covariance[0][1];
+      covariance[2][0] = covariance[0][2];
+      covariance[2][1] = covariance[1][2];
+
+      float values[3];
+      float3 vectors[3];
+      symmetric_eigen3(covariance, values, vectors);
+      /* Clamp the anisotropy: a 4:1 squash already turns a sphere into a convincing disc, and more
+       * than that starts to alias on the voxel grid. */
+      constexpr float MAX_ANISOTROPY = 4.0f;
+      float clamped[3];
+      const float largest = std::max(std::max(values[0], values[1]), values[2]);
+      for (int axis = 0; axis < 3; axis++) {
+        clamped[axis] = std::max(values[axis], largest / (MAX_ANISOTROPY * MAX_ANISOTROPY));
+        clamped[axis] = std::max(clamped[axis], min_lambda);
+      }
+      /* Scales are `1 / sqrt(lambda)`, normalised so their product is 1 (volume preserving). */
+      float scales[3];
+      float product = 1.0f;
+      for (int axis = 0; axis < 3; axis++) {
+        scales[axis] = 1.0f / std::sqrt(clamped[axis]);
+        product *= scales[axis];
+      }
+      const float normalize = 1.0f / std::cbrt(product);
+      for (int axis = 0; axis < 3; axis++) {
+        scales[axis] *= normalize;
+      }
+      /* S = sum_axis scale[axis] * (u u^T), which is symmetric. */
+      KernelShape shape;
+      float3 rows[3] = {float3(0.0f), float3(0.0f), float3(0.0f)};
+      for (int axis = 0; axis < 3; axis++) {
+        const float3 u = vectors[axis];
+        const float s = scales[axis];
+        rows[0] += float3(u.x * u.x, u.x * u.y, u.x * u.z) * s;
+        rows[1] += float3(u.y * u.x, u.y * u.y, u.y * u.z) * s;
+        rows[2] += float3(u.z * u.x, u.z * u.y, u.z * u.z) * s;
+      }
+      shape.row_x = rows[0];
+      shape.row_y = rows[1];
+      shape.row_z = rows[2];
+      r_shapes[i] = shape;
+    }
+  });
+  kdtree_free(tree);
+}
+
+/**
  * Sum of the kernel over a full lattice with spacing `spacing`, times the volume of one lattice
  * cell. Dividing the splatted density by it makes the density of a lattice exactly 1.0.
  */
-static double lattice_kernel_sum(const float spacing)
+static double lattice_kernel_sum(const float spacing, const float radius_scale)
 {
   const double s = spacing;
-  const double h = 2.0 * s;
+  const double h = double(radius_scale) * s;
   const double h2 = h * h;
   const double kernel = (315.0 / (64.0 * M_PI)) / (h2 * h2 * h2 * h2 * h);
   const int reach = int(std::ceil(h / s));
@@ -140,14 +323,17 @@ static double lattice_kernel_sum(const float spacing)
 
 /** Poly6 splat of the given particles into `grid` (which is used by a single thread). */
 static void splat_particles(const Span<FluidParticle> particles,
+                            const Span<KernelShape> kernel_shapes,
+                            const float radius_scale,
                             const float voxel_size,
                             const double normalizer,
                             openvdb::FloatGrid &grid)
 {
   openvdb::FloatGrid::Accessor accessor = grid.getAccessor();
   const double voxel_size_sq = double(voxel_size) * double(voxel_size);
-  for (const FluidParticle &particle : particles) {
-    const double h = 2.0 * double(particle.radius);
+  for (const int particle_i : particles.index_range()) {
+    const FluidParticle &particle = particles[particle_i];
+    const double h = double(radius_scale) * double(particle.radius);
     if (h <= 0.0 || particle.volume <= 0.0f) {
       continue;
     }
@@ -160,21 +346,43 @@ static void splat_particles(const Span<FluidParticle> particles,
         openvdb::Vec3d(particle.position.x, particle.position.y, particle.position.z));
     /* OpenVDB voxel `i` is centered at `i * voxel_size` (unlike image space, there is no half
      * voxel offset), which is also why `worldToIndexCellCentered` rounds instead of flooring. */
-    const int reach = int(std::ceil(h / double(voxel_size)));
+    const bool shaped = kernel_shapes.size() == particles.size();
+    /* World space extent of the (possibly sheared) kernel: an ellipsoid inside `|S d| < h`. */
+    float extent = float(h);
+    if (shaped) {
+      const KernelShape &shape = kernel_shapes[particle_i];
+      const float3 row_x = shape.row_x * float(h);
+      const float3 row_y = shape.row_y * float(h);
+      const float3 row_z = shape.row_z * float(h);
+      extent = std::max({std::fabs(row_x.x) + std::fabs(row_x.y) + std::fabs(row_x.z),
+                         std::fabs(row_y.x) + std::fabs(row_y.y) + std::fabs(row_y.z),
+                         std::fabs(row_z.x) + std::fabs(row_z.y) + std::fabs(row_z.z)});
+    }
+    const int reach = int(std::ceil(double(extent) / double(voxel_size)));
     const int base_i = int(std::floor(center.x()));
     const int base_j = int(std::floor(center.y()));
     const int base_k = int(std::floor(center.z()));
+    const KernelShape *shape = shaped ? &kernel_shapes[particle_i] : nullptr;
     for (int k = base_k - reach; k <= base_k + reach; k++) {
       const double dz = double(k) - center.z();
       for (int j = base_j - reach; j <= base_j + reach; j++) {
         const double dy = double(j) - center.y();
-        const double dyz2 = (dy * dy + dz * dz) * voxel_size_sq;
-        if (dyz2 >= h2) {
-          continue;
-        }
         for (int i = base_i - reach; i <= base_i + reach; i++) {
           const double dx = double(i) - center.x();
-          const double d2 = dyz2 + dx * dx * voxel_size_sq;
+          double d2;
+          if (shape == nullptr) {
+            d2 = (dx * dx + dy * dy + dz * dz) * voxel_size_sq;
+          }
+          else {
+            /* `|S d|^2` with `S` symmetric: the distance the kernel actually sees. */
+            const float3 d = float3(float(dx * double(voxel_size)),
+                                    float(dy * double(voxel_size)),
+                                    float(dz * double(voxel_size)));
+            const float3 sd = float3(math::dot(shape->row_x, d),
+                                     math::dot(shape->row_y, d),
+                                     math::dot(shape->row_z, d));
+            d2 = double(math::dot(sd, sd));
+          }
           if (d2 >= h2) {
             continue;
           }
@@ -259,11 +467,18 @@ static void smooth_positions_taubin(Mesh &mesh,
  */
 static void smooth_density_field(openvdb::FloatGrid &grid,
                                  const int iterations,
-                                 const float strength)
+                                 const float strength,
+                                 const float edge_preserving,
+                                 const float iso_level)
 {
   if (iterations <= 0 || strength <= 0.0f) {
     return;
   }
+  /* Bilateral weight on the value difference: a plain average flattens the particle-scale ripple and
+   * a droplet with it, while this only accepts neighbours of similar density, so a thin jet or a
+   * separated droplet keeps its own level. `edge_preserving = 0` reproduces the plain average. */
+  const float range_sigma = std::max(edge_preserving, 0.0f) * std::max(iso_level, 1e-3f);
+  const float inv_range_sigma_sq = range_sigma > 0.0f ? 1.0f / (range_sigma * range_sigma) : 0.0f;
   static const openvdb::Coord offsets[6] = {
       openvdb::Coord(1, 0, 0),
       openvdb::Coord(-1, 0, 0),
@@ -285,11 +500,20 @@ static void smooth_density_field(openvdb::FloatGrid &grid,
       const openvdb::Coord coord = coords[i];
       const float center = accessor.getValue(coord);
       float sum = 0.0f;
+      float weight_sum = 0.0f;
       for (const openvdb::Coord &offset : offsets) {
         const openvdb::Coord other = coord + offset;
-        sum += accessor.isValueOn(other) ? accessor.getValue(other) : center;
+        const float value = accessor.isValueOn(other) ? accessor.getValue(other) : center;
+        float weight = 1.0f;
+        if (inv_range_sigma_sq > 0.0f) {
+          const float difference = value - center;
+          weight = std::exp(-difference * difference * inv_range_sigma_sq);
+        }
+        sum += value * weight;
+        weight_sum += weight;
       }
-      values[i] = center + (sum / 6.0f - center) * strength;
+      const float average = weight_sum > 0.0f ? sum / weight_sum : center;
+      values[i] = center + (average - center) * strength;
     }
     for (const int i : coords.index_range()) {
       accessor.setValue(coords[i], values[i]);
@@ -342,6 +566,26 @@ static void node_declare(NodeDeclarationBuilder &b)
           "Relaxation passes on the density field. The surface of the particles is quilted at the "
           "scale of the particle spacing without this; the mesh smoothing above only removes the "
           "smaller marching cubes steps");
+  b.add_input<decl::Float>("Kernel Radius"_ustr)
+      .default_value(2.0f)
+      .min(1.0f)
+      .max(4.0f)
+      .description(
+          "Support of one particle's kernel, in particle radii. The kernel has to cover about two "
+          "particle spacings; raise it when the surface still shows one bump per particle");
+  b.add_input<decl::Bool>("Anisotropic"_ustr)
+      .default_value(false)
+      .description(
+          "Fit each particle's kernel to its neighbourhood (Yu & Turk): flat across a sheet, round "
+          "inside a droplet. Smooths sheets and waterfalls without rounding off droplets or jets, "
+          "at the cost of a neighbourhood query per particle");
+  b.add_input<decl::Float>("Edge Preserving"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .max(1.0f)
+      .description(
+          "Bilateral weighting of the density relaxation: 0 is a plain average, 1 only averages "
+          "neighbours of similar density so thin sheets and droplets keep their own level");
   b.add_input<decl::Float>("Adaptivity"_ustr)
       .default_value(0.0f)
       .min(0.0f)
@@ -367,6 +611,13 @@ static void node_geo_exec(GeoNodeExecParams params)
   const float iso_level = std::max(0.0f, params.extract_input<float>("Iso Level"_ustr));
   const int smoothing = std::max(0, params.extract_input<int>("Smoothing"_ustr));
   const int density_smoothing = std::max(0, params.extract_input<int>("Density Smoothing"_ustr));
+  const float radius_scale = math::clamp(params.extract_input<float>("Kernel Radius"_ustr),
+                                         1.0f,
+                                         4.0f);
+  const bool anisotropic = params.extract_input<bool>("Anisotropic"_ustr);
+  const float edge_preserving = math::clamp(params.extract_input<float>("Edge Preserving"_ustr),
+                                            0.0f,
+                                            1.0f);
   const float adaptivity = math::clamp(params.extract_input<float>("Adaptivity"_ustr), 0.0f, 1.0f);
   const bool smooth_shading = params.extract_input<bool>("Smooth Shading"_ustr);
 
@@ -396,7 +647,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     return;
   }
   const float voxel_size = voxel_size_input > 0.0f ? voxel_size_input : 0.5f * mean_radius;
-  const double normalizer = lattice_kernel_sum(mean_radius);
+  const double normalizer = lattice_kernel_sum(mean_radius, radius_scale);
   if (std::getenv("BLENDER_FLUID_SURFACE_DEBUG") != nullptr) {
     printf("FLUID_SURFACE_DEBUG %ld particles mean_radius=%f voxel_size=%f normalizer=%f\n",
            long(particles.size()),
@@ -408,6 +659,11 @@ static void node_geo_exec(GeoNodeExecParams params)
   /* The splat is done into one grid per bucket of particles and the grids are merged afterwards,
    * because an OpenVDB grid is not thread safe. One bucket per parallel task, so no two tasks ever
    * touch the same grid. */
+  Array<KernelShape> kernel_shapes;
+  if (anisotropic) {
+    build_kernel_shapes(particles.as_span(), mean_radius, kernel_shapes);
+  }
+
   const int bucket_num = std::clamp(BLI_system_thread_count(), 1, 32);
   Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
   for (const int i : IndexRange(bucket_num)) {
@@ -424,7 +680,13 @@ static void node_geo_exec(GeoNodeExecParams params)
       if (start >= end) {
         continue;
       }
+      Span<KernelShape> shapes;
+      if (!kernel_shapes.is_empty()) {
+        shapes = kernel_shapes.as_span().slice(start, end - start);
+      }
       splat_particles(particles.as_span().slice(start, end - start),
+                      shapes,
+                      radius_scale,
                       voxel_size,
                       normalizer,
                       *bucket_grids[bucket_i]);
@@ -444,7 +706,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
   grid->setGridClass(openvdb::GRID_FOG_VOLUME);
   grid->tree().prune();
-  smooth_density_field(*grid, density_smoothing, 0.5f);
+  smooth_density_field(*grid, density_smoothing, 0.5f, edge_preserving, iso_level);
 
   Mesh *mesh = nullptr;
   if (grid->activeVoxelCount() > 0) {
