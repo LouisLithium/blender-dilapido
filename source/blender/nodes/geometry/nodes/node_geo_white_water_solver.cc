@@ -7,10 +7,17 @@
  *
  * `White Water Solver`: foam, spray and bubbles on top of a solved fluid.
  *
- * The node is stateless like the other solvers: `White Water` is the point set of the previous
- * frame (fed back by a Simulation Zone), `Fluid` provides the flow velocity, `Surface` the mesh the
- * foam sticks to and the emission samples, `Colliders` kill the spray on impact. Everything else is
- * a parameter panel; the node returns the new point set plus one output per type.
+ * Like the other Dilapido solvers the node only has `World`, `Delta Time` and `Stats`; everything it
+ * works on lives in the world bundle:
+ *
+ *  - `geometry`: the white water of the previous frame (the state), written back,
+ *  - `fluid`: the fluid particles with their `velocity` attribute (emission density, foam drift),
+ *  - `surface`: the fluid surface mesh (emission samples, foam sticking),
+ *  - `effectors`: the colliders (`Dilapido Collider`), the spray dies on them,
+ *  - `settings`: `Blender.WhiteWaterSettings` with every parameter.
+ *
+ * The `White Water Dynamics` asset builds that world inside a simulation zone; the node is stateless
+ * like the others, so replaying a frame always produces the same particles.
  */
 
 #include <algorithm>
@@ -19,12 +26,9 @@
 #include <string>
 
 #include "BLI_array.hh"
-#include "BLI_math_base.hh"
-#include "BLI_math_matrix.hh"
 #include "BLI_math_vector.hh"
 
 #include "BKE_attribute.hh"
-#include "BKE_curves.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
@@ -34,6 +38,7 @@
 
 #include "NOD_bundle_type.hh"
 #include "NOD_geometry_nodes_bundle.hh"
+#include "NOD_geometry_nodes_physics_bundles.hh"
 
 #include "node_geometry_util.hh"
 
@@ -49,21 +54,199 @@ namespace {
 constexpr StringRef COLLIDER_MESH_TYPE = "Blender.Collider.Mesh";
 constexpr StringRef COLLIDER_BOX_TYPE = "Blender.Collider.Box";
 
-/** Menu of the clustering model. A Houdini style explicit cluster mode will be a second item. */
-enum class WhiteWaterClusterMode : int {
-  Strain = 0,
+/** All solver parameters, stored in the world bundle so the asset can expose them in panels. */
+class WhiteWaterSettingsBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.WhiteWaterSettings";
+  static const FlatBundleTypePtr &get_bundle_type();
 };
 
-static const EnumPropertyItem cluster_mode_items[] = {
-    {int(WhiteWaterClusterMode::Strain),
-     "STRAIN",
-     0,
-     N_("Strain"),
-     N_("Clusters emerge from the neighbour links: a clump is held together while its relative "
-        "speed stays below `Break Strain`, so a fast shear tears it apart. Links form again once "
-        "the flow calms down")},
-    {0, nullptr, 0, nullptr, nullptr},
-};
+const FlatBundleTypePtr &WhiteWaterSettingsBundle::get_bundle_type()
+{
+  static const FlatBundleTypePtr bundle_type = []() {
+    FlatBundleTypeBuilder b(WhiteWaterSettingsBundle::name);
+    b.add<decl::Bool>("foam"_ustr);
+    b.add<decl::Bool>("spray"_ustr);
+    b.add<decl::Bool>("bubbles"_ustr);
+    b.add<decl::Float>("foam_emission"_ustr).min(0.0f);
+    b.add<decl::Float>("spray_emission"_ustr).min(0.0f);
+    b.add<decl::Float>("bubble_emission"_ustr).min(0.0f);
+    b.add<decl::Float>("emission_scale"_ustr).min(0.0f);
+    b.add<decl::Int>("seed"_ustr);
+    b.add<decl::Float>("foam_threshold"_ustr).min(0.0f);
+    b.add<decl::Float>("foam_full_speed"_ustr).min(0.01f);
+    b.add<decl::Float>("spray_threshold"_ustr).min(0.0f);
+    b.add<decl::Float>("spray_full_speed"_ustr).min(0.01f);
+    b.add<decl::Float>("bubble_threshold"_ustr).min(0.0f);
+    b.add<decl::Float>("bubble_full_speed"_ustr).min(0.01f);
+    b.add<decl::Float>("foam_lifetime"_ustr).min(0.01f);
+    b.add<decl::Float>("spray_lifetime"_ustr).min(0.01f);
+    b.add<decl::Float>("bubble_lifetime"_ustr).min(0.01f);
+    b.add<decl::Float>("foam_size"_ustr).min(1e-4f);
+    b.add<decl::Float>("spray_size"_ustr).min(1e-4f);
+    b.add<decl::Float>("bubble_size"_ustr).min(1e-4f);
+    b.add<decl::Float>("foam_stick"_ustr).min(0.0f).max(1.0f);
+    b.add<decl::Float>("spray_speed"_ustr).min(0.0f);
+    b.add<decl::Float>("bubble_buoyancy"_ustr).min(0.0f);
+    b.add<decl::Float>("bubble_depth"_ustr).min(0.0f);
+    b.add<decl::Bool>("bubble_to_foam"_ustr);
+    b.add<decl::Vector>("gravity"_ustr);
+    b.add<decl::Float>("drag"_ustr).min(0.0f);
+    b.add<decl::Int>("cluster_mode"_ustr).min(0);
+    b.add<decl::Float>("cohesion"_ustr).min(0.0f);
+    b.add<decl::Float>("cohesion_radius"_ustr).min(1e-4f);
+    b.add<decl::Float>("separation"_ustr).min(0.0f);
+    b.add<decl::Float>("separation_radius"_ustr).min(1e-4f);
+    b.add<decl::Bool>("same_type_only"_ustr);
+    b.add<decl::Float>("break_strain"_ustr).min(0.0f);
+    b.add<decl::Int>("max_cluster_size"_ustr).min(1);
+    b.add<decl::Float>("cluster_damping"_ustr).min(0.0f);
+    b.add<decl::Int>("max_particles"_ustr).min(0);
+    b.add<decl::Bool>("use_bounds"_ustr);
+    b.add<decl::Vector>("bounds_min"_ustr);
+    b.add<decl::Vector>("bounds_max"_ustr);
+    const FlatBundleTypePtr flat_type = b.build();
+    BundleTypeRegistry::register_type(flat_type);
+    return flat_type;
+  }();
+  return bundle_type;
+}
+
+NestedBundleTypePtr make_world_type()
+{
+  Vector<std::shared_ptr<const FlatBundleType>> types;
+  types.append(WhiteWaterSettingsBundle::get_bundle_type());
+  types.append(MeshColliderBundle::get_bundle_type());
+  types.append(BoxColliderBundle::get_bundle_type());
+
+  NestedBundleTypePtr world_type = std::make_shared<const NestedBundleType>(
+      "Blender.WhiteWaterSolverWorld", std::move(types));
+  BundleTypeRegistry::register_type(world_type);
+  return world_type;
+}
+
+/* -------------------------------------------------------------------- */
+/** \name Reading the world
+ * \{ */
+
+float read_float(const Bundle &bundle, const StringRef key, const float fallback)
+{
+  if (const float *value = bundle.lookup_ptr<float>(*BundleKey::from_str(key))) {
+    return *value;
+  }
+  return fallback;
+}
+
+int read_int(const Bundle &bundle, const StringRef key, const int fallback)
+{
+  if (const int *value = bundle.lookup_ptr<int>(*BundleKey::from_str(key))) {
+    return *value;
+  }
+  return fallback;
+}
+
+bool read_bool(const Bundle &bundle, const StringRef key, const bool fallback)
+{
+  if (const bool *value = bundle.lookup_ptr<bool>(*BundleKey::from_str(key))) {
+    return *value;
+  }
+  return fallback;
+}
+
+float3 read_vector(const Bundle &bundle, const StringRef key, const float3 &fallback)
+{
+  if (const float3 *value = bundle.lookup_ptr<float3>(*BundleKey::from_str(key))) {
+    return *value;
+  }
+  return fallback;
+}
+
+whitewater::Settings read_settings(const Bundle &world)
+{
+  whitewater::Settings settings;
+  const BundlePtr *bundle_ptr = world.lookup_ptr<BundlePtr>(*BundleKey::from_str("settings"));
+  if (bundle_ptr == nullptr || !*bundle_ptr) {
+    return settings;
+  }
+  const Bundle &bundle = **bundle_ptr;
+  settings.foam = read_bool(bundle, "foam", settings.foam);
+  settings.spray = read_bool(bundle, "spray", settings.spray);
+  settings.bubbles = read_bool(bundle, "bubbles", settings.bubbles);
+  settings.foam_emission = std::max(0.0f, read_float(bundle, "foam_emission", settings.foam_emission));
+  settings.spray_emission = std::max(
+      0.0f, read_float(bundle, "spray_emission", settings.spray_emission));
+  settings.bubble_emission = std::max(
+      0.0f, read_float(bundle, "bubble_emission", settings.bubble_emission));
+  settings.emission_scale = std::max(0.0f,
+                                     read_float(bundle, "emission_scale", settings.emission_scale));
+  settings.seed = read_int(bundle, "seed", settings.seed);
+  settings.foam_threshold = std::max(0.0f,
+                                     read_float(bundle, "foam_threshold", settings.foam_threshold));
+  settings.foam_full_speed = std::max(settings.foam_threshold + 1e-3f,
+                                      read_float(bundle, "foam_full_speed",
+                                                 settings.foam_full_speed));
+  settings.spray_threshold = std::max(
+      0.0f, read_float(bundle, "spray_threshold", settings.spray_threshold));
+  settings.spray_full_speed = std::max(settings.spray_threshold + 1e-3f,
+                                       read_float(bundle, "spray_full_speed",
+                                                  settings.spray_full_speed));
+  settings.bubble_threshold = std::max(
+      0.0f, read_float(bundle, "bubble_threshold", settings.bubble_threshold));
+  settings.bubble_full_speed = std::max(settings.bubble_threshold + 1e-3f,
+                                        read_float(bundle, "bubble_full_speed",
+                                                   settings.bubble_full_speed));
+  settings.foam_lifetime = std::max(0.01f,
+                                    read_float(bundle, "foam_lifetime", settings.foam_lifetime));
+  settings.spray_lifetime = std::max(0.01f,
+                                     read_float(bundle, "spray_lifetime", settings.spray_lifetime));
+  settings.bubble_lifetime = std::max(
+      0.01f, read_float(bundle, "bubble_lifetime", settings.bubble_lifetime));
+  settings.foam_size = std::max(1e-4f, read_float(bundle, "foam_size", settings.foam_size));
+  settings.spray_size = std::max(1e-4f, read_float(bundle, "spray_size", settings.spray_size));
+  settings.bubble_size = std::max(1e-4f, read_float(bundle, "bubble_size", settings.bubble_size));
+  settings.foam_stick = math::clamp(read_float(bundle, "foam_stick", settings.foam_stick),
+                                    0.0f,
+                                    1.0f);
+  settings.spray_speed = std::max(0.0f, read_float(bundle, "spray_speed", settings.spray_speed));
+  settings.bubble_buoyancy = std::max(0.0f,
+                                      read_float(bundle, "bubble_buoyancy",
+                                                 settings.bubble_buoyancy));
+  settings.bubble_depth = std::max(0.0f,
+                                   read_float(bundle, "bubble_depth", settings.bubble_depth));
+  settings.bubble_to_foam = read_bool(bundle, "bubble_to_foam", settings.bubble_to_foam);
+  settings.gravity = read_vector(bundle, "gravity", settings.gravity);
+  settings.drag = std::max(0.0f, read_float(bundle, "drag", settings.drag));
+  settings.cluster_mode = read_int(bundle, "cluster_mode", int(settings.cluster_mode)) == 0 ?
+                              whitewater::ClusterMode::Strain :
+                              whitewater::ClusterMode::Strain;
+  settings.cohesion = std::max(0.0f, read_float(bundle, "cohesion", settings.cohesion));
+  settings.cohesion_radius = std::max(1e-4f,
+                                      read_float(bundle, "cohesion_radius",
+                                                 settings.cohesion_radius));
+  settings.separation = std::max(0.0f, read_float(bundle, "separation", settings.separation));
+  settings.separation_radius = std::max(1e-4f,
+                                        read_float(bundle, "separation_radius",
+                                                   settings.separation_radius));
+  settings.same_type_only = read_bool(bundle, "same_type_only", settings.same_type_only);
+  settings.break_strain = std::max(0.0f,
+                                   read_float(bundle, "break_strain", settings.break_strain));
+  settings.max_cluster_size = std::max(1, read_int(bundle, "max_cluster_size",
+                                                   settings.max_cluster_size));
+  settings.cluster_damping = std::max(0.0f,
+                                      read_float(bundle, "cluster_damping",
+                                                 settings.cluster_damping));
+  settings.max_particles = std::max(0, read_int(bundle, "max_particles", settings.max_particles));
+  settings.use_bounds = read_bool(bundle, "use_bounds", settings.use_bounds);
+  settings.bounds_min = read_vector(bundle, "bounds_min", settings.bounds_min);
+  settings.bounds_max = read_vector(bundle, "bounds_max", settings.bounds_max);
+  return settings;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Particles
+ * \{ */
 
 template<typename T>
 VArray<T> lookup_or_default(const bke::AttributeAccessor &attributes,
@@ -79,7 +262,6 @@ VArray<T> lookup_or_default(const bke::AttributeAccessor &attributes,
   return VArray<T>::from_single(fallback, size);
 }
 
-/** Append the point set of one component to `r_particles` (the previous frame's state). */
 void read_state(const GeometryComponent &component, whitewater::ParticleData &r_particles)
 {
   const AttrDomain domain = AttrDomain::Point;
@@ -104,8 +286,7 @@ void read_state(const GeometryComponent &component, whitewater::ParticleData &r_
   const VArray<int> types = lookup_or_default<int>(*attributes, "type", domain, 0, count);
   const VArray<int> clusters = lookup_or_default<int>(*attributes, "cluster", domain, -1, count);
 
-  const int offset = r_particles.size();
-  r_particles.reserve(offset + count);
+  r_particles.reserve(r_particles.size() + count);
   for (const int i : IndexRange(count)) {
     r_particles.positions.append(positions[i]);
     r_particles.velocities.append(velocities[i]);
@@ -114,7 +295,6 @@ void read_state(const GeometryComponent &component, whitewater::ParticleData &r_
     r_particles.radii.append(radii[i]);
     r_particles.types.append(types[i]);
     r_particles.clusters.append(clusters[i]);
-    (void)offset;
   }
 }
 
@@ -143,6 +323,48 @@ void read_fluid(const GeometryComponent &component,
   }
 }
 
+/** Write the white water into a new point cloud. */
+void write_particles(const whitewater::ParticleData &particles, GeometrySet &r_geometry)
+{
+  const int count = particles.size();
+  PointCloud *pointcloud = BKE_pointcloud_new_nomain(count);
+  if (count > 0) {
+    bke::MutableAttributeAccessor attributes = pointcloud->attributes_for_write();
+    const AttrDomain domain = AttrDomain::Point;
+    bke::SpanAttributeWriter<float3> positions = attributes.lookup_or_add_for_write_span<float3>(
+        "position", domain);
+    bke::SpanAttributeWriter<float3> velocities = attributes.lookup_or_add_for_write_span<float3>(
+        "velocity", domain);
+    bke::SpanAttributeWriter<float> ages = attributes.lookup_or_add_for_write_span<float>("age",
+                                                                                         domain);
+    bke::SpanAttributeWriter<float> lifetimes = attributes.lookup_or_add_for_write_span<float>(
+        "lifetime", domain);
+    bke::SpanAttributeWriter<float> radii = attributes.lookup_or_add_for_write_span<float>(
+        "radius", domain);
+    bke::SpanAttributeWriter<int> types = attributes.lookup_or_add_for_write_span<int>("type",
+                                                                                       domain);
+    bke::SpanAttributeWriter<int> clusters = attributes.lookup_or_add_for_write_span<int>(
+        "cluster", domain);
+    for (const int i : IndexRange(count)) {
+      positions.span[i] = particles.positions[i];
+      velocities.span[i] = particles.velocities[i];
+      ages.span[i] = particles.ages[i];
+      lifetimes.span[i] = particles.lifetimes[i];
+      radii.span[i] = particles.radii[i];
+      types.span[i] = particles.types[i];
+      clusters.span[i] = particles.clusters[i];
+    }
+    positions.finish();
+    velocities.finish();
+    ages.finish();
+    lifetimes.finish();
+    radii.finish();
+    types.finish();
+    clusters.finish();
+  }
+  r_geometry.replace_pointcloud(pointcloud);
+}
+
 void append_mesh_triangles(const Mesh &mesh, Vector<float3> &r_triangles)
 {
   const Span<float3> verts = mesh.vert_positions();
@@ -167,7 +389,7 @@ void append_box_triangles(const Mesh &mesh, Vector<float3> &r_triangles)
     min = math::min(min, v);
     max = math::max(max, v);
   }
-  const float3 c[8] = {
+  const float3 corners[8] = {
       float3(min.x, min.y, min.z),
       float3(max.x, min.y, min.z),
       float3(max.x, max.y, min.z),
@@ -180,12 +402,12 @@ void append_box_triangles(const Mesh &mesh, Vector<float3> &r_triangles)
   static const int quads[6][4] = {{0, 1, 2, 3}, {4, 7, 6, 5}, {0, 4, 5, 1},
                                   {1, 5, 6, 2}, {2, 6, 7, 3}, {3, 7, 4, 0}};
   for (const auto &quad : quads) {
-    r_triangles.append(c[quad[0]]);
-    r_triangles.append(c[quad[1]]);
-    r_triangles.append(c[quad[2]]);
-    r_triangles.append(c[quad[0]]);
-    r_triangles.append(c[quad[2]]);
-    r_triangles.append(c[quad[3]]);
+    r_triangles.append(corners[quad[0]]);
+    r_triangles.append(corners[quad[1]]);
+    r_triangles.append(corners[quad[2]]);
+    r_triangles.append(corners[quad[0]]);
+    r_triangles.append(corners[quad[2]]);
+    r_triangles.append(corners[quad[3]]);
   }
 }
 
@@ -235,63 +457,6 @@ void gather_colliders(const Bundle &bundle, Vector<float3> &r_triangles)
   }
 }
 
-/** Write one type (or every type when `type_filter < 0`) into a new point cloud. */
-void write_points(const whitewater::ParticleData &particles,
-                  const int type_filter,
-                  GeometrySet &r_geometry)
-{
-  int count = 0;
-  for (const int i : IndexRange(particles.size())) {
-    if (type_filter < 0 || particles.types[i] == type_filter) {
-      count++;
-    }
-  }
-  PointCloud *pointcloud = BKE_pointcloud_new_nomain(count);
-  if (count == 0) {
-    r_geometry.replace_pointcloud(pointcloud);
-    return;
-  }
-  bke::MutableAttributeAccessor attributes = pointcloud->attributes_for_write();
-  const AttrDomain domain = AttrDomain::Point;
-  bke::SpanAttributeWriter<float3> positions = attributes.lookup_or_add_for_write_span<float3>(
-      "position", domain);
-  bke::SpanAttributeWriter<float3> velocities = attributes.lookup_or_add_for_write_span<float3>(
-      "velocity", domain);
-  bke::SpanAttributeWriter<float> ages = attributes.lookup_or_add_for_write_span<float>("age",
-                                                                                       domain);
-  bke::SpanAttributeWriter<float> lifetimes = attributes.lookup_or_add_for_write_span<float>(
-      "lifetime", domain);
-  bke::SpanAttributeWriter<float> radii = attributes.lookup_or_add_for_write_span<float>("radius",
-                                                                                        domain);
-  bke::SpanAttributeWriter<int> types = attributes.lookup_or_add_for_write_span<int>("type",
-                                                                                     domain);
-  bke::SpanAttributeWriter<int> clusters = attributes.lookup_or_add_for_write_span<int>(
-      "cluster", domain);
-
-  int write = 0;
-  for (const int i : IndexRange(particles.size())) {
-    if (type_filter >= 0 && particles.types[i] != type_filter) {
-      continue;
-    }
-    positions.span[write] = particles.positions[i];
-    velocities.span[write] = particles.velocities[i];
-    ages.span[write] = particles.ages[i];
-    lifetimes.span[write] = particles.lifetimes[i];
-    radii.span[write] = particles.radii[i];
-    types.span[write] = particles.types[i];
-    clusters.span[write] = particles.clusters[i];
-    write++;
-  }
-  positions.finish();
-  velocities.finish();
-  ages.finish();
-  lifetimes.finish();
-  radii.finish();
-  types.finish();
-  clusters.finish();
-  r_geometry.replace_pointcloud(pointcloud);
-}
-
 BundlePtr stats_to_bundle(const whitewater::Stats &stats)
 {
   BundlePtr bundle_ptr = Bundle::create();
@@ -308,348 +473,95 @@ BundlePtr stats_to_bundle(const whitewater::Stats &stats)
   return bundle_ptr;
 }
 
+/** \} */
+
 }  // namespace
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.use_custom_socket_order();
+  static NestedBundleTypePtr world_type = make_world_type();
 
-  b.add_input<decl::Menu>("Mode"_ustr)
-      .static_items(cluster_mode_items)
-      .default_value(MenuValue(int(WhiteWaterClusterMode::Strain)))
-      .description("How the clumps of white water are built");
-
-  b.add_input<decl::Geometry>("White Water"_ustr)
-      .supported_type({GeometryComponent::Type::Mesh, GeometryComponent::Type::PointCloud})
-      .description(
-          "The white water of the previous frame, usually `Simulation Input`. Leave it empty to "
-          "start a new simulation");
-  b.add_input<decl::Geometry>("Fluid"_ustr)
-      .supported_type({GeometryComponent::Type::Mesh, GeometryComponent::Type::PointCloud})
-      .description(
-          "Fluid particles with a `velocity` attribute: the flow speed drives the emission and the "
-          "foam drifts with it. The point cloud of `Textura Dynamics` or `Puncliga Dynamics`");
-  b.add_input<decl::Geometry>("Surface"_ustr)
-      .supported_type({GeometryComponent::Type::Mesh})
-      .description(
-          "Fluid surface mesh (`Fluid Surface`): white water is emitted from its triangles and the "
-          "foam sticks to it");
-  b.add_input<decl::Bundle>("Colliders"_ustr)
+  b.add_input<decl::Bundle>("World"_ustr)
+      .bundle_type(world_type)
       .structure_type(StructureType::Single)
-      .description("`Dilapido Collider` bundles; the spray dies when it touches one");
+      .description(
+          "The simulation: `geometry` holds the white water of the previous frame, `fluid` the "
+          "fluid particles (with `velocity`), `surface` the fluid surface mesh, `effectors` the "
+          "colliders and `settings` the parameters (Blender.WhiteWaterSettings). Leave it empty to "
+          "start a new simulation");
+  b.add_output<decl::Bundle>("World"_ustr)
+      .description("The world with the white water of this frame: feed it back inside the zone");
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 24.0f)
       .min(0.0f)
       .subtype(PROP_TIME_ABSOLUTE)
       .description("Length of the frame in seconds; drive it with `Simulation Input > Delta Time`");
-
-  {
-    auto &panel = b.add_panel("Emission"_ustr).default_closed(false);
-    panel.add_input<decl::Bool>("Foam"_ustr)
-        .default_value(true)
-        .description("Emit foam where the surface moves faster than `Foam Threshold`");
-    panel.add_input<decl::Bool>("Spray"_ustr)
-        .default_value(true)
-        .description("Emit droplets that fly off the surface and fall back");
-    panel.add_input<decl::Bool>("Bubbles"_ustr)
-        .default_value(false)
-        .description("Emit bubbles below the surface; they rise and pop into foam");
-    panel.add_input<decl::Float>("Emission Scale"_ustr)
-        .default_value(1.0f)
-        .min(0.0f)
-        .max(20.0f)
-        .description("Multiplier of all emission rates");
-    panel.add_input<decl::Int>("Seed"_ustr)
-        .default_value(0)
-        .description("Random seed of the emission and the sizes");
-    panel.add_input<decl::Float>("Foam Emission"_ustr)
-        .default_value(40.0f)
-        .min(0.0f)
-        .subtype(PROP_NONE)
-        .description("Foam particles per square metre of surface per second at full speed");
-    panel.add_input<decl::Float>("Foam Threshold"_ustr)
-        .default_value(1.5f)
-        .min(0.0f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed below which no foam is emitted");
-    panel.add_input<decl::Float>("Foam Full Speed"_ustr)
-        .default_value(5.0f)
-        .min(0.01f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed at which the foam emission reaches `Foam Emission`");
-    panel.add_input<decl::Float>("Spray Emission"_ustr)
-        .default_value(20.0f)
-        .min(0.0f)
-        .subtype(PROP_NONE)
-        .description("Spray particles per square metre of surface per second at full speed");
-    panel.add_input<decl::Float>("Spray Threshold"_ustr)
-        .default_value(2.5f)
-        .min(0.0f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed below which no spray is emitted");
-    panel.add_input<decl::Float>("Spray Full Speed"_ustr)
-        .default_value(6.0f)
-        .min(0.01f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed at which the spray emission reaches `Spray Emission`");
-    panel.add_input<decl::Float>("Bubble Emission"_ustr)
-        .default_value(8.0f)
-        .min(0.0f)
-        .subtype(PROP_NONE)
-        .description("Bubbles per square metre of surface per second at full speed");
-    panel.add_input<decl::Float>("Bubble Threshold"_ustr)
-        .default_value(0.5f)
-        .min(0.0f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed below which no bubbles are emitted");
-    panel.add_input<decl::Float>("Bubble Full Speed"_ustr)
-        .default_value(2.0f)
-        .min(0.01f)
-        .subtype(PROP_VELOCITY)
-        .description("Surface speed at which the bubble emission reaches `Bubble Emission`");
-  }
-  {
-    auto &panel = b.add_panel("Foam"_ustr).default_closed(false);
-    panel.add_input<decl::Float>("Foam Lifetime"_ustr)
-        .default_value(4.0f)
-        .min(0.01f)
-        .subtype(PROP_TIME_ABSOLUTE)
-        .usage_by_bool("Foam"_ustr, true)
-        .description("Seconds a foam particle lives");
-    panel.add_input<decl::Float>("Foam Size"_ustr)
-        .default_value(0.02f)
-        .min(1e-4f)
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Foam"_ustr, true)
-        .description("Radius of a foam particle");
-    panel.add_input<decl::Float>("Foam Stick"_ustr)
-        .default_value(0.7f)
-        .min(0.0f)
-        .max(1.0f)
-        .usage_by_bool("Foam"_ustr, true)
-        .description(
-            "How strongly the foam rides the flow and stays on the surface (0 = static stickers)");
-  }
-  {
-    auto &panel = b.add_panel("Spray"_ustr).default_closed(false);
-    panel.add_input<decl::Float>("Spray Lifetime"_ustr)
-        .default_value(1.2f)
-        .min(0.01f)
-        .subtype(PROP_TIME_ABSOLUTE)
-        .usage_by_bool("Spray"_ustr, true)
-        .description("Seconds a droplet lives if it does not hit anything");
-    panel.add_input<decl::Float>("Spray Size"_ustr)
-        .default_value(0.015f)
-        .min(1e-4f)
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Spray"_ustr, true)
-        .description("Radius of a spray droplet");
-    panel.add_input<decl::Float>("Spray Speed"_ustr)
-        .default_value(1.5f)
-        .min(0.0f)
-        .subtype(PROP_VELOCITY)
-        .usage_by_bool("Spray"_ustr, true)
-        .description("Extra speed along the surface normal when a droplet is born");
-    panel.add_input<decl::Float>("Drag"_ustr)
-        .default_value(1.0f)
-        .min(0.0f)
-        .usage_by_bool("Spray"_ustr, true)
-        .description("Air drag of spray and bubbles (1/s)");
-    panel.add_input<decl::Vector>("Gravity"_ustr)
-        .default_value(float3(0.0f, 0.0f, -9.81f))
-        .subtype(PROP_ACCELERATION)
-        .usage_by_bool("Spray"_ustr, true)
-        .description("Gravity of the spray droplets");
-  }
-  {
-    auto &panel = b.add_panel("Bubbles"_ustr).default_closed(false);
-    panel.add_input<decl::Float>("Bubble Lifetime"_ustr)
-        .default_value(3.0f)
-        .min(0.01f)
-        .subtype(PROP_TIME_ABSOLUTE)
-        .usage_by_bool("Bubbles"_ustr, true)
-        .description("Seconds a bubble lives");
-    panel.add_input<decl::Float>("Bubble Size"_ustr)
-        .default_value(0.01f)
-        .min(1e-4f)
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Bubbles"_ustr, true)
-        .description("Radius of a bubble");
-    panel.add_input<decl::Float>("Buoyancy"_ustr)
-        .default_value(2.0f)
-        .min(0.0f)
-        .usage_by_bool("Bubbles"_ustr, true)
-        .description("Upward acceleration of the bubbles (m/s^2)");
-    panel.add_input<decl::Float>("Bubble Depth"_ustr)
-        .default_value(0.15f)
-        .min(0.0f)
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Bubbles"_ustr, true)
-        .description("How far below the surface a bubble is born");
-    panel.add_input<decl::Bool>("Bubble to Foam"_ustr)
-        .default_value(true)
-        .usage_by_bool("Bubbles"_ustr, true)
-        .description("Turn a bubble into foam when it reaches the surface");
-  }
-  {
-    auto &panel = b.add_panel("Clusters"_ustr).default_closed(false);
-    panel.add_input<decl::Float>("Cohesion"_ustr)
-        .default_value(2.0f)
-        .min(0.0f)
-        .description(
-            "Attraction between neighbours, as an acceleration at contact. Makes the white water "
-            "clump instead of moving as independent points");
-    panel.add_input<decl::Float>("Cohesion Radius"_ustr)
-        .default_value(0.05f)
-        .min(1e-4f)
-        .subtype(PROP_DISTANCE)
-        .description("Neighbours within this distance attract each other");
-    panel.add_input<decl::Float>("Separation"_ustr)
-        .default_value(40.0f)
-        .min(0.0f)
-        .description("Repulsion between overlapping particles, as an acceleration at contact");
-    panel.add_input<decl::Float>("Separation Radius"_ustr)
-        .default_value(0.02f)
-        .min(1e-4f)
-        .subtype(PROP_DISTANCE)
-        .description("Particles closer than this push each other apart");
-    panel.add_input<decl::Bool>("Same Type Only"_ustr)
-        .default_value(true)
-        .description("Foam, spray and bubbles only interact with their own type");
-    panel.add_input<decl::Float>("Break Strain"_ustr)
-        .default_value(8.0f)
-        .min(0.0f)
-        .description(
-            "A cohesion link breaks when the relative speed divided by the cohesion radius is "
-            "above this (1/s). Low values tear the clumps apart easily, high values keep them "
-            "together");
-    panel.add_input<decl::Int>("Max Cluster Size"_ustr)
-        .default_value(64)
-        .min(1)
-        .description("Larger clumps are split into deterministic sub clusters");
-    panel.add_input<decl::Float>("Cluster Damping"_ustr)
-        .default_value(0.5f)
-        .min(0.0f)
-        .description("Relative velocity damping between linked neighbours (1/s)");
-  }
-  {
-    auto &panel = b.add_panel("Limits"_ustr).default_closed(true);
-    panel.add_input<decl::Int>("Max Particles"_ustr)
-        .default_value(50000)
-        .min(0)
-        .description("Hard budget; the oldest particles are dropped first");
-    panel.add_input<decl::Bool>("Use Bounds"_ustr)
-        .default_value(false)
-        .description("Delete particles that leave a box (useful to keep splash clean)");
-    panel.add_input<decl::Vector>("Bounds Min"_ustr)
-        .default_value(float3(-100.0f))
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Use Bounds"_ustr, true)
-        .description("Lower corner of the culling box");
-    panel.add_input<decl::Vector>("Bounds Max"_ustr)
-        .default_value(float3(100.0f))
-        .subtype(PROP_DISTANCE)
-        .usage_by_bool("Use Bounds"_ustr, true)
-        .description("Upper corner of the culling box");
-  }
-
-  b.add_output<decl::Geometry>("White Water"_ustr).propagate_all();
-  b.add_output<decl::Geometry>("Foam"_ustr);
-  b.add_output<decl::Geometry>("Spray"_ustr);
-  b.add_output<decl::Geometry>("Bubbles"_ustr);
-  b.add_output<decl::Bundle>("Stats"_ustr);
+  b.add_output<decl::Bundle>("Stats"_ustr)
+      .description("Particle and cluster counts, emission and timing, for debugging");
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
 {
-  whitewater::Settings settings;
-  settings.foam = params.extract_input<bool>("Foam"_ustr);
-  settings.spray = params.extract_input<bool>("Spray"_ustr);
-  settings.bubbles = params.extract_input<bool>("Bubbles"_ustr);
-  settings.emission_scale = std::max(0.0f, params.extract_input<float>("Emission Scale"_ustr));
-  settings.seed = params.extract_input<int>("Seed"_ustr);
-  settings.foam_emission = std::max(0.0f, params.extract_input<float>("Foam Emission"_ustr));
-  settings.foam_threshold = std::max(0.0f, params.extract_input<float>("Foam Threshold"_ustr));
-  settings.foam_full_speed = std::max(settings.foam_threshold + 1e-3f,
-                                      params.extract_input<float>("Foam Full Speed"_ustr));
-  settings.spray_emission = std::max(0.0f, params.extract_input<float>("Spray Emission"_ustr));
-  settings.spray_threshold = std::max(0.0f, params.extract_input<float>("Spray Threshold"_ustr));
-  settings.spray_full_speed = std::max(settings.spray_threshold + 1e-3f,
-                                       params.extract_input<float>("Spray Full Speed"_ustr));
-  settings.bubble_emission = std::max(0.0f, params.extract_input<float>("Bubble Emission"_ustr));
-  settings.bubble_threshold = std::max(0.0f, params.extract_input<float>("Bubble Threshold"_ustr));
-  settings.bubble_full_speed = std::max(settings.bubble_threshold + 1e-3f,
-                                        params.extract_input<float>("Bubble Full Speed"_ustr));
-  settings.foam_lifetime = std::max(0.01f, params.extract_input<float>("Foam Lifetime"_ustr));
-  settings.foam_size = std::max(1e-4f, params.extract_input<float>("Foam Size"_ustr));
-  settings.foam_stick = math::clamp(params.extract_input<float>("Foam Stick"_ustr), 0.0f, 1.0f);
-  settings.spray_lifetime = std::max(0.01f, params.extract_input<float>("Spray Lifetime"_ustr));
-  settings.spray_size = std::max(1e-4f, params.extract_input<float>("Spray Size"_ustr));
-  settings.spray_speed = std::max(0.0f, params.extract_input<float>("Spray Speed"_ustr));
-  settings.drag = std::max(0.0f, params.extract_input<float>("Drag"_ustr));
-  settings.gravity = params.extract_input<float3>("Gravity"_ustr);
-  settings.bubble_lifetime = std::max(0.01f, params.extract_input<float>("Bubble Lifetime"_ustr));
-  settings.bubble_size = std::max(1e-4f, params.extract_input<float>("Bubble Size"_ustr));
-  settings.bubble_buoyancy = std::max(0.0f, params.extract_input<float>("Buoyancy"_ustr));
-  settings.bubble_depth = std::max(0.0f, params.extract_input<float>("Bubble Depth"_ustr));
-  settings.bubble_to_foam = params.extract_input<bool>("Bubble to Foam"_ustr);
-  settings.cohesion = std::max(0.0f, params.extract_input<float>("Cohesion"_ustr));
-  settings.cohesion_radius = std::max(1e-4f, params.extract_input<float>("Cohesion Radius"_ustr));
-  settings.separation = std::max(0.0f, params.extract_input<float>("Separation"_ustr));
-  settings.separation_radius = std::max(1e-4f, params.extract_input<float>("Separation Radius"_ustr));
-  settings.same_type_only = params.extract_input<bool>("Same Type Only"_ustr);
-  settings.break_strain = std::max(0.0f, params.extract_input<float>("Break Strain"_ustr));
-  settings.max_cluster_size = std::max(1, params.extract_input<int>("Max Cluster Size"_ustr));
-  settings.cluster_damping = std::max(0.0f, params.extract_input<float>("Cluster Damping"_ustr));
-  settings.max_particles = std::max(0, params.extract_input<int>("Max Particles"_ustr));
-  settings.use_bounds = params.extract_input<bool>("Use Bounds"_ustr);
-  settings.bounds_min = params.extract_input<float3>("Bounds Min"_ustr);
-  settings.bounds_max = params.extract_input<float3>("Bounds Max"_ustr);
-
-  const int mode = params.extract_input<MenuValue>("Mode"_ustr).value;
-  settings.cluster_mode = mode == int(WhiteWaterClusterMode::Strain) ? whitewater::ClusterMode::Strain :
-                                                                       whitewater::ClusterMode::Strain;
-
+  BundlePtr world_ptr = params.get_input<BundlePtr>("World"_ustr);
+  if (!world_ptr) {
+    params.set_default_remaining_outputs();
+    return;
+  }
+  const float delta_time = std::max(0.0f, params.extract_input<float>("Delta Time"_ustr));
+  whitewater::Settings settings = read_settings(*world_ptr);
   if (const Scene *scene = DEG_get_input_scene(params.depsgraph())) {
     settings.frame = scene->r.cfra;
   }
 
   whitewater::ParticleData particles;
-  const GeometrySet state_set = params.extract_input<GeometrySet>("White Water"_ustr);
-  for (const GeometryComponent::Type type : {GeometryComponent::Type::PointCloud,
-                                             GeometryComponent::Type::Mesh})
-  {
-    const GeometryComponent *component = state_set.get_component(type);
-    if (component != nullptr) {
-      read_state(*component, particles);
+  const GeometrySet *state_geometry = world_ptr->lookup_ptr<GeometrySet>(
+      *BundleKey::from_str("geometry"));
+  if (state_geometry != nullptr) {
+    for (const GeometryComponent::Type type : {GeometryComponent::Type::PointCloud,
+                                               GeometryComponent::Type::Mesh})
+    {
+      const GeometryComponent *component = state_geometry->get_component(type);
+      if (component != nullptr) {
+        read_state(*component, particles);
+      }
     }
   }
 
   Vector<float3> fluid_positions;
   Vector<float3> fluid_velocities;
-  const GeometrySet fluid_set = params.extract_input<GeometrySet>("Fluid"_ustr);
-  for (const GeometryComponent::Type type : {GeometryComponent::Type::Mesh,
-                                             GeometryComponent::Type::PointCloud})
+  if (const GeometrySet *fluid = world_ptr->lookup_ptr<GeometrySet>(
+          *BundleKey::from_str("fluid")))
   {
-    const GeometryComponent *component = fluid_set.get_component(type);
-    if (component != nullptr) {
-      read_fluid(*component, fluid_positions, fluid_velocities);
+    for (const GeometryComponent::Type type : {GeometryComponent::Type::Mesh,
+                                               GeometryComponent::Type::PointCloud})
+    {
+      const GeometryComponent *component = fluid->get_component(type);
+      if (component != nullptr) {
+        read_fluid(*component, fluid_positions, fluid_velocities);
+      }
     }
   }
 
-  const GeometrySet surface_set = params.extract_input<GeometrySet>("Surface"_ustr);
-  const Mesh *surface = surface_set.get_mesh();
-
-  Vector<float3> collider_triangles;
-  if (BundlePtr colliders = params.get_input<BundlePtr>("Colliders"_ustr)) {
-    gather_colliders(*colliders, collider_triangles);
+  const Mesh *surface = nullptr;
+  if (const GeometrySet *surface_geometry = world_ptr->lookup_ptr<GeometrySet>(
+          *BundleKey::from_str("surface")))
+  {
+    surface = surface_geometry->get_mesh();
   }
 
-  const float delta_time = std::max(0.0f, params.extract_input<float>("Delta Time"_ustr));
+  Vector<float3> collider_triangles;
+  if (const BundlePtr *effectors = world_ptr->lookup_ptr<BundlePtr>(
+          *BundleKey::from_str("effectors")))
+  {
+    if (*effectors) {
+      gather_colliders(**effectors, collider_triangles);
+    }
+  }
 
   if (particles.size() == 0 && (surface == nullptr || fluid_positions.is_empty())) {
-    /* Nothing to simulate and nothing to emit from. */
-    params.set_default_remaining_outputs();
+    /* Nothing to simulate and nothing to emit from: keep the world as it is. */
+    params.set_output("World"_ustr, world_ptr);
+    params.set_output("Stats"_ustr, stats_to_bundle(whitewater::Stats{}));
     return;
   }
 
@@ -666,24 +578,23 @@ static void node_geo_exec(GeoNodeExecParams params)
                           delta_time,
                           stats);
 
-  GeometrySet all;
-  write_points(particles, -1, all);
-  params.set_output("White Water"_ustr, std::move(all));
-  GeometrySet foam;
-  write_points(particles, int(whitewater::ParticleType::Foam), foam);
-  params.set_output("Foam"_ustr, std::move(foam));
-  GeometrySet spray;
-  write_points(particles, int(whitewater::ParticleType::Spray), spray);
-  params.set_output("Spray"_ustr, std::move(spray));
-  GeometrySet bubbles;
-  write_points(particles, int(whitewater::ParticleType::Bubble), bubbles);
-  params.set_output("Bubbles"_ustr, std::move(bubbles));
+  Bundle &world = world_ptr.ensure_mutable_inplace();
+  GeometrySet result;
+  write_particles(particles, result);
+  world.add_override(*BundleKey::from_str("geometry"), result);
+
+  params.set_output("World"_ustr, std::move(world_ptr));
   params.set_output("Stats"_ustr, stats_to_bundle(stats));
 }
 
 static void node_register()
 {
   static bke::bNodeType ntype;
+
+  /* Register the bundle types even when the node is only referenced by an asset: the store nodes of
+   * `White Water Dynamics` write them by name. */
+  WhiteWaterSettingsBundle::get_bundle_type();
+  make_world_type();
 
   geo_node_type_base(&ntype, "GeometryNodeWhiteWaterSolver"_ustr);
   ntype.ui_name = "White Water Solver";
@@ -693,7 +604,7 @@ static void node_register()
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.declare = node_declare;
-  ntype.default_width = bke::NodeWidth::_240;
+  ntype.default_width = bke::NodeWidth::_180;
   bke::node_register_type(ntype);
 }
 NOD_REGISTER_NODE(node_register)
