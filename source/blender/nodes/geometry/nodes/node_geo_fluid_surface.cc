@@ -67,6 +67,8 @@ enum class SurfaceMode : int {
   Density = 0,
   /** Kernel weighted average of the per particle sphere distances (a smoothed distance field). */
   Distance = 1,
+  /** Material fraction: each particle's volume splatted with the solver's B-spline. */
+  Mpm = 2,
 };
 
 /** One fluid particle as far as the surface reconstruction is concerned. */
@@ -106,15 +108,20 @@ static void gather_particles_from_component(const GeometryComponent &component,
   }
   const VArray<float> radii =
       attributes->lookup_or_default<float>("radius", AttrDomain::Point, 0.05f).varray;
-  /* The fluid stores the physical particle mass and the rest density, so the volume of a particle
-   * is `mass / density`. Without them the particle is assumed to fill the lattice cell of the
-   * recommended spacing, which is exactly one radius. */
+  /* The particle volume is what the MPM mode needs: every particle represents `volume` of material,
+   * so the surface is the fraction of a cell that the material fills. Sources write it explicitly
+   * (`textura_volume`, measured from the seed spacing), otherwise it follows `mass / density`, and
+   * without either the particle is assumed to fill the lattice cell of one radius. */
+  const VArray<float> volumes =
+      attributes->lookup_or_default<float>("textura_volume", AttrDomain::Point, 0.0f).varray;
   const VArray<float> masses =
       attributes->lookup_or_default<float>("mass", AttrDomain::Point, 0.0f).varray;
-  const VArray<float> densities = attributes
-                                      ->lookup_or_default<float>(
-                                          "puncliga_rest_density", AttrDomain::Point, 0.0f)
-                                      .varray;
+  const VArray<float> puncliga_densities = attributes
+                                              ->lookup_or_default<float>(
+                                                  "puncliga_rest_density", AttrDomain::Point, 0.0f)
+                                              .varray;
+  const VArray<float> textura_densities =
+      attributes->lookup_or_default<float>("textura_density", AttrDomain::Point, 0.0f).varray;
 
   const int offset = r_particles.size();
   r_particles.resize(offset + points_num);
@@ -123,10 +130,13 @@ static void gather_particles_from_component(const GeometryComponent &component,
     const float radius = override_radius > 0.0f ? override_radius : radii[i];
     const float safe_radius = std::max(radius, 1e-5f);
     const float mass = masses[i];
-    const float density = densities[i];
-    const float volume = (mass > 0.0f && density > 0.0f) ?
-                             mass / density :
-                             safe_radius * safe_radius * safe_radius;
+    const float density = puncliga_densities[i] > 0.0f ? puncliga_densities[i] :
+                                                         textura_densities[i];
+    const float volume = volumes[i] > 0.0f ?
+                             volumes[i] :
+                             ((mass > 0.0f && density > 0.0f) ?
+                                  mass / density :
+                                  safe_radius * safe_radius * safe_radius);
     dst[i] = {positions[i], safe_radius, volume};
   }
 }
@@ -464,6 +474,92 @@ static void splat_union_sdf(const Span<FluidParticle> particles,
   }
 }
 
+/** Quadratic (order 2) B-spline weight of `u` in cell units: support 1.5, sums to one per lattice. */
+static double b_spline_quadratic(const double u)
+{
+  const double t = std::fabs(u);
+  if (t < 0.5) {
+    return 0.75 - t * t;
+  }
+  if (t < 1.5) {
+    const double remaining = 1.5 - t;
+    return 0.5 * remaining * remaining;
+  }
+  return 0.0;
+}
+
+/**
+ * Splats one bucket of particles as a material fraction, the way the MPM solver transfers mass.
+ *
+ * Every particle is a blob of its own volume `V`, splatted with the quadratic B-spline `N` that the
+ * solver uses for particle-to-grid:
+ *
+ *     fraction(x) = sum_p N((x - p) / h) / h^3 * V_p,  h = cbrt(V_p)
+ *
+ * because `V_p / h^3` is exactly one, a lattice whose spacing equals `h` fills a full cell with
+ * `1.0`. That is the property the density mode lacks: `N` is a partition of unity of the *material*
+ * volume, so a loose or irregular particle set does not change the field, only the resolution at
+ * which the fraction is sampled. A particle that represents a larger chunk of material simply
+ * spreads over a larger support, which is what makes MPM seeds (which vary with compression and
+ * CFL) look consistent instead of shrinking or bulging with their spacing.
+ *
+ * `width_scale` (the `Kernel Radius` socket) widens the support to `width_scale * h`; the amplitude
+ * becomes `V / (width_scale * h)^3`, so the lattice sum stays exactly one at any width and the
+ * surface only gets smoother, never denser.
+ *
+ * `Iso Level` then reads as "fraction of a cell that is material": 0.5 puts the surface half a
+ * particle spacing outside the outermost centres, 0.2 keeps a sparse spray that is mostly air.
+ */
+static void splat_mpm_particles(const Span<FluidParticle> particles,
+                                const float width_scale,
+                                const float voxel_size,
+                                openvdb::FloatGrid &grid)
+{
+  openvdb::FloatGrid::Accessor accessor = grid.getAccessor();
+  const double voxel = double(voxel_size);
+  /* `Kernel Radius` is expressed in particle radii, and an MPM particle's radius is half the edge
+   * of the volume it represents (the `radius = spacing / 2` layout `Init Textura Data` writes). So
+   * the default of two radii is exactly the solver's own stencil width `h`, which keeps the
+   * partition of unity and thin sheets; 4 widens it to two particle sizes (smoother volumes). */
+  const double scale = std::max(1.0, 0.5 * double(width_scale));
+  for (const FluidParticle &particle : particles) {
+    const double natural = std::cbrt(double(particle.volume));
+    if (!(natural > 0.0)) {
+      continue;
+    }
+    const double h = scale * natural;
+    const double inv_h = 1.0 / h;
+    const double amplitude = double(particle.volume) / (h * h * h);
+    const openvdb::Vec3d center = grid.transform().worldToIndex(
+        openvdb::Vec3d(particle.position.x, particle.position.y, particle.position.z));
+    const int reach = int(std::ceil(1.5 * h / voxel));
+    const int base_i = int(std::floor(center.x()));
+    const int base_j = int(std::floor(center.y()));
+    const int base_k = int(std::floor(center.z()));
+    for (int k = base_k - reach; k <= base_k + reach; k++) {
+      const double wz = b_spline_quadratic((double(k) - center.z()) * voxel * inv_h);
+      if (wz <= 0.0) {
+        continue;
+      }
+      for (int j = base_j - reach; j <= base_j + reach; j++) {
+        const double wy = b_spline_quadratic((double(j) - center.y()) * voxel * inv_h);
+        if (wy <= 0.0) {
+          continue;
+        }
+        const double wyz = wy * wz * amplitude;
+        for (int i = base_i - reach; i <= base_i + reach; i++) {
+          const double wx = b_spline_quadratic((double(i) - center.x()) * voxel * inv_h);
+          if (wx <= 0.0) {
+            continue;
+          }
+          const openvdb::Coord coord(i, j, k);
+          accessor.setValue(coord, accessor.getValue(coord) + float(wx * wyz));
+        }
+      }
+    }
+  }
+}
+
 /** Taubin λ|μ smoothing: removes the marching cubes noise without shrinking the surface. */
 static void smooth_positions_taubin(Mesh &mesh,
                                     const int iterations,
@@ -607,6 +703,13 @@ static const EnumPropertyItem surface_mode_items[] = {
      N_("Union of the particle spheres, smoothed as a level set. Flattens sheets and keeps "
         "droplets round; Iso Level 0.5 puts the surface at the particle radius, larger values push "
         "it outwards. Anisotropic and Edge Preserving do not apply in this mode")},
+    {int(SurfaceMode::Mpm),
+     "MPM",
+     0,
+     N_("MPM"),
+     N_("Splat each particle's volume with the solver's B-spline and extract the material "
+        "fraction. Independent of the particle spacing, so loose or compressed MPM seeds keep the "
+        "same surface; Iso Level is the fraction of a cell that is material")},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -627,22 +730,27 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value(0.0f)
       .min(0.0f)
       .subtype(PROP_DISTANCE)
-      .description("Resolution of the density field. 0 uses half of the particle radius");
+      .description("Resolution of the field. 0 uses half of the particle radius, or half of the "
+                   "natural size of a particle's volume in MPM mode");
   b.add_input<decl::Float>("Particle Radius"_ustr)
       .default_value(0.0f)
       .min(0.0f)
       .subtype(PROP_DISTANCE)
+      .usage_by_menu("Mode"_ustr, Array<int>{int(SurfaceMode::Density),
+                                             int(SurfaceMode::Distance)})
       .description(
           "Radius of the particles. 0 uses the `radius` attribute of the input (0.05 m when the "
           "geometry has none); any other value overrides the attribute. The kernel support is this "
-          "times `Kernel Radius`");
+          "times `Kernel Radius`. Not used by the MPM mode, which derives its size from the "
+          "particle volume");
   b.add_input<decl::Float>("Iso Level"_ustr)
       .default_value(0.6f)
       .min(0.01f)
       .max(2.0f)
       .description(
           "Density of the surface, as a fraction of the rest density of the particles. 0.5 puts "
-          "it through the centers of the outermost particles, higher values make it fuller");
+          "it through the centers of the outermost particles, higher values make it fuller. In MPM "
+          "mode it is the fraction of a cell that has to be material");
   b.add_input<decl::Int>("Smoothing"_ustr)
       .default_value(2)
       .min(0)
@@ -663,10 +771,13 @@ static void node_declare(NodeDeclarationBuilder &b)
       .min(1.0f)
       .max(4.0f)
       .description(
-          "Support of one particle's kernel, in particle radii. The kernel has to cover about two "
-          "particle spacings; raise it when the surface still shows one bump per particle");
+          "Support of one particle's kernel, in particle radii. It has to cover about two particle "
+          "spacings; raise it when the surface still shows one bump per particle. In MPM mode a "
+          "particle's radius is half the edge of its volume, so 2 is the solver's own stencil "
+          "width and 4 is a support of two particle sizes");
   b.add_input<decl::Bool>("Anisotropic"_ustr)
       .default_value(false)
+      .usage_by_menu("Mode"_ustr, Array<int>{int(SurfaceMode::Density)})
       .description(
           "Fit each particle's kernel to its neighbourhood (Yu & Turk): flat across a sheet, round "
           "inside a droplet. Smooths sheets and waterfalls without rounding off droplets or jets, "
@@ -675,6 +786,7 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value(0.0f)
       .min(0.0f)
       .max(1.0f)
+      .usage_by_menu("Mode"_ustr, Array<int>{int(SurfaceMode::Density), int(SurfaceMode::Mpm)})
       .description(
           "Bilateral weighting of the density relaxation: 0 is a plain average, 1 only averages "
           "neighbours of similar density so thin sheets and droplets keep their own level");
@@ -699,6 +811,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const GeometrySet geometry = params.extract_input<GeometrySet>("Points"_ustr);
   const int mode = params.extract_input<MenuValue>("Mode"_ustr).value;
   const bool distance_mode = mode == int(SurfaceMode::Distance);
+  const bool mpm_mode = mode == int(SurfaceMode::Mpm);
   /* 0 means "use the `radius` attribute of the input"; a value overrides it, which is what makes the
    * socket visible in the node instead of being ignored by attribute carrying inputs. */
   const float radius_override = std::max(0.0f,
@@ -734,21 +847,30 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   double radius_sum = 0.0;
+  double volume_sum = 0.0;
   float max_radius = 0.0f;
+  float max_volume = 0.0f;
   float3 bbox_min(FLT_MAX);
   float3 bbox_max(-FLT_MAX);
   for (const FluidParticle &particle : particles) {
     radius_sum += particle.radius;
+    volume_sum += particle.volume;
     max_radius = std::max(max_radius, particle.radius);
+    max_volume = std::max(max_volume, particle.volume);
     bbox_min = math::min(bbox_min, particle.position);
     bbox_max = math::max(bbox_max, particle.position);
   }
   const float mean_radius = float(radius_sum / double(particles.size()));
-  if (mean_radius <= 0.0f || max_radius <= 0.0f) {
+  const float mean_volume = float(volume_sum / double(particles.size()));
+  if (mean_radius <= 0.0f || max_radius <= 0.0f || !(mean_volume > 0.0f)) {
     params.set_default_remaining_outputs();
     return;
   }
-  float voxel_size = voxel_size_input > 0.0f ? voxel_size_input : 0.5f * mean_radius;
+  /* MPM mode has no kernel radius: the natural size of a particle is the edge of the volume it
+   * represents, which is what the B-spline splat spreads over. */
+  const float mean_size = mpm_mode ? std::cbrt(mean_volume) : mean_radius;
+  const float max_size = mpm_mode ? std::cbrt(max_volume) : max_radius;
+  float voxel_size = voxel_size_input > 0.0f ? voxel_size_input : 0.5f * mean_size;
 
   /* The splat cost per particle grows cubically with the kernel support measured in voxels, and
    * every bucket keeps its own copy of the grid. A `Particle Radius` far larger than the input's
@@ -756,7 +878,9 @@ static void node_geo_exec(GeoNodeExecParams params)
    * radius with the four times kernel radius and a 15 mm voxel is a support of 335 voxels per
    * particle, which is hours of work and gigabytes of grid. Coarsen the voxel size until both the
    * splat work and the bucket memory fit a budget, and say so instead of appearing to hang. */
-  const float support = radius_scale * max_radius;
+  const float support = mpm_mode ?
+                           1.5f * std::max(1.0f, 0.5f * radius_scale) * max_size :
+                           radius_scale * max_radius;
   const float requested_voxel_size = voxel_size;
   constexpr int MAX_SUPPORT_VOXELS = 24;
   if (support / voxel_size > float(MAX_SUPPORT_VOXELS)) {
@@ -786,9 +910,12 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
   const double normalizer = lattice_kernel_sum(mean_radius, radius_scale);
   if (std::getenv("BLENDER_FLUID_SURFACE_DEBUG") != nullptr) {
-    printf("FLUID_SURFACE_DEBUG %ld particles mean_radius=%f voxel_size=%f normalizer=%f\n",
+    printf("FLUID_SURFACE_DEBUG %ld particles mode=%d mean_radius=%f mean_volume=%f "
+           "voxel_size=%f normalizer=%f\n",
            long(particles.size()),
+           mode,
            mean_radius,
+           mean_volume,
            voxel_size,
            normalizer);
   }
@@ -797,7 +924,7 @@ static void node_geo_exec(GeoNodeExecParams params)
    * because an OpenVDB grid is not thread safe. One bucket per parallel task, so no two tasks ever
    * touch the same grid. */
   Array<KernelShape> kernel_shapes;
-  if (anisotropic) {
+  if (anisotropic && !distance_mode && !mpm_mode) {
     build_kernel_shapes(particles.as_span(), mean_radius, kernel_shapes);
   }
 
@@ -867,6 +994,41 @@ static void node_geo_exec(GeoNodeExecParams params)
       }
     }
     iso_value = (iso_level - 0.5f) * 2.0f * mean_radius;
+  }
+  else if (mpm_mode) {
+    /* MPM mode: the material fraction, splatted with the solver's quadratic B-spline. `Iso Level`
+     * is the fraction of a cell that has to be filled, so it means the same thing at any spacing. */
+    Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
+    for (const int i : IndexRange(bucket_num)) {
+      bucket_grids[i] = openvdb::FloatGrid::create(0.0f);
+      bucket_grids[i]->setTransform(
+          openvdb::math::Transform::createLinearTransform(double(voxel_size)));
+    }
+    threading::parallel_for(IndexRange(bucket_num), 1, [&](const IndexRange range) {
+      for (const int bucket_i : range) {
+        const int64_t start = bucket_i * bucket_size;
+        const int64_t end = std::min(start + bucket_size, particles_num);
+        if (start >= end) {
+          continue;
+        }
+        splat_mpm_particles(particles.as_span().slice(start, end - start),
+                            radius_scale,
+                            voxel_size,
+                            *bucket_grids[bucket_i]);
+      }
+    });
+    grid = bucket_grids[0];
+    {
+      openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+      for (const int bucket_i : IndexRange(1, bucket_num - 1)) {
+        for (auto iter = bucket_grids[bucket_i]->cbeginValueOn(); iter; ++iter) {
+          const openvdb::Coord coord = iter.getCoord();
+          accessor.setValue(coord, accessor.getValue(coord) + iter.getValue());
+        }
+        bucket_grids[bucket_i].reset();
+      }
+    }
+    grid->setGridClass(openvdb::GRID_FOG_VOLUME);
   }
   else {
     Array<openvdb::FloatGrid::Ptr> bucket_grids(bucket_num);
