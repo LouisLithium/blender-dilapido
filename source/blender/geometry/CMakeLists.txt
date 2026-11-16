@@ -79,6 +79,7 @@ set(SRC
   ha/GEO_ha_sdf.cc
   ha/GEO_ha_status.cc
   ha/GEO_ha_xpbd.cc
+  ha/GEO_ha_fluid_surface.cc
 
   GEO_tetrahedralize.cc
 
@@ -90,6 +91,8 @@ set(SRC
   whitewater/GEO_white_water_solver.cc
 
   xpbd/intern/xpbd_constraint_coloring.cc
+
+  ha/GEO_ha_fluid_surface.hh
 
   textura/GEO_textura_solver.hh
   textura/GEO_textura_device.hh

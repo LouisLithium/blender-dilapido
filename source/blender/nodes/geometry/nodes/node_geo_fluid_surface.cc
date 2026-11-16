@@ -36,6 +36,7 @@
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
 #include "BLI_task.hh"
+#include "BLI_time.h"
 #include "BLI_threads.h"
 
 #include "BKE_attribute.hh"
@@ -47,7 +48,13 @@
 
 #include "BLT_translation.hh"
 
+#include "NOD_geometry_nodes_lazy_function.hh"
+
 #include "node_geometry_util.hh"
+
+#include "GEO_ha_context.hh"
+#include "GEO_ha_fluid_surface.hh"
+#include "GEO_ha_status.hh"
 
 #ifdef WITH_OPENVDB
 #  include "BKE_volume_grid.hh"
@@ -689,6 +696,36 @@ static void smooth_density_field(openvdb::FloatGrid &grid,
 
 #endif /* WITH_OPENVDB */
 
+/** Turns the dense field the device produced into a grid the OpenVDB mesher understands. */
+static openvdb::FloatGrid::Ptr grid_from_dense_field(const geometry::ha::FluidSurfaceField &field)
+{
+  openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(0.0f);
+  openvdb::math::Transform::Ptr transform = openvdb::math::Transform::createLinearTransform(
+      double(field.voxel_size));
+  /* The device grid puts node (i, j, k) at `origin + i * voxel`, which is how OpenVDB maps an index
+   * for a linear transform, so the transform only carries the origin. */
+  transform->postTranslate(openvdb::Vec3d(double(field.origin.x),
+                                         double(field.origin.y),
+                                         double(field.origin.z)));
+  grid->setTransform(transform);
+  openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+  const int3 dims = field.dims;
+  for (const int k : IndexRange(dims.z)) {
+    for (const int j : IndexRange(dims.y)) {
+      const int64_t row = (int64_t(k) * dims.y + j) * dims.x;
+      for (const int i : IndexRange(dims.x)) {
+        const float value = field.values[row + i];
+        if (value > 0.0f) {
+          accessor.setValue(openvdb::Coord(i, j, k), value);
+        }
+      }
+    }
+  }
+  grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+  grid->tree().prune();
+  return grid;
+}
+
 static const EnumPropertyItem surface_mode_items[] = {
     {int(SurfaceMode::Density),
      "DENSITY",
@@ -946,9 +983,69 @@ static void node_geo_exec(GeoNodeExecParams params)
   const int64_t particles_num = particles.size();
   const int64_t bucket_size = (particles_num + bucket_num - 1) / bucket_num;
 
+  /* Phase timings for performance work (`BLENDER_FLUID_SURFACE_PROFILE=1`). */
+  double phase_time = BLI_time_now_seconds();
+  auto lap = [&](const char *label) {
+    if (std::getenv("BLENDER_FLUID_SURFACE_PROFILE") == nullptr) {
+      return;
+    }
+    const double now = BLI_time_now_seconds();
+    fprintf(stderr, "FLUID_SURFACE %-10s %6.1f ms\n", label, (now - phase_time) * 1000.0);
+    phase_time = now;
+  };
+  lap("gather");
+
+  /* Device path: the particle splat and the field relaxation run on the compute backend, the
+   * isosurface extraction stays on the CPU (OpenVDB). Every other mode and the anisotropic kernel
+   * report a reason and use the CPU. */
+  const GeoNodesUserData &user_data = *static_cast<const GeoNodesUserData *>(params.user_data());
+  const int backend_request = user_data.ha_backend_request ? *user_data.ha_backend_request : 0;
+  const char *gpu_env = std::getenv("BLENDER_FLUID_SURFACE_GPU");
+  const bool force_gpu = gpu_env != nullptr && StringRef(gpu_env) == "1";
+  const bool force_cpu = gpu_env != nullptr && StringRef(gpu_env) == "0";
+  const bool device_requested = !force_cpu &&
+                                (force_gpu || backend_request == 1 || backend_request == 2);
+  bool device_used = false;
+  std::string device_reason;
+  geometry::ha::FluidSurfaceField device_field;
+  if (device_requested) {
+    if (distance_mode) {
+      device_reason = "the Distance mode is CPU only";
+    }
+    else if (anisotropic) {
+      device_reason = "the anisotropic kernel is CPU only";
+    }
+    else {
+      geometry::ha::FluidSurfaceSettings device_settings;
+      device_settings.voxel_size = voxel_size;
+      device_settings.radius_scale = radius_scale;
+      device_settings.mpm_mode = mpm_mode;
+      device_settings.normalizer = float(normalizer);
+      device_settings.smoothing = density_smoothing;
+      device_settings.edge_preserving = edge_preserving;
+      device_settings.value_scale = iso_level;
+      Vector<float3> device_positions(particles.size());
+      Vector<float> device_radii(particles.size());
+      Vector<float> device_volumes(particles.size());
+      for (const int i : IndexRange(particles.size())) {
+        device_positions[i] = particles[i].position;
+        device_radii[i] = particles[i].radius;
+        device_volumes[i] = particles[i].volume;
+      }
+      const Span<const float3> position_span(device_positions.data(), device_positions.size());
+      const Span<const float> radius_span(device_radii.data(), device_radii.size());
+      const Span<const float> volume_span(device_volumes.data(), device_volumes.size());
+      device_used = geometry::ha::ha_fluid_surface_field(
+          position_span, radius_span, volume_span, device_settings, device_field, device_reason);
+    }
+  }
+
   openvdb::FloatGrid::Ptr grid;
   float iso_value = iso_level;
-  if (distance_mode) {
+  if (device_used) {
+    grid = grid_from_dense_field(device_field);
+  }
+  else if (distance_mode) {
     /* Distance mode: union of the particle spheres, then OpenVDB's level set filter, which smooths
      * the field *and* re-normalises it, so the surface is smoothed without collapsing. `Iso Level`
      * becomes a metric offset: 0.5 puts the surface at the particle radius, larger values push it
@@ -1069,10 +1166,12 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     grid->setGridClass(openvdb::GRID_FOG_VOLUME);
   }
-  if (!distance_mode) {
+  lap("splat");
+  if (!distance_mode && !device_used) {
     grid->tree().prune();
     smooth_density_field(*grid, density_smoothing, 0.5f, edge_preserving, iso_level);
   }
+  lap("smoothing");
 
   Mesh *mesh = nullptr;
   if (grid->activeVoxelCount() > 0) {
@@ -1081,7 +1180,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   if (mesh == nullptr) {
     mesh = BKE_mesh_new_nomain(0, 0, 0, 0);
   }
+  lap("extract");
   smooth_positions_taubin(*mesh, smoothing, 0.5f, -0.53f);
+  lap("taubin");
   bke::mesh_smooth_set(*mesh, smooth_shading);
 
   GeometrySet mesh_set;
@@ -1095,6 +1196,40 @@ static void node_geo_exec(GeoNodeExecParams params)
     volume_set.replace_volume(volume);
   }
   params.set_output("Density"_ustr, std::move(volume_set));
+
+  if (device_requested && !device_used && !device_reason.empty()) {
+    params.error_message_add(backend_request == 2 ? NodeWarningType::Warning :
+                                                    NodeWarningType::Info,
+                             fmt::format("Fluid Surface: the field was built on the CPU ({})",
+                                         device_reason));
+  }
+  if (backend_request != 0) {
+    geometry::ha::HaNodeStatus status;
+    status.backend = geometry::ha::ha_gpu_backend_name();
+    status.state = device_used ? geometry::ha::HaNodeState::Device : geometry::ha::HaNodeState::Fallback;
+    status.reason = device_used ? std::string() : device_reason;
+    status.elements = int(particles.size());
+    geometry::ha::ha_status_set(params.node().owner_tree(), params.node(), status);
+  }
+  else {
+    geometry::ha::ha_status_clear(params.node().owner_tree(), params.node());
+  }
+  if (std::getenv("BLENDER_FLUID_SURFACE_GPU_LOG") != nullptr) {
+    if (device_used) {
+      fprintf(stderr,
+              "FLUID_SURFACE_GPU backend=device particles=%d cells=%d smoothing=%d\n",
+              int(particles.size()),
+              int(device_field.values.size()),
+              density_smoothing);
+    }
+    else {
+      fprintf(stderr,
+              "FLUID_SURFACE_GPU backend=cpu requested=%d reason=%s\n",
+              int(device_requested),
+              device_reason.c_str());
+    }
+    fflush(stderr);
+  }
 #else
   params.error_message_add(NodeWarningType::Error,
                            TIP_("Fluid Surface requires a build with OpenVDB"));
