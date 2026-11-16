@@ -200,6 +200,23 @@ static Array<const rl::RelationsInNode *> prepare_relations_by_node(const bNodeT
         node_relations = &relations;
         break;
       }
+      case GEO_NODE_HW_ACCELERATE_INPUT:
+      case GEO_NODE_HW_ACCELERATE_OUTPUT: {
+        /* The zone is a backend scope, not a loop: the geometry flows through the body once. Data
+         * and references that come from outside pass through, but references created inside the
+         * zone stay local (the zone output creates new ones), exactly like the repeat zone. Without
+         * this a node outside the zone that lazily references the zone output (e.g. `Set Point
+         * Radius`) made the lazy-function builder look up a socket of a node inside the zone,
+         * which is not part of the outer graph: null dereference in
+         * `build_reference_sets_outside_of_zones`. */
+        rl::RelationsInNode &relations = scope.construct<rl::RelationsInNode>();
+        if (node->type_legacy == GEO_NODE_HW_ACCELERATE_INPUT) {
+          relations.data_propagations.append({0, 0});
+          relations.reference_propagations.append({0, 0});
+        }
+        node_relations = &relations;
+        break;
+      }
       case NODE_REROUTE: {
         static const rl::RelationsInNode reroute_relations = []() {
           rl::RelationsInNode relations;
@@ -545,6 +562,41 @@ static bool pass_left_to_right(const bNodeTree &tree,
         }
         break;
       }
+      case GEO_NODE_HW_ACCELERATE_OUTPUT: {
+        const bNodeTreeZone *zone = get_zone_of_node_if_full(zones, *node);
+        if (!zone) {
+          break;
+        }
+        const bNode &input_node = *zone->input_node();
+        const bNode &output_node = *zone->output_node();
+        /* The body runs exactly once, so the geometry from the zone input reaches the output. Data
+         * and references from outside may therefore also be referenced on the outside. References
+         * created inside the zone may not (the output creates new ones). */
+        const int in_index = input_node.input_socket(0).index_in_tree();
+        const int src_index = output_node.input_socket(0).index_in_tree();
+        const int dst_index = output_node.output_socket(0).index_in_tree();
+        r_potential_data_by_socket[dst_index] |= r_potential_data_by_socket[in_index];
+        r_potential_reference_by_socket[dst_index] |= r_potential_reference_by_socket[in_index];
+
+        const BitVector<> outside_references = get_references_coming_from_outside_zone(
+            *zone, {&r_potential_data_by_socket, &r_potential_reference_by_socket});
+        bits::inplace_or_masked(r_potential_data_by_socket[dst_index],
+                                outside_references,
+                                r_potential_data_by_socket[src_index]);
+        bits::inplace_or_masked(r_potential_reference_by_socket[dst_index],
+                                outside_references,
+                                r_potential_reference_by_socket[src_index]);
+
+        /* Keep the body input and output in sync so the analysis converges. */
+        const int body_in_index = input_node.output_socket(0).index_in_tree();
+        needs_extra_pass |= or_into_each_other_masked(r_potential_data_by_socket[src_index],
+                                                      r_potential_data_by_socket[body_in_index],
+                                                      outside_references);
+        needs_extra_pass |= or_into_each_other_masked(r_potential_reference_by_socket[src_index],
+                                                      r_potential_reference_by_socket[body_in_index],
+                                                      outside_references);
+        break;
+      }
       case GEO_NODE_REPEAT_OUTPUT: {
         const bNodeTreeZone *zone = get_zone_of_node_if_full(zones, *node);
         if (!zone) {
@@ -784,6 +836,28 @@ static bool pass_right_to_left(const bNodeTree &tree,
               node->input_socket(storage->main_items.items_num + item_i).index_in_tree();
           r_required_data_by_socket[dst_index] |= r_required_data_by_socket[src_index];
         }
+        break;
+      }
+      case GEO_NODE_HW_ACCELERATE_OUTPUT: {
+        const bNodeTreeZone *zone = get_zone_of_node_if_full(zones, *node);
+        if (!zone) {
+          break;
+        }
+        const bNode &output_node = *zone->output_node();
+        r_required_data_by_socket[output_node.input_socket(0).index_in_tree()] |=
+            r_required_data_by_socket[output_node.output_socket(0).index_in_tree()];
+        break;
+      }
+      case GEO_NODE_HW_ACCELERATE_INPUT: {
+        const bNodeTreeZone *zone = get_zone_of_node_if_full(zones, *node);
+        if (!zone) {
+          break;
+        }
+        const bNode &input_node = *zone->input_node();
+        const bNode &output_node = *zone->output_node();
+        needs_extra_pass |= or_into_each_other(
+            r_required_data_by_socket[input_node.output_socket(0).index_in_tree()],
+            r_required_data_by_socket[output_node.input_socket(0).index_in_tree()]);
         break;
       }
       case GEO_NODE_REPEAT_OUTPUT: {

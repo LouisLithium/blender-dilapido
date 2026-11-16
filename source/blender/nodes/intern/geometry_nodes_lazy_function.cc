@@ -24,6 +24,8 @@
 #include "NOD_geometry_exec.hh"
 #include "NOD_geometry_nodes_bundle.hh"
 #include "NOD_geometry_nodes_closure.hh"
+#include <cstdio>
+
 #include "NOD_geometry_nodes_lazy_function.hh"
 #include "NOD_geometry_nodes_list.hh"
 #include "NOD_multi_function.hh"
@@ -3150,11 +3152,20 @@ struct GeometryNodesLazyFunctionBuilder {
       switch (reference_set.type) {
         case ReferenceSetType::LocalReferenceSet: {
           const bNodeSocket &bsocket = *reference_set.socket;
-          lf::OutputSocket &lf_socket = *graph_params.lf_output_by_bsocket.lookup(&bsocket);
+          lf::OutputSocket *lf_socket = graph_params.lf_output_by_bsocket.lookup_default(&bsocket,
+                                                                                         nullptr);
+          if (lf_socket == nullptr) {
+            /* The socket is not part of the outer graph (it is inside a zone that did not pass the
+             * reference through). `node_tree_reference_lifetimes.cc` keeps references created
+             * inside a zone local, so this should not happen; skipping one reference set is much
+             * better than dereferencing null. */
+            BLI_assert_unreachable();
+            break;
+          }
           lf::OutputSocket *lf_usage_socket = graph_params.usage_by_bsocket.lookup_default(
               &bsocket, nullptr);
           lf::OutputSocket &lf_reference_set_socket = this->get_extracted_reference_set(
-              lf_socket, lf_usage_socket, graph_params);
+              *lf_socket, lf_usage_socket, graph_params);
           lf_reference_sets.add_new(reference_set_i, &lf_reference_set_socket);
           break;
         }
@@ -3223,7 +3234,14 @@ struct GeometryNodesLazyFunctionBuilder {
             return;
           }
         }
-        lf_reference_sets_to_join.append(lf_reference_sets.lookup(reference_set_i));
+        lf::OutputSocket *lf_reference_set = lf_reference_sets.lookup_default(reference_set_i,
+                                                                             nullptr);
+        if (lf_reference_set == nullptr) {
+          /* A reference set the analysis asked for but that no socket provides (see the
+           * `BLI_assert_unreachable` in `build_reference_sets_outside_of_zones`). Skip it. */
+          return;
+        }
+        lf_reference_sets_to_join.append(lf_reference_set);
       });
 
       if (lf::OutputSocket *lf_joined_reference_set = this->join_reference_sets(
