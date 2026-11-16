@@ -55,6 +55,21 @@ struct Settings {
   float bubble_emission = 8.0f;
   float emission_scale = 1.0f;
 
+  /**
+   * Extra emission where the flow is rotational (|curl v|), normalized by `vorticity_scale` (1/s).
+   * 0 keeps the plain speed driven emission.
+   */
+  float vorticity_weight = 0.0f;
+  float vorticity_scale = 20.0f;
+  /**
+   * Extra emission where the flow converges (`-div v`, air entrained into the water), normalized by
+   * `divergence_scale` (1/s). This is the classic "trapped air" term of white water.
+   */
+  float trapped_air_weight = 0.0f;
+  float divergence_scale = 10.0f;
+  /** Give the bubbles twice the trapped air contribution (they are the air itself). */
+  bool air_to_bubbles = true;
+
   /** Speed window that drives the emission density of each type (m/s). */
   float foam_threshold = 1.5f;
   float foam_full_speed = 5.0f;
@@ -115,6 +130,8 @@ struct Stats {
   int emitted = 0;
   int clusters = 0;
   int links = 0;
+  /** Cells of the coarse flow grid that were used for the vorticity/trapped air terms. */
+  int grid_cells = 0;
   float max_speed = 0.0f;
   double milliseconds = 0.0;
 };

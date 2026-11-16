@@ -72,6 +72,11 @@ const FlatBundleTypePtr &WhiteWaterSettingsBundle::get_bundle_type()
     b.add<decl::Float>("spray_emission"_ustr).min(0.0f);
     b.add<decl::Float>("bubble_emission"_ustr).min(0.0f);
     b.add<decl::Float>("emission_scale"_ustr).min(0.0f);
+    b.add<decl::Float>("vorticity_weight"_ustr).min(0.0f);
+    b.add<decl::Float>("vorticity_scale"_ustr).min(1e-3f);
+    b.add<decl::Float>("trapped_air_weight"_ustr).min(0.0f);
+    b.add<decl::Float>("divergence_scale"_ustr).min(1e-3f);
+    b.add<decl::Bool>("air_to_bubbles"_ustr);
     b.add<decl::Int>("seed"_ustr);
     b.add<decl::Float>("foam_threshold"_ustr).min(0.0f);
     b.add<decl::Float>("foam_full_speed"_ustr).min(0.01f);
@@ -179,6 +184,19 @@ whitewater::Settings read_settings(const Bundle &world)
       0.0f, read_float(bundle, "bubble_emission", settings.bubble_emission));
   settings.emission_scale = std::max(0.0f,
                                      read_float(bundle, "emission_scale", settings.emission_scale));
+  settings.vorticity_weight = std::max(0.0f,
+                                       read_float(bundle, "vorticity_weight",
+                                                  settings.vorticity_weight));
+  settings.vorticity_scale = std::max(1e-3f,
+                                      read_float(bundle, "vorticity_scale",
+                                                 settings.vorticity_scale));
+  settings.trapped_air_weight = std::max(0.0f,
+                                         read_float(bundle, "trapped_air_weight",
+                                                    settings.trapped_air_weight));
+  settings.divergence_scale = std::max(1e-3f,
+                                       read_float(bundle, "divergence_scale",
+                                                  settings.divergence_scale));
+  settings.air_to_bubbles = read_bool(bundle, "air_to_bubbles", settings.air_to_bubbles);
   settings.seed = read_int(bundle, "seed", settings.seed);
   settings.foam_threshold = std::max(0.0f,
                                      read_float(bundle, "foam_threshold", settings.foam_threshold));

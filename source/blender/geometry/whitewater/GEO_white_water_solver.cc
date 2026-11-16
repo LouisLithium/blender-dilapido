@@ -167,6 +167,261 @@ class ParticleGrid {
 /** \} */
 
 /* -------------------------------------------------------------------- */
+/** \name Coarse flow grid
+ * \{ */
+
+/**
+ * Coarse velocity field built from the fluid particles once per frame.
+ *
+ * White water wants more than the speed of the nearest particle: the *curl* of the velocity is where
+ * the foam belongs (shear layers, breaking crests) and its negative *divergence* is the trapped air
+ * of a plunging jet. Both come from the same field, so one pass over the particles gives all three
+ * criteria (speed, vorticity, trapped air) and the emission reads them with a trilinear sample
+ * instead of a nearest particle lookup.
+ *
+ * Determinism: the particles are counting sorted into cells (ascending index order within a cell),
+ * every cell sums its own bucket, and the derivative passes only read the resulting field, so the
+ * result does not depend on the thread count and no atomics are involved.
+ */
+class FlowGrid {
+ public:
+  struct Sample {
+    float3 velocity = float3(0.0f);
+    float speed = 0.0f;
+    /** Magnitude of the curl of the velocity (1/s). */
+    float vorticity = 0.0f;
+    /** Positive where the flow converges: air is being entrained (1/s). */
+    float trapped_air = 0.0f;
+    bool found = false;
+  };
+
+  void build(const Span<const float3> positions,
+             const Span<const float3> velocities,
+             const float mean_spacing)
+  {
+    cell_count_ = 0;
+    active_cells_ = 0;
+    positions_ = positions;
+    velocities_ = velocities;
+    const int count = int(positions.size());
+    if (count == 0) {
+      return;
+    }
+    float3 min = positions[0];
+    float3 max = positions[0];
+    for (const float3 &p : positions) {
+      min = math::min(min, p);
+      max = math::max(max, p);
+    }
+    const float3 extent = math::max(max - min, float3(1e-5f));
+    /* One cell is about two particle spacings, so the central differences see real neighbours: a
+     * grid derived from the bounding volume collapses on a thin sheet (its volume is almost zero)
+     * and the derivative stencil then only reads the cell itself. */
+    float cell = 2.0f * mean_spacing;
+    if (!(cell > 1e-4f)) {
+      cell = std::cbrt(extent.x * extent.y * extent.z / float(count));
+    }
+    cell = math::clamp(cell, 1e-3f, 0.5f);
+    constexpr int MAX_CELLS = 262144;
+    /* A margin keeps the field sampleable just outside the particle cloud: the surface mesh sits
+     * about half a particle radius outside the outermost particles, which is outside a tight
+     * bounding box on a thin sheet. */
+    constexpr int MARGIN_CELLS = 3;
+    for (int attempt = 0; attempt < 8; attempt++) {
+      dims_ = int3(std::max(1, int(std::ceil(extent.x / cell))) + 2 * MARGIN_CELLS,
+                   std::max(1, int(std::ceil(extent.y / cell))) + 2 * MARGIN_CELLS,
+                   std::max(1, int(std::ceil(extent.z / cell))) + 2 * MARGIN_CELLS);
+      const int64_t cells = int64_t(dims_.x) * dims_.y * dims_.z;
+      if (cells <= MAX_CELLS) {
+        break;
+      }
+      cell *= std::cbrt(double(cells) / double(MAX_CELLS));
+    }
+    origin_ = min - float3(float(MARGIN_CELLS) * cell);
+    cell_size_ = cell;
+    const int cells = dims_.x * dims_.y * dims_.z;
+    cell_count_ = cells;
+
+    Array<int> cell_of(count, 0);
+    Array<int> counts(cells, 0);
+    for (const int i : IndexRange(count)) {
+      const int3 c = cell_of_position(positions[i]);
+      const int index = ((c.z * dims_.y) + c.y) * dims_.x + c.x;
+      cell_of[i] = index;
+      counts[index]++;
+    }
+    offsets_.reinitialize(cells + 1);
+    int total = 0;
+    for (const int i : IndexRange(cells)) {
+      offsets_[i] = total;
+      total += counts[i];
+    }
+    offsets_[cells] = total;
+    Array<int> cursor = offsets_;
+    indices_.reinitialize(count);
+    for (const int i : IndexRange(count)) {
+      indices_[cursor[cell_of[i]]++] = i;
+    }
+
+    counts_.reinitialize(cells);
+    counts_.fill(0);
+    velocity_.reinitialize(cells);
+    velocity_.fill(float3(0.0f));
+    vorticity_.reinitialize(cells);
+    vorticity_.fill(0.0f);
+    trapped_air_.reinitialize(cells);
+    trapped_air_.fill(0.0f);
+    threading::parallel_for(IndexRange(cells), 4096, [&](const IndexRange range) {
+      for (const int cell_index : range) {
+        float3 sum(0.0f);
+        int n = 0;
+        for (int k = offsets_[cell_index]; k < offsets_[cell_index + 1]; k++) {
+          sum += velocities_[indices_[k]];
+          n++;
+        }
+        counts_[cell_index] = n;
+        if (n > 0) {
+          velocity_[cell_index] = sum / float(n);
+        }
+      }
+    });
+    for (const int i : IndexRange(cells)) {
+      active_cells_ += counts_[i] > 0 ? 1 : 0;
+    }
+
+    /* Central differences of the cell centred velocity. A missing neighbour falls back to the cell
+     * itself, which keeps a sparse cloud from inventing a derivative. */
+    threading::parallel_for(IndexRange(cells), 4096, [&](const IndexRange range) {
+      for (const int cell_index : range) {
+        if (counts_[cell_index] == 0) {
+          continue;
+        }
+        const int x = cell_index % dims_.x;
+        const int y = (cell_index / dims_.x) % dims_.y;
+        const int z = cell_index / (dims_.x * dims_.y);
+        const float3 center = velocity_[cell_index];
+        const float3 xp = velocity_or(x + 1, y, z, center);
+        const float3 xm = velocity_or(x - 1, y, z, center);
+        const float3 yp = velocity_or(x, y + 1, z, center);
+        const float3 ym = velocity_or(x, y - 1, z, center);
+        const float3 zp = velocity_or(x, y, z + 1, center);
+        const float3 zm = velocity_or(x, y, z - 1, center);
+        const float inv = 0.5f / cell_size_;
+        const float3 curl((zp.y - zm.y) * inv - (yp.z - ym.z) * inv,
+                          (xp.z - xm.z) * inv - (zp.x - zm.x) * inv,
+                          (yp.x - ym.x) * inv - (xp.y - xm.y) * inv);
+        const float divergence = ((xp.x - xm.x) + (yp.y - ym.y) + (zp.z - zm.z)) * inv;
+        vorticity_[cell_index] = math::length(curl);
+        trapped_air_[cell_index] = std::max(0.0f, -divergence);
+      }
+    });
+  }
+
+  bool is_valid() const
+  {
+    return cell_count_ > 0;
+  }
+
+  int cell_count() const
+  {
+    return cell_count_;
+  }
+
+  int active_cell_count() const
+  {
+    return active_cells_;
+  }
+
+  Sample sample(const float3 &position) const
+  {
+    Sample result;
+    if (cell_count_ == 0) {
+      return result;
+    }
+    const float3 local = (position - origin_) / cell_size_;
+    /* Clamp into the grid (with the margin the surface is normally inside anyway): a point just
+     * outside samples the nearest cell instead of falling back to the nearest particle. */
+    const int base_x = math::clamp(int(std::floor(local.x)), 0, dims_.x - 1);
+    const int base_y = math::clamp(int(std::floor(local.y)), 0, dims_.y - 1);
+    const int base_z = math::clamp(int(std::floor(local.z)), 0, dims_.z - 1);
+    const float fx = base_x == dims_.x - 1 ? 0.0f : math::clamp(local.x - float(base_x), 0.0f, 1.0f);
+    const float fy = base_y == dims_.y - 1 ? 0.0f : math::clamp(local.y - float(base_y), 0.0f, 1.0f);
+    const float fz = base_z == dims_.z - 1 ? 0.0f : math::clamp(local.z - float(base_z), 0.0f, 1.0f);
+    float weight_sum = 0.0f;
+    float3 velocity(0.0f);
+    float vorticity = 0.0f;
+    float trapped_air = 0.0f;
+    for (int dz = 0; dz <= 1; dz++) {
+      const float wz = dz == 0 ? 1.0f - fz : fz;
+      for (int dy = 0; dy <= 1; dy++) {
+        const float wy = dy == 0 ? 1.0f - fy : fy;
+        for (int dx = 0; dx <= 1; dx++) {
+          const float wx = dx == 0 ? 1.0f - fx : fx;
+          const int x = base_x + dx;
+          const int y = base_y + dy;
+          const int z = base_z + dz;
+          if (x < 0 || y < 0 || z < 0 || x >= dims_.x || y >= dims_.y || z >= dims_.z) {
+            continue;
+          }
+          const int index = ((z * dims_.y) + y) * dims_.x + x;
+          if (counts_[index] == 0) {
+            continue;
+          }
+          const float w = wx * wy * wz;
+          weight_sum += w;
+          velocity += velocity_[index] * w;
+          vorticity += vorticity_[index] * w;
+          trapped_air += trapped_air_[index] * w;
+        }
+      }
+    }
+    if (weight_sum < 1e-4f) {
+      return result;
+    }
+    result.velocity = velocity / weight_sum;
+    result.speed = math::length(result.velocity);
+    result.vorticity = vorticity / weight_sum;
+    result.trapped_air = trapped_air / weight_sum;
+    result.found = true;
+    return result;
+  }
+
+ private:
+  int3 cell_of_position(const float3 &position) const
+  {
+    const float3 local = (position - origin_) / cell_size_;
+    return int3(math::clamp(int(std::floor(local.x)), 0, dims_.x - 1),
+                math::clamp(int(std::floor(local.y)), 0, dims_.y - 1),
+                math::clamp(int(std::floor(local.z)), 0, dims_.z - 1));
+  }
+
+  float3 velocity_or(const int x, const int y, const int z, const float3 &fallback) const
+  {
+    if (x < 0 || y < 0 || z < 0 || x >= dims_.x || y >= dims_.y || z >= dims_.z) {
+      return fallback;
+    }
+    const int index = ((z * dims_.y) + y) * dims_.x + x;
+    return counts_[index] > 0 ? velocity_[index] : fallback;
+  }
+
+  float3 origin_ = float3(0.0f);
+  float cell_size_ = 0.0f;
+  int3 dims_ = int3(0);
+  int cell_count_ = 0;
+  int active_cells_ = 0;
+  Span<const float3> positions_;
+  Span<const float3> velocities_;
+  Array<int> offsets_;
+  Array<int> indices_;
+  Array<int> counts_;
+  Array<float3> velocity_;
+  Array<float> vorticity_;
+  Array<float> trapped_air_;
+};
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Triangle queries
  * \{ */
 
@@ -352,6 +607,8 @@ void ParticleData::remove_front(const int count)
 struct FlowSample {
   float3 velocity = float3(0.0f);
   float speed = 0.0f;
+  float vorticity = 0.0f;
+  float trapped_air = 0.0f;
   bool found = false;
 };
 
@@ -399,6 +656,7 @@ static float emission_density(const float speed,
 static void emit_particles(ParticleData &particles,
                            const Mesh &surface,
                            const KDTree<float3> *flow_tree,
+                           const FlowGrid &flow_grid,
                            const Span<const float3> fluid_velocities,
                            const Settings &settings,
                            const float delta_time,
@@ -427,10 +685,27 @@ static void emit_particles(ParticleData &particles,
     const float area = 0.5f * double_area;
     const float3 normal = normal_vec / double_area;
     const float3 centroid = (a + b + c) / 3.0f;
-    const FlowSample flow = sample_flow(flow_tree, fluid_velocities, centroid);
+    /* The coarse grid gives the speed, the curl and the divergence at once; the nearest particle is
+     * the fallback when the grid has no mass at this point (a very sparse splash). */
+    FlowSample flow;
+    const FlowGrid::Sample grid_sample = flow_grid.sample(centroid);
+    if (grid_sample.found) {
+      flow.velocity = grid_sample.velocity;
+      flow.speed = grid_sample.speed;
+      flow.vorticity = grid_sample.vorticity;
+      flow.trapped_air = grid_sample.trapped_air;
+      flow.found = true;
+    }
+    else {
+      flow = sample_flow(flow_tree, fluid_velocities, centroid);
+    }
     if (!flow.found) {
       continue;
     }
+    const float vorticity_factor = math::clamp(
+        flow.vorticity / std::max(settings.vorticity_scale, 1e-3f), 0.0f, 1.0f);
+    const float trapped_air_factor = math::clamp(
+        flow.trapped_air / std::max(settings.divergence_scale, 1e-3f), 0.0f, 1.0f);
 
     for (int type = 0; type < 3; type++) {
       if (type == int(ParticleType::Foam) && !settings.foam) {
@@ -452,8 +727,18 @@ static void emit_particles(ParticleData &particles,
                                    settings.foam_full_speed :
                                type == int(ParticleType::Spray) ? settings.spray_full_speed :
                                                                   settings.bubble_full_speed;
+      /* Vorticity and trapped air multiply the speed driven emission; both weights default to 0,
+       * which reproduces the plain speed window. Bubbles are the air itself, so they get the trapped
+       * air term twice when `Air to Bubbles` is on. */
+      float boost = 1.0f + settings.vorticity_weight * vorticity_factor +
+                    settings.trapped_air_weight * trapped_air_factor;
+      if (type == int(ParticleType::Bubble) && settings.air_to_bubbles) {
+        boost += settings.trapped_air_weight * trapped_air_factor;
+      }
       const float density = emission_density(
-          flow.speed, threshold, full_speed, rate, delta_time, settings.emission_scale);
+                                flow.speed, threshold, full_speed, rate, delta_time,
+                                settings.emission_scale) *
+                            boost;
       if (density <= 0.0f) {
         continue;
       }
@@ -607,6 +892,34 @@ static void build_clusters(ParticleData &particles,
 /** \name Frame
  * \{ */
 
+/**
+ * Median distance from a fluid particle to its nearest neighbour: the spacing of the particle cloud,
+ * which decides the cell size of the flow grid.
+ */
+static float estimate_fluid_spacing(const KDTree<float3> *tree, const Span<const float3> positions)
+{
+  const int count = int(positions.size());
+  if (tree == nullptr || count < 8) {
+    return 0.0f;
+  }
+  const int samples = std::min(count, 1024);
+  const int step = std::max(1, count / samples);
+  Vector<float> distances;
+  distances.reserve(samples);
+  for (int i = 0; i < count; i += step) {
+    KDTreeNearest<float3> nearest[2];
+    const int found = kdtree_find_nearest_n(tree, positions[i], nearest, 2);
+    if (found >= 2 && nearest[1].dist > 0.0f) {
+      distances.append(nearest[1].dist);
+    }
+  }
+  if (distances.is_empty()) {
+    return 0.0f;
+  }
+  std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
+  return distances[distances.size() / 2];
+}
+
 void solve_frame(ParticleData &particles,
                  const Mesh *surface,
                  const Span<const float3> fluid_positions,
@@ -627,6 +940,12 @@ void solve_frame(ParticleData &particles,
       kdtree_insert(flow_tree, i, fluid_positions[i]);
     }
     kdtree_balance(flow_tree);
+  }
+  FlowGrid flow_grid;
+  if (fluid_positions.size() > 0 && fluid_positions.size() == fluid_velocities.size()) {
+    const float spacing = estimate_fluid_spacing(flow_tree, fluid_positions);
+    flow_grid.build(fluid_positions, fluid_velocities, spacing);
+    r_stats.grid_cells = flow_grid.active_cell_count();
   }
 
   const bke::BVHTreeFromMesh surface_bvh = surface != nullptr ? surface->bvh_corner_tris() :
@@ -821,7 +1140,7 @@ void solve_frame(ParticleData &particles,
 
   if (surface != nullptr && flow_tree != nullptr && dt > 0.0f) {
     emit_particles(
-        particles, *surface, flow_tree, fluid_velocities, settings, dt, r_stats);
+        particles, *surface, flow_tree, flow_grid, fluid_velocities, settings, dt, r_stats);
   }
 
   /* Hard budget: drop the oldest particles first. */
