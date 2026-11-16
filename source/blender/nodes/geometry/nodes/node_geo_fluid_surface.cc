@@ -26,6 +26,7 @@
  * marching cubes output is removed.
  */
 
+#include <cfloat>
 #include <cmath>
 
 #include "BLI_array.hh"
@@ -733,15 +734,56 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   double radius_sum = 0.0;
+  float max_radius = 0.0f;
+  float3 bbox_min(FLT_MAX);
+  float3 bbox_max(-FLT_MAX);
   for (const FluidParticle &particle : particles) {
     radius_sum += particle.radius;
+    max_radius = std::max(max_radius, particle.radius);
+    bbox_min = math::min(bbox_min, particle.position);
+    bbox_max = math::max(bbox_max, particle.position);
   }
   const float mean_radius = float(radius_sum / double(particles.size()));
-  if (mean_radius <= 0.0f) {
+  if (mean_radius <= 0.0f || max_radius <= 0.0f) {
     params.set_default_remaining_outputs();
     return;
   }
-  const float voxel_size = voxel_size_input > 0.0f ? voxel_size_input : 0.5f * mean_radius;
+  float voxel_size = voxel_size_input > 0.0f ? voxel_size_input : 0.5f * mean_radius;
+
+  /* The splat cost per particle grows cubically with the kernel support measured in voxels, and
+   * every bucket keeps its own copy of the grid. A `Particle Radius` far larger than the input's
+   * own radius (a leftover experiment, say) therefore used to freeze the node: half a metre of
+   * radius with the four times kernel radius and a 15 mm voxel is a support of 335 voxels per
+   * particle, which is hours of work and gigabytes of grid. Coarsen the voxel size until both the
+   * splat work and the bucket memory fit a budget, and say so instead of appearing to hang. */
+  const float support = radius_scale * max_radius;
+  const float requested_voxel_size = voxel_size;
+  constexpr int MAX_SUPPORT_VOXELS = 24;
+  if (support / voxel_size > float(MAX_SUPPORT_VOXELS)) {
+    voxel_size = support / float(MAX_SUPPORT_VOXELS);
+  }
+  constexpr double MAX_SPLAT_WORK = 3.0e9;
+  for (int attempt = 0; attempt < 8; attempt++) {
+    const double reach = std::ceil(double(support) / double(voxel_size));
+    const double side = 2.0 * reach + 1.0;
+    const double work = double(particles.size()) * side * side * side;
+    if (work <= MAX_SPLAT_WORK) {
+      break;
+    }
+    voxel_size *= float(std::cbrt(work / MAX_SPLAT_WORK));
+  }
+  if (voxel_size > requested_voxel_size * 1.01f) {
+    params.error_message_add(
+        NodeWarningType::Warning,
+        fmt::format("Fluid Surface: the kernel support is {:.4g} m, which needs {:.0f} voxels at the "
+                    "requested {:.4g} m voxel size. The voxel size was raised to {:.4g} m so the "
+                    "reconstruction stays affordable; lower `Particle Radius`, `Kernel Radius` or "
+                    "the point count for the requested resolution",
+                    double(support),
+                    double(std::ceil(double(support) / double(requested_voxel_size))),
+                    double(requested_voxel_size),
+                    double(voxel_size)));
+  }
   const double normalizer = lattice_kernel_sum(mean_radius, radius_scale);
   if (std::getenv("BLENDER_FLUID_SURFACE_DEBUG") != nullptr) {
     printf("FLUID_SURFACE_DEBUG %ld particles mean_radius=%f voxel_size=%f normalizer=%f\n",
@@ -759,7 +801,21 @@ static void node_geo_exec(GeoNodeExecParams params)
     build_kernel_shapes(particles.as_span(), mean_radius, kernel_shapes);
   }
 
-  const int bucket_num = std::clamp(BLI_system_thread_count(), 1, 32);
+  /* One grid per bucket, so the number of buckets also multiplies the memory: a dense box of the
+   * particles inflated by the kernel support. Keep the copies within a budget (a huge radius with a
+   * fine voxel would otherwise allocate gigabytes before the first splat). */
+  int bucket_num = std::clamp(BLI_system_thread_count(), 1, 32);
+  {
+    const float3 extent = (bbox_max - bbox_min) + float3(2.0f * support);
+    double cells = 1.0;
+    for (const int axis : IndexRange(3)) {
+      cells *= std::max(1.0, std::ceil(double(extent[axis]) / double(voxel_size)));
+    }
+    constexpr double MAX_BUCKET_BYTES = 1.5e9;
+    const double bytes_per_bucket = cells * 4.0 + 65536.0;
+    const int64_t buckets_by_memory = int64_t(MAX_BUCKET_BYTES / bytes_per_bucket);
+    bucket_num = int(std::clamp<int64_t>(buckets_by_memory, 1, bucket_num));
+  }
   const int64_t particles_num = particles.size();
   const int64_t bucket_size = (particles_num + bucket_num - 1) / bucket_num;
 
