@@ -91,6 +91,9 @@ const FlatBundleTypePtr &WhiteWaterSettingsBundle::get_bundle_type()
     b.add<decl::Float>("spray_size"_ustr).min(1e-4f);
     b.add<decl::Float>("bubble_size"_ustr).min(1e-4f);
     b.add<decl::Float>("foam_stick"_ustr).min(0.0f).max(1.0f);
+    b.add<decl::Vector>("up"_ustr);
+    b.add<decl::Float>("foam_upward"_ustr).min(-1.0f).max(1.0f);
+    b.add<decl::Bool>("foam_underside_kill"_ustr);
     b.add<decl::Float>("spray_speed"_ustr).min(0.0f);
     b.add<decl::Float>("bubble_buoyancy"_ustr).min(0.0f);
     b.add<decl::Float>("bubble_depth"_ustr).min(0.0f);
@@ -225,6 +228,12 @@ whitewater::Settings read_settings(const Bundle &world)
   settings.foam_stick = math::clamp(read_float(bundle, "foam_stick", settings.foam_stick),
                                     0.0f,
                                     1.0f);
+  settings.up = read_vector(bundle, "up", settings.up);
+  settings.foam_upward = math::clamp(read_float(bundle, "foam_upward", settings.foam_upward),
+                                      -1.0f,
+                                      1.0f);
+  settings.foam_underside_kill = read_bool(bundle, "foam_underside_kill",
+                                           settings.foam_underside_kill);
   settings.spray_speed = std::max(0.0f, read_float(bundle, "spray_speed", settings.spray_speed));
   settings.bubble_buoyancy = std::max(0.0f,
                                       read_float(bundle, "bubble_buoyancy",

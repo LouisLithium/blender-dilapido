@@ -85,6 +85,16 @@ struct Settings {
   float spray_size = 0.015f;
   float bubble_size = 0.01f;
 
+  /** World up; foam is kept off the downward facing parts of the surface (Z up by default). */
+  float3 up = float3(0.0f, 0.0f, 1.0f);
+  /**
+   * Minimum `dot(surface normal, up)` for foam emission. 0.2 keeps the upward and gently tilted
+   * faces (crests, splash crowns) and excludes vertical walls and the underside, which is where
+   * foam would otherwise slide to the bottom of a puddle. -1 allows every face.
+   */
+  float foam_upward = 0.2f;
+  /** Delete foam that ends up on a downward facing part of the surface (puddle bottom, ceiling). */
+  bool foam_underside_kill = true;
   /** Blend of a foam particle's velocity towards the fluid velocity (0 = static, 1 = rides). */
   float foam_stick = 0.7f;
   /** Extra speed along the surface normal when a spray particle is born (m/s). */

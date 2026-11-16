@@ -509,7 +509,8 @@ class TriangleBVH {
 static bool surface_nearest(const bke::BVHTreeFromMesh &bvh,
                             const float3 &position,
                             float3 &r_closest,
-                            float &r_distance)
+                            float &r_distance,
+                            int &r_triangle)
 {
   if (bvh.tree == nullptr) {
     return false;
@@ -524,6 +525,7 @@ static bool surface_nearest(const bke::BVHTreeFromMesh &bvh,
   }
   r_closest = float3(nearest.co);
   r_distance = std::sqrt(nearest.dist_sq);
+  r_triangle = nearest.index;
   return true;
 }
 
@@ -715,6 +717,11 @@ static void emit_particles(ParticleData &particles,
         continue;
       }
       if (type == int(ParticleType::Bubble) && !settings.bubbles) {
+        continue;
+      }
+      if (type == int(ParticleType::Foam) &&
+          math::dot(normal, settings.up) < settings.foam_upward) {
+        /* Foam belongs on the free surface, not on the underside of a puddle or on a ceiling. */
         continue;
       }
       const float rate = type == int(ParticleType::Foam) ? settings.foam_emission :
@@ -981,7 +988,8 @@ void solve_frame(ParticleData &particles,
           if (surface_bvh.tree != nullptr) {
             float3 closest;
             float distance = 0.0f;
-            if (surface_nearest(surface_bvh, position, closest, distance)) {
+            int triangle = -1;
+            if (surface_nearest(surface_bvh, position, closest, distance, triangle)) {
               position = math::interpolate(position, closest, stick_blend);
             }
           }
@@ -1086,6 +1094,27 @@ void solve_frame(ParticleData &particles,
         keep[i] = false;
         continue;
       }
+      if (particles.types[i] == int(ParticleType::Foam) && settings.foam_underside_kill &&
+          surface_bvh.tree != nullptr)
+      {
+        float3 closest;
+        float distance = 0.0f;
+        int triangle = -1;
+        if (surface_nearest(surface_bvh, position, closest, distance, triangle) && triangle >= 0 &&
+            triangle < int(surface_bvh.corner_tris.size()))
+        {
+          const int3 tri = surface_bvh.corner_tris[triangle];
+          const float3 &a = surface_bvh.vert_positions[surface_bvh.corner_verts[tri[0]]];
+          const float3 &b = surface_bvh.vert_positions[surface_bvh.corner_verts[tri[1]]];
+          const float3 &c = surface_bvh.vert_positions[surface_bvh.corner_verts[tri[2]]];
+          const float3 cross = math::cross(b - a, c - a);
+          const float length = math::length(cross);
+          if (length > 1e-12f && math::dot(cross / length, settings.up) < -0.2f) {
+            keep[i] = false;
+            continue;
+          }
+        }
+      }
       if (particles.types[i] == int(ParticleType::Spray) && collider_bvh.is_valid()) {
         float distance = 0.0f;
         if (collider_bvh.nearest(position, distance) && distance < particles.radii[i]) {
@@ -1097,7 +1126,8 @@ void solve_frame(ParticleData &particles,
           settings.bubble_to_foam) {
         float3 closest;
         float distance = 0.0f;
-        if (surface_nearest(surface_bvh, position, closest, distance) &&
+        int triangle = -1;
+        if (surface_nearest(surface_bvh, position, closest, distance, triangle) &&
             distance < particles.radii[i]) {
           /* The bubble popped: it becomes foam at the water line. */
           particles.types[i] = int(ParticleType::Foam);
