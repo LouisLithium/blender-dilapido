@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "BLI_array.hh"
 #include "BLI_kdopbvh.hh"
@@ -18,6 +20,8 @@
 
 #include "BKE_bvhutils.hh"
 #include "BKE_mesh.hh"
+
+#include "GEO_ha_white_water.hh"
 
 #include "GEO_white_water_solver.hh"
 
@@ -197,7 +201,10 @@ class FlowGrid {
 
   void build(const Span<const float3> positions,
              const Span<const float3> velocities,
-             const float mean_spacing)
+             const float mean_spacing,
+             const float3 &extra_min = float3(0.0f),
+             const float3 &extra_max = float3(0.0f),
+             const bool has_extra = false)
   {
     cell_count_ = 0;
     active_cells_ = 0;
@@ -212,6 +219,12 @@ class FlowGrid {
     for (const float3 &p : positions) {
       min = math::min(min, p);
       max = math::max(max, p);
+    }
+    if (has_extra) {
+      /* The surface mesh sits slightly outside the particle cloud; extending the box keeps the
+       * emission samples inside the grid instead of falling back to a nearest particle lookup. */
+      min = math::min(min, extra_min);
+      max = math::max(max, extra_max);
     }
     const float3 extent = math::max(max - min, float3(1e-5f));
     /* One cell is about two particle spacings, so the central differences see real neighbours: a
@@ -315,6 +328,81 @@ class FlowGrid {
         trapped_air_[cell_index] = std::max(0.0f, -divergence);
       }
     });
+    extrapolate();
+  }
+
+  /**
+   * Fills the empty cells with the average of their filled neighbours, layer by layer.
+   *
+   * The mesh the white water is emitted on sits a little outside the particle cloud, and the
+   * margin around the box is empty by construction, so without this every surface sample would
+   * fall back to a nearest particle lookup (measured: 3072 of 3072 triangles). Extrapolating the
+   * velocity, the vorticity and the trapped air keeps the field defined over the whole box, so the
+   * emission and the foam advection read a smooth flow instead of a single particle.
+   */
+  void extrapolate(const int layers = 8)
+  {
+    if (cell_count_ == 0) {
+      return;
+    }
+    constexpr int3 offsets[6] = {
+        int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)};
+    Array<float3> next_velocity;
+    Array<float> next_vorticity;
+    Array<float> next_trapped_air;
+    Array<int> next_counts;
+    for (int layer = 0; layer < layers; layer++) {
+      next_velocity = velocity_;
+      next_vorticity = vorticity_;
+      next_trapped_air = trapped_air_;
+      next_counts = counts_;
+      std::atomic<bool> changed{false};
+      threading::parallel_for(IndexRange(cell_count_), 4096, [&](const IndexRange range) {
+        for (const int c : range) {
+          if (counts_[c] > 0) {
+            continue;
+          }
+          const int x = c % dims_.x;
+          const int y = (c / dims_.x) % dims_.y;
+          const int z = c / (dims_.x * dims_.y);
+          float3 velocity(0.0f);
+          float vorticity = 0.0f;
+          float trapped_air = 0.0f;
+          int n = 0;
+          for (const int3 &offset : offsets) {
+            const int nx = x + offset.x;
+            const int ny = y + offset.y;
+            const int nz = z + offset.z;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= dims_.x || ny >= dims_.y || nz >= dims_.z) {
+              continue;
+            }
+            const int index = ((nz * dims_.y) + ny) * dims_.x + nx;
+            if (counts_[index] == 0) {
+              continue;
+            }
+            velocity += velocity_[index];
+            vorticity += vorticity_[index];
+            trapped_air += trapped_air_[index];
+            n++;
+          }
+          if (n == 0) {
+            continue;
+          }
+          next_velocity[c] = velocity / float(n);
+          next_vorticity[c] = vorticity / float(n);
+          next_trapped_air[c] = trapped_air / float(n);
+          next_counts[c] = 1;
+          changed.store(true, std::memory_order_relaxed);
+        }
+      });
+      std::swap(velocity_, next_velocity);
+      std::swap(vorticity_, next_vorticity);
+      std::swap(trapped_air_, next_trapped_air);
+      std::swap(counts_, next_counts);
+      if (!changed.load(std::memory_order_relaxed)) {
+        break;
+      }
+    }
   }
 
   bool is_valid() const
@@ -420,6 +508,51 @@ class FlowGrid {
 };
 
 /** \} */
+
+/** CSR neighbour list, built once per frame from the particle grid. */
+struct NeighborList {
+  Array<int> offsets;
+  Array<int> indices;
+
+  bool is_empty() const
+  {
+    return offsets.is_empty();
+  }
+
+  void build(const ParticleGrid &grid, const Span<const float3> positions)
+  {
+    const int count = int(positions.size());
+    offsets.reinitialize(count + 1);
+    if (count == 0 || grid.is_empty()) {
+      offsets.fill(0);
+      return;
+    }
+    Array<int> counts(count, 0);
+    threading::parallel_for(IndexRange(count), 1024, [&](const IndexRange range) {
+      for (const int i : range) {
+        int n = 0;
+        grid.foreach_neighbor(i, positions, [&](const int, const float3 &, const float) { n++; });
+        counts[i] = n;
+      }
+    });
+    int total = 0;
+    for (const int i : IndexRange(count)) {
+      offsets[i] = total;
+      total += counts[i];
+    }
+    offsets[count] = total;
+    indices.reinitialize(total);
+    Array<int> cursor = offsets;
+    threading::parallel_for(IndexRange(count), 1024, [&](const IndexRange range) {
+      for (const int i : range) {
+        int cursor_i = cursor[i];
+        grid.foreach_neighbor(i, positions, [&](const int j, const float3 &, const float) {
+          indices[cursor_i++] = j;
+        });
+      }
+    });
+  }
+};
 
 /* -------------------------------------------------------------------- */
 /** \name Triangle queries
@@ -589,7 +722,7 @@ void ParticleData::remove_front(const int count)
     types[i] = types[i + remove];
     clusters[i] = clusters[i + remove];
   }
-  for (const int i : IndexRange(remove)) {
+  for (int i = 0; i < remove; i++) {
     positions.pop_last();
     velocities.pop_last();
     ages.pop_last();
@@ -811,7 +944,7 @@ static void emit_particles(ParticleData &particles,
  * again once the flow calms down.
  */
 static void build_clusters(ParticleData &particles,
-                           const ParticleGrid &grid,
+                           const NeighborList &neighbors,
                            const Span<const float3> positions,
                            const Settings &settings,
                            Stats &r_stats)
@@ -834,34 +967,35 @@ static void build_clusters(ParticleData &particles,
   const float radius = std::max(settings.cohesion_radius, 1e-5f);
   for (const int i : IndexRange(count)) {
     const int type_i = particles.types[i];
-    grid.foreach_neighbor(
-        i, positions, [&](const int j, const float3 &delta, const float distance) {
-          if (j <= i) {
-            return;
-          }
-          if (settings.same_type_only && particles.types[j] != type_i) {
-            return;
-          }
-          if (distance > radius) {
-            return;
-          }
-          /* Strain rate of the link: the relative speed over the cohesion radius. Using the full
-           * relative speed (not only its normal part) is what makes a shear tear the clump apart;
-           * a clump that moves as a whole has almost no relative speed and keeps its links. The
-           * radius (instead of the tiny neighbour distance) keeps the value in a useful range. */
-          const float3 relative = particles.velocities[j] - particles.velocities[i];
-          const float strain = math::length(relative) / radius;
-          if (strain > settings.break_strain) {
-            return;
-          }
-          (void)delta;
-          links++;
-          const int root_i = find_root(i);
-          const int root_j = find_root(j);
-          if (root_i != root_j) {
-            parent[root_j] = root_i;
-          }
-        });
+    for (int k = neighbors.offsets[i]; k < neighbors.offsets[i + 1]; k++) {
+      const int j = neighbors.indices[k];
+      if (j <= i) {
+        continue;
+      }
+      if (settings.same_type_only && particles.types[j] != type_i) {
+        continue;
+      }
+      const float3 to_j = positions[j] - positions[i];
+      const float distance = math::length(to_j);
+      if (distance > radius) {
+        continue;
+      }
+      /* Strain rate of the link: the relative speed over the cohesion radius. Using the full
+       * relative speed (not only its normal part) is what makes a shear tear the clump apart;
+       * a clump that moves as a whole has almost no relative speed and keeps its links. The
+       * radius (instead of the tiny neighbour distance) keeps the value in a useful range. */
+      const float3 relative = particles.velocities[j] - particles.velocities[i];
+      const float strain = math::length(relative) / radius;
+      if (strain > settings.break_strain) {
+        continue;
+      }
+      links++;
+      const int root_i = find_root(i);
+      const int root_j = find_root(j);
+      if (root_i != root_j) {
+        parent[root_j] = root_i;
+      }
+    }
   }
   r_stats.links = links;
 
@@ -934,11 +1068,25 @@ void solve_frame(ParticleData &particles,
                  const Span<const float3> collider_triangles,
                  const Settings &settings,
                  const float delta_time,
-                 Stats &r_stats)
+                 Stats &r_stats,
+                 const bool device_requested,
+                 const bool device_strict,
+                 bool *r_device_used,
+                 std::string *r_device_reason)
 {
   const double start_time = BLI_time_now_seconds();
   const float dt = math::clamp(delta_time, 0.0f, 0.25f);
   r_stats = Stats{};
+  /* Phase timings for performance work (`BLENDER_WHITE_WATER_PROFILE=1`). */
+  double phase_time = start_time;
+  auto lap = [&](const char *label) {
+    if (std::getenv("BLENDER_WHITE_WATER_PROFILE") == nullptr) {
+      return;
+    }
+    const double now = BLI_time_now_seconds();
+    fprintf(stderr, "WHITE_WATER %-10s %6.2f ms\n", label, (now - phase_time) * 1000.0);
+    phase_time = now;
+  };
 
   KDTree<float3> *flow_tree = nullptr;
   if (fluid_positions.size() > 0 && fluid_positions.size() == fluid_velocities.size()) {
@@ -948,12 +1096,34 @@ void solve_frame(ParticleData &particles,
     }
     kdtree_balance(flow_tree);
   }
+  lap("kdtree");
+  float3 surface_min(FLT_MAX);
+  float3 surface_max(-FLT_MAX);
+  bool has_surface_bounds = false;
+  if (surface != nullptr) {
+    for (const float3 &looptri_vertex : surface->vert_positions()) {
+      surface_min = math::min(surface_min, looptri_vertex);
+      surface_max = math::max(surface_max, looptri_vertex);
+      has_surface_bounds = true;
+    }
+  }
   FlowGrid flow_grid;
   if (fluid_positions.size() > 0 && fluid_positions.size() == fluid_velocities.size()) {
     const float spacing = estimate_fluid_spacing(flow_tree, fluid_positions);
-    flow_grid.build(fluid_positions, fluid_velocities, spacing);
+    flow_grid.build(fluid_positions,
+                    fluid_velocities,
+                    spacing,
+                    surface_min,
+                    surface_max,
+                    has_surface_bounds);
     r_stats.grid_cells = flow_grid.active_cell_count();
   }
+  if (flow_grid.is_valid()) {
+    /* The grid already covers the surface, so the per particle KD lookup is not needed. */
+    kdtree_free(flow_tree);
+    flow_tree = nullptr;
+  }
+  lap("flowgrid");
 
   const bke::BVHTreeFromMesh surface_bvh = surface != nullptr ? surface->bvh_corner_tris() :
                                                                bke::BVHTreeFromMesh();
@@ -983,7 +1153,15 @@ void solve_frame(ParticleData &particles,
           /* Foam has no inertia of its own: it rides the flow (`Foam Stick` scales that) and is glued
            * to the surface instead of easing towards it. Easing left a visible layer of foam hanging
            * above the fluid whenever the surface decelerated under it. */
-          const FlowSample flow = sample_flow(flow_tree, fluid_velocities, position);
+          FlowSample flow;
+          const FlowGrid::Sample grid_sample = flow_grid.sample(position);
+          if (grid_sample.found) {
+            flow.velocity = grid_sample.velocity;
+            flow.found = true;
+          }
+          else {
+            flow = sample_flow(flow_tree, fluid_velocities, position);
+          }
           if (flow.found) {
             velocity = flow.velocity * stick;
           }
@@ -1004,76 +1182,142 @@ void solve_frame(ParticleData &particles,
       }
     });
   }
+  lap("advect");
 
   /* Neighbour coupled forces: cohesion (clumping), separation (no overlap) and relative velocity
-   * damping. Accumulated per particle (Jacobi) so the result is independent of the thread count. */
+   * damping. The neighbour list is built once and shared with the cluster pass and (when the device
+   * is requested) with the device force pass, so the O(N x k) work happens a single time; the
+   * forces themselves are accumulated per particle (Jacobi), which keeps them independent of the
+   * thread count. */
+  /* The device has to upload the positions, the velocities and the neighbour list and read the
+   * deltas back, which costs more than the force loop itself on a small particle set (measured:
+   * 20k foam is slower on the device, 58k is ~40% faster in this phase). Below the threshold the
+   * frame stays on the CPU; `Strict` means the user asked for the device explicitly and skips
+   * it, and `BLENDER_WHITE_WATER_GPU_MIN_PARTICLES` overrides the threshold (tests use 0). */
+  static const int min_particles = []() {
+    const char *env = std::getenv("BLENDER_WHITE_WATER_GPU_MIN_PARTICLES");
+    const int value = env != nullptr ? int(std::atoi(env)) : 32768;
+    return std::max(value, 0);
+  }();
   const bool has_forces = settings.cohesion > 0.0f || settings.separation > 0.0f ||
                           settings.cluster_damping > 0.0f;
   Array<float3> deltas(particles.size(), float3(0.0f));
+  Vector<float3> positions;
   ParticleGrid grid;
+  NeighborList neighbors;
+  bool forces_on_device = false;
   if (has_forces && particles.size() > 1) {
-    Vector<float3> positions(particles.size());
+    positions.reinitialize(particles.size());
     for (const int i : IndexRange(particles.size())) {
       positions[i] = particles.positions[i];
     }
-    const float cell = std::max({settings.cohesion_radius, settings.separation_radius, 1e-4f});
     const Span<const float3> position_span(positions.data(), positions.size());
+    const float cell = std::max({settings.cohesion_radius, settings.separation_radius, 1e-4f});
     grid.build(position_span, cell);
-    threading::parallel_for(IndexRange(particles.size()), 1024, [&](const IndexRange range) {
-      for (const int i : range) {
-        const int type_i = particles.types[i];
-        float3 delta(0.0f);
-        int neighbors = 0;
-        grid.foreach_neighbor(
-            i, position_span, [&](const int j, const float3 &to_j, const float distance) {
-              if (settings.same_type_only && particles.types[j] != type_i) {
-                return;
-              }
-              neighbors++;
-              const float safe_distance = std::max(distance, 1e-6f);
-              const float3 direction = to_j / safe_distance;
-              if (settings.separation > 0.0f && distance < settings.separation_radius) {
-                const float factor = 1.0f - distance / std::max(settings.separation_radius, 1e-6f);
-                delta -= direction * (settings.separation * factor * dt);
-              }
-              if (settings.cohesion > 0.0f && distance < settings.cohesion_radius) {
-                const float factor = 1.0f -
-                                     distance / std::max(settings.cohesion_radius, 1e-6f);
-                delta += direction * (settings.cohesion * factor * dt);
-              }
-              if (settings.cluster_damping > 0.0f && distance < settings.cohesion_radius) {
-                const float factor = 1.0f -
-                                     distance / std::max(settings.cohesion_radius, 1e-6f);
-                delta += (particles.velocities[j] - particles.velocities[i]) *
-                         (settings.cluster_damping * factor * dt);
-              }
-            });
-        /* Average over the neighbours, so `Cohesion` is an acceleration and not a density
-         * dependent sum, and never let one frame change the velocity by more than a sane amount. */
-        if (neighbors > 0) {
-          delta /= float(neighbors);
-        }
-        const float max_delta = 0.25f;
-        if (math::length_squared(delta) > max_delta * max_delta) {
-          delta = math::normalize(delta) * max_delta;
-        }
-        deltas[i] = delta;
+    neighbors.build(grid, position_span);
+    const bool device_eligible = device_requested &&
+                                 (device_strict || particles.size() >= min_particles);
+    if (device_eligible) {
+      ha::WhiteWaterForceSettings force_settings;
+      force_settings.cohesion = settings.cohesion;
+      force_settings.cohesion_radius = settings.cohesion_radius;
+      force_settings.separation = settings.separation;
+      force_settings.separation_radius = settings.separation_radius;
+      force_settings.cluster_damping = settings.cluster_damping;
+      force_settings.same_type_only = settings.same_type_only;
+      force_settings.delta_time = dt;
+      std::string reason;
+      forces_on_device = ha::ha_white_water_forces(
+          position_span,
+          particles.velocities.as_mutable_span(),
+          Span<const int>(particles.types.data(), particles.types.size()),
+          Span<const int>(neighbors.offsets.data(), neighbors.offsets.size()),
+          Span<const int>(neighbors.indices.data(), neighbors.indices.size()),
+          force_settings,
+          reason);
+      if (r_device_reason != nullptr) {
+        *r_device_reason = reason;
       }
-    });
-    threading::parallel_for(IndexRange(particles.size()), 1024, [&](const IndexRange range) {
-      for (const int i : range) {
-        particles.velocities[i] += deltas[i];
-      }
-    });
+    }
+    if (!forces_on_device) {
+      threading::parallel_for(IndexRange(particles.size()), 1024, [&](const IndexRange range) {
+        for (const int i : range) {
+          const int type_i = particles.types[i];
+          const float3 &position_i = position_span[i];
+          float3 delta(0.0f);
+          int count = 0;
+          for (int k = neighbors.offsets[i]; k < neighbors.offsets[i + 1]; k++) {
+            const int j = neighbors.indices[k];
+            if (settings.same_type_only && particles.types[j] != type_i) {
+              continue;
+            }
+            const float3 to_j = position_span[j] - position_i;
+            const float distance = math::length(to_j);
+            count++;
+            const float safe_distance = std::max(distance, 1e-6f);
+            const float3 direction = to_j / safe_distance;
+            if (settings.separation > 0.0f && distance < settings.separation_radius) {
+              const float factor = 1.0f - distance / std::max(settings.separation_radius, 1e-6f);
+              delta -= direction * (settings.separation * factor * dt);
+            }
+            if (settings.cohesion > 0.0f && distance < settings.cohesion_radius) {
+              const float factor = 1.0f - distance / std::max(settings.cohesion_radius, 1e-6f);
+              delta += direction * (settings.cohesion * factor * dt);
+            }
+            if (settings.cluster_damping > 0.0f && distance < settings.cohesion_radius) {
+              const float factor = 1.0f - distance / std::max(settings.cohesion_radius, 1e-6f);
+              delta += (particles.velocities[j] - particles.velocities[i]) *
+                       (settings.cluster_damping * factor * dt);
+            }
+          }
+          /* Average over the neighbours, so `Cohesion` is an acceleration and not a density
+           * dependent sum, and never let one frame change the velocity by more than a sane amount.
+           */
+          if (count > 0) {
+            delta /= float(count);
+          }
+          const float max_delta = 0.25f;
+          if (math::length_squared(delta) > max_delta * max_delta) {
+            delta = math::normalize(delta) * max_delta;
+          }
+          deltas[i] = delta;
+        }
+      });
+      threading::parallel_for(IndexRange(particles.size()), 1024, [&](const IndexRange range) {
+        for (const int i : range) {
+          particles.velocities[i] += deltas[i];
+        }
+      });
+    }
+  }
+  lap("forces");
+
+  if (r_device_used != nullptr) {
+    *r_device_used = forces_on_device;
+  }
+  if (device_requested && !forces_on_device && r_device_reason != nullptr) {
+    if (r_device_reason->empty()) {
+      *r_device_reason = has_forces ? "fewer than two particles" :
+                                      "no neighbour forces are enabled";
+    }
+  }
+  if (device_requested && !forces_on_device && !device_strict && r_device_reason != nullptr) {
+    if (!has_forces) {
+      *r_device_reason = "no neighbour forces are enabled";
+    }
+    else if (particles.size() < min_particles) {
+      *r_device_reason = "below the device particle threshold (" +
+                         std::to_string(particles.size()) + " of " +
+                         std::to_string(min_particles) + ")";
+    }
   }
 
-  if (settings.cluster_mode == ClusterMode::Strain && grid.cell_size() > 0.0f) {
-    Vector<float3> positions(particles.size());
-    for (const int i : IndexRange(particles.size())) {
-      positions[i] = particles.positions[i];
-    }
-    const Span<const float3> position_span(positions.data(), positions.size());
-    build_clusters(particles, grid, position_span, settings, r_stats);
+  if (settings.cluster_mode == ClusterMode::Strain && !neighbors.is_empty()) {
+    build_clusters(particles,
+                   neighbors,
+                   Span<const float3>(positions.data(), positions.size()),
+                   settings,
+                   r_stats);
   }
   else {
     for (const int i : IndexRange(particles.size())) {
@@ -1081,6 +1325,7 @@ void solve_frame(ParticleData &particles,
     }
     r_stats.clusters = particles.size();
   }
+  lap("clusters");
 
   /* Kill, convert bubbles that reached the surface, and drop everything out of bounds. */
   Array<bool> keep(particles.size(), true);
@@ -1173,10 +1418,12 @@ void solve_frame(ParticleData &particles,
     }
   }
 
-  if (surface != nullptr && flow_tree != nullptr && dt > 0.0f) {
+  lap("kill");
+  if (surface != nullptr && (flow_tree != nullptr || flow_grid.is_valid()) && dt > 0.0f) {
     emit_particles(
         particles, *surface, flow_tree, flow_grid, fluid_velocities, settings, dt, r_stats);
   }
+  lap("emit");
 
   /* Hard budget: drop the oldest particles first. */
   const int max_particles = std::max(settings.max_particles, 0);

@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -42,6 +43,8 @@
 
 #include "node_geometry_util.hh"
 
+#include "GEO_ha_context.hh"
+#include "GEO_ha_status.hh"
 #include "GEO_white_water_solver.hh"
 
 namespace blender::nodes::node_geo_white_water_solver_cc {
@@ -592,6 +595,18 @@ static void node_geo_exec(GeoNodeExecParams params)
     return;
   }
 
+  /* The neighbour coupled forces can run on the compute backend; every other phase (emission,
+   * advection, the union-find cluster pass) stays on the CPU. */
+  const GeoNodesUserData &user_data = *static_cast<const GeoNodesUserData *>(params.user_data());
+  const int backend_request = user_data.ha_backend_request ? *user_data.ha_backend_request : 0;
+  const char *gpu_env = std::getenv("BLENDER_WHITE_WATER_GPU");
+  const bool force_gpu = gpu_env != nullptr && StringRef(gpu_env) == "1";
+  const bool force_cpu = gpu_env != nullptr && StringRef(gpu_env) == "0";
+  const bool device_requested = !force_cpu &&
+                                (force_gpu || backend_request == 1 || backend_request == 2);
+  bool device_used = false;
+  std::string device_reason;
+
   whitewater::Stats stats;
   const Span<const float3> fluid_position_span(fluid_positions.data(), fluid_positions.size());
   const Span<const float3> fluid_velocity_span(fluid_velocities.data(), fluid_velocities.size());
@@ -603,7 +618,11 @@ static void node_geo_exec(GeoNodeExecParams params)
                           collider_span,
                           settings,
                           delta_time,
-                          stats);
+                          stats,
+                          device_requested,
+                          backend_request == 2,
+                          &device_used,
+                          &device_reason);
 
   Bundle &world = world_ptr.ensure_mutable_inplace();
   GeometrySet result;
@@ -612,6 +631,40 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   params.set_output("World"_ustr, std::move(world_ptr));
   params.set_output("Stats"_ustr, stats_to_bundle(stats));
+
+  if (device_requested && !device_used && !device_reason.empty()) {
+    params.error_message_add(
+        backend_request == 2 ? NodeWarningType::Warning : NodeWarningType::Info,
+        fmt::format("White Water Solver: the neighbour forces are applied on the CPU ({})",
+                    device_reason));
+  }
+  if (backend_request != 0) {
+    geometry::ha::HaNodeStatus status;
+    status.backend = geometry::ha::ha_gpu_backend_name();
+    status.state = device_used ? geometry::ha::HaNodeState::Device :
+                                 geometry::ha::HaNodeState::Fallback;
+    status.reason = device_used ? std::string() : device_reason;
+    status.elements = stats.particles;
+    geometry::ha::ha_status_set(params.node().owner_tree(), params.node(), status);
+  }
+  else {
+    geometry::ha::ha_status_clear(params.node().owner_tree(), params.node());
+  }
+  if (std::getenv("BLENDER_WHITE_WATER_GPU_LOG") != nullptr) {
+    if (device_used) {
+      fprintf(stderr,
+              "WHITE_WATER_GPU backend=device particles=%d clusters=%d\n",
+              stats.particles,
+              stats.clusters);
+    }
+    else {
+      fprintf(stderr,
+              "WHITE_WATER_GPU backend=cpu requested=%d reason=%s\n",
+              int(device_requested),
+              device_reason.c_str());
+    }
+    fflush(stderr);
+  }
 }
 
 static void node_register()

@@ -10,10 +10,13 @@
  * other apart (separation) and split when the flow tears a clump apart.
  *
  * This is a one way post process: the fluid drives the white water, never the other way around.
- * Everything is CPU and deterministic (fixed neighbour order, Jacobi accumulation, no atomics).
+ * Deterministic (fixed neighbour order, Jacobi accumulation, no atomics). The neighbour coupled
+ * forces can run on the compute backend (see `GEO_ha_white_water.hh`); the rest is CPU.
  */
 
 #pragma once
+
+#include <string>
 
 #include "BLI_math_vector_types.hh"
 #include "BLI_span.hh"
@@ -183,7 +186,12 @@ struct ParticleData {
  * \param fluid_velocities: same length as `fluid_positions`.
  * \param collider_triangles: flat triangle list (3 positions per triangle), spray dies inside it.
  * \param settings: all parameters of the node.
+ * \param device_requested: the `HW Accelerate` zone (or `BLENDER_WHITE_WATER_GPU=1`) asked for the
+ *   compute backend.
+ * \param device_strict: the zone is in `Strict`, which bypasses the device particle threshold.
  * \param r_stats: counts and timing for the `Stats` output.
+ * \param r_device_used: whether the neighbour coupled forces ran on the device.
+ * \param r_device_reason: why they did not, when the device was requested.
  */
 void solve_frame(ParticleData &particles,
                  const Mesh *surface,
@@ -192,6 +200,10 @@ void solve_frame(ParticleData &particles,
                  Span<const float3> collider_triangles,
                  const Settings &settings,
                  float delta_time,
-                 Stats &r_stats);
+                 Stats &r_stats,
+                 bool device_requested = false,
+                 bool device_strict = false,
+                 bool *r_device_used = nullptr,
+                 std::string *r_device_reason = nullptr);
 
 }  // namespace blender::geometry::whitewater
