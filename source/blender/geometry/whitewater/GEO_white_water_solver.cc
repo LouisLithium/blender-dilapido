@@ -776,7 +776,7 @@ static void emit_particles(ParticleData &particles,
         float3 velocity = flow.velocity;
         float3 spawn = position;
         if (type == int(ParticleType::Foam)) {
-          spawn += normal * (0.25f * size);
+          /* Exactly on the surface: foam is a surface phenomenon, any offset shows as a gap. */
         }
         else if (type == int(ParticleType::Spray)) {
           spawn += normal * (0.5f * size);
@@ -966,7 +966,6 @@ void solve_frame(ParticleData &particles,
   if (previous_count > 0 && dt > 0.0f) {
     /* Advect, steer foam towards the flow and the surface, age everything. */
     const float stick = math::clamp(settings.foam_stick, 0.0f, 1.0f);
-    const float stick_blend = stick > 0.0f ? 1.0f - std::exp(-10.0f * stick * dt) : 0.0f;
     threading::parallel_for(IndexRange(previous_count), 1024, [&](const IndexRange range) {
       for (const int i : range) {
         const int type = particles.types[i];
@@ -980,19 +979,25 @@ void solve_frame(ParticleData &particles,
           velocity.z += settings.bubble_buoyancy * dt;
           velocity /= (1.0f + settings.drag * dt);
         }
-        else if (type == int(ParticleType::Foam) && stick_blend > 0.0f) {
+        else if (type == int(ParticleType::Foam)) {
+          /* Foam has no inertia of its own: it rides the flow (`Foam Stick` scales that) and is glued
+           * to the surface instead of easing towards it. Easing left a visible layer of foam hanging
+           * above the fluid whenever the surface decelerated under it. */
           const FlowSample flow = sample_flow(flow_tree, fluid_velocities, position);
           if (flow.found) {
-            velocity = math::interpolate(velocity, flow.velocity, stick_blend);
+            velocity = flow.velocity * stick;
           }
+          position += velocity * dt;
           if (surface_bvh.tree != nullptr) {
             float3 closest;
             float distance = 0.0f;
             int triangle = -1;
             if (surface_nearest(surface_bvh, position, closest, distance, triangle)) {
-              position = math::interpolate(position, closest, stick_blend);
+              position = closest;
             }
           }
+          particles.ages[i] += dt;
+          continue;
         }
         position += velocity * dt;
         particles.ages[i] += dt;
