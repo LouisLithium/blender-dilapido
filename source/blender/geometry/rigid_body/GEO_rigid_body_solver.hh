@@ -198,10 +198,18 @@ struct SolverWorldKey {
   const void *object = nullptr;
   const void *tree = nullptr;
   const void *node = nullptr;
+  /**
+   * Session UIDs of the owning object and node tree. Raw pointers alone are not enough: a scene
+   * can be freed and a new one allocated at the same addresses, which used to hand the new
+   * simulation the warm started world (and history) of the previous one.
+   */
+  unsigned int object_uid = 0;
+  unsigned int tree_uid = 0;
 
   bool operator==(const SolverWorldKey &other) const
   {
-    return object == other.object && tree == other.tree && node == other.node;
+    return object == other.object && tree == other.tree && node == other.node &&
+           object_uid == other.object_uid && tree_uid == other.tree_uid;
   }
 };
 

@@ -34,6 +34,8 @@
 #include "BKE_attribute.hh"
 #include "BKE_instances.hh"
 #include "BKE_mesh.hh"
+#include "BKE_node.hh"
+#include "BKE_object.hh"
 #include "BKE_pointcloud.hh"
 
 #include "BLI_array.hh"
@@ -942,7 +944,14 @@ static void node_geo_exec(GeoNodeExecParams params){
   if (const GeoNodesUserData *user_data = params.user_data()) {
     if (user_data->call_data != nullptr) {
       solver_key.object = user_data->call_data->self_object();
+      solver_key.object_uid = solver_key.object ?
+                                  static_cast<const Object *>(solver_key.object)->id.session_uid :
+                                  0;
       solver_key.tree = user_data->call_data->root_ntree;
+      if (solver_key.tree != nullptr) {
+        const bNodeTree *tree = static_cast<const bNodeTree *>(solver_key.tree);
+        solver_key.tree_uid = tree->owner_id ? tree->owner_id->session_uid : tree->id.session_uid;
+      }
       solver_key.node = &params.node();
     }
     else {

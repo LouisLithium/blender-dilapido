@@ -687,6 +687,10 @@ struct SolverWorldKeyHasher {
       hash ^= uint64_t(reinterpret_cast<uintptr_t>(pointer));
       hash *= 0x100000001b3ull;
     }
+    hash ^= uint64_t(key.object_uid);
+    hash *= 0x100000001b3ull;
+    hash ^= uint64_t(key.tree_uid);
+    hash *= 0x100000001b3ull;
     return hash;
   }
 };
