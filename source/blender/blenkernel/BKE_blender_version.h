@@ -27,6 +27,8 @@ namespace blender {
 #define BLENDER_VERSION_CYCLE release
 /** Blender release type suffix. LTS or blank. */
 #define BLENDER_VERSION_SUFFIX LTS
+/** Name of this Blender distribution, shown next to the version in the user interface. */
+#define BLENDER_VERSION_DISTRIBUTION "Dilapido"
 
 /* Blender file format version. */
 #define BLENDER_FILE_VERSION BLENDER_VERSION
@@ -47,6 +49,15 @@ const char *BKE_blender_version_string();
 
 /** As above but does not show patch version. */
 const char *BKE_blender_version_string_compact();
+
+/** User readable version string with the distribution name, e.g. "Blender Dilapido 5.2.4 LTS". */
+const char *BKE_blender_version_string_branded();
+
+/** As above but without the release cycle / suffix, e.g. "Blender Dilapido 5.2.4". */
+const char *BKE_blender_version_string_branded_compact();
+
+/** Name of this Blender distribution ("Dilapido"). */
+const char *BKE_blender_version_distribution();
 
 /** Returns true when version cycle is alpha, otherwise (beta, rc) returns false. */
 bool BKE_blender_version_is_alpha();

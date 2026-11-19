@@ -604,7 +604,7 @@ static void arg_py_context_restore(bContext *C, BlendePyContextStore *c_py)
 
 static void print_version_full()
 {
-  printf("Blender %s\n", BKE_blender_version_string());
+  printf("%s\n", BKE_blender_version_string_branded());
 #  ifdef BUILD_DATE
   printf("\tbuild date: %s\n", build_date);
   printf("\tbuild time: %s\n", build_time);
@@ -626,13 +626,13 @@ static void print_version_short()
 #  ifdef BUILD_DATE
   /* NOTE: We include built time since sometimes we need to tell broken from
    * working built of the same hash. */
-  printf("Blender %s (hash %s built %s %s)\n",
-         BKE_blender_version_string(),
+  printf("%s (hash %s built %s %s)\n",
+         BKE_blender_version_string_branded(),
          build_hash,
          build_date,
          build_time);
 #  else
-  printf("Blender %s\n", BKE_blender_version_string());
+  printf("%s\n", BKE_blender_version_string_branded());
 #  endif
 }
 
@@ -661,7 +661,7 @@ static void print_help(bArgs *ba, bool all)
 
 #  define PRINT(...) BLI_args_printf(ba, __VA_ARGS__)
 
-  PRINT("Blender %s\n", BKE_blender_version_string());
+  PRINT("%s\n", BKE_blender_version_string_branded());
   PRINT("Usage: blender [args ...] [file] [args ...]\n");
   PRINT("\n");
 
@@ -1370,7 +1370,7 @@ static const char arg_handle_debug_mode_set_doc[] =
 static int arg_handle_debug_mode_set(int /*argc*/, const char ** /*argv*/, void *data)
 {
   G.debug |= G_DEBUG;
-  printf("Blender %s\n", BKE_blender_version_string());
+  printf("%s\n", BKE_blender_version_string_branded());
   MEM_set_memory_debug();
 #  ifndef NDEBUG
   BLI_mempool_set_memory_debug();

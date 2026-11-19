@@ -314,7 +314,7 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
     button_func_set(but, [block](bContext &C) { wm_block_splash_close(&C, block); });
 
     wm_block_splash_add_label(block,
-                              BKE_blender_version_string(),
+                              BKE_blender_version_string_branded(),
                               splash_width - 8.0 * UI_SCALE_FAC,
                               splash_height - 13.0 * UI_SCALE_FAC);
   }
@@ -477,7 +477,7 @@ static ui::Block *wm_block_about_create(bContext *C, ARegion *region, void * /*a
 
   ui::Layout &col = layout.column(true);
 
-  uiItemL_ex(&col, IFACE_("Blender"), ICON_NONE, true, false);
+  uiItemL_ex(&col, IFACE_("Blender Dilapido"), ICON_NONE, true, false);
 
   MenuType *mt = WM_menutype_find("WM_MT_splash_about", true);
   if (mt) {
@@ -500,7 +500,7 @@ static wmOperatorStatus wm_splash_about_invoke(bContext *C,
 
 void WM_OT_splash_about(wmOperatorType *ot)
 {
-  ot->name = "About Blender";
+  ot->name = "About Blender Dilapido";
   ot->idname = "WM_OT_splash_about";
   ot->description = "Open a window with information about Blender";
 

@@ -691,7 +691,7 @@ static std::string wm_window_title_text(
     }
   }
 
-  win_title.append(fmt::format(" - Blender {}", BKE_blender_version_string()));
+  win_title.append(fmt::format(" - {}", BKE_blender_version_string_branded()));
 
   return win_title;
 }

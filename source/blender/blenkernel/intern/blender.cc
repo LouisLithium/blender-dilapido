@@ -101,6 +101,10 @@ static char blender_version_string[48] = "";
 /* Only includes patch if non-zero. */
 static char blender_version_string_compact[48] = "";
 
+/* Version with the distribution name, used by the UI. */
+static char blender_version_string_branded[64] = "";
+static char blender_version_string_branded_compact[64] = "";
+
 static void blender_version_init()
 {
   const char *version_cycle = "";
@@ -141,6 +145,22 @@ static void blender_version_init()
                 BLENDER_VERSION % 100,
                 BLENDER_VERSION_PATCH,
                 version_cycle_compact);
+
+  SNPRINTF_UTF8(blender_version_string_branded,
+                "Blender %s %d.%01d.%d%s%s",
+                BLENDER_VERSION_DISTRIBUTION,
+                BLENDER_VERSION / 100,
+                BLENDER_VERSION % 100,
+                BLENDER_VERSION_PATCH,
+                version_suffix,
+                version_cycle);
+
+  SNPRINTF_UTF8(blender_version_string_branded_compact,
+                "Blender %s %d.%01d.%d",
+                BLENDER_VERSION_DISTRIBUTION,
+                BLENDER_VERSION / 100,
+                BLENDER_VERSION % 100,
+                BLENDER_VERSION_PATCH);
 }
 
 const char *BKE_blender_version_string()
@@ -151,6 +171,21 @@ const char *BKE_blender_version_string()
 const char *BKE_blender_version_string_compact()
 {
   return blender_version_string_compact;
+}
+
+const char *BKE_blender_version_string_branded()
+{
+  return blender_version_string_branded;
+}
+
+const char *BKE_blender_version_string_branded_compact()
+{
+  return blender_version_string_branded_compact;
+}
+
+const char *BKE_blender_version_distribution()
+{
+  return BLENDER_VERSION_DISTRIBUTION;
 }
 
 void BKE_blender_version_blendfile_string_from_values(char *str_buff,
