@@ -132,6 +132,7 @@ set(SRC
   nodes/node_geo_import_csv.cc
   nodes/node_geo_import_obj.cc
   nodes/node_geo_import_ply.cc
+  nodes/node_geo_ignis_aero_force.cc
   nodes/node_geo_ignis_solver.cc
   nodes/node_geo_ignis_visualize.cc
   nodes/node_geo_init_ignis_data.cc
@@ -298,6 +299,7 @@ set(SRC
   nodes/node_geo_switch.cc
   nodes/node_geo_tag_filter.cc
   nodes/node_geo_tetrahedralize.cc
+  nodes/node_geo_textura_buoyancy.cc
   nodes/node_geo_textura_solver.cc
   nodes/node_geo_tool_3d_cursor.cc
   nodes/node_geo_tool_active_element.cc

@@ -28,6 +28,7 @@
 #include "BLI_offset_indices.hh"
 
 #include "BLI_span.hh"
+#include "BLI_string_utf8.h"
 #include "BLI_task.hh"
 
 

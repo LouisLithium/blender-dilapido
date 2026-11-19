@@ -10772,6 +10772,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeGridVoxelize");
   define("GeometryNode", "GeometryNodeDilapidoForce");
   define("GeometryNode", "GeometryNodeDilapidoFieldRemap");
+  define("GeometryNode", "GeometryNodeIgnisAeroForce");
   define("GeometryNode", "GeometryNodeIgnisSolver");
   define("GeometryNode", "GeometryNodeIgnisVisualize");
   define("GeometryNode", "GeometryNodeInitIgnisData");
@@ -10942,6 +10943,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeSwitch");
   define("GeometryNode", "GeometryNodeTagFilter");
   define("GeometryNode", "GeometryNodeTetrahedralize");
+  define("GeometryNode", "GeometryNodeTexturaBuoyancy");
   define("GeometryNode", "GeometryNodeTexturaSolver");
   define("GeometryNode", "GeometryNodeTool3DCursor");
   define("GeometryNode", "GeometryNodeToolActiveElement");

@@ -1123,6 +1123,7 @@ class NODE_MT_gn_dilapido_ignis_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeInitIgnisData")
         self.node_operator(layout, "GeometryNodeIgnisSolver")
         self.node_operator(layout, "GeometryNodeIgnisVisualize")
+        self.node_operator(layout, "GeometryNodeIgnisAeroForce")
 
 
 class NODE_MT_gn_dilapido_textura_base(node_add_menu.NodeMenu):
@@ -1134,6 +1135,7 @@ class NODE_MT_gn_dilapido_textura_base(node_add_menu.NodeMenu):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeInitTexturaData")
         self.node_operator(layout, "GeometryNodeTexturaSolver")
+        self.node_operator(layout, "GeometryNodeTexturaBuoyancy")
 
 
 class NODE_MT_gn_dilapido_white_water_base(node_add_menu.NodeMenu):
