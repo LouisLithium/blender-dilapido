@@ -11,6 +11,7 @@
 
 #include "GEO_rigid_body_solver.hh"
 
+#include "BLI_math_matrix.hh"
 #include "BLI_math_quaternion.hh"
 #include "BLI_math_vector.hh"
 
@@ -29,17 +30,24 @@
 #include <Jolt/Physics/Collision/GroupFilterTable.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Constraints/ConeConstraint.h>
 #include <Jolt/Physics/Constraints/Constraint.h>
+#include <Jolt/Physics/Constraints/DistanceConstraint.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
 #include <Jolt/Physics/Constraints/SixDOFConstraint.h>
 #include <Jolt/Physics/Constraints/SpringSettings.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/RegisterTypes.h>
 // clang-format on
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <memory>
@@ -284,6 +292,28 @@ RefConst<Shape> make_body_shape(const BodyShape &shape,
                                  std::max(half_extents.z, 5.0e-3f)));
       }
       break;
+    }
+    case ShapeType::Capsule: {
+      const float radius = std::max(shape.capsule_radius, 1.0e-3f);
+      const float half_height = std::max(shape.capsule_half_height, 0.0f);
+      RefConst<Shape> capsule = new CapsuleShape(half_height, radius);
+      if (math::length_squared(shape.local_offset) > 1.0e-12f) {
+        /* Bones keep their body origin at the head, so the capsule is shifted along the bone. A
+         * decorated shape also moves the center of mass, which the constraint code expects. */
+        RotatedTranslatedShapeSettings settings(Vec3(shape.local_offset.x,
+                                                     shape.local_offset.y,
+                                                     shape.local_offset.z),
+                                                Quat::sIdentity(),
+                                                capsule.GetPtr());
+        const ShapeSettings::ShapeResult result = settings.Create();
+        if (!result.HasError()) {
+          return result.Get();
+        }
+        if (std::getenv("BLENDER_RBD_DEBUG") != nullptr) {
+          printf("RBD_DEBUG capsule offset failed: %s\n", result.GetError().c_str());
+        }
+      }
+      return capsule;
     }
     case ShapeType::Sphere:
       break;
@@ -536,6 +566,11 @@ static uint64_t context_signature(Span<BodyState> bodies,
     hash = hash_mix(hash, uint64_t(shape.type));
     hash = hash_mix(hash, uint64_t(shape.points_start));
     hash = hash_mix(hash, uint64_t(shape.points_count));
+    hash = hash_mix(hash, uint64_t(std::llround(double(shape.capsule_half_height) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(shape.capsule_radius) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(shape.local_offset.x) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(shape.local_offset.y) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(shape.local_offset.z) * 1.0e5)));
   }
   /* A coarse hash of the shape points, so a different fracture with the same piece count   *
    * invalidates the world as well. */
@@ -551,6 +586,15 @@ static uint64_t context_signature(Span<BodyState> bodies,
     hash = hash_mix(hash, uint64_t(constraint.body_a));
     hash = hash_mix(hash, uint64_t(constraint.body_b));
     hash = hash_mix(hash, uint64_t(constraint.type));
+    /* Anchors are inputs too: editing a joint's bind pose has to rebuild the world, otherwise the
+     * cached Jolt constraint keeps the old anchor. */
+    hash = hash_mix(hash, uint64_t(constraint.has_anchors));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_a.x) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_a.y) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_a.z) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_b.x) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_b.y) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.anchor_b.z) * 1.0e4)));
     /* The break thresholds and spring settings are part of the cached state (they decide when a
      * * constraint gets disabled), so they have to invalidate the world as well: two solver nodes
      * * that only differ in these must not share a cached world. */
@@ -559,6 +603,27 @@ static uint64_t context_signature(Span<BodyState> bodies,
     hash = hash_mix(hash, uint64_t(std::llround(double(constraint.break_angle) * 1.0e3)));
     hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frequency) * 1.0e3)));
     hash = hash_mix(hash, uint64_t(std::llround(double(constraint.damping) * 1.0e3)));
+    /* Angular joints: the frames, limits and the collision flag all decide the cached constraint,
+     * so they have to invalidate the world when they change. */
+    hash = hash_mix(hash, uint64_t(constraint.has_frames));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_a.w) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_a.x) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_a.y) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_a.z) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_b.w) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_b.x) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_b.y) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.frame_b.z) * 1.0e5)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.swing_limit) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.twist_limit) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.hinge_min) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.hinge_max) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.hinge_axis.x) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.hinge_axis.y) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.hinge_axis.z) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.distance_min) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(std::llround(double(constraint.distance_max) * 1.0e4)));
+    hash = hash_mix(hash, uint64_t(constraint.disable_collision));
   }
   return hash;
 }
@@ -984,6 +1049,11 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
    * * its own sub group, the pairs that are glued are disabled in the table below. The table costs
    * * `bodies^2 / 16` bytes, so it is only built for scenes where that stays reasonable. */
   const bool want_collision_filter = (settings.disable_glued_collisions && !constraints.is_empty()) ||
+                                     std::any_of(constraints.begin(),
+                                                 constraints.end(),
+                                                 [](const ConstraintDef &def) {
+                                                   return def.disable_collision;
+                                                 }) ||
                                      settings.ignore_initial_overlap;
   /* The filter table costs `bodies^2 / 16` bytes, so it is still capped, but high enough for a
    * scene model that was split into thousands of islands. */
@@ -1082,6 +1152,16 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
       float3 extents(0.0f);
       if (shape.type == ShapeType::Box) {
         extents = shape.half_extents * 2.0f;
+      }
+      else if (shape.type == ShapeType::Capsule) {
+        /* Capsule along local Y: length = 2 * (half height + radius). A box inertia from these
+         * extents is not exact for the rounded caps, but it is finite and keeps limbs from
+         * spinning like a sphere. */
+        const float length = 2.0f * (std::max(shape.capsule_half_height, 0.0f) +
+                                     std::max(shape.capsule_radius, 1.0e-3f));
+        extents = float3(2.0f * std::max(shape.capsule_radius, 1.0e-3f),
+                         length,
+                         2.0f * std::max(shape.capsule_radius, 1.0e-3f));
       }
       else if (shape.type == ShapeType::ConvexHull && shape.points_count > 0) {
         float3 min_point(FLT_MAX, FLT_MAX, FLT_MAX);
@@ -1207,6 +1287,74 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
                                                             Vec3 &com_b) -> Ref<Constraint> {
     /* Build the Jolt constraint described by `def`. Used both when the world is built and when a
      * * constraint is replaced at runtime (soft fallback, hardening). */
+    if (def.type >= 2 && def.type <= 5) {
+      /* Angular joints (ragdolls): a point constraint with angular limits, expressed in the two
+       * joint frames. The frames are stored in body local space, so they only need the center of
+       * mass subtracted from the positions (rotations are unaffected by a pure translation). */
+      com_a = body_a->GetShape()->GetCenterOfMass();
+      com_b = body_b->GetShape()->GetCenterOfMass();
+      const Vec3 point_a = (has_anchors ? anchor_a : Vec3::sZero()) - com_a;
+      const Vec3 point_b = (has_anchors ? anchor_b : Vec3::sZero()) - com_b;
+      const math::Quaternion frame_a = def.has_frames ? def.frame_a : math::Quaternion::identity();
+      const math::Quaternion frame_b = def.has_frames ? def.frame_b : math::Quaternion::identity();
+      const float3x3 rot_a = math::from_rotation<float3x3>(frame_a);
+      const float3x3 rot_b = math::from_rotation<float3x3>(frame_b);
+      const auto axis = [](const float3x3 &rot, const float3 &local_axis) {
+        const float3 value = math::transform_direction(rot, local_axis);
+        return to_jolt(math::normalize(value));
+      };
+      const auto perpendicular = [](const Vec3 &axis_value) {
+        const Vec3 helper = std::abs(axis_value.GetY()) < 0.9f ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+        return axis_value.Cross(helper).Normalized();
+      };
+      if (def.type == 2) {
+        SwingTwistConstraintSettings settings;
+        settings.mSpace = EConstraintSpace::LocalToBodyCOM;
+        settings.mPosition1 = point_a;
+        settings.mPosition2 = point_b;
+        settings.mTwistAxis1 = axis(rot_a, float3(0.0f, 1.0f, 0.0f));
+        settings.mPlaneAxis1 = axis(rot_a, float3(0.0f, 0.0f, 1.0f));
+        settings.mTwistAxis2 = axis(rot_b, float3(0.0f, 1.0f, 0.0f));
+        settings.mPlaneAxis2 = axis(rot_b, float3(0.0f, 0.0f, 1.0f));
+        settings.mNormalHalfConeAngle = std::max(def.swing_limit, 0.0f);
+        settings.mPlaneHalfConeAngle = std::max(def.swing_limit, 0.0f);
+        settings.mTwistMinAngle = -std::max(def.twist_limit, 0.0f);
+        settings.mTwistMaxAngle = std::max(def.twist_limit, 0.0f);
+        return settings.Create(*body_a, *body_b);
+      }
+      if (def.type == 3) {
+        HingeConstraintSettings settings;
+        settings.mSpace = EConstraintSpace::LocalToBodyCOM;
+        settings.mPoint1 = point_a;
+        settings.mPoint2 = point_b;
+        const Vec3 hinge_a = axis(rot_a, def.hinge_axis);
+        const Vec3 hinge_b = axis(rot_b, def.hinge_axis);
+        settings.mHingeAxis1 = hinge_a;
+        settings.mHingeAxis2 = hinge_b;
+        settings.mNormalAxis1 = perpendicular(hinge_a);
+        settings.mNormalAxis2 = perpendicular(hinge_b);
+        settings.mLimitsMin = std::min(def.hinge_min, def.hinge_max);
+        settings.mLimitsMax = std::max(def.hinge_min, def.hinge_max);
+        return settings.Create(*body_a, *body_b);
+      }
+      if (def.type == 4) {
+        ConeConstraintSettings settings;
+        settings.mSpace = EConstraintSpace::LocalToBodyCOM;
+        settings.mPoint1 = point_a;
+        settings.mPoint2 = point_b;
+        settings.mTwistAxis1 = axis(rot_a, float3(0.0f, 1.0f, 0.0f));
+        settings.mTwistAxis2 = axis(rot_b, float3(0.0f, 1.0f, 0.0f));
+        settings.mHalfConeAngle = std::max(def.swing_limit, 0.0f);
+        return settings.Create(*body_a, *body_b);
+      }
+      DistanceConstraintSettings settings;
+      settings.mSpace = EConstraintSpace::LocalToBodyCOM;
+      settings.mPoint1 = point_a;
+      settings.mPoint2 = point_b;
+      settings.mMinDistance = std::max(def.distance_min, 0.0f);
+      settings.mMaxDistance = std::max(def.distance_max, settings.mMinDistance);
+      return settings.Create(*body_a, *body_b);
+    }
     if (def.type == 1) {
       /* Soft constraint: the anchors are held together by a spring instead of being welded, and
        * * the rotation stays rigid (Jolt only supports springs on the translation axes). */
@@ -1329,7 +1477,9 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
       if (glue_filter) {
         /* Let the two bodies pass through each other from now on: the glue holds them together and
          * * their shared cut faces would otherwise generate contacts that fight the constraint. */
-        glue_filter->DisableCollision(uint32(def.body_a), uint32(def.body_b));
+        if (settings.disable_glued_collisions || def.disable_collision) {
+          glue_filter->DisableCollision(uint32(def.body_a), uint32(def.body_b));
+        }
       }
       active.constraint = constraint;
       active.anchor_a = to_jolt(def.anchor_a);
@@ -1403,16 +1553,49 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
         /* The threshold is compared against the impulse of the whole frame so far, not against a
          * * single substep: that keeps it independent of the substep count and makes it line up
          * with         * the momentum the constraint has to absorb (`mass * velocity change`). */
-        Vec3 lambda;
-        if (def.type == 1) {
-          lambda = static_cast<const SixDOFConstraint *>(active.constraint.GetPtr())
-                       ->GetTotalLambdaPosition();
+        float lambda_length = 0.0f;
+        switch (def.type) {
+          case 1:
+            lambda_length = static_cast<const SixDOFConstraint *>(active.constraint.GetPtr())
+                                ->GetTotalLambdaPosition()
+                                .Length();
+            break;
+          case 2: {
+            const auto *swing_twist =
+                static_cast<const SwingTwistConstraint *>(active.constraint.GetPtr());
+            lambda_length = swing_twist->GetTotalLambdaPosition().Length() +
+                            std::abs(swing_twist->GetTotalLambdaTwist()) +
+                            std::abs(swing_twist->GetTotalLambdaSwingY()) +
+                            std::abs(swing_twist->GetTotalLambdaSwingZ());
+            break;
+          }
+          case 3: {
+            const auto *hinge = static_cast<const HingeConstraint *>(active.constraint.GetPtr());
+            const auto rotation = hinge->GetTotalLambdaRotation();
+            lambda_length = hinge->GetTotalLambdaPosition().Length() +
+                            std::abs(rotation[0]) + std::abs(rotation[1]) +
+                            std::abs(hinge->GetTotalLambdaRotationLimits());
+            break;
+          }
+          case 4: {
+            const auto *cone = static_cast<const ConeConstraint *>(active.constraint.GetPtr());
+            lambda_length = cone->GetTotalLambdaPosition().Length() +
+                            std::abs(cone->GetTotalLambdaRotation());
+            break;
+          }
+          case 5: {
+            const auto *distance =
+                static_cast<const DistanceConstraint *>(active.constraint.GetPtr());
+            lambda_length = std::abs(distance->GetTotalLambdaPosition());
+            break;
+          }
+          default:
+            lambda_length = static_cast<const FixedConstraint *>(active.constraint.GetPtr())
+                                ->GetTotalLambdaPosition()
+                                .Length();
+            break;
         }
-        else {
-          lambda = static_cast<const FixedConstraint *>(active.constraint.GetPtr())
-                       ->GetTotalLambdaPosition();
-        }
-        active.impulse_accumulator += lambda.Length();
+        active.impulse_accumulator += lambda_length;
         if (active.impulse_accumulator > def.break_impulse) {
           broken = true;
         }

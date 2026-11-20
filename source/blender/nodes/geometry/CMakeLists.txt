@@ -29,6 +29,7 @@ set(INC_SYS
 
 set(SRC
   nodes/node_geo_accumulate_field.cc
+  nodes/node_geo_armature_bones.cc
   nodes/node_geo_attribute_capture.cc
   nodes/node_geo_attribute_domain_size.cc
   nodes/node_geo_attribute_statistic.cc
@@ -142,6 +143,7 @@ set(SRC
   nodes/node_geo_index_of_nearest.cc
   nodes/node_geo_index_switch.cc
   nodes/node_geo_init_puncliga_data.cc
+  nodes/node_geo_init_ragdoll_bodies.cc
   nodes/node_geo_init_rigid_body.cc
   nodes/node_geo_init_textura_data.cc
   nodes/node_geo_hw_accelerate.cc
@@ -230,6 +232,7 @@ set(SRC
   nodes/node_geo_point_deform.cc
   nodes/node_geo_points_to_volume.cc
   nodes/node_geo_proximity.cc
+  nodes/node_geo_ragdoll_joints.cc
   nodes/node_geo_raycast.cc
   nodes/node_geo_dilapido_force.cc
   nodes/node_geo_dilapido_field_remap.cc

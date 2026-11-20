@@ -10682,6 +10682,7 @@ static void rna_def_nodes(BlenderRNA *brna)
 
   define("GeometryNode", "GeometryNodeAccumulateField");
   define("GeometryNode", "GeometryNodeApplySimulatedData");
+  define("GeometryNode", "GeometryNodeArmatureBones");
   define("GeometryNode", "GeometryNodeAttributeDomainSize");
   define("GeometryNode", "GeometryNodeAttributeStatistic");
   define("GeometryNode", "GeometryNodeBake", rna_def_geo_bake);
@@ -10789,6 +10790,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeIndexOfNearest");
   define("GeometryNode", "GeometryNodeIndexSwitch", def_geo_index_switch);
   define("GeometryNode", "GeometryNodeInitPuncligaData");
+  define("GeometryNode", "GeometryNodeInitRagdollBodies");
   define("GeometryNode", "GeometryNodeInitRigidBody");
   define("GeometryNode", "GeometryNodeInitTexturaData");
   define("GeometryNode", "GeometryNodeInputActiveCamera");
@@ -10867,6 +10869,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodePointsToVertices");
   define("GeometryNode", "GeometryNodePointsToVolume");
   define("GeometryNode", "GeometryNodeProximity");
+  define("GeometryNode", "GeometryNodeRagdollJoints");
   define("GeometryNode", "GeometryNodeRaycast");
   define("GeometryNode", "GeometryNodeRBDCollider");
   define("GeometryNode", "GeometryNodeRBDConstraintFromPieces");

@@ -454,7 +454,27 @@ static void collect_body_shapes(const GeometrySet &geometry,
   if (reference_handles.size() != body_num) {
     return;
   }
+  const bke::AttributeAccessor attributes = instances->attributes();
+  const VArray<int> shape_types =
+      attributes.lookup_or_default<int>("shape", AttrDomain::Instance, 0).varray;
+  const VArray<float> capsule_half_heights =
+      attributes.lookup_or_default<float>("shape_half_height", AttrDomain::Instance, 0.0f).varray;
+  const VArray<float> capsule_radii =
+      attributes.lookup_or_default<float>("shape_radius", AttrDomain::Instance, 0.05f).varray;
+  const VArray<float3> capsule_offsets =
+      attributes.lookup_or_default<float3>("shape_offset", AttrDomain::Instance, float3(0.0f))
+          .varray;
   for (const int i : IndexRange(body_num)) {
+    if (shape_types[i] == 1) {
+      /* Capsule (ragdoll bones). The instance geometry is only for display, the collision shape
+       * comes from these attributes, so no mesh is needed here. */
+      BodyShape &shape = r_shapes[i];
+      shape.type = ShapeType::Capsule;
+      shape.capsule_half_height = std::max(capsule_half_heights[i], 0.0f);
+      shape.capsule_radius = std::max(capsule_radii[i], 1.0e-3f);
+      shape.local_offset = capsule_offsets[i];
+      continue;
+    }
     const int reference_i = reference_handles[i];
     const Span<bke::InstanceReference> references = instances->references();
     if (reference_i < 0 || reference_i >= references.size()) {
@@ -499,10 +519,22 @@ struct RawConstraint {
   float break_impulse = 0.0f;
   float break_distance = 0.0f;
   float break_angle = 0.0f;
-  /** 0 = fixed (weld), 1 = soft. */
+  /** 0 = fixed (weld), 1 = soft, 2 = swing-twist, 3 = hinge, 4 = cone, 5 = distance. */
   int type = 0;
   float frequency = 5.0f;
   float damping = 0.5f;
+  /** Angular joint frames (body local) and limits; only used by type >= 2. */
+  bool has_frames = false;
+  math::Quaternion frame_a = math::Quaternion::identity();
+  math::Quaternion frame_b = math::Quaternion::identity();
+  float swing_limit = 0.0f;
+  float twist_limit = 0.0f;
+  float hinge_min = -float(M_PI);
+  float hinge_max = float(M_PI);
+  float3 hinge_axis = float3(1.0f, 0.0f, 0.0f);
+  float distance_min = 0.0f;
+  float distance_max = 0.0f;
+  bool disable_collision = true;
   /** 0 = disable on break, 1 = replace with a soft constraint. */
   int fallback = 0;
   /** Seconds of stable deformation before the rest pose is re-baselined (0 = off). */
@@ -608,6 +640,34 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
       attributes.lookup_or_default<float>("harden_time", AttrDomain::Point, 0.0f).varray;
   const VArray<float> harden_accums =
       attributes.lookup_or_default<float>("harden_accum", AttrDomain::Point, 0.0f).varray;
+  const bool has_frames = attributes.contains("frame_a") && attributes.contains("frame_b");
+  const VArray<math::Quaternion> frame_a =
+      attributes
+          .lookup_or_default<math::Quaternion>(
+              "frame_a", AttrDomain::Point, math::Quaternion::identity())
+          .varray;
+  const VArray<math::Quaternion> frame_b =
+      attributes
+          .lookup_or_default<math::Quaternion>(
+              "frame_b", AttrDomain::Point, math::Quaternion::identity())
+          .varray;
+  const VArray<float> swing_limits =
+      attributes.lookup_or_default<float>("swing_limit", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> twist_limits =
+      attributes.lookup_or_default<float>("twist_limit", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> hinge_mins =
+      attributes.lookup_or_default<float>("hinge_min", AttrDomain::Point, -float(M_PI)).varray;
+  const VArray<float> hinge_maxs =
+      attributes.lookup_or_default<float>("hinge_max", AttrDomain::Point, float(M_PI)).varray;
+  const VArray<float3> hinge_axes =
+      attributes.lookup_or_default<float3>("hinge_axis", AttrDomain::Point, float3(1.0f, 0.0f, 0.0f))
+          .varray;
+  const VArray<float> distance_mins =
+      attributes.lookup_or_default<float>("distance_min", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> distance_maxs =
+      attributes.lookup_or_default<float>("distance_max", AttrDomain::Point, 0.0f).varray;
+  const VArray<bool> disable_collisions =
+      attributes.lookup_or_default<bool>("disable_collision", AttrDomain::Point, true).varray;
 
   for (const int i : IndexRange(pointcloud.totpoint)) {
     if (body_a[i] < 0 || body_b[i] < 0) {
@@ -629,6 +689,17 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
     constraint.fallback = fallbacks[i];
     constraint.harden_time = harden_times[i];
     constraint.harden_accum = harden_accums[i];
+    constraint.has_frames = has_frames;
+    constraint.frame_a = frame_a[i];
+    constraint.frame_b = frame_b[i];
+    constraint.swing_limit = swing_limits[i];
+    constraint.twist_limit = twist_limits[i];
+    constraint.hinge_min = hinge_mins[i];
+    constraint.hinge_max = hinge_maxs[i];
+    constraint.hinge_axis = hinge_axes[i];
+    constraint.distance_min = distance_mins[i];
+    constraint.distance_max = distance_maxs[i];
+    constraint.disable_collision = disable_collisions[i];
     constraint.source_path = path;
     constraint.source_point = i;
     constraints.append(constraint);
@@ -1097,6 +1168,17 @@ static void node_geo_exec(GeoNodeExecParams params){
       def.fallback = raw.fallback;
       def.harden_time = std::max(raw.harden_time, 0.0f);
       def.harden_accum = std::max(raw.harden_accum, 0.0f);
+      def.has_frames = raw.has_frames;
+      def.frame_a = raw.frame_a;
+      def.frame_b = raw.frame_b;
+      def.swing_limit = std::max(raw.swing_limit, 0.0f);
+      def.twist_limit = std::max(raw.twist_limit, 0.0f);
+      def.hinge_min = raw.hinge_min;
+      def.hinge_max = raw.hinge_max;
+      def.hinge_axis = raw.hinge_axis;
+      def.distance_min = std::max(raw.distance_min, 0.0f);
+      def.distance_max = std::max(raw.distance_max, def.distance_min);
+      def.disable_collision = raw.disable_collision;
       constraint_source[constraints.size()] = raw_i;
       constraints.append(def);
     }

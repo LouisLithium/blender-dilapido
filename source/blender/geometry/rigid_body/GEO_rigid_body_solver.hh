@@ -52,6 +52,8 @@ enum class ShapeType : int {
   Sphere = 0,
   Box = 1,
   ConvexHull = 2,
+  /** Capsule along the body's local Y axis, optionally shifted by #BodyShape::local_offset. */
+  Capsule = 3,
 };
 
 /**
@@ -65,6 +67,15 @@ struct BodyShape {
   /** Used by #ShapeType::ConvexHull, indexes into the `shape_points` span. */
   int points_start = 0;
   int points_count = 0;
+  /** Used by #ShapeType::Capsule: half the length of the cylindrical part. */
+  float capsule_half_height = 0.0f;
+  /** Used by #ShapeType::Capsule. */
+  float capsule_radius = 0.05f;
+  /**
+   * Translation of the shape relative to the body origin. A bone body keeps its origin at the bone
+   * head, so its capsule is shifted by half the bone length along local Y.
+   */
+  float3 local_offset = float3(0.0f);
 };
 
 /**
@@ -221,7 +232,11 @@ struct ConstraintDef {
   int body_a = -1;
   int body_b = -1;
   bool enabled = true;
-  /** 0 = fixed (weld), 1 = soft (springy translation, rigid rotation). */
+  /**
+   * 0 = fixed (weld), 1 = soft (springy translation, rigid rotation), 2 = swing-twist (ball joint
+   * with a cone and a twist limit), 3 = hinge (one axis with angular limits), 4 = cone,
+   * 5 = distance.
+   */
   int type = 0;
   /**
    * What happens when this constraint breaks: 0 disables it, 1 replaces it with a soft constraint
@@ -236,13 +251,36 @@ struct ConstraintDef {
   /** Time this constraint has already been deformed (persisted from the previous frame). */
   float harden_accum = 0.0f;
   /**
-   * When set, the anchors below are used (in body local space, relative to the center of mass).
+   * When set, the anchors below are used (in body local space, relative to the body origin).
    * Otherwise Jolt derives the anchor from the current relative pose, which makes the constraint
    * follow any drift that happened before (bad when the physics world is rebuilt every frame).
    */
   bool has_anchors = false;
   float3 anchor_a = float3(0.0f);
   float3 anchor_b = float3(0.0f);
+  /**
+   * Orientation of the joint frame in body local space (only used by the angular joints). At the
+   * bind pose the two frames line up, so all limit angles are measured from that relative pose.
+   */
+  bool has_frames = false;
+  math::Quaternion frame_a = math::Quaternion::identity();
+  math::Quaternion frame_b = math::Quaternion::identity();
+  /** Half cone angle of a swing-twist or cone joint, in radians. */
+  float swing_limit = 0.0f;
+  /** Symmetric twist limit of a swing-twist joint, in radians. */
+  float twist_limit = 0.0f;
+  /** Hinge limits in radians, around #hinge_axis (joint frame). */
+  float hinge_min = -float(M_PI);
+  float hinge_max = float(M_PI);
+  float3 hinge_axis = float3(1.0f, 0.0f, 0.0f);
+  /** Distance joint range in metres (0/0 keeps the two anchors together). */
+  float distance_min = 0.0f;
+  float distance_max = 0.0f;
+  /**
+   * Disable collision between the two bodies while this constraint exists. Joint-connected bones
+   * would otherwise push each other apart at the joint.
+   */
+  bool disable_collision = true;
   /** Break conditions of a glue constraint. Zero or negative disables the check. */
   float break_impulse = 0.0f;
   float break_distance = 0.0f;

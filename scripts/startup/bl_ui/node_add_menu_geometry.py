@@ -1100,6 +1100,18 @@ class NODE_MT_gn_dilapido_rbd_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeRigidBodySolver")
 
 
+class NODE_MT_gn_dilapido_ragdoll_base(node_add_menu.NodeMenu):
+    """Bone-based ragdolls: bones to capsules, joints and the rigid body solver."""
+
+    bl_label = "Ragdoll"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeArmatureBones")
+        self.node_operator(layout, "GeometryNodeInitRagdollBodies")
+        self.node_operator(layout, "GeometryNodeRagdollJoints")
+
+
 class NODE_MT_gn_dilapido_puncliga_base(node_add_menu.NodeMenu):
     """The XPBD solver: cloth, fluids and soft bodies."""
 
@@ -1163,6 +1175,7 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         layout.separator()
         self.draw_menu(layout, "RBD")
+        self.draw_menu(layout, "Ragdoll")
         self.draw_menu(layout, "Puncliga")
         self.draw_menu(layout, "Ignis")
         self.draw_menu(layout, "Textura")
@@ -1213,6 +1226,7 @@ add_menus = {
     "NODE_MT_category_simulation": NODE_MT_gn_simulation_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO": NODE_MT_gn_dilapido_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_RBD": NODE_MT_gn_dilapido_rbd_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_RAGDOLL": NODE_MT_gn_dilapido_ragdoll_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_PUNCLIGA": NODE_MT_gn_dilapido_puncliga_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_IGNIS": NODE_MT_gn_dilapido_ignis_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_TEXTURA": NODE_MT_gn_dilapido_textura_base,
