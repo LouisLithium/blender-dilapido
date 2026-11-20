@@ -58,6 +58,7 @@ struct SpherePackingSettings {
   float jitter = 0.25f;
   int max_spheres = 5000;
   int seed = 0;
+  int shape_group = -1;
 };
 
 struct SpherePackingResult {
@@ -374,6 +375,13 @@ static void node_declare(NodeDeclarationBuilder &b)
         .max(1.0f)
         .description("Random offset of the candidate grid inside one cell");
     panel.add_input<decl::Int>("Seed"_ustr).default_value(0).description("Jitter seed");
+    panel.add_input<decl::Int>("Shape Group"_ustr)
+        .default_value(-1)
+        .min(-1)
+        .description(
+            "Written as the `puncliga_shape_group` attribute. Points of one packing with the same "
+            "group stay one rigid piece, also when several packings are joined. -1 leaves the "
+            "attribute unset, so `Init Puncliga Data` falls back to the `Piece ID`");
   }
   {
     auto &panel = b.add_panel("Limits"_ustr).default_closed(false);
@@ -411,6 +419,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.jitter = params.get_input<float>("Jitter"_ustr);
   settings.max_spheres = params.get_input<int>("Max Spheres"_ustr);
   settings.seed = params.get_input<int>("Seed"_ustr);
+  settings.shape_group = params.get_input<int>("Shape Group"_ustr);
 
   SpherePackingResult result;
   std::string error;
@@ -444,6 +453,15 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     radius_writer.finish();
     id_writer.finish();
+  }
+  if (settings.shape_group >= 0) {
+    bke::SpanAttributeWriter<int> group_writer =
+        attributes.lookup_or_add_for_write_only_span<int>("puncliga_shape_group",
+                                                          bke::AttrDomain::Point);
+    if (group_writer) {
+      group_writer.span.fill(settings.shape_group);
+      group_writer.finish();
+    }
   }
 
   if (std::getenv("BLENDER_PUNCLIGA_PACKING_DEBUG") != nullptr) {

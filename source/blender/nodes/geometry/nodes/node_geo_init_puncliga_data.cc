@@ -499,8 +499,9 @@ static void node_declare(NodeDeclarationBuilder &b)
         .structure_type(StructureType::Field)
         .usage_by_menu("Type"_ustr, rigid)
         .description(
-            "Group id of every point. Points with the same id are one rigid piece. -1 uses the "
-            "`Piece ID` of this node, which keeps pieces of a joined geometry apart");
+            "Group id of every point. Points with the same id are one rigid piece. -1 keeps the "
+            "`puncliga_shape_group` attribute of the input (a sphere packing can write it), or "
+            "uses the `Piece ID` of this node when there is none");
     panel.add_input<decl::Float>("Shape Stiffness"_ustr)
         .default_value(1.0f)
         .min(0.0f)
@@ -865,6 +866,10 @@ static void write_shape_matching_component(bke::MutableAttributeAccessor attribu
   evaluator.evaluate();
   const VArray<int> groups = evaluator.get_evaluated<int>(0);
   const VArray<float> stiffnesses = evaluator.get_evaluated<float>(1);
+  /* A sphere packing can write the group itself; -1 keeps it instead of falling back to the
+   * `Piece ID`. */
+  const VArray<int> existing_groups = *attributes.lookup<int>(attribute_names::shape_group,
+                                                              bke::AttrDomain::Point);
 
   bke::SpanAttributeWriter<bool> selection_writer =
       attributes.lookup_or_add_for_write_only_span<bool>(attribute_names::shape_matching,
@@ -880,7 +885,8 @@ static void write_shape_matching_component(bke::MutableAttributeAccessor attribu
   }
   for (const int i : IndexRange(points_num)) {
     selection_writer.span[i] = enabled;
-    group_writer.span[i] = groups[i] >= 0 ? groups[i] : piece_id;
+    group_writer.span[i] = groups[i] >= 0 ? groups[i] :
+                                          (existing_groups ? existing_groups[i] : piece_id);
     stiffness_writer.span[i] = math::clamp(stiffnesses[i], 0.0f, 1.0f);
   }
   selection_writer.finish();
