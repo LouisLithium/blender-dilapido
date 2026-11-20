@@ -25,6 +25,7 @@
 
 #include "BKE_attribute.hh"
 #include "BKE_bvhutils.hh"
+#include "BKE_geometry_fields.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
@@ -58,7 +59,6 @@ struct SpherePackingSettings {
   float jitter = 0.25f;
   int max_spheres = 5000;
   int seed = 0;
-  int shape_group = -1;
 };
 
 struct SpherePackingResult {
@@ -378,10 +378,13 @@ static void node_declare(NodeDeclarationBuilder &b)
     panel.add_input<decl::Int>("Shape Group"_ustr)
         .default_value(-1)
         .min(-1)
+        .structure_type(StructureType::Field)
         .description(
-            "Written as the `puncliga_shape_group` attribute. Points of one packing with the same "
-            "group stay one rigid piece, also when several packings are joined. -1 leaves the "
-            "attribute unset, so `Init Puncliga Data` falls back to the `Piece ID`");
+            "Evaluated on the generated points and written as `puncliga_shape_group`. Points of one "
+            "packing with the same group stay one rigid piece, also when several packings are "
+            "joined. The field can use `Position`, `Index`, `radius` and `id`; to read an attribute "
+            "of the input mesh, sample that mesh inside the field. -1 leaves the attribute unset, "
+            "so `Init Puncliga Data` falls back to the `Piece ID`");
   }
   {
     auto &panel = b.add_panel("Limits"_ustr).default_closed(false);
@@ -419,7 +422,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   settings.jitter = params.get_input<float>("Jitter"_ustr);
   settings.max_spheres = params.get_input<int>("Max Spheres"_ustr);
   settings.seed = params.get_input<int>("Seed"_ustr);
-  settings.shape_group = params.get_input<int>("Shape Group"_ustr);
+  const Field<int> shape_group_field = params.extract_input<Field<int>>("Shape Group"_ustr);
 
   SpherePackingResult result;
   std::string error;
@@ -454,12 +457,28 @@ static void node_geo_exec(GeoNodeExecParams params)
     radius_writer.finish();
     id_writer.finish();
   }
-  if (settings.shape_group >= 0) {
+  /* The group field is evaluated on the generated point cloud, so `Position`, `Index`, `radius` and
+   * `id` are per sphere. */
+  const bke::GeometryFieldContext group_context{*pointcloud};
+  fn::FieldEvaluator group_evaluator{group_context, spheres_num};
+  group_evaluator.add(shape_group_field);
+  group_evaluator.evaluate();
+  const VArray<int> groups = group_evaluator.get_evaluated<int>(0);
+  bool has_group = false;
+  for (const int i : IndexRange(spheres_num)) {
+    if (groups[i] >= 0) {
+      has_group = true;
+      break;
+    }
+  }
+  if (has_group) {
     bke::SpanAttributeWriter<int> group_writer =
         attributes.lookup_or_add_for_write_only_span<int>("puncliga_shape_group",
                                                           bke::AttrDomain::Point);
     if (group_writer) {
-      group_writer.span.fill(settings.shape_group);
+      for (const int i : IndexRange(spheres_num)) {
+        group_writer.span[i] = groups[i];
+      }
       group_writer.finish();
     }
   }

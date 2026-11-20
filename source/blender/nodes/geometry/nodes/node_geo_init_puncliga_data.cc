@@ -885,8 +885,9 @@ static void write_shape_matching_component(bke::MutableAttributeAccessor attribu
   }
   for (const int i : IndexRange(points_num)) {
     selection_writer.span[i] = enabled;
+    const int existing_group = existing_groups ? existing_groups[i] : -1;
     group_writer.span[i] = groups[i] >= 0 ? groups[i] :
-                                          (existing_groups ? existing_groups[i] : piece_id);
+                                          (existing_group >= 0 ? existing_group : piece_id);
     stiffness_writer.span[i] = math::clamp(stiffnesses[i], 0.0f, 1.0f);
   }
   selection_writer.finish();
