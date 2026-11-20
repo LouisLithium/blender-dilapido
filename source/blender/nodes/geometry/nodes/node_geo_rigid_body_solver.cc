@@ -41,6 +41,7 @@
 #include "BLI_array.hh"
 #include "BLI_map.hh"
 #include "BLI_math_matrix.hh"
+#include "BLI_math_quaternion.hh"
 #include "BLI_math_quaternion_types.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_set.hh"
@@ -248,6 +249,12 @@ static void node_declare(NodeDeclarationBuilder &b)
             "Let glued pieces collide with each other. Off by default: the cut faces of two glued "
             "fragments touch, so the contact solver would push them apart while the glue pulls "
             "them back");
+    solver_panel.add_input<decl::Bool>("Rebase Joints"_ustr)
+        .default_value(true)
+        .description(
+            "When a body switches from animated to simulated, re-express its angular joints in the "
+            "pose it has at the switch (instead of the pose the joints were authored in), so a "
+            "ragdoll captured mid-animation does not snap back when the animation is turned off");
     solver_panel.add_input<decl::Vector>("Gravity"_ustr)
         .default_value(float3(0.0f, 0.0f, -9.81f))
         .description("Gravity used for this solver step");
@@ -346,6 +353,10 @@ static void write_point_body_states(PointCloud &pointcloud, Span<BodyState> stat
       attributes.lookup_or_add_for_write_span<float3>("velocity", AttrDomain::Point);
   bke::SpanAttributeWriter<float3> angular_velocities =
       attributes.lookup_or_add_for_write_span<float3>("angular_velocity", AttrDomain::Point);
+  /* The flag is written back too: next frame it is the *previous* state of the body, which is how
+   * the solver tells "this body was animated last frame" from "it has always been simulated". */
+  bke::SpanAttributeWriter<bool> animated =
+      attributes.lookup_or_add_for_write_span<bool>("animated", AttrDomain::Point);
 
   for (const int i : states.index_range()) {
     const BodyState &state = states[i];
@@ -353,12 +364,14 @@ static void write_point_body_states(PointCloud &pointcloud, Span<BodyState> stat
     rotations.span[i] = state.rotation;
     linear_velocities.span[i] = state.linear_velocity;
     angular_velocities.span[i] = state.angular_velocity;
+    animated.span[i] = state.animated;
   }
 
   positions.finish();
   rotations.finish();
   linear_velocities.finish();
   angular_velocities.finish();
+  animated.finish();
 }
 
 /** \} */
@@ -440,14 +453,20 @@ static void write_instance_body_states(bke::Instances &instances, Span<BodyState
       attributes.lookup_or_add_for_write_span<float3>("angular_velocity", AttrDomain::Instance);
   bke::SpanAttributeWriter<bool> sleeping =
       attributes.lookup_or_add_for_write_span<bool>("sleeping", AttrDomain::Instance);
+  /* Keep the animated flag in the state: it is compared with the live flag next frame to detect the
+   * switch from animation to simulation (and only then re-base the joints and copy the switch pose). */
+  bke::SpanAttributeWriter<bool> animated =
+      attributes.lookup_or_add_for_write_span<bool>("animated", AttrDomain::Instance);
   for (const int i : states.index_range()) {
     linear_velocities.span[i] = states[i].linear_velocity;
     angular_velocities.span[i] = states[i].angular_velocity;
     sleeping.span[i] = states[i].sleeping;
+    animated.span[i] = states[i].animated;
   }
   linear_velocities.finish();
   angular_velocities.finish();
   sleeping.finish();
+  animated.finish();
 }
 
 /**
@@ -1042,6 +1061,12 @@ static void node_geo_exec(GeoNodeExecParams params){
     }
   }
   Array<ConstraintFeedback> constraint_feedback(raw_constraints.size());
+  /* Joint frames re-based on the frame a body switches from animation to simulation. Indexed by
+   * the raw constraint index; written back into the constraint point cloud at the end of the frame
+   * so a later world rebuild keeps the captured pose. */
+  Array<bool> frames_rebased(raw_constraints.size(), false);
+  Vector<math::Quaternion> rebased_frame_a(raw_constraints.size());
+  Vector<math::Quaternion> rebased_frame_b(raw_constraints.size());
 
   SimulateSettings settings;
   settings.gravity = gravity;
@@ -1135,6 +1160,8 @@ static void node_geo_exec(GeoNodeExecParams params){
     }
 
     Array<BodyState> states;
+    /** Bodies that were animated last frame and are simulated now (see the pose copy below). */
+    Array<bool> switched_bodies;
     bke::Instances *instances = nullptr;
     PointCloud *pointcloud = nullptr;
     if (has_instances) {
@@ -1143,6 +1170,7 @@ static void node_geo_exec(GeoNodeExecParams params){
         continue;
       }
       states = read_instance_body_states(*instances);
+      switched_bodies = Array<bool>(states.size(), false);
       for (BodyState &state : states) {
         state.previous_position = state.position;
         state.previous_rotation = state.rotation;
@@ -1183,9 +1211,20 @@ static void node_geo_exec(GeoNodeExecParams params){
                                               .varray;
         const int upstream_num = std::min(int(upstream_transforms.size()), int(states.size()));
         for (const int i : IndexRange(upstream_num)) {
+          /* The flag in the state is the one written back last frame, so this detects the switch
+           * from animation to simulation. */
+          const bool was_animated = states[i].animated;
           states[i].animated = animated_flags[i];
           states[i].active = active_flags[i];
           if (!states[i].animated) {
+            if (was_animated) {
+              /* First simulated frame: start at the pose the animation has *now* instead of the
+               * previous frame's state (which is one frame behind). The velocity from the last
+               * animated frame is already in the state. */
+              states[i].position = upstream_transforms[i].location();
+              states[i].rotation = math::to_quaternion(upstream_transforms[i]);
+              switched_bodies[i] = true;
+            }
             continue;
           }
           states[i].position = upstream_transforms[i].location();
@@ -1281,6 +1320,41 @@ static void node_geo_exec(GeoNodeExecParams params){
       constraint_source[constraints.size()] = raw_i;
       constraints.append(def);
     }
+
+    /* Joint re-base: angular joints derive their zero from the relative orientation captured when
+     * they were authored (the bind pose). When a body switches from animation to simulation in a
+     * different pose, keeping that zero would snap the ragdoll back. On the switch frame the joint
+     * frames are re-expressed so the current relative orientation becomes the new zero; the result
+     * is written back into the constraint point cloud below, so later world rebuilds keep it. */
+    if (!switched_bodies.is_empty() && !constraints.is_empty() &&
+        params.get_input<bool>("Rebase Joints"_ustr))
+    {
+      int rebased = 0;
+      for (const int def_i : constraints.index_range()) {
+        ConstraintDef &def = constraints[def_i];
+        /* Only joints whose limits are expressed in the joint frame can be re-based: a hinge keeps
+         * its authored axis and a distance joint has no orientation at all. */
+        if (!def.has_frames || (def.type != 2 && def.type != 4)) {
+          continue;
+        }
+        if (!switched_bodies[def.body_a] && !switched_bodies[def.body_b]) {
+          continue;
+        }
+        const math::Quaternion rot_a = math::normalize(states[def.body_a].rotation);
+        const math::Quaternion rot_b = math::normalize(states[def.body_b].rotation);
+        def.frame_a = math::normalize(math::conjugate(rot_a) * rot_b * def.frame_b);
+        const int raw_i = constraint_source[def_i];
+        frames_rebased[raw_i] = true;
+        rebased_frame_a[raw_i] = def.frame_a;
+        rebased_frame_b[raw_i] = def.frame_b;
+        rebased++;
+      }
+      if (rebased > 0 && std::getenv("BLENDER_RBD_DEBUG") != nullptr) {
+        printf("RBD_DEBUG joint rebase constraints=%d\n", rebased);
+        fflush(stdout);
+      }
+    }
+
     Array<ConstraintFeedback> broken(constraints.size());
 
     Vector<BodyShape> shapes;
@@ -1383,6 +1457,32 @@ static void node_geo_exec(GeoNodeExecParams params){
           body_a_world.span[point] = feedback.body_a_world;
           body_b_world.span[point] = feedback.body_b_world;
         }
+      }
+      /* The re-based joint frames are written back as well, so a world rebuild later (warm start
+       * disabled, a collider edited, a scrub) does not fall back to the bind pose and snap the
+       * ragdoll. Only clouds that actually carry joint frames get touched. */
+      if (attributes.contains("frame_a") && attributes.contains("frame_b")) {
+        bke::SpanAttributeWriter<math::Quaternion> frame_a =
+            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_a", AttrDomain::Point);
+        bke::SpanAttributeWriter<math::Quaternion> frame_b =
+            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_b", AttrDomain::Point);
+        for (const int raw_i : raw_constraints.index_range()) {
+          if (!frames_rebased[raw_i]) {
+            continue;
+          }
+          const RawConstraint &raw = raw_constraints[raw_i];
+          if (raw.source_path != path) {
+            continue;
+          }
+          const int point = raw.source_point;
+          if (point < 0 || point >= frame_a.span.size()) {
+            continue;
+          }
+          frame_a.span[point] = rebased_frame_a[raw_i];
+          frame_b.span[point] = rebased_frame_b[raw_i];
+        }
+        frame_a.finish();
+        frame_b.finish();
       }
       enabled.finish();
       types.finish();
