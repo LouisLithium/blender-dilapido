@@ -1766,11 +1766,52 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
     }
     const float animated_dt = std::max(settings.delta_time, 1.0e-5f);
     /* The velocity of the animation is what a body keeps when the animation is switched off, so it
-     * is computed here (Jolt resets a kinematic body's velocity once it reached its target). */
-    if (ctx->written_states.size() == bodies.size()) {
-      bodies[i].linear_velocity = (bodies[i].position - ctx->written_states[i].position) /
-                                  animated_dt;
+     * is computed here (Jolt resets a kinematic body's velocity once it reached its target).
+     * `BodyState.position` is the body origin (bone head), while Jolt's linear velocity is the
+     * center-of-mass velocity, so the rotation of the capsule offset has to be added. */
+    float3 v_origin(0.0f);
+    float3 omega(0.0f);
+    if (bodies[i].has_previous_pose) {
+      v_origin = (bodies[i].position - bodies[i].previous_position) / animated_dt;
+      const math::Quaternion current = math::normalize(bodies[i].rotation);
+      const math::Quaternion previous = math::normalize(bodies[i].previous_rotation);
+      math::Quaternion delta = math::normalize(current * math::conjugate(previous));
+      if (delta.w < 0.0f) {
+        delta = delta * -1.0f;
+      }
+      const auto axis_angle = math::to_axis_angle(delta);
+      omega = float3(axis_angle.axis()) *
+              (axis_angle.angle().radian() / animated_dt);
     }
+    if (settings.animation_velocity_scale != 1.0f) {
+      v_origin *= settings.animation_velocity_scale;
+      omega *= settings.animation_velocity_scale;
+    }
+    const float max_linear = settings.animation_max_linear_speed;
+    if (max_linear > 0.0f) {
+      const float length = math::length(v_origin);
+      if (length > max_linear) {
+        v_origin *= max_linear / length;
+      }
+    }
+    const float max_angular = settings.animation_max_angular_speed;
+    if (max_angular > 0.0f) {
+      const float length = math::length(omega);
+      if (length > max_angular) {
+        omega *= max_angular / length;
+      }
+    }
+    if (Body *body = physics_system.GetBodyLockInterfaceNoLock().TryGetBody(body_id)) {
+      const float3 local_com(body->GetShape()->GetCenterOfMass().GetX(),
+                             body->GetShape()->GetCenterOfMass().GetY(),
+                             body->GetShape()->GetCenterOfMass().GetZ());
+      const float3x3 rotation = math::from_rotation<float3x3>(
+          math::normalize(bodies[i].rotation));
+      const float3 com_world = math::transform_direction(rotation, local_com);
+      v_origin += math::cross(omega, com_world);
+    }
+    bodies[i].linear_velocity = v_origin;
+    bodies[i].angular_velocity = omega;
     body_interface.MoveKinematic(body_id,
                                  to_jolt_r(bodies[i].position),
                                  to_jolt(bodies[i].rotation),
@@ -1907,9 +1948,10 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
         rotation.GetW(), rotation.GetX(), rotation.GetY(), rotation.GetZ());
     if (!state.animated) {
       state.linear_velocity = to_blender(body->GetLinearVelocity());
+      /* Animated bodies keep the angular velocity derived from the animation; Jolt resets a
+       * kinematic body's angular velocity once it reaches its target. */
+      state.angular_velocity = to_blender(body->GetAngularVelocity());
     }
-    /* Animated bodies keep the velocity that was derived from their animation. */
-    state.angular_velocity = to_blender(body->GetAngularVelocity());
     if (!state.active) {
       /* An inactive body was not integrated: it keeps its pose, and any velocity it had when it was
        * switched off is dropped (Jolt reports zero for a kinematic body anyway). */

@@ -51,6 +51,13 @@ struct BodyState {
   /** 0 = no limit. */
   float servo_max_torque = 0.0f;
   /**
+   * Pose the body had in the previous state (the geometry state before the animation pose is
+   * copied in). Used to derive the animation velocity without relying on the warm-start handle.
+   */
+  bool has_previous_pose = false;
+  float3 previous_position = float3(0.0f);
+  math::Quaternion previous_rotation = math::Quaternion::identity();
+  /**
    * False when the user switched the body off: it is not simulated (nothing can move it), but the
    * other bodies still collide with it, like an animated body without a new pose. Unlike
    * #animated this can change while the simulation runs: the Jolt motion type of the body is
@@ -154,6 +161,12 @@ struct SimulateSettings {
   /** Sweep a collider that moved between frames through the substeps instead of teleporting it
    * once per frame. Without it a fast moving collider passes through the bodies. */
   bool sweep_colliders = true;
+  /** Scale applied to the linear/angular velocity derived from an animated body before it is
+   * switched to a dynamic body. 0 starts the ragdoll at rest, 1 keeps the full animation motion. */
+  float animation_velocity_scale = 1.0f;
+  /** Safety clamps for the animation-derived velocity (m/s and rad/s). 0 disables the clamp. */
+  float animation_max_linear_speed = 50.0f;
+  float animation_max_angular_speed = 30.0f;
   /**
    * Take body pairs that already interpenetrate when the world is built out of collision. The
    * contact solver would push them apart with a huge impulse on the first frame, which looks like

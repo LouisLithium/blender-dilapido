@@ -174,6 +174,23 @@ static void node_declare(NodeDeclarationBuilder &b)
         .subtype(PROP_VELOCITY)
         .description("Speed ceiling in m/s, used when Speed Limit is on (the angular speed is "
                      "limited to 0.6 times this)");
+    solver_panel.add_input<decl::Float>("Velocity Transfer"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .description(
+            "How much of the animation velocity a body keeps when it is switched from animated "
+            "(kinematic) to simulated. 0 starts the ragdoll at rest, 1 keeps the full motion");
+    solver_panel.add_input<decl::Float>("Max Transfer Speed"_ustr)
+        .default_value(50.0f)
+        .min(0.0f)
+        .subtype(PROP_VELOCITY)
+        .description("Upper bound for the animation-derived linear velocity (m/s); 0 disables it");
+    solver_panel.add_input<decl::Float>("Max Transfer Angular"_ustr)
+        .default_value(30.0f)
+        .min(0.0f)
+        .subtype(PROP_VELOCITY)
+        .description("Upper bound for the animation-derived angular velocity (rad/s); 0 disables it");
     solver_panel.add_input<decl::Int>("Threads"_ustr)
         .default_value(1)
         .description(
@@ -1044,6 +1061,12 @@ static void node_geo_exec(GeoNodeExecParams params){
   settings.ignore_initial_overlap = params.get_input<bool>("Ignore Initial Overlap"_ustr);
   settings.speed_limit = params.get_input<bool>("Speed Limit"_ustr);
   settings.max_speed = std::max(params.get_input<float>("Max Speed"_ustr), 0.0f);
+  settings.animation_velocity_scale = math::clamp(
+      params.get_input<float>("Velocity Transfer"_ustr), 0.0f, 1.0f);
+  settings.animation_max_linear_speed = std::max(
+      params.get_input<float>("Max Transfer Speed"_ustr), 0.0f);
+  settings.animation_max_angular_speed = std::max(
+      params.get_input<float>("Max Transfer Angular"_ustr), 0.0f);
   if (settings.speed_limit && settings.max_speed < 1.0e-3f) {
     /* A ceiling of 0 freezes every body (it can only be moved by penetration recovery), which is
      * never what the user wants, so the limit is ignored and the node says why. */
@@ -1120,6 +1143,11 @@ static void node_geo_exec(GeoNodeExecParams params){
         continue;
       }
       states = read_instance_body_states(*instances);
+      for (BodyState &state : states) {
+        state.previous_position = state.position;
+        state.previous_rotation = state.rotation;
+        state.has_previous_pose = true;
+      }
       {
         int massless = 0;
         for (const BodyState &state : states) {
@@ -1171,6 +1199,11 @@ static void node_geo_exec(GeoNodeExecParams params){
         continue;
       }
       states = read_point_body_states(*pointcloud);
+      for (BodyState &state : states) {
+        state.previous_position = state.position;
+        state.previous_rotation = state.rotation;
+        state.has_previous_pose = true;
+      }
     }
 
     const int body_num = int(states.size());
