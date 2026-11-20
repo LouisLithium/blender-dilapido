@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,7 @@
 #include "GEO_xpbd_constraint_point_contact.hh"
 #include "GEO_xpbd_constraint_segment_contact.hh"
 #include "GEO_xpbd_constraint_segment_face.hh"
+#include "GEO_xpbd_constraint_shape_matching.hh"
 #include "GEO_xpbd_hair_grid.hh"
 #include "GEO_xpbd_constraint_rod_bend_twist.hh"
 #include "GEO_xpbd_constraint_rod_stretch_shear.hh"
@@ -95,6 +97,9 @@ constexpr StringRefNull hair_contact_thickness = "puncliga_hair_contact_thicknes
 constexpr StringRefNull same_strand_collision = "puncliga_same_strand_collision";
 constexpr StringRefNull guide_tether = "puncliga_guide_tether";
 constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
+constexpr StringRefNull shape_matching = "puncliga_shape_matching";
+constexpr StringRefNull shape_group = "puncliga_shape_group";
+constexpr StringRefNull shape_stiffness = "puncliga_shape_stiffness";
 
 }  // namespace attribute_names
 
@@ -134,6 +139,7 @@ static NestedBundleTypePtr make_world_type()
   types.append(EdgeLengthConstraintBundle::get_bundle_type());
   types.append(VolumeConstraintBundle::get_bundle_type());
   types.append(CrossEdgeLengthConstraintBundle::get_bundle_type());
+  types.append(ShapeMatchingBundle::get_bundle_type());
   types.append(FluidBundle::get_bundle_type());
 
   /* Not actually used by the node but only registered here. */
@@ -377,6 +383,33 @@ struct VolumeConstraintUsage {
   Vector<float> edge_rest_lengths;
   Vector<float> edge_compliances;
   MutableSpan<float> edge_lambdas;
+
+  xpbd::ConstraintColoring coloring;
+};
+
+/** Keeps a group of points in a least squares best fit shape. */
+struct ShapeMatchingConstraint {
+  std::string path;
+  bool selection = true;
+  int group = 0;
+  float stiffness = 1.0f;
+  float error_threshold = 1e-3f;
+};
+struct ShapeMatchingConstraintUsage {
+  /** Index of the corresponding #ShapeMatchingConstraint. */
+  int constraint_i;
+
+  /**
+   * Flattened groups: `group_offsets` has one entry per group plus one, the other arrays have one
+   * entry per participating point. The arrays have to outlive the constraint set, which only holds
+   * spans.
+   */
+  Array<int> group_offsets;
+  Vector<int> points;
+  Vector<float3> rest_offsets;
+  Vector<float> masses;
+  Vector<float> stiffnesses;
+  Vector<float> rest_radii;
 
   xpbd::ConstraintColoring coloring;
 };
@@ -652,6 +685,12 @@ struct GeometryData {
   Vector<EdgeLengthConstraintUsage> edge_length_constraints;
   Vector<VolumeConstraintUsage> volume_constraints;
   Vector<CrossEdgeLengthConstraintUsage> cross_edge_length_constraints;
+  Vector<ShapeMatchingConstraintUsage> shape_matching_constraints;
+  /**
+   * Dense shape matching group of every point, or -1 when the point does not take part. Used by the
+   * self collision pass to treat the rest pose of one shape matched piece as one island.
+   */
+  Array<int> shape_group_ids;
   Vector<MeshColliderUsage> mesh_colliders;
   Vector<RodStretchShearConstraintUsage> rod_stretch_shear_constraints;
   Vector<RodBendTwistConstraintUsage> rod_bend_twist_constraints;
@@ -1486,6 +1525,7 @@ struct ConstraintsInfo {
   Vector<EdgeLengthConstraint> edge_length_constraints;
   Vector<VolumeConstraint> volume_constraints;
   Vector<CrossEdgeLengthConstraint> cross_edge_length_constraints;
+  Vector<ShapeMatchingConstraint> shape_matching_constraints;
   Vector<FluidConstraint> fluid_constraints;
 };
 
@@ -1670,6 +1710,7 @@ class XpbdSolverStep {
     this->gather_from_world__edge_length_constraints();
     this->gather_from_world__volume_constraints();
     this->gather_from_world__cross_edge_length_constraints();
+    this->gather_from_world__shape_matching();
     this->gather_from_world__damping();
     this->gather_from_world__pin_positions();
     this->gather_from_world__pin_rotations();
@@ -1689,6 +1730,10 @@ class XpbdSolverStep {
       this->create_chunk_constraints__pin_positions(tls, chunk_i);
       this->create_chunk_constraints__pin_rotations(tls, chunk_i);
     });
+
+    /* The shape matching groups leave out the hard pinned points, so they have to be built after the
+     * pin constraints above marked them. */
+    this->prepare_shape_matching();
 
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
@@ -3664,6 +3709,233 @@ class XpbdSolverStep {
     }
   }
 
+  void gather_from_world__shape_matching()
+  {
+    const Span<std::string> paths = nested_bundle_paths_.lookup_as(ShapeMatchingBundle::name);
+    for (const StringRef path : paths) {
+      const BundlePtr *bundle_ptr = world_.lookup_path_ptr<BundlePtr>(path);
+      if (!bundle_ptr || !*bundle_ptr) {
+        continue;
+      }
+      const Bundle &bundle = **bundle_ptr;
+      ShapeMatchingConstraint constraint;
+      constraint.path = path;
+      constraint.selection =
+          bundle.lookup<bool>(*BundleKey::from_str("selection")).value_or(true);
+      constraint.group = bundle.lookup<int>(*BundleKey::from_str("group")).value_or(0);
+      constraint.stiffness = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("stiffness")).value_or(1.0f), 0.0f, 1.0f);
+      constraint.error_threshold =
+          bundle.lookup<float>(*BundleKey::from_str("error_threshold")).value_or(1e-3f);
+      const int constraint_i = constraints_.shape_matching_constraints.append_and_get_index(
+          std::move(constraint));
+
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        if (geo_data.domain != AttrDomain::Point) {
+          continue;
+        }
+        if (!this->effector_applies_to_geometry(path, bundle, data_key_i)) {
+          continue;
+        }
+        if (!geo_data.shape_matching_constraints.is_empty()) {
+          this->report(
+              NodeWarningType::Warning,
+              fmt::format("Geometry \"{}\" is affected by more than one shape matching constraint, "
+                          "ignoring \"{}\"",
+                          geometries_.geometry_sets[geometries_.data_keys[data_key_i].geo_bundle_i]
+                              .path,
+                          path));
+          continue;
+        }
+        ShapeMatchingConstraintUsage usage;
+        usage.constraint_i = constraint_i;
+        geo_data.shape_matching_constraints.append(std::move(usage));
+      }
+    }
+  }
+
+  /**
+   * Builds the shape matching groups of every geometry that a `Blender.Constraint.ShapeMatching`
+   * bundle applies to. Runs after the pin constraints have marked the hard pinned points, which are
+   * left out of the fit (a pinned point must not be moved by the shape matching projection).
+   */
+  void prepare_shape_matching()
+  {
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      geo_data.shape_group_ids.reinitialize(geo_data.size);
+      geo_data.shape_group_ids.fill(-1);
+
+      for (ShapeMatchingConstraintUsage &usage : geo_data.shape_matching_constraints) {
+        const ShapeMatchingConstraint &constraint =
+            constraints_.shape_matching_constraints[usage.constraint_i];
+        const int size = geo_data.size;
+        if (size == 0 || geo_data.inv_masses.size() != size) {
+          continue;
+        }
+
+        /* The parameter attributes are written by `Init Puncliga Data`; the bundle values are the
+         * fallbacks for hand built worlds that only add the constraint bundle. */
+        const VArray<bool> selection_attr_stored = *geo_data.attributes.lookup<bool>(
+            attribute_names::shape_matching, AttrDomain::Point);
+        const VArray<bool> selection_attr =
+            (selection_attr_stored && selection_attr_stored.size() == size) ?
+                selection_attr_stored :
+                VArray<bool>::from_single(constraint.selection, size);
+        const VArray<int> group_attr_stored = *geo_data.attributes.lookup<int>(
+            attribute_names::shape_group, AttrDomain::Point);
+        const VArray<int> group_attr =
+            (group_attr_stored && group_attr_stored.size() == size) ?
+                group_attr_stored :
+                VArray<int>::from_single(constraint.group, size);
+        const VArray<float> stiffness_attr_stored = *geo_data.attributes.lookup<float>(
+            attribute_names::shape_stiffness, AttrDomain::Point);
+        const VArray<float> stiffness_attr =
+            (stiffness_attr_stored && stiffness_attr_stored.size() == size) ?
+                stiffness_attr_stored :
+                VArray<float>::from_single(constraint.stiffness, size);
+        const VArray<float3> rest_positions_attr = this->lookup_rest_positions(data_key_i);
+        if (!rest_positions_attr || rest_positions_attr.size() != size) {
+          this->report(
+              NodeWarningType::Error,
+              fmt::format("Shape matching on \"{}\" needs a `rest_position` attribute (the "
+                          "`Init Puncliga Data` node in the Rigid mode writes it)",
+                          geometries_.geometry_sets[geometries_.data_keys[data_key_i].geo_bundle_i]
+                              .path));
+          continue;
+        }
+
+        /* Group id -> dense group index, in the order the points are visited so the result does not
+         * depend on the hash order. */
+        Map<int, int> group_map;
+        Array<int> point_group(size, -1);
+        Vector<Vector<int>> group_points;
+        for (const int point_i : IndexRange(size)) {
+          if (!selection_attr[point_i]) {
+            continue;
+          }
+          if (geo_data.is_hard_pinned[point_i] || !(geo_data.inv_masses[point_i] > 0.0f)) {
+            continue;
+          }
+          const int group_id = std::max(group_attr[point_i], 0);
+          int group_i;
+          if (const int *found = group_map.lookup_ptr(group_id)) {
+            group_i = *found;
+          }
+          else {
+            group_i = int(group_points.size());
+            group_map.add_new(group_id, group_i);
+            group_points.append(Vector<int>());
+          }
+          group_points[group_i].append(point_i);
+          point_group[point_i] = group_i;
+        }
+
+        /* Keep only the groups that can define a rotation. */
+        Vector<int> valid_groups;
+        valid_groups.reserve(group_points.size());
+        for (const int group_i : group_points.index_range()) {
+          const Span<int> points = group_points[group_i].as_span();
+          if (points.size() < 3) {
+            for (const int point_i : points) {
+              point_group[point_i] = -1;
+            }
+            continue;
+          }
+          float total_mass = 0.0f;
+          float3 rest_center(0.0f);
+          for (const int point_i : points) {
+            const float mass = math::safe_rcp(geo_data.inv_masses[point_i]);
+            total_mass += mass;
+            rest_center += mass * rest_positions_attr[point_i];
+          }
+          if (!(total_mass > 0.0f)) {
+            for (const int point_i : points) {
+              point_group[point_i] = -1;
+            }
+            continue;
+          }
+          rest_center /= total_mass;
+          float weighted_radius_sq = 0.0f;
+          for (const int point_i : points) {
+            const float mass = math::safe_rcp(geo_data.inv_masses[point_i]);
+            weighted_radius_sq += mass *
+                                  math::length_squared(rest_positions_attr[point_i] - rest_center);
+          }
+          const float rest_radius = math::sqrt(weighted_radius_sq / total_mass);
+          if (!(rest_radius > 1e-6f) || !std::isfinite(rest_radius)) {
+            for (const int point_i : points) {
+              point_group[point_i] = -1;
+            }
+            continue;
+          }
+          valid_groups.append(group_i);
+        }
+
+        if (valid_groups.is_empty()) {
+          continue;
+        }
+
+        usage.group_offsets.reinitialize(valid_groups.size() + 1);
+        usage.points.clear();
+        usage.rest_offsets.clear();
+        usage.masses.clear();
+        usage.stiffnesses.clear();
+        usage.rest_radii.clear();
+        usage.group_offsets[0] = 0;
+        for (const int valid_i : valid_groups.index_range()) {
+          const Span<int> points = group_points[valid_groups[valid_i]].as_span();
+          float total_mass = 0.0f;
+          float3 rest_center(0.0f);
+          for (const int point_i : points) {
+            const float mass = math::safe_rcp(geo_data.inv_masses[point_i]);
+            total_mass += mass;
+            rest_center += mass * rest_positions_attr[point_i];
+          }
+          rest_center /= total_mass;
+          float weighted_radius_sq = 0.0f;
+          for (const int point_i : points) {
+            const float mass = math::safe_rcp(geo_data.inv_masses[point_i]);
+            weighted_radius_sq += mass *
+                                  math::length_squared(rest_positions_attr[point_i] - rest_center);
+          }
+          for (const int point_i : points) {
+            usage.points.append(point_i);
+          }
+          for (const int point_i : points) {
+            usage.rest_offsets.append(rest_positions_attr[point_i] - rest_center);
+            usage.masses.append(math::safe_rcp(geo_data.inv_masses[point_i]));
+            usage.stiffnesses.append(
+                math::clamp(stiffness_attr ? stiffness_attr[point_i] : 1.0f, 0.0f, 1.0f));
+            geo_data.shape_group_ids[point_i] = valid_i;
+          }
+          usage.rest_radii.append(math::sqrt(weighted_radius_sq / total_mass));
+          usage.group_offsets[valid_i + 1] = int(usage.points.size());
+        }
+
+        TLS &tls = tls_.local();
+        auto &constraint_set = tls.scope.construct<xpbd::ShapeMatchingConstraintSet>(
+            data_key_i,
+            OffsetIndices<int>(usage.group_offsets.as_span()),
+            usage.points.as_span(),
+            usage.rest_offsets.as_span(),
+            usage.masses.as_span(),
+            usage.stiffnesses.as_span(),
+            usage.rest_radii.as_span());
+        usage.coloring = constraint_set.color_constraints(tls.allocator);
+        geo_data.static_constraints.append({&constraint_set, std::move(usage.coloring)});
+
+        if (std::getenv("BLENDER_XPBD_DEBUG") != nullptr) {
+          printf("XPBD_SHAPE '%s' groups %d points %d\n",
+                 std::string(constraint.path).c_str(),
+                 int(valid_groups.size()),
+                 int(usage.points.size()));
+        }
+      }
+    }
+  }
+
   void foreach_cross_edge(const Mesh &mesh,
                           std::invocable<int /*edge_i*/, int /*v0*/, int /*v1*/> auto &&fn)
   {
@@ -5614,6 +5886,12 @@ class XpbdSolverStep {
     Vector<int2> bonds;
     /** Concatenated rest positions, and current positions as the fallback. */
     Vector<float3> rest_positions_combined;
+    /**
+     * Shape matching group of every contact point, or -1. The points of one shape matched piece are
+     * one island for the rest distance filter below: a sphere packed piece overlaps by design, so
+     * its own points must not push each other apart while two different pieces still collide.
+     */
+    Vector<int64_t> shape_group_keys;
 
     for (const int data_key_i : geometries_.data_keys.index_range()) {
       GeometryData &geo_data = *geometries_.data[data_key_i];
@@ -5717,6 +5995,12 @@ class XpbdSolverStep {
         contacts.point_thickness.append(thickness_values[point_i]);
         const bool pinned = geo_data.is_hard_pinned[point_i] || rigid_pin[point_i];
         contacts.point_inv_mass.append(pinned ? 0.0f : inv_masses[point_i]);
+        const int shape_group_i = geo_data.shape_group_ids.is_empty() ?
+                                      -1 :
+                                      geo_data.shape_group_ids[point_i];
+        shape_group_keys.append(shape_group_i >= 0 ?
+                                    (int64_t(data_key_i) << 32) | int64_t(shape_group_i + 1) :
+                                    -1);
       }
 
       /* Rest positions of the world geometry are already in the space of the solver (the world is
@@ -5797,6 +6081,24 @@ class XpbdSolverStep {
       const int root1 = find_island(bond[1]);
       if (root0 != root1) {
         contacts.island_ids[root0] = root1;
+      }
+    }
+    /* Merge the points of every shape matched piece into one island (see `shape_group_keys`). */
+    Map<int64_t, int> first_point_by_shape_group;
+    for (const int point_i : IndexRange(points_num)) {
+      const int64_t key = shape_group_keys[point_i];
+      if (key < 0) {
+        continue;
+      }
+      if (const int *first_point = first_point_by_shape_group.lookup_ptr(key)) {
+        const int root0 = find_island(point_i);
+        const int root1 = find_island(*first_point);
+        if (root0 != root1) {
+          contacts.island_ids[root0] = root1;
+        }
+      }
+      else {
+        first_point_by_shape_group.add_new(key, point_i);
       }
     }
     for (const int point_i : IndexRange(points_num)) {

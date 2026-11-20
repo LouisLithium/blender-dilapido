@@ -5,8 +5,9 @@
 /** \file
  * \ingroup geo_nodes
  *
- * Marks a geometry as one of the simulated types of the `Puncliga Dynamics` asset and stores the
- * parameters of that type as attributes on the geometry.
+ * Marks a geometry as one of the simulated types of the `Puncliga Dynamics` asset (cloth, fluid,
+ * soft body, hair or a rigid piece) and stores the parameters of that type as attributes on the
+ * geometry.
  *
  * The attributes are the interface to the solver: the fluid reads its parameters per particle from
  * them (so several fluids with different densities can be simulated in one world), and the cloth
@@ -17,6 +18,7 @@
 
 #include "BKE_attribute_math.hh"
 #include "BKE_curves.hh"
+#include "BKE_geometry_fields.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
@@ -35,6 +37,7 @@ enum class PuncligaType : int {
   Fluid = 1,
   SoftBody = 2,
   Hair = 3,
+  Rigid = 4,
 };
 
 /**
@@ -73,6 +76,13 @@ static const EnumPropertyItem puncliga_type_items[] = {
      N_("Hair"),
      N_("Simulate the curves as hair: rod stretch/shear and bend/twist constraints, with the root "
         "of every curve pinned by default")},
+    {int(PuncligaType::Rigid),
+     "RIGID",
+     0,
+     N_("Rigid"),
+     N_("Simulate the points as quasi rigid pieces with a shape matching constraint. The points "
+        "are usually a sphere packing of a mesh (`Distribute Points` in volume mode), and every "
+        "piece is kept in its rest shape while the points still collide with each other")},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -132,6 +142,9 @@ constexpr StringRefNull hair_contact_thickness = "puncliga_hair_contact_thicknes
 constexpr StringRefNull same_strand_collision = "puncliga_same_strand_collision";
 constexpr StringRefNull guide_tether = "puncliga_guide_tether";
 constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
+constexpr StringRefNull shape_matching = "puncliga_shape_matching";
+constexpr StringRefNull shape_group = "puncliga_shape_group";
+constexpr StringRefNull shape_stiffness = "puncliga_shape_stiffness";
 }  // namespace attribute_names
 
 /** The socket declares its options per type, see `.usage_by_menu()` below. */
@@ -152,6 +165,7 @@ static void node_declare(NodeDeclarationBuilder &b)
   const int fluid = int(PuncligaType::Fluid);
   const int soft = int(PuncligaType::SoftBody);
   const int hair = int(PuncligaType::Hair);
+  const int rigid = int(PuncligaType::Rigid);
 
   /* General properties first, then the panels of the individual types. */
   {
@@ -170,7 +184,7 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0.05f)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
-        .usage_by_menu("Type"_ustr, {cloth, fluid, soft})
+        .usage_by_menu("Type"_ustr, {cloth, fluid, soft, rigid})
         .description("Radius of the points for the point/mesh collider contacts");
     panel.add_input<decl::Int>("Piece ID"_ustr)
         .default_value(0)
@@ -444,6 +458,60 @@ static void node_declare(NodeDeclarationBuilder &b)
         .usage_by_menu("Type"_ustr, hair)
         .description("Pin the points where `Hair Pin` is below 0.5 instead");
   }
+  {
+    auto &panel = b.add_panel("Rigid"_ustr).default_closed(false);
+    panel.add_input<decl::Float>("Rigid Density"_ustr)
+        .default_value(1000.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description(
+            "Density of the material in kg/m^3, used to compute the mass of a point from the volume "
+            "of its sphere (4/3 pi r^3)");
+    panel.add_input<decl::Float>("Rigid Linear Damping"_ustr)
+        .default_value(0.1f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description("Velocity damping of the rigid pieces in 1/s");
+    panel.add_input<decl::Bool>("Rigid Self Collision"_ustr)
+        .default_value(true)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description(
+            "Push the points of the rigid pieces apart when they come closer than the sum of their "
+            "collision radii, so pieces collide with each other");
+    panel.add_input<decl::Float>("Rigid Contact Thickness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description("Extra distance kept between two colliding points, on top of their radii");
+  }
+  {
+    auto &panel = b.add_panel("Shape Matching"_ustr).default_closed(false);
+    panel.add_input<decl::Bool>("Shape Matching"_ustr)
+        .default_value(true)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description(
+            "Keep every piece in its rest shape with a least squares shape matching constraint. "
+            "Every piece is defined by `Shape Group` (by default the `Piece ID`)");
+    panel.add_input<decl::Int>("Shape Group"_ustr)
+        .default_value(-1)
+        .min(-1)
+        .structure_type(StructureType::Field)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description(
+            "Group id of every point. Points with the same id are one rigid piece. -1 uses the "
+            "`Piece ID` of this node, which keeps pieces of a joined geometry apart");
+    panel.add_input<decl::Float>("Shape Stiffness"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .structure_type(StructureType::Field)
+        .usage_by_menu("Type"_ustr, rigid)
+        .description(
+            "Projection strength per constraint iteration: 1 keeps a piece rigid in one solve, "
+            "smaller values let it deform. This is a position based projection, so the effective "
+            "stiffness also depends on the constraint iterations");
+  }
 
   b.add_output<decl::Geometry>("Geometry"_ustr).propagate_all();
 }
@@ -695,6 +763,116 @@ static void write_hair_inertia(GeometrySet &geometry, const float mass)
   inertia.finish();
 }
 
+/** Stores the rest pose of every supported component under both rest attribute names. */
+static void write_rest_positions(GeometrySet &geometry)
+{
+  const auto write = [](bke::MutableAttributeAccessor attributes, const Span<float3> positions) {
+    if (positions.is_empty()) {
+      return;
+    }
+    for (const StringRef name : {StringRef("rest_position"),
+                                 StringRef("puncliga_rest_position")})
+    {
+      bke::SpanAttributeWriter<float3> writer =
+          attributes.lookup_or_add_for_write_only_span<float3>(name, bke::AttrDomain::Point);
+      if (!writer) {
+        continue;
+      }
+      writer.span.copy_from(positions);
+      writer.finish();
+    }
+  };
+  if (Mesh *mesh = geometry.get_mesh_for_write()) {
+    write(mesh->attributes_for_write(), mesh->vert_positions());
+  }
+  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
+    write(pointcloud->attributes_for_write(), pointcloud->positions());
+  }
+  if (Curves *curves_id = geometry.get_curves_for_write()) {
+    bke::CurvesGeometry &curves = curves_id->geometry.wrap();
+    write(curves.attributes_for_write(), curves.positions());
+  }
+}
+
+static void write_shape_matching_component(bke::MutableAttributeAccessor attributes,
+                                           const fn::FieldContext &field_context,
+                                           const int points_num,
+                                           const bool enabled,
+                                           const fn::Field<int> &group_field,
+                                           const fn::Field<float> &stiffness_field,
+                                           const int piece_id)
+{
+  if (points_num == 0) {
+    return;
+  }
+  fn::FieldEvaluator evaluator{field_context, points_num};
+  evaluator.add(group_field);
+  evaluator.add(stiffness_field);
+  evaluator.evaluate();
+  const VArray<int> groups = evaluator.get_evaluated<int>(0);
+  const VArray<float> stiffnesses = evaluator.get_evaluated<float>(1);
+
+  bke::SpanAttributeWriter<bool> selection_writer =
+      attributes.lookup_or_add_for_write_only_span<bool>(attribute_names::shape_matching,
+                                                         bke::AttrDomain::Point);
+  bke::SpanAttributeWriter<int> group_writer =
+      attributes.lookup_or_add_for_write_only_span<int>(attribute_names::shape_group,
+                                                        bke::AttrDomain::Point);
+  bke::SpanAttributeWriter<float> stiffness_writer =
+      attributes.lookup_or_add_for_write_only_span<float>(attribute_names::shape_stiffness,
+                                                          bke::AttrDomain::Point);
+  if (!selection_writer || !group_writer || !stiffness_writer) {
+    return;
+  }
+  for (const int i : IndexRange(points_num)) {
+    selection_writer.span[i] = enabled;
+    group_writer.span[i] = groups[i] >= 0 ? groups[i] : piece_id;
+    stiffness_writer.span[i] = math::clamp(stiffnesses[i], 0.0f, 1.0f);
+  }
+  selection_writer.finish();
+  group_writer.finish();
+  stiffness_writer.finish();
+}
+
+static void write_shape_matching(GeometrySet &geometry,
+                                 const bool enabled,
+                                 const fn::Field<int> &group_field,
+                                 const fn::Field<float> &stiffness_field,
+                                 const int piece_id)
+{
+  if (Mesh *mesh = geometry.get_mesh_for_write()) {
+    const bke::GeometryFieldContext field_context{*mesh, bke::AttrDomain::Point};
+    write_shape_matching_component(mesh->attributes_for_write(),
+                                   field_context,
+                                   mesh->verts_num,
+                                   enabled,
+                                   group_field,
+                                   stiffness_field,
+                                   piece_id);
+  }
+  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
+    const bke::GeometryFieldContext field_context{*pointcloud};
+    write_shape_matching_component(pointcloud->attributes_for_write(),
+                                   field_context,
+                                   pointcloud->totpoint,
+                                   enabled,
+                                   group_field,
+                                   stiffness_field,
+                                   piece_id);
+  }
+  if (Curves *curves_id = geometry.get_curves_for_write()) {
+    bke::CurvesGeometry &curves = curves_id->geometry.wrap();
+    const bke::CurvesFieldContext field_context{curves, bke::AttrDomain::Point};
+    write_shape_matching_component(curves.attributes_for_write(),
+                                   field_context,
+                                   curves.points_num(),
+                                   enabled,
+                                   group_field,
+                                   stiffness_field,
+                                   piece_id);
+  }
+}
+
 static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet geometry = params.extract_input<GeometrySet>("Geometry"_ustr);
@@ -712,6 +890,11 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     else if (type == int(PuncligaType::Hair)) {
       mass = 0.01f;
+    }
+    else if (type == int(PuncligaType::Rigid)) {
+      /* A point represents one sphere of the packing. */
+      const float density = params.get_input<float>("Rigid Density"_ustr);
+      mass = density * (4.0f / 3.0f) * 3.14159265358979323846f * radius * radius * radius;
     }
     else {
       mass = 0.1f;
@@ -861,6 +1044,34 @@ static void node_geo_exec(GeoNodeExecParams params)
                           params.get_input<bool>("Boundary Particles"_ustr));
       break;
     }
+    case PuncligaType::Rigid: {
+      if (geometry.get_mesh() == nullptr && geometry.get_pointcloud() == nullptr) {
+        params.error_message_add(
+            NodeWarningType::Warning,
+            TIP_("Rigid needs a mesh or a point cloud (the points are usually a sphere packing of "
+                 "the mesh, made with `Distribute Points` in volume mode)"));
+        break;
+      }
+      write_rest_positions(geometry);
+      write_shape_matching(geometry,
+                           params.get_input<bool>("Shape Matching"_ustr),
+                           params.extract_input<Field<int>>("Shape Group"_ustr),
+                           params.extract_input<Field<float>>("Shape Stiffness"_ustr),
+                           params.get_input<int>("Piece ID"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::linear_damping,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Rigid Linear Damping"_ustr));
+      write_uniform<bool>(geometry,
+                          attribute_names::self_collision,
+                          bke::AttrDomain::Point,
+                          params.get_input<bool>("Rigid Self Collision"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::contact_thickness,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Rigid Contact Thickness"_ustr));
+      break;
+    }
     case PuncligaType::SoftBody: {
       /* The solver builds the distance constraints of the elements from their rest lengths, so the
        * rest pose has to be stored before the geometry starts to move. */
@@ -923,8 +1134,8 @@ static void node_register()
   geo_node_type_base(&ntype, "GeometryNodeInitPuncligaData"_ustr);
   ntype.ui_name = "Init Puncliga Data";
   ntype.ui_description =
-      "Mark geometry as cloth, fluid or soft body and store the parameters that `Puncliga "
-      "Dynamics` needs";
+      "Mark geometry as cloth, fluid, soft body, hair or a rigid piece and store the parameters "
+      "that `Puncliga Dynamics` needs";
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.declare = node_declare;

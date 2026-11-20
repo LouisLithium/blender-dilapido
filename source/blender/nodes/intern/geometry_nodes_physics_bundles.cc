@@ -194,6 +194,30 @@ const FlatBundleTypePtr &VolumeConstraintBundle::get_bundle_type()
   return bundle_type;
 }
 
+const FlatBundleTypePtr &ShapeMatchingBundle::get_bundle_type()
+{
+  static const FlatBundleTypePtr bundle_type = []() {
+    FlatBundleTypeBuilder b(ShapeMatchingBundle::name);
+    add_filter(b);
+    b.add<decl::Bool>("selection"_ustr)
+        .default_value(true)
+        .description("Fallback for the `puncliga_shape_matching` point attribute");
+    b.add<decl::Int>("group"_ustr)
+        .default_value(0)
+        .description("Fallback for the `puncliga_shape_group` point attribute");
+    b.add<decl::Float>("stiffness"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .description("Fallback for the `puncliga_shape_stiffness` point attribute");
+    b.add<decl::Float>("error_threshold"_ustr).default_value(1e-3f).min(1e-5f);
+    const FlatBundleTypePtr bundle_type = b.build();
+    BundleTypeRegistry::register_type(bundle_type);
+    return bundle_type;
+  }();
+  return bundle_type;
+}
+
 const FlatBundleTypePtr &CrossEdgeLengthConstraintBundle::get_bundle_type()
 {
   static const FlatBundleTypePtr bundle_type = []() {

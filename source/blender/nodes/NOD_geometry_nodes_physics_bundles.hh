@@ -80,6 +80,16 @@ class VolumeConstraintBundle {
 };
 
 /**
+ * Keeps a group of points in a least squares best fit shape. The groups are defined per point by
+ * an integer attribute, and every group is solved independently.
+ */
+class ShapeMatchingBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.Constraint.ShapeMatching";
+  static const FlatBundleTypePtr &get_bundle_type();
+};
+
+/**
  * Turns the points of a geometry into a position based fluid. The density constraint is solved
  * between all particles of the geometry that are within the support radius of each other.
  */
