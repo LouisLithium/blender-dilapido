@@ -794,6 +794,60 @@ static void write_rest_positions(GeometrySet &geometry)
   }
 }
 
+/** Whether the geometry already carries a per point `radius` attribute (a sphere packing does). */
+static bool has_point_radius(const GeometrySet &geometry)
+{
+  const auto has = [](const bke::AttributeAccessor attributes) {
+    const VArray<float> radius = *attributes.lookup<float>("radius", bke::AttrDomain::Point);
+    return bool(radius);
+  };
+  if (const Mesh *mesh = geometry.get_mesh()) {
+    return has(mesh->attributes());
+  }
+  if (const PointCloud *pointcloud = geometry.get_pointcloud()) {
+    return has(pointcloud->attributes());
+  }
+  if (const Curves *curves_id = geometry.get_curves()) {
+    return has(curves_id->geometry.wrap().attributes());
+  }
+  return false;
+}
+
+/** Per point mass of a rigid piece: one point represents one sphere of the packing. */
+static void write_rigid_mass(GeometrySet &geometry,
+                             const float density,
+                             const float fallback_radius)
+{
+  const auto write = [&](bke::MutableAttributeAccessor attributes, const int points_num,
+                         const VArray<float> radii, const float fallback_radius) {
+    bke::SpanAttributeWriter<float> mass = attributes.lookup_or_add_for_write_span<float>(
+        "mass", bke::AttrDomain::Point);
+    if (!mass) {
+      return;
+    }
+    for (const int i : IndexRange(points_num)) {
+      const float radius = radii ? radii[i] : fallback_radius;
+      mass.span[i] = density * (4.0f / 3.0f) * 3.14159265358979323846f * radius * radius * radius;
+    }
+    mass.finish();
+  };
+  if (Mesh *mesh = geometry.get_mesh_for_write()) {
+    const VArray<float> radii = *mesh->attributes().lookup<float>("radius", bke::AttrDomain::Point);
+    write(mesh->attributes_for_write(), mesh->verts_num, radii, fallback_radius);
+  }
+  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
+    const VArray<float> radii =
+        *pointcloud->attributes().lookup<float>("radius", bke::AttrDomain::Point);
+    write(pointcloud->attributes_for_write(), pointcloud->totpoint, radii, fallback_radius);
+  }
+  if (Curves *curves_id = geometry.get_curves_for_write()) {
+    bke::CurvesGeometry &curves = curves_id->geometry.wrap();
+    const VArray<float> radii = *curves.attributes().lookup<float>("radius",
+                                                                  bke::AttrDomain::Point);
+    write(curves.attributes_for_write(), curves.points_num(), radii, fallback_radius);
+  }
+}
+
 static void write_shape_matching_component(bke::MutableAttributeAccessor attributes,
                                            const fn::FieldContext &field_context,
                                            const int points_num,
@@ -907,7 +961,12 @@ static void node_geo_exec(GeoNodeExecParams params)
                      attribute_names::piece_id,
                      bke::AttrDomain::Point,
                      params.get_input<int>("Piece ID"_ustr));
-  write_uniform<float>(geometry, "radius", bke::AttrDomain::Point, radius);
+  /* A sphere packing writes its own per point radius; keep it instead of replacing it with the
+   * fallback of the shared `Collision Radius` socket. */
+  const bool keep_radius = type == int(PuncligaType::Rigid) && has_point_radius(geometry);
+  if (!keep_radius) {
+    write_uniform<float>(geometry, "radius", bke::AttrDomain::Point, radius);
+  }
   write_uniform<float>(geometry, "mass", bke::AttrDomain::Point, mass);
   write_uniform<float>(geometry, "static_friction", bke::AttrDomain::Point, friction);
   write_uniform<float>(geometry, "dynamic_friction", bke::AttrDomain::Point, friction);
@@ -1053,6 +1112,11 @@ static void node_geo_exec(GeoNodeExecParams params)
         break;
       }
       write_rest_positions(geometry);
+      if (params.get_input<float>("Mass"_ustr) <= 0.0f) {
+        /* Variable sized spheres need a per point mass. */
+        write_rigid_mass(
+            geometry, params.get_input<float>("Rigid Density"_ustr), radius);
+      }
       write_shape_matching(geometry,
                            params.get_input<bool>("Shape Matching"_ustr),
                            params.extract_input<Field<int>>("Shape Group"_ustr),

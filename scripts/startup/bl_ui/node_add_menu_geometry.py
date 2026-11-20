@@ -1122,6 +1122,7 @@ class NODE_MT_gn_dilapido_puncliga_base(node_add_menu.NodeMenu):
     def draw(self, context):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeInitPuncligaData")
+        self.node_operator(layout, "GeometryNodePuncligaSpherePacking")
         self.node_operator(layout, "GeometryNodeTetrahedralize")
         layout.separator()
         self.node_operator(layout, "GeometryNodeFluidSurface")
