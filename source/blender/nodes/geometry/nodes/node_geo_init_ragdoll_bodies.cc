@@ -30,6 +30,8 @@
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
 
+#include "DNA_meshdata_types.h"
+
 #include "FN_field_evaluation.hh"
 
 #include "node_geometry_util.hh"
@@ -254,6 +256,13 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
   const VArray<int> bone_parents =
       attributes.lookup_or_default<int>("bone_parent", AttrDomain::Point, -1).varray;
+  const VArray<MStringProperty> bone_names =
+      attributes.lookup<MStringProperty>("bone_name").varray;
+  const VArray<float4x4> bone_rest_matrices =
+      attributes
+          .lookup_or_default<float4x4>(
+              "bone_rest_matrix", AttrDomain::Point, float4x4::identity())
+          .varray;
 
   bke::GeometryFieldContext field_context(*bones, AttrDomain::Point);
   fn::FieldEvaluator evaluator(field_context, count);
@@ -349,6 +358,12 @@ static void node_geo_exec(GeoNodeExecParams params)
     bke::SpanAttributeWriter<float3> shape_offset_writer =
         instance_attributes.lookup_or_add_for_write_span<float3>("shape_offset",
                                                                 AttrDomain::Instance);
+    bke::SpanAttributeWriter<MStringProperty> bone_name_writer =
+        instance_attributes.lookup_or_add_for_write_span<MStringProperty>("bone_name",
+                                                                          AttrDomain::Instance);
+    bke::SpanAttributeWriter<float4x4> bone_rest_writer =
+        instance_attributes.lookup_or_add_for_write_span<float4x4>("bone_rest_matrix",
+                                                                   AttrDomain::Instance);
 
     for (const int i : IndexRange(count)) {
       const int bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
@@ -367,6 +382,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       half_height_writer.span[i] = half_heights[i];
       shape_radius_writer.span[i] = body_radii[i];
       shape_offset_writer.span[i] = float3(0.0f, half_heights[i] + body_radii[i], 0.0f);
+      bone_name_writer.span[i] = bone_names ? bone_names[i] : MStringProperty{};
+      bone_rest_writer.span[i] = bone_rest_matrices[i];
     }
 
     piece_id_writer.finish();
@@ -384,6 +401,8 @@ static void node_geo_exec(GeoNodeExecParams params)
     half_height_writer.finish();
     shape_radius_writer.finish();
     shape_offset_writer.finish();
+    bone_name_writer.finish();
+    bone_rest_writer.finish();
   }
 
   /* A point per bone, so the official force assets can evaluate per-bone forces and the solver can
