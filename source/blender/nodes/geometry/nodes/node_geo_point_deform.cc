@@ -43,11 +43,14 @@
 
 #include "BKE_attribute.hh"
 #include "BKE_curves.hh"
+#include "BKE_geometry_fields.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
 
 #include "BLT_translation.hh"
+
+#include "FN_field.hh"
 
 #include "node_geometry_util.hh"
 
@@ -141,6 +144,15 @@ static void node_declare(NodeDeclarationBuilder &b)
             "Only let the lattice points of the connected island of the nearest point capture "
             "(when the rest lattice is a mesh). Without it a transform can mix two parts that are "
             "close in space but move differently, which collapses a bent joint");
+    panel.add_input<decl::Int>("Group ID"_ustr)
+        .default_value(-1)
+        .min(-1)
+        .structure_type(StructureType::Field)
+        .description(
+            "Evaluated on `Rest Points`: only lattice points with the same group id capture a "
+            "target point, which keeps pieces of a joined lattice apart even without edges (a "
+            "sphere packing for example). -1 disables the grouping, a point with -1 is not "
+            "restricted");
   }
   {
     auto &panel = b.add_panel("Deform"_ustr).default_closed(false);
@@ -539,6 +551,9 @@ class PointDeformer {
   const Span<int> islands_;
   /** Number of points of the island of every rest point. */
   const Span<int> island_sizes_;
+  /** Group id of every rest point, empty when the group field is not used. */
+  const Span<int> groups_;
+  const bool has_groups_;
   const int min_points_;
   const int max_points_;
   const float radius_;
@@ -553,6 +568,8 @@ class PointDeformer {
                 const KDTree<float3> *tree,
                 const Span<int> islands,
                 const Span<int> island_sizes,
+                const Span<int> groups,
+                const bool has_groups,
                 const int min_points,
                 const int max_points,
                 const float radius,
@@ -564,6 +581,8 @@ class PointDeformer {
         tree_(tree),
         islands_(islands),
         island_sizes_(island_sizes),
+        groups_(groups),
+        has_groups_(has_groups),
         min_points_(min_points),
         max_points_(max_points),
         radius_(radius),
@@ -663,32 +682,38 @@ class PointDeformer {
       return 0;
     }
 
-    if (!islands_.is_empty()) {
-      const int nearest_index = candidates[0].index;
-      /* A mesh of loose vertices has one point per island; a lone point cannot be the only source
-       * of a transform (it would turn the whole deformation into a translation), so those fall back
-       * to the plain neighbours. */
-      if (island_sizes_[nearest_index] >= math::max(2, min_points_)) {
-        const int island = islands_[nearest_index];
-        while (true) {
-          int same_island = 0;
-          for (int i = 0; i < found && same_island < max_points_; i++) {
-            if (islands_[candidates[i].index] != island) {
-              continue;
-            }
-            candidates[same_island] = candidates[i];
-            same_island++;
+    const int nearest_index = candidates[0].index;
+    /* A mesh of loose vertices has one point per island; a lone point cannot be the only source of
+     * a transform (it would turn the whole deformation into a translation), so those fall back to
+     * the plain neighbours. */
+    const bool use_islands = !islands_.is_empty() &&
+                             island_sizes_[nearest_index] >= math::max(2, min_points_);
+    const int island = use_islands ? islands_[nearest_index] : -1;
+    const int group = has_groups_ ? groups_[nearest_index] : -1;
+    const bool use_groups = group >= 0;
+    if (use_islands || use_groups) {
+      while (true) {
+        int same_piece = 0;
+        for (int i = 0; i < found && same_piece < max_points_; i++) {
+          const int index = candidates[i].index;
+          if (use_islands && islands_[index] != island) {
+            continue;
           }
-          if (same_island >= min_points_ || capacity >= math::min(lattice_num, max_candidates)) {
-            found = math::max(same_island, 1);
-            break;
+          if (use_groups && groups_[index] != group) {
+            continue;
           }
-          /* The island is spread out over space: ask for more candidates. */
-          capacity = math::min(math::min(lattice_num, max_candidates), capacity * 4);
-          found = kdtree_find_nearest_n(tree_, point, candidates.data(), uint(capacity));
-          if (found == 0) {
-            return 0;
-          }
+          candidates[same_piece] = candidates[i];
+          same_piece++;
+        }
+        if (same_piece >= min_points_ || capacity >= math::min(lattice_num, max_candidates)) {
+          found = math::max(same_piece, 1);
+          break;
+        }
+        /* The piece is spread out over space: ask for more candidates. */
+        capacity = math::min(math::min(lattice_num, max_candidates), capacity * 4);
+        found = kdtree_find_nearest_n(tree_, point, candidates.data(), uint(capacity));
+        if (found == 0) {
+          return 0;
         }
       }
     }
@@ -782,6 +807,37 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
   }
 
+  /* The group field belongs to the rest lattice: a target point uses the group of its nearest
+   * lattice point, so the group ids do not have to exist on the high resolution mesh. */
+  Array<int> groups;
+  bool has_groups = false;
+  const Field<int> group_field = params.extract_input<Field<int>>("Group ID"_ustr);
+  const auto evaluate_groups = [&](const fn::FieldContext &field_context, const int count) {
+    fn::FieldEvaluator evaluator{field_context, count};
+    evaluator.add(group_field);
+    evaluator.evaluate();
+    const VArray<int> values = evaluator.get_evaluated<int>(0);
+    groups.reinitialize(count);
+    for (const int i : IndexRange(count)) {
+      groups[i] = values[i];
+      has_groups |= values[i] >= 0;
+    }
+  };
+  if (const Mesh *rest_mesh = rest_geometry.get_mesh()) {
+    evaluate_groups(bke::GeometryFieldContext(*rest_mesh, AttrDomain::Point),
+                    rest_mesh->verts_num);
+  }
+  else if (const PointCloud *rest_pointcloud = rest_geometry.get_pointcloud()) {
+    evaluate_groups(bke::GeometryFieldContext(*rest_pointcloud), rest_pointcloud->totpoint);
+  }
+  else if (const Curves *rest_curves = rest_geometry.get_curves()) {
+    evaluate_groups(bke::CurvesFieldContext(rest_curves->geometry.wrap(), AttrDomain::Point),
+                    rest_curves->geometry.wrap().points_num());
+  }
+  if (!has_groups) {
+    groups = {};
+  }
+
   KDTree<float3> *tree = kdtree_new<float3>(uint(lattice_num));
   for (const int i : IndexRange(lattice_num)) {
     kdtree_insert(tree, i, rest.positions[i]);
@@ -796,6 +852,8 @@ static void node_geo_exec(GeoNodeExecParams params)
                                tree,
                                islands,
                                island_vertex_sizes,
+                               groups,
+                               has_groups,
                                min_points,
                                max_points,
                                radius,
