@@ -10870,6 +10870,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodePointsToVolume");
   define("GeometryNode", "GeometryNodeProximity");
   define("GeometryNode", "GeometryNodeRagdollJoints");
+  define("GeometryNode", "GeometryNodeRagdollMotors");
   define("GeometryNode", "GeometryNodeRaycast");
   define("GeometryNode", "GeometryNodeRBDCollider");
   define("GeometryNode", "GeometryNodeRBDConstraintFromPieces");

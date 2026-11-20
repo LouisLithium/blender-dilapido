@@ -233,6 +233,7 @@ set(SRC
   nodes/node_geo_points_to_volume.cc
   nodes/node_geo_proximity.cc
   nodes/node_geo_ragdoll_joints.cc
+  nodes/node_geo_ragdoll_motors.cc
   nodes/node_geo_raycast.cc
   nodes/node_geo_dilapido_force.cc
   nodes/node_geo_dilapido_field_remap.cc

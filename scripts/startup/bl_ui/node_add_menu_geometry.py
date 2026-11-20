@@ -1110,6 +1110,7 @@ class NODE_MT_gn_dilapido_ragdoll_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeArmatureBones")
         self.node_operator(layout, "GeometryNodeInitRagdollBodies")
         self.node_operator(layout, "GeometryNodeRagdollJoints")
+        self.node_operator(layout, "GeometryNodeRagdollMotors")
         self.node_operator(layout, "GeometryNodeSkinFromBones")
 
 

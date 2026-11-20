@@ -40,6 +40,17 @@ struct BodyState {
    */
   bool animated = false;
   /**
+   * Active ragdoll servo: when #has_servo is true, the solver applies a PD torque towards
+   * #servo_target every substep. The target is the animated bone rotation; strength and damping
+   * are in N m / rad and N m s / rad. A strength of 0 leaves the body passive.
+   */
+  bool has_servo = false;
+  math::Quaternion servo_target = math::Quaternion::identity();
+  float servo_strength = 0.0f;
+  float servo_damping = 0.0f;
+  /** 0 = no limit. */
+  float servo_max_torque = 0.0f;
+  /**
    * False when the user switched the body off: it is not simulated (nothing can move it), but the
    * other bodies still collide with it, like an animated body without a new pose. Unlike
    * #animated this can change while the simulation runs: the Jolt motion type of the body is

@@ -707,8 +707,52 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
   return constraints;
 }
 
-/**
- * Read the `piece_id` of every body of a geometry set, so constraints can be mapped from ids
+/** Returns true if the point cloud carries per-body motors (active ragdoll servo). */
+static bool is_motor_cloud(const PointCloud &pointcloud)
+{
+  const bke::AttributeAccessor attributes = pointcloud.attributes();
+  return attributes.contains("is_ragdoll_motor") && attributes.contains("target_rotation");
+}
+
+struct RawMotor {
+  int piece_id = -1;
+  math::Quaternion target = math::Quaternion::identity();
+  float strength = 0.0f;
+  float damping = 0.0f;
+  float max_torque = 0.0f;
+};
+
+static void read_motors(const PointCloud &pointcloud, Vector<RawMotor> &r_motors)
+{
+  const bke::AttributeAccessor attributes = pointcloud.attributes();
+  const VArray<int> piece_ids =
+      attributes.lookup_or_default<int>("piece_id", AttrDomain::Point, -1).varray;
+  const VArray<math::Quaternion> targets =
+      attributes
+          .lookup_or_default<math::Quaternion>(
+              "target_rotation", AttrDomain::Point, math::Quaternion::identity())
+          .varray;
+  const VArray<float> strengths =
+      attributes.lookup_or_default<float>("strength", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> dampings =
+      attributes.lookup_or_default<float>("damping", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> max_torques =
+      attributes.lookup_or_default<float>("max_torque", AttrDomain::Point, 0.0f).varray;
+  for (const int i : IndexRange(pointcloud.totpoint)) {
+    if (piece_ids[i] < 0 || strengths[i] <= 0.0f) {
+      continue;
+    }
+    RawMotor motor;
+    motor.piece_id = piece_ids[i];
+    motor.target = targets[i];
+    motor.strength = strengths[i];
+    motor.damping = std::max(dampings[i], 0.0f);
+    motor.max_torque = std::max(max_torques[i], 0.0f);
+    r_motors.append(motor);
+  }
+}
+
+/** Read the `piece_id` of every body of a geometry set, so constraints can be mapped from ids
  * to the local body indices.
  */
 static Array<int> read_body_ids(const GeometrySet &geometry, const int body_num)
@@ -955,6 +999,7 @@ static void node_geo_exec(GeoNodeExecParams params){
   Vector<std::string> constraint_paths;
   Vector<RawBodyForce> raw_body_forces;
   Vector<std::string> body_force_paths;
+  Vector<RawMotor> raw_motors;
   for (const StringRef path : paths) {
     const GeometrySet *geometry = world.lookup_path_ptr<GeometrySet>(path);
     if (!geometry || !geometry->has_pointcloud()) {
@@ -974,6 +1019,9 @@ static void node_geo_exec(GeoNodeExecParams params){
     else if (is_body_force_cloud(*pointcloud)) {
       read_body_forces(*pointcloud, path, raw_body_forces);
       body_force_paths.append(std::string(path));
+    }
+    else if (is_motor_cloud(*pointcloud)) {
+      read_motors(*pointcloud, raw_motors);
     }
   }
   Array<ConstraintFeedback> constraint_feedback(raw_constraints.size());
@@ -1047,6 +1095,9 @@ static void node_geo_exec(GeoNodeExecParams params){
     if (geometry->has_pointcloud() && !geometry->has_instances()) {
       const PointCloud *pointcloud_read = geometry->get_pointcloud();
       if (pointcloud_read && is_constraint_cloud(*pointcloud_read)) {
+        continue;
+      }
+      if (pointcloud_read && is_motor_cloud(*pointcloud_read)) {
         continue;
       }
       if (pointcloud_read && pointcloud_read->attributes().contains("piece_id")) {
@@ -1141,6 +1192,21 @@ static void node_geo_exec(GeoNodeExecParams params){
       }
       states[*index].external_force += body_force.force;
       states[*index].external_torque += body_force.torque;
+    }
+
+    /* Active ragdoll servos: the target orientation comes from the live armature and may change
+     * every frame, so it is applied as a torque and deliberately not part of the world signature. */
+    for (const RawMotor &motor : raw_motors) {
+      const int *index = id_to_index.lookup_ptr(motor.piece_id);
+      if (!index) {
+        continue;
+      }
+      BodyState &state = states[*index];
+      state.has_servo = true;
+      state.servo_target = motor.target;
+      state.servo_strength = motor.strength;
+      state.servo_damping = motor.damping;
+      state.servo_max_torque = motor.max_torque;
     }
 
     Vector<ConstraintDef> constraints;

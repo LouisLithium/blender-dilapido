@@ -1405,18 +1405,22 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
   };
   /* Jolt clears the force and torque accumulators of a body after every step, so external forces
    * * have to be applied again for each substep (below). Walking the bodies is only worth it when
-   * at   * least one of them actually has a force. */
+   * at   * least one of them actually has a force or an active servo. */
   bool any_external_force = false;
+  bool any_servo = false;
   for (const BodyState &state : bodies) {
     if (state.external_force != float3(0.0f) || state.external_torque != float3(0.0f)) {
       any_external_force = true;
-      break;
+    }
+    if (state.has_servo && state.servo_strength > 0.0f && !state.animated && state.active) {
+      any_servo = true;
     }
   }
   const auto apply_external_forces = [&]() {
-    if (!any_external_force) {
+    if (!any_external_force && !any_servo) {
       return;
     }
+    const BodyLockInterfaceNoLock &servo_lock = physics_system.GetBodyLockInterfaceNoLock();
     for (const int i : bodies.index_range()) {
       const BodyID body_id = body_ids[i];
       if (body_id.IsInvalid()) {
@@ -1427,6 +1431,43 @@ void simulate_bodies(MutableSpan<BodyState> bodies,
       }
       if (bodies[i].external_torque != float3(0.0f) && finite3(bodies[i].external_torque)) {
         body_interface.AddTorque(body_id, to_jolt(bodies[i].external_torque));
+      }
+      const BodyState &state = bodies[i];
+      if (!state.has_servo || !(state.servo_strength > 0.0f) || state.animated || !state.active) {
+        continue;
+      }
+      Body *servo_body = servo_lock.TryGetBody(body_id);
+      if (!servo_body) {
+        continue;
+      }
+      /* PD towards the animated orientation: torque = k * angle * axis - d * angular_velocity.
+       * `GetAxisAngle` returns the shortest rotation (0..pi), and the sign is flipped so the
+       * blend always takes the short way around. */
+      Quat delta = to_jolt(state.servo_target) * servo_body->GetRotation().Conjugated();
+      if (delta.GetW() < 0.0f) {
+        delta = delta * -1.0f;
+      }
+      Vec3 axis(0, 0, 0);
+      float angle = 0.0f;
+      delta.GetAxisAngle(axis, angle);
+      /* Scale the gains by the body's inertia so a strength of X means "X rad/s² per rad" for any
+       * bone size. Using the largest inertia keeps the weakest axis controllable. */
+      const MotionProperties *motion = servo_body->GetMotionProperties();
+      const Vec3 inverse_inertia = motion->GetInverseInertiaDiagonal();
+      const float smallest_inverse = std::max(std::min({inverse_inertia.GetX(),
+                                                        inverse_inertia.GetY(),
+                                                        inverse_inertia.GetZ()}),
+                                              1.0e-9f);
+      const float inertia = 1.0f / smallest_inverse;
+      Vec3 torque = axis * (angle * state.servo_strength * inertia) -
+                    servo_body->GetAngularVelocity() * (state.servo_damping * inertia);
+      if (state.servo_max_torque > 0.0f && torque.Length() > state.servo_max_torque) {
+        torque *= state.servo_max_torque / torque.Length();
+      }
+      if (std::isfinite(torque.GetX()) && std::isfinite(torque.GetY()) &&
+          std::isfinite(torque.GetZ()))
+      {
+        body_interface.AddTorque(body_id, torque);
       }
     }
   };
