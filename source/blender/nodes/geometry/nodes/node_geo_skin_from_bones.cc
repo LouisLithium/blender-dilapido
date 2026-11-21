@@ -60,6 +60,7 @@ static const EnumPropertyItem mode_items[] = {
 
 struct BoneTransform {
   std::string name;
+  int agent = 0;
   float4x4 deform;
   math::Quaternion rotation;
   float3 translation;
@@ -84,6 +85,8 @@ static bool read_bones(const GeometrySet &bones,
       r_error = "Bones has no `bone_name` attribute (use Armature Bones or Init Ragdoll Bodies)";
       return false;
     }
+    const VArray<int> agents =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Instance, 0).varray;
     const VArray<float4x4> rests =
         attributes
             .lookup_or_default<float4x4>(
@@ -95,6 +98,7 @@ static bool read_bones(const GeometrySet &bones,
     for (const int i : IndexRange(count)) {
       BoneTransform &bone = r_bones[i];
       bone.name = string_from_property(names[i]);
+      bone.agent = agents[i];
       bone.deform = transforms[i] * math::invert(rests[i]);
       bone.rotation = math::normalize(math::to_quaternion(bone.deform));
       bone.translation = bone.deform.location();
@@ -113,6 +117,8 @@ static bool read_bones(const GeometrySet &bones,
       r_error = "Bones has no `bone_name` attribute (use Armature Bones)";
       return false;
     }
+    const VArray<int> agents =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
     const VArray<float4x4> poses =
         attributes
             .lookup_or_default<float4x4>(
@@ -128,6 +134,7 @@ static bool read_bones(const GeometrySet &bones,
     for (const int i : IndexRange(count)) {
       BoneTransform &bone = r_bones[i];
       bone.name = string_from_property(names[i]);
+      bone.agent = agents[i];
       bone.deform = poses[i] * math::invert(rests[i]);
       bone.rotation = math::normalize(math::to_quaternion(bone.deform));
       bone.translation = bone.deform.location();
@@ -189,10 +196,10 @@ static void node_geo_exec(GeoNodeExecParams params)
   const int max_influences = math::clamp(params.extract_input<int>("Max Influences"_ustr), 1, 8);
   const bool normalize = params.extract_input<bool>("Normalize Weights"_ustr);
 
-  Map<std::string, int> bone_by_name;
-  bone_by_name.reserve(bones.size());
+  Map<int, Map<std::string, int>> bones_by_agent;
+  bones_by_agent.reserve(bones.size());
   for (const int i : bones.index_range()) {
-    bone_by_name.add(bones[i].name, i);
+    bones_by_agent.lookup_or_add_default(bones[i].agent).add(bones[i].name, i);
   }
 
   const bke::AttributeAccessor attributes = mesh->attributes();
@@ -200,20 +207,54 @@ static void node_geo_exec(GeoNodeExecParams params)
     int bone_index;
     VArray<float> weights;
   };
-  Vector<WeightChannel> channels;
-  channels.reserve(bones.size());
-  for (const bDeformGroup &group : mesh->vertex_group_names) {
-    const int *bone_index = bone_by_name.lookup_ptr(std::string(group.name));
-    if (!bone_index) {
-      continue;
+  const bool has_vertex_agents = attributes.contains("agent_id");
+  const VArray<int> vertex_agents =
+      attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
+
+  /* Resolve every vertex to the bone *of its own agent*, so several characters can share bone
+   * names (and one joined mesh) without their vertex groups colliding. */
+  const int mesh_vertex_count = int(mesh->verts_num);
+  Array<int> vertex_slot(mesh_vertex_count, 0);
+  Map<int, int> agent_slots;
+  for (const int vertex : IndexRange(mesh_vertex_count)) {
+    const int agent = has_vertex_agents ? vertex_agents[vertex] : 0;
+    const int *slot = agent_slots.lookup_ptr(agent);
+    if (slot != nullptr) {
+      vertex_slot[vertex] = *slot;
     }
-    const VArray<float> weights = attributes.lookup<float>(group.name, AttrDomain::Point).varray;
-    if (!weights) {
-      continue;
+    else {
+      const int new_slot = int(agent_slots.size());
+      agent_slots.add(agent, new_slot);
+      vertex_slot[vertex] = new_slot;
     }
-    channels.append({*bone_index, weights});
   }
-  if (channels.is_empty()) {
+  Vector<int> slot_agents(agent_slots.size());
+  for (const auto item : agent_slots.items()) {
+    slot_agents[item.value] = item.key;
+  }
+
+  Vector<Vector<WeightChannel>> channels_by_agent(agent_slots.size());
+  int channel_count = 0;
+  for (const int slot : slot_agents.index_range()) {
+    const Map<std::string, int> *by_name = bones_by_agent.lookup_ptr(slot_agents[slot]);
+    if (by_name == nullptr) {
+      continue;
+    }
+    Vector<WeightChannel> &channels = channels_by_agent[slot];
+    for (const bDeformGroup &group : mesh->vertex_group_names) {
+      const int *bone_index = by_name->lookup_ptr(std::string(group.name));
+      if (!bone_index) {
+        continue;
+      }
+      const VArray<float> weights = attributes.lookup<float>(group.name, AttrDomain::Point).varray;
+      if (!weights) {
+        continue;
+      }
+      channels.append({*bone_index, weights});
+    }
+    channel_count += int(channels.size());
+  }
+  if (channel_count == 0) {
     params.error_message_add(
         NodeWarningType::Info,
         TIP_("Skin From Bones: no vertex group matches a bone name, returning the mesh unchanged"));
@@ -233,6 +274,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   Array<Influence> influences(max_influences);
 
   for (const int vertex : IndexRange(vertex_count)) {
+    const Vector<WeightChannel> &channels = channels_by_agent[vertex_slot[vertex]];
     int count = 0;
     for (const WeightChannel &channel : channels) {
       const float weight = channel.weights[vertex];

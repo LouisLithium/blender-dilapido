@@ -14,9 +14,10 @@
  * only drives the spine and arms.
  */
 
+#include <cstdint>
+
 #include "BLI_array.hh"
-#include "BLI_map.hh"
-#include "BLI_math_matrix.hh"
+#include "BLI_map.hh"#include "BLI_math_matrix.hh"
 #include "BLI_math_quaternion.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_vector.hh"
@@ -62,19 +63,27 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_output<decl::Geometry>("Motors"_ustr);
 }
 
-static Map<int, int> read_body_ids(const GeometrySet &bodies)
+/** Combine an agent id and a bone index into one key (both non-negative). */
+static int64_t make_bone_key(const int agent, const int bone)
 {
-  Map<int, int> ids;
+  return (int64_t(uint32_t(agent)) << 32) | uint32_t(bone);
+}
+
+static Map<int64_t, int> read_body_ids(const GeometrySet &bodies)
+{
+  Map<int64_t, int> ids;
   if (bodies.has_instances()) {
     const bke::Instances &instances = *bodies.get_instances();
     const bke::AttributeAccessor attributes = instances.attributes();
     const VArray<int> bone_indices =
         attributes.lookup_or_default<int>("bone_index", AttrDomain::Instance, -1).varray;
+    const VArray<int> agent_ids =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Instance, 0).varray;
     const VArray<int> piece_ids =
         attributes.lookup_or_default<int>("piece_id", AttrDomain::Instance, -1).varray;
     for (const int i : IndexRange(instances.instances_num())) {
       if (bone_indices[i] >= 0 && piece_ids[i] >= 0) {
-        ids.add(bone_indices[i], piece_ids[i]);
+        ids.add(make_bone_key(agent_ids[i], bone_indices[i]), piece_ids[i]);
       }
     }
   }
@@ -82,11 +91,13 @@ static Map<int, int> read_body_ids(const GeometrySet &bodies)
     const bke::AttributeAccessor attributes = bodies.get_pointcloud()->attributes();
     const VArray<int> bone_indices =
         attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
+    const VArray<int> agent_ids =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
     const VArray<int> piece_ids =
         attributes.lookup_or_default<int>("piece_id", AttrDomain::Point, -1).varray;
     for (const int i : IndexRange(bodies.get_pointcloud()->totpoint)) {
       if (bone_indices[i] >= 0 && piece_ids[i] >= 0) {
-        ids.add(bone_indices[i], piece_ids[i]);
+        ids.add(make_bone_key(agent_ids[i], bone_indices[i]), piece_ids[i]);
       }
     }
   }
@@ -106,7 +117,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   GeometrySet bodies_geometry = params.extract_input<GeometrySet>("Bodies"_ustr);
-  const Map<int, int> body_ids = read_body_ids(bodies_geometry);
+  const Map<int64_t, int> body_ids = read_body_ids(bodies_geometry);
 
   const int count = bones->totpoint;
   const bke::AttributeAccessor attributes = bones->attributes();
@@ -117,6 +128,8 @@ static void node_geo_exec(GeoNodeExecParams params)
           .varray;
   const VArray<int> bone_indices =
       attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
+  const VArray<int> agent_ids =
+      attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
 
   bke::GeometryFieldContext field_context(*bones, AttrDomain::Point);
   fn::FieldEvaluator evaluator(field_context, count);
@@ -137,6 +150,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       "position", domain);
   bke::SpanAttributeWriter<int> piece_id_writer =
       out_attributes.lookup_or_add_for_write_span<int>("piece_id", domain);
+  bke::SpanAttributeWriter<int> agent_id_writer =
+      out_attributes.lookup_or_add_for_write_span<int>("agent_id", domain);
   bke::SpanAttributeWriter<math::Quaternion> target_writer =
       out_attributes.lookup_or_add_for_write_span<math::Quaternion>("target_rotation", domain);
   bke::SpanAttributeWriter<float> strength_writer =
@@ -151,9 +166,12 @@ static void node_geo_exec(GeoNodeExecParams params)
   for (const int i : IndexRange(count)) {
     const float4x4 pose = pose_matrices[i];
     const int bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
-    const int piece_id = body_ids.contains(bone_index) ? body_ids.lookup(bone_index) : bone_index;
+    const int agent = std::max(agent_ids[i], 0);
+    const int64_t key = make_bone_key(agent, bone_index);
+    const int piece_id = body_ids.contains(key) ? body_ids.lookup(key) : bone_index;
     positions.span[i] = pose.location();
     piece_id_writer.span[i] = masks[i] ? piece_id : -1;
+    agent_id_writer.span[i] = agent;
     target_writer.span[i] = math::normalize(math::to_quaternion(pose));
     strength_writer.span[i] = masks[i] ? std::max(strengths[i], 0.0f) : 0.0f;
     damping_writer.span[i] = std::max(dampings[i], 0.0f);
@@ -163,6 +181,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   positions.finish();
   piece_id_writer.finish();
+  agent_id_writer.finish();
   target_writer.finish();
   strength_writer.finish();
   damping_writer.finish();

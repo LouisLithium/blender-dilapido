@@ -15,6 +15,7 @@
  */
 
 #include <cmath>
+#include <cstdint>
 
 #include "BLI_array.hh"
 #include "BLI_map.hh"
@@ -118,20 +119,29 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_output<decl::Geometry>("Constraints"_ustr);
 }
 
-/** Return the piece id of every bone index in a ragdoll body set. */
-static Map<int, int> read_body_ids(const GeometrySet &bodies)
+/** Combine an agent id and a bone index into one key, so several ragdolls can share one bone
+ * cloud without their identical bone indices colliding. Both values are non-negative. */
+static int64_t make_bone_key(const int agent, const int bone)
 {
-  Map<int, int> ids;
+  return (int64_t(uint32_t(agent)) << 32) | uint32_t(bone);
+}
+
+/** Return the piece id of every (agent, bone index) in a ragdoll body set. */
+static Map<int64_t, int> read_body_ids(const GeometrySet &bodies)
+{
+  Map<int64_t, int> ids;
   if (bodies.has_instances()) {
     const bke::Instances &instances = *bodies.get_instances();
     const bke::AttributeAccessor attributes = instances.attributes();
     const VArray<int> bone_indices =
         attributes.lookup_or_default<int>("bone_index", AttrDomain::Instance, -1).varray;
+    const VArray<int> agent_ids =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Instance, 0).varray;
     const VArray<int> piece_ids =
         attributes.lookup_or_default<int>("piece_id", AttrDomain::Instance, -1).varray;
     for (const int i : IndexRange(instances.instances_num())) {
       if (bone_indices[i] >= 0 && piece_ids[i] >= 0) {
-        ids.add(bone_indices[i], piece_ids[i]);
+        ids.add(make_bone_key(agent_ids[i], bone_indices[i]), piece_ids[i]);
       }
     }
   }
@@ -139,11 +149,13 @@ static Map<int, int> read_body_ids(const GeometrySet &bodies)
     const bke::AttributeAccessor attributes = bodies.get_pointcloud()->attributes();
     const VArray<int> bone_indices =
         attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
+    const VArray<int> agent_ids =
+        attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
     const VArray<int> piece_ids =
         attributes.lookup_or_default<int>("piece_id", AttrDomain::Point, -1).varray;
     for (const int i : IndexRange(bodies.get_pointcloud()->totpoint)) {
       if (bone_indices[i] >= 0 && piece_ids[i] >= 0) {
-        ids.add(bone_indices[i], piece_ids[i]);
+        ids.add(make_bone_key(agent_ids[i], bone_indices[i]), piece_ids[i]);
       }
     }
   }
@@ -163,7 +175,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   GeometrySet bodies_geometry = params.extract_input<GeometrySet>("Bodies"_ustr);
-  const Map<int, int> body_ids = read_body_ids(bodies_geometry);
+  const Map<int64_t, int> body_ids = read_body_ids(bodies_geometry);
 
   const int default_type = params.extract_input<MenuValue>("Joint Type"_ustr).value;
   const float default_swing = std::max(params.extract_input<float>("Swing Limit"_ustr), 0.0f);
@@ -191,6 +203,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
   const VArray<int> bone_parents =
       attributes.lookup_or_default<int>("bone_parent", AttrDomain::Point, -1).varray;
+  const VArray<int> agent_ids =
+      attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
 
   const VArray<int> joint_types =
       attributes.lookup_or_default<int>("ragdoll_joint_type", AttrDomain::Point, default_type)
@@ -220,10 +234,10 @@ static void node_geo_exec(GeoNodeExecParams params)
           .lookup_or_default<float>("ragdoll_distance_max", AttrDomain::Point, default_distance_max)
           .varray;
 
-  Map<int, int> index_of_bone;
+  Map<int64_t, int> index_of_bone;
   for (const int i : IndexRange(count)) {
     const int bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
-    index_of_bone.add(bone_index, i);
+    index_of_bone.add(make_bone_key(agent_ids[i], bone_index), i);
   }
 
   Vector<int> joint_bones;
@@ -234,11 +248,12 @@ static void node_geo_exec(GeoNodeExecParams params)
     if (bone_parents[i] < 0) {
       continue;
     }
-    if (!index_of_bone.contains(bone_parents[i])) {
+    const int64_t parent_key = make_bone_key(agent_ids[i], bone_parents[i]);
+    if (!index_of_bone.contains(parent_key)) {
       continue;
     }
     joint_bones.append(i);
-    joint_parents.append(index_of_bone.lookup(bone_parents[i]));
+    joint_parents.append(index_of_bone.lookup(parent_key));
   }
 
   const int joint_count = int(joint_bones.size());
@@ -256,6 +271,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       out_attributes.lookup_or_add_for_write_span<int>("body_a", domain);
   bke::SpanAttributeWriter<int> body_b_writer =
       out_attributes.lookup_or_add_for_write_span<int>("body_b", domain);
+  bke::SpanAttributeWriter<int> agent_id_writer =
+      out_attributes.lookup_or_add_for_write_span<int>("agent_id", domain);
   bke::SpanAttributeWriter<bool> enabled_writer =
       out_attributes.lookup_or_add_for_write_span<bool>("enabled", domain);
   bke::SpanAttributeWriter<int> type_writer =
@@ -320,11 +337,15 @@ static void node_geo_exec(GeoNodeExecParams params)
 
     const int child_bone = bone_indices[child] >= 0 ? bone_indices[child] : child;
     const int parent_bone = bone_indices[parent] >= 0 ? bone_indices[parent] : parent;
-    const int child_id = body_ids.contains(child_bone) ? body_ids.lookup(child_bone) : child_bone;
-    const int parent_id = body_ids.contains(parent_bone) ? body_ids.lookup(parent_bone) :
-                                                           parent_bone;
+    const int agent = agent_ids[child];
+    const int64_t child_key = make_bone_key(agent, child_bone);
+    const int64_t parent_key = make_bone_key(agent, parent_bone);
+    const int child_id = body_ids.contains(child_key) ? body_ids.lookup(child_key) : child_bone;
+    const int parent_id = body_ids.contains(parent_key) ? body_ids.lookup(parent_key) :
+                                                          parent_bone;
 
     positions.span[joint] = joint_position;
+    agent_id_writer.span[joint] = agent;
     body_a_writer.span[joint] = parent_id;
     body_b_writer.span[joint] = child_id;
     enabled_writer.span[joint] = true;
@@ -357,6 +378,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   positions.finish();
   body_a_writer.finish();
   body_b_writer.finish();
+  agent_id_writer.finish();
   enabled_writer.finish();
   type_writer.finish();
   anchor_a_writer.finish();

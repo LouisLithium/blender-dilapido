@@ -203,7 +203,11 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Int>("Group ID"_ustr)
       .default_value(0)
       .min(0)
-      .description("Keeps piece ids of several ragdolls apart, like Init Rigid Body");
+      .structure_type(StructureType::Field)
+      .description(
+          "Agent/group index that keeps piece ids apart: `piece_id = bone_index + Group ID * "
+          "1,000,000`. Use a per-bone field (e.g. a stored `agent_id` attribute) to build several "
+          "characters in one world");
   b.add_input<decl::Bool>("Animate"_ustr)
       .default_value(false)
       .structure_type(StructureType::Field)
@@ -244,7 +248,6 @@ static void node_geo_exec(GeoNodeExecParams params)
   const float angular_damping = math::clamp(params.extract_input<float>("Angular Damping"_ustr),
                                             0.0f,
                                             1.0f);
-  const int group_id = std::max(params.extract_input<int>("Group ID"_ustr), 0);
 
   const bke::AttributeAccessor attributes = bones->attributes();
   const VArray<float4x4> pose_matrices =
@@ -272,6 +275,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   evaluator.add(params.extract_input<Field<bool>>("Active"_ustr));
   evaluator.add(params.extract_input<Field<float3>>("Initial Velocity"_ustr));
   evaluator.add(params.extract_input<Field<float3>>("Initial Angular Velocity"_ustr));
+  evaluator.add(params.extract_input<Field<int>>("Group ID"_ustr));
   evaluator.evaluate();
   const VArray<float> radii = evaluator.get_evaluated<float>(0);
   const VArray<float> masses = evaluator.get_evaluated<float>(1);
@@ -279,6 +283,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const VArray<bool> actives = evaluator.get_evaluated<bool>(3);
   const VArray<float3> velocities = evaluator.get_evaluated<float3>(4);
   const VArray<float3> angular_velocities = evaluator.get_evaluated<float3>(5);
+  const VArray<int> group_ids = evaluator.get_evaluated<int>(6);
 
   bke::Instances *instances = new bke::Instances(count);
   MutableSpan<float4x4> transforms = instances->transforms_for_write();
@@ -288,6 +293,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   Array<float> body_radii(count);
   Array<float> half_heights(count);
   Array<int> piece_ids(count);
+  Array<int> agent_ids(count);
+  Array<int> body_slots(count);
   Array<float3> body_positions(count);
 
   for (const int i : IndexRange(count)) {
@@ -316,7 +323,10 @@ static void node_geo_exec(GeoNodeExecParams params)
     body_radii[i] = radius;
     half_heights[i] = half_height;
     const int bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
-    piece_ids[i] = bone_index + group_id * 1000000;
+    const int agent = std::max(group_ids[i], 0);
+    piece_ids[i] = bone_index + agent * 1000000;
+    agent_ids[i] = agent;
+    body_slots[i] = bone_index;
     body_positions[i] = pose.location();
   }
 
@@ -326,6 +336,10 @@ static void node_geo_exec(GeoNodeExecParams params)
         instance_attributes.lookup_or_add_for_write_span<int>("piece_id", AttrDomain::Instance);
     bke::SpanAttributeWriter<int> bone_index_writer =
         instance_attributes.lookup_or_add_for_write_span<int>("bone_index", AttrDomain::Instance);
+    bke::SpanAttributeWriter<int> agent_id_writer =
+        instance_attributes.lookup_or_add_for_write_span<int>("agent_id", AttrDomain::Instance);
+    bke::SpanAttributeWriter<int> body_slot_writer =
+        instance_attributes.lookup_or_add_for_write_span<int>("body_slot", AttrDomain::Instance);
     bke::SpanAttributeWriter<int> bone_parent_writer =
         instance_attributes.lookup_or_add_for_write_span<int>("bone_parent", AttrDomain::Instance);
     bke::SpanAttributeWriter<float> mass_writer =
@@ -369,6 +383,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       const int bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
       piece_id_writer.span[i] = piece_ids[i];
       bone_index_writer.span[i] = bone_index;
+      agent_id_writer.span[i] = agent_ids[i];
+      body_slot_writer.span[i] = body_slots[i];
       bone_parent_writer.span[i] = bone_parents[i];
       mass_writer.span[i] = body_masses[i];
       radius_writer.span[i] = body_radii[i];
@@ -388,6 +404,8 @@ static void node_geo_exec(GeoNodeExecParams params)
 
     piece_id_writer.finish();
     bone_index_writer.finish();
+    agent_id_writer.finish();
+    body_slot_writer.finish();
     bone_parent_writer.finish();
     mass_writer.finish();
     radius_writer.finish();
@@ -416,6 +434,10 @@ static void node_geo_exec(GeoNodeExecParams params)
         point_attributes.lookup_or_add_for_write_span<int>("piece_id", AttrDomain::Point);
     bke::SpanAttributeWriter<int> bone_index_writer =
         point_attributes.lookup_or_add_for_write_span<int>("bone_index", AttrDomain::Point);
+    bke::SpanAttributeWriter<int> agent_id_writer =
+        point_attributes.lookup_or_add_for_write_span<int>("agent_id", AttrDomain::Point);
+    bke::SpanAttributeWriter<int> body_slot_writer =
+        point_attributes.lookup_or_add_for_write_span<int>("body_slot", AttrDomain::Point);
     bke::SpanAttributeWriter<float> mass_writer =
         point_attributes.lookup_or_add_for_write_span<float>("mass", AttrDomain::Point);
     bke::SpanAttributeWriter<float> radius_writer =
@@ -424,12 +446,16 @@ static void node_geo_exec(GeoNodeExecParams params)
       positions.span[i] = body_positions[i];
       piece_id_writer.span[i] = piece_ids[i];
       bone_index_writer.span[i] = bone_indices[i] >= 0 ? bone_indices[i] : i;
+      agent_id_writer.span[i] = agent_ids[i];
+      body_slot_writer.span[i] = body_slots[i];
       mass_writer.span[i] = body_masses[i];
       radius_writer.span[i] = body_radii[i];
     }
     positions.finish();
     piece_id_writer.finish();
     bone_index_writer.finish();
+    agent_id_writer.finish();
+    body_slot_writer.finish();
     mass_writer.finish();
     radius_writer.finish();
     body_points->tag_positions_changed();

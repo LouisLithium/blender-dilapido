@@ -1108,6 +1108,7 @@ class NODE_MT_gn_dilapido_ragdoll_base(node_add_menu.NodeMenu):
     def draw(self, context):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeArmatureBones")
+        self.node_operator(layout, "GeometryNodeRagdollBonesMerge")
         self.node_operator(layout, "GeometryNodeInitRagdollBodies")
         self.node_operator(layout, "GeometryNodeRagdollJoints")
         self.node_operator(layout, "GeometryNodeRagdollMotors")

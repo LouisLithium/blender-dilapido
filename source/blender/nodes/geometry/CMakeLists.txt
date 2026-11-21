@@ -233,6 +233,7 @@ set(SRC
   nodes/node_geo_points_to_volume.cc
   nodes/node_geo_proximity.cc
   nodes/node_geo_puncliga_sphere_packing.cc
+  nodes/node_geo_ragdoll_bones_merge.cc
   nodes/node_geo_ragdoll_joints.cc
   nodes/node_geo_ragdoll_motors.cc
   nodes/node_geo_raycast.cc
