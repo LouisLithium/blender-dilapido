@@ -7,6 +7,7 @@ set(INC
   ..
   include
   ../intern
+  ../../animrig
   ../../editors/include
   ../../compositor
   ../../makesrna
@@ -50,6 +51,7 @@ set(SRC
   nodes/node_geo_convex_hull.cc
   nodes/node_geo_create_crowd_agent.cc
   nodes/node_geo_crowd_animation_info.cc
+  nodes/node_geo_crowd_bones.cc
   nodes/node_geo_crowd_state.cc
   nodes/node_geo_cube_grid_topology.cc
   nodes/node_geo_curve_endpoint_selection.cc
@@ -147,8 +149,7 @@ set(SRC
   nodes/node_geo_index_switch.cc
   nodes/node_geo_init_crowd_data.cc
   nodes/node_geo_init_puncliga_data.cc
-  nodes/node_geo_init_ragdoll_bodies.cc
-  nodes/node_geo_init_rigid_body.cc
+  nodes/node_geo_init_ragdoll_bodies.cc  nodes/node_geo_init_rigid_body.cc
   nodes/node_geo_init_textura_data.cc
   nodes/node_geo_hw_accelerate.cc
   nodes/node_geo_input_active_camera.cc
@@ -250,6 +251,7 @@ set(SRC
   nodes/node_geo_rbd_constraint_from_pieces.cc
   nodes/node_geo_realize_instances.cc
   nodes/node_geo_regex_remove_named_attribute.cc
+  nodes/node_geo_remesh.cc
   nodes/node_geo_remove_attribute.cc
   nodes/node_geo_rename_attribute.cc
   nodes/node_geo_repeat.cc
@@ -358,6 +360,7 @@ set(SRC
 )
 
 set(LIB
+  PRIVATE bf::animrig
   PRIVATE bf::blenkernel
   PRIVATE bf::blenlib
   PRIVATE bf::blenloader

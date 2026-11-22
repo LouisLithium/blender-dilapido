@@ -91,6 +91,10 @@ static void node_geo_exec(GeoNodeExecParams params)
   const int root_motion = params.extract_input<MenuValue>("Root Motion"_ustr).value;
 
   std::string action_name;
+  std::string armature_name;
+  if (armature != nullptr) {
+    armature_name = std::string(armature->id.name + 2);
+  }
   if (armature != nullptr && armature->adt != nullptr && armature->adt->action != nullptr) {
     const bAction *action = armature->adt->action;
     action_name = std::string(action->id.name + 2);
@@ -117,6 +121,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   animation.add(*BundleKey::from_str("loop"), loop);
   animation.add(*BundleKey::from_str("root_motion"), root_motion);
   animation.add(*BundleKey::from_str("action_name"), action_name);
+  animation.add(*BundleKey::from_str("armature_name"), armature_name);
   params.set_output("Animation"_ustr, std::move(animation_ptr));
 }
 

@@ -10702,6 +10702,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeCornersOfVertex");
   define("GeometryNode", "GeometryNodeCreateCrowdAgent");
   define("GeometryNode", "GeometryNodeCrowdAnimationInfo");
+  define("GeometryNode", "GeometryNodeCrowdBones");
   define("GeometryNode", "GeometryNodeCrowdState");
   define("GeometryNode", "GeometryNodeCubeGridTopology");
   define("GeometryNode", "GeometryNodeCurveArc");
@@ -10884,6 +10885,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeRBDConstraintFromPieces");
   define("GeometryNode", "GeometryNodeRBDConstraintLines");
   define("GeometryNode", "GeometryNodeRegexRemoveNamedAttribute");
+  define("GeometryNode", "GeometryNodeRemesh");
   define("GeometryNode", "GeometryNodeRealizeInstances");
   define("GeometryNode", "GeometryNodeRemoveAttribute");
   define("GeometryNode", "GeometryNodeRenameAttribute");

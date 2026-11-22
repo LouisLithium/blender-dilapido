@@ -548,6 +548,7 @@ class NODE_MT_gn_mesh_operations_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeMeshToPoints")
         self.node_operator(layout, "GeometryNodeMeshToSDFGrid")
         self.node_operator(layout, "GeometryNodeMeshToVolume")
+        self.node_operator(layout, "GeometryNodeRemesh")
         self.node_operator(layout, "GeometryNodeScaleElements")
         self.node_operator(layout, "GeometryNodeSplitEdges")
         self.node_operator(layout, "GeometryNodeSubdivideMesh")
@@ -1176,6 +1177,7 @@ class NODE_MT_gn_dilapido_crowd_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeCrowdState")
         self.node_operator(layout, "GeometryNodeJoinCrowdStates")
         self.node_operator(layout, "GeometryNodeCrowdAnimationInfo")
+        self.node_operator(layout, "GeometryNodeCrowdBones")
         self.node_operator(layout, "GeometryNodeInitCrowdData")
 
 
@@ -1191,6 +1193,7 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeDilapidoFieldRemap")
         self.node_operator(layout, "GeometryNodePointDeform")
         self.node_operator(layout, "GeometryNodeDistributePoints")
+        self.node_operator(layout, "GeometryNodeRemesh")
         self.node_operator(layout, "GeometryNodeRegexRemoveNamedAttribute")
         layout.separator()
         self.draw_menu(layout, "RBD")
