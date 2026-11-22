@@ -431,10 +431,9 @@ static void node_geo_exec(GeoNodeExecParams params)
         positions[point],
         rotations ? math::normalize(rotations[point]) : math::Quaternion::identity(),
         float3(scale));
-    const int root_bone = order.is_empty() ? 0 : order[0];
-    const float4x4 root_rest = rest_matrices[root_bone];
-    /* The point is the spawn anchor; the bone channels carry the animation relative to rest. */
-    const float4x4 instance_root = point_transform * math::invert(root_rest);
+    /* The point transform places the template; the rest matrices keep the armature's own bone
+     * orientation, so the skeleton is not rotated relative to the mesh. */
+    const float4x4 instance_root = point_transform;
 
     /* Resolve the current and previous states. */
     const std::string state_name = state_names_attr ? crowd::read_string(state_names_attr[point]) :

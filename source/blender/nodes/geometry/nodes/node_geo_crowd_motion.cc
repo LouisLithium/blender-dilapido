@@ -188,11 +188,6 @@ static int find_nearest_target(const Span<Target> targets,
   return best;
 }
 
-static void write_state(MStringProperty &dst, const StringRef state)
-{
-  crowd::write_string(dst, state);
-}
-
 static void node_declare(NodeDeclarationBuilder &b)
 {
   b.add_input<decl::Geometry>("Points"_ustr)
@@ -233,13 +228,6 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Push agents apart after integration so they do not overlap");
   b.add_input<decl::Int>("Max Neighbors"_ustr).default_value(16).min(1).max(64);
 
-  b.add_input<decl::Bool>("State By Speed"_ustr)
-      .default_value(false)
-      .description("Automatically switch between the idle and walk states from the speed");
-  b.add_input<decl::Float>("Idle Speed"_ustr).default_value(0.1f).min(0.0f);
-  b.add_input<decl::String>("Idle State"_ustr).default_value("Idle");
-  b.add_input<decl::String>("Walk State"_ustr).default_value("Walk");
-
   b.add_output<decl::Geometry>("Points"_ustr);
 }
 
@@ -269,10 +257,6 @@ static void node_geo_exec(GeoNodeExecParams params)
       params.extract_input<float>("Separation Strength"_ustr), 0.0f);
   const bool hard_separation = params.extract_input<bool>("Hard Separation"_ustr);
   const int max_neighbors = math::clamp(params.extract_input<int>("Max Neighbors"_ustr), 1, 64);
-  const bool state_by_speed = params.extract_input<bool>("State By Speed"_ustr);
-  const float idle_speed = std::max(params.extract_input<float>("Idle Speed"_ustr), 0.0f);
-  const std::string idle_state = params.extract_input<std::string>("Idle State"_ustr);
-  const std::string walk_state = params.extract_input<std::string>("Walk State"_ustr);
 
   Vector<Target> targets;
   read_targets(targets_geometry, targets);
@@ -292,12 +276,6 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_add_for_write_span<float>("state_time", domain);
   bke::SpanAttributeWriter<float> target_distance_writer =
       attributes.lookup_or_add_for_write_span<float>("target_distance", domain);
-  bke::SpanAttributeWriter<MStringProperty> state_writer =
-      attributes.lookup_or_add_for_write_span<MStringProperty>("state", domain);
-  bke::SpanAttributeWriter<MStringProperty> prev_state_writer =
-      attributes.lookup_or_add_for_write_span<MStringProperty>("prev_state", domain);
-  bke::SpanAttributeWriter<int> state_id_writer =
-      attributes.lookup_or_add_for_write_span<int>("state_id", domain);
 
   const bke::AttributeAccessor src_attributes = points->attributes();
   const VArray<int> target_groups =
@@ -472,35 +450,12 @@ static void node_geo_exec(GeoNodeExecParams params)
                                          std::min(1.0f, turn_rate * delta_time));
       }
 
-      float state_time = src_state_times[i] + delta_time;
-      std::string new_state = state_name;
-      if (state_by_speed) {
-        const float horizontal_speed = math::length(float2(velocity.x, velocity.y));
-        if (horizontal_speed < idle_speed && state_name != idle_state) {
-          new_state = idle_state;
-          state_time = 0.0f;
-        }
-        else if (horizontal_speed >= idle_speed && (state_name.empty() || state_name == idle_state) &&
-                 state_name != walk_state)
-        {
-          new_state = walk_state;
-          state_time = 0.0f;
-        }
-      }
-
       positions[i] = new_position;
       velocities[i] = velocity;
       position_writer.span[i] = new_position;
       velocity_writer.span[i] = velocity;
       rotation_writer.span[i] = rotations[i];
-      state_time_writer.span[i] = state_time;
-      if (new_state != state_name) {
-        if (!state_name.empty()) {
-          write_state(prev_state_writer.span[i], state_name);
-        }
-        write_state(state_writer.span[i], new_state);
-        state_id_writer.span[i] = -1;
-      }
+      state_time_writer.span[i] = src_state_times[i] + delta_time;
     }
   });
 
@@ -563,9 +518,6 @@ static void node_geo_exec(GeoNodeExecParams params)
   rotation_writer.finish();
   state_time_writer.finish();
   target_distance_writer.finish();
-  state_writer.finish();
-  prev_state_writer.finish();
-  state_id_writer.finish();
   result->tag_positions_changed();
 
   params.set_output("Points"_ustr, GeometrySet::from_pointcloud(result));
