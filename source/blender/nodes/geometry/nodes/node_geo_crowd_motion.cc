@@ -442,9 +442,9 @@ static void node_geo_exec(GeoNodeExecParams params)
       float3 forward = float3(velocity.x, velocity.y, 0.0f);
       const float forward_length = math::length(forward);
       if (forward_length > 1.0e-4f) {
-        /* The point rotation uses +Y as the character forward axis. A positive yaw about +Z turns
-         * +Y towards -X, so negate the X component to turn towards the velocity. */
-        const float yaw = std::atan2(-forward.x, forward.y);
+        /* The character's forward axis is -Y. A rotation of `yaw` about +Z maps local -Y to
+         * (sin(yaw), -cos(yaw)), so this yaw makes -Y point along the velocity. */
+        const float yaw = std::atan2(forward.x, -forward.y);
         const math::Quaternion target_rotation = math::to_quaternion(
             math::EulerXYZ(float3(0.0f, 0.0f, yaw)));
         rotations[i] = math::interpolate(rotations[i],
