@@ -339,6 +339,12 @@ def build_quick_crowd_walk(node_tree):
     links.new(group_input.outputs["Mesh"], instance.inputs["Instance"])
     links.new(sim_output_geometry, instance.inputs["Points"])
 
+    rotation_attr = nodes.new("GeometryNodeInputNamedAttribute")
+    rotation_attr.label = "Agent Rotation"
+    rotation_attr.data_type = "QUATERNION"
+    rotation_attr.inputs["Name"].default_value = "rotation"
+    links.new(rotation_attr.outputs["Attribute"], instance.inputs["Rotation"])
+
     realize = nodes.new("GeometryNodeRealizeInstances")
     realize.label = "Realize Crowd"
     links.new(instance.outputs["Instances"], realize.inputs["Geometry"])
@@ -371,6 +377,7 @@ def build_quick_crowd_walk(node_tree):
     scene_time.location = (1500.0, -260.0)
     bones.location = (1750.0, 260.0)
     instance.location = (1750.0, -60.0)
+    rotation_attr.location = (1500.0, -500.0)
     realize.location = (1980.0, -60.0)
     skin.location = (2220.0, 80.0)
     group_output.location = (2480.0, 80.0)
