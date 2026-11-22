@@ -48,6 +48,9 @@ set(SRC
   nodes/node_geo_combine_bundle.cc
   nodes/node_geo_common.cc
   nodes/node_geo_convex_hull.cc
+  nodes/node_geo_create_crowd_agent.cc
+  nodes/node_geo_crowd_agent_states.cc
+  nodes/node_geo_crowd_animation_info.cc
   nodes/node_geo_cube_grid_topology.cc
   nodes/node_geo_curve_endpoint_selection.cc
   nodes/node_geo_curve_fill.cc
@@ -142,6 +145,7 @@ set(SRC
   nodes/node_geo_import_vdb.cc
   nodes/node_geo_index_of_nearest.cc
   nodes/node_geo_index_switch.cc
+  nodes/node_geo_init_crowd_data.cc
   nodes/node_geo_init_puncliga_data.cc
   nodes/node_geo_init_ragdoll_bodies.cc
   nodes/node_geo_init_rigid_body.cc
@@ -189,6 +193,7 @@ set(SRC
   nodes/node_geo_interpolate_curves.cc
   nodes/node_geo_is_viewport.cc
   nodes/node_geo_join_bundle.cc
+  nodes/node_geo_join_crowd_agents.cc
   nodes/node_geo_join_geometry.cc
   nodes/node_geo_list_get_item.cc
   nodes/node_geo_list_length.cc

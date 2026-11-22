@@ -1164,6 +1164,20 @@ class NODE_MT_gn_dilapido_white_water_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeWhiteWaterSolver")
 
 
+class NODE_MT_gn_dilapido_crowd_base(node_add_menu.NodeMenu):
+    """Crowd agent templates, state tables and spawn initialization."""
+
+    bl_label = "Crowd"
+
+    def draw(self, context):
+        layout = self.layout
+        self.node_operator(layout, "GeometryNodeCreateCrowdAgent")
+        self.node_operator(layout, "GeometryNodeJoinCrowdAgents")
+        self.node_operator(layout, "GeometryNodeCrowdAgentStates")
+        self.node_operator(layout, "GeometryNodeCrowdAnimationInfo")
+        self.node_operator(layout, "GeometryNodeInitCrowdData")
+
+
 class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
     """Everything the Dilapido solvers share, plus one submenu per solver."""
 
@@ -1180,6 +1194,7 @@ class NODE_MT_gn_dilapido_base(node_add_menu.NodeMenu):
         layout.separator()
         self.draw_menu(layout, "RBD")
         self.draw_menu(layout, "Ragdoll")
+        self.draw_menu(layout, "Crowd")
         self.draw_menu(layout, "Puncliga")
         self.draw_menu(layout, "Ignis")
         self.draw_menu(layout, "Textura")
@@ -1231,6 +1246,7 @@ add_menus = {
     "NODE_MT_geometry_node_GEO_DILAPIDO": NODE_MT_gn_dilapido_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_RBD": NODE_MT_gn_dilapido_rbd_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_RAGDOLL": NODE_MT_gn_dilapido_ragdoll_base,
+    "NODE_MT_geometry_node_GEO_DILAPIDO_CROWD": NODE_MT_gn_dilapido_crowd_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_PUNCLIGA": NODE_MT_gn_dilapido_puncliga_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_IGNIS": NODE_MT_gn_dilapido_ignis_base,
     "NODE_MT_geometry_node_GEO_DILAPIDO_TEXTURA": NODE_MT_gn_dilapido_textura_base,

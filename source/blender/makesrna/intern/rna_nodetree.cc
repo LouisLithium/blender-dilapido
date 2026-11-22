@@ -10700,6 +10700,9 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeCornersOfEdge");
   define("GeometryNode", "GeometryNodeCornersOfFace");
   define("GeometryNode", "GeometryNodeCornersOfVertex");
+  define("GeometryNode", "GeometryNodeCreateCrowdAgent");
+  define("GeometryNode", "GeometryNodeCrowdAgentStates");
+  define("GeometryNode", "GeometryNodeCrowdAnimationInfo");
   define("GeometryNode", "GeometryNodeCubeGridTopology");
   define("GeometryNode", "GeometryNodeCurveArc");
   define("GeometryNode", "GeometryNodeCurveEndpointSelection");
@@ -10789,6 +10792,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeImportVDB");
   define("GeometryNode", "GeometryNodeIndexOfNearest");
   define("GeometryNode", "GeometryNodeIndexSwitch", def_geo_index_switch);
+  define("GeometryNode", "GeometryNodeInitCrowdData");
   define("GeometryNode", "GeometryNodeInitPuncligaData");
   define("GeometryNode", "GeometryNodeInitRagdollBodies");
   define("GeometryNode", "GeometryNodeInitRigidBody");
@@ -10834,6 +10838,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeInstanceTransform");
   define("GeometryNode", "GeometryNodeInterpolateCurves");
   define("GeometryNode", "GeometryNodeIsViewport");
+  define("GeometryNode", "GeometryNodeJoinCrowdAgents");
   define("GeometryNode", "GeometryNodeJoinGeometry");
   define("GeometryNode", "GeometryNodeListGetItem");
   define("GeometryNode", "GeometryNodeListLength");
