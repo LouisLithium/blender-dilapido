@@ -26,7 +26,12 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Float>("Blend In"_ustr).default_value(0.2f).min(0.0f);
   b.add_input<decl::Float>("Blend Out"_ustr).default_value(0.2f).min(0.0f);
   b.add_input<decl::Bool>("Loop"_ustr).default_value(true);
-  b.add_input<decl::Float>("Speed"_ustr).default_value(1.0f).min(0.0f);
+  b.add_input<decl::Float>("Speed"_ustr).default_value(1.0f).min(0.0f)
+      .description("Animation playback speed multiplier");
+  b.add_input<decl::Float>("Move Speed"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .description("Movement speed in m/s for Crowd Motion (0 = stationary)");
 
   b.add_output<decl::Bundle>("State"_ustr);
 }
@@ -39,6 +44,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const float blend_out = std::max(params.extract_input<float>("Blend Out"_ustr), 0.0f);
   const bool loop = params.extract_input<bool>("Loop"_ustr);
   const float speed = std::max(params.extract_input<float>("Speed"_ustr), 0.0f);
+  const float move_speed = std::max(params.extract_input<float>("Move Speed"_ustr), 0.0f);
 
   BundlePtr state_ptr = Bundle::create();
   Bundle &state = state_ptr.ensure_mutable_inplace();
@@ -48,6 +54,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   state.add(*BundleKey::from_str("blend_out"), blend_out);
   state.add(*BundleKey::from_str("loop"), loop);
   state.add(*BundleKey::from_str("speed"), speed);
+  state.add(*BundleKey::from_str("move_speed"), move_speed);
   if (animation) {
     state.add(*BundleKey::from_str("animation"), animation);
   }

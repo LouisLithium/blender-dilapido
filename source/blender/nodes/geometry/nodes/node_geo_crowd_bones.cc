@@ -65,6 +65,7 @@ struct TemplateInfo {
   int template_id = 0;
   const PointCloud *rest = nullptr;
   const Bundle *states = nullptr;
+  std::string armature_name;
 };
 
 struct BoneSample {
@@ -98,6 +99,7 @@ static void read_templates(const Bundle &agents, Vector<TemplateInfo> &r_templat
     info.rest = bones->get_pointcloud();
     const std::optional<BundlePtr> states = (*agent)->lookup_path<BundlePtr>("states");
     info.states = states ? states->get() : nullptr;
+    info.armature_name = (*agent)->lookup_path<std::string>("armature_name").value_or("");
     r_templates.append(info);
   }
 }
@@ -192,6 +194,108 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_output<decl::Geometry>("Bones"_ustr);
 }
 
+struct ClipInfo {
+  const Bundle *animation = nullptr;
+  std::string armature_name;
+  std::string action_name;
+  float frame_start = 1.0f;
+  float frame_end = 1.0f;
+  float fps = 24.0f;
+  float speed = 1.0f;
+  float phase = 0.0f;
+  bool loop = true;
+  bool root_motion = false;
+};
+
+static ClipInfo read_clip(const Bundle *state, const TemplateInfo &templ)
+{
+  ClipInfo clip;
+  if (state == nullptr) {
+    return clip;
+  }
+  const std::optional<BundlePtr> animation_ptr = state->lookup_path<BundlePtr>("animation");
+  clip.animation = animation_ptr ? animation_ptr->get() : nullptr;
+
+  const float state_speed = state->lookup_path<float>("speed").value_or(1.0f);
+  if (clip.animation != nullptr) {
+    clip.frame_start = clip.animation->lookup_path<float>("frame_start").value_or(1.0f);
+    clip.frame_end = clip.animation->lookup_path<float>("frame_end")
+                         .value_or(clip.frame_start + 1.0f);
+    clip.fps = clip.animation->lookup_path<float>("fps").value_or(24.0f);
+    clip.speed = clip.animation->lookup_path<float>("speed").value_or(1.0f) *
+                 std::max(state_speed, 0.0f);
+    clip.phase = clip.animation->lookup_path<float>("phase").value_or(0.0f);
+    clip.loop = state->lookup_path<bool>("loop")
+                    .value_or(clip.animation->lookup_path<bool>("loop").value_or(true));
+    clip.root_motion = clip.animation->lookup_path<int>("root_motion").value_or(0) != 0;
+    clip.action_name = clip.animation->lookup_path<std::string>("action_name").value_or("");
+    clip.armature_name = !templ.armature_name.empty() ?
+                             templ.armature_name :
+                             clip.animation->lookup_path<std::string>("armature_name")
+                                 .value_or("");
+  }
+  else {
+    clip.loop = state->lookup_path<bool>("loop").value_or(true);
+    clip.armature_name = templ.armature_name;
+  }
+  return clip;
+}
+
+static float clip_frame(const ClipInfo &clip,
+                        const float time,
+                        const float point_phase,
+                        const float point_speed)
+{
+  const float clip_frames = std::max(clip.frame_end - clip.frame_start, 1.0f);
+  const float phase = point_phase + clip.phase;
+  float time_frames = (time * clip.fps * std::max(clip.speed, 0.0f) *
+                       std::max(point_speed, 0.0f)) +
+                      phase * clip_frames;
+  if (clip.loop) {
+    time_frames = std::fmod(time_frames, clip_frames);
+    if (time_frames < 0.0f) {
+      time_frames += clip_frames;
+    }
+  }
+  else {
+    time_frames = math::clamp(time_frames, 0.0f, clip_frames);
+  }
+  return clip.frame_start + time_frames;
+}
+
+static bAction *find_clip_action(Main *bmain, const ClipInfo &clip, Object *armature)
+{
+  bAction *action = clip.action_name.empty() ?
+                        nullptr :
+                        (bAction *)BKE_libblock_find_name(bmain, ID_AC, clip.action_name.c_str());
+  if (action == nullptr && armature != nullptr && armature->adt != nullptr) {
+    action = armature->adt->action;
+  }
+  return action;
+}
+
+static animrig::slot_handle_t find_clip_slot(bAction *action, Object *armature)
+{
+  if (action == nullptr || armature == nullptr || armature->adt == nullptr) {
+    return animrig::Slot::unassigned;
+  }
+  animrig::Action &action_ref = action->wrap();
+  animrig::slot_handle_t slot_handle = armature->adt->slot_handle;
+  if (action_ref.slot_for_handle(slot_handle) != nullptr) {
+    return slot_handle;
+  }
+  for (const animrig::Slot *slot : action_ref.slots()) {
+    if (slot->idtype == ID_OB) {
+      return slot->handle;
+    }
+  }
+  if (!action_ref.slots().is_empty()) {
+    return action_ref.slots()[0]->handle;
+  }
+  return animrig::Slot::unassigned;
+}
+
+
 static void node_geo_exec(GeoNodeExecParams params)
 {
   BundlePtr agents = params.extract_input<BundlePtr>("Agents"_ustr);
@@ -230,6 +334,10 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_default<int>("state_id", AttrDomain::Point, -1).varray;
   const VArray<MStringProperty> state_names_attr =
       attributes.lookup<MStringProperty>("state").varray;
+  const VArray<MStringProperty> prev_states =
+      attributes.lookup<MStringProperty>("prev_state").varray;
+  const VArray<float> state_times =
+      attributes.lookup_or_default<float>("state_time", AttrDomain::Point, 0.0f).varray;
   const VArray<float> phases =
       attributes.lookup_or_default<float>("phase", AttrDomain::Point, 0.0f).varray;
   const VArray<float> speeds =
@@ -264,108 +372,6 @@ static void node_geo_exec(GeoNodeExecParams params)
     const int bone_count = rest.totpoint;
     if (bone_count == 0) {
       continue;
-    }
-
-    /* Resolve the state's animation metadata. */
-    const std::string state_name = state_names_attr ? crowd::read_string(state_names_attr[point]) :
-                                                      "";
-    const Bundle *state = find_state(templ,
-                                     fallback_states ? fallback_states.get() : nullptr,
-                                     state_name,
-                                     state_ids[point]);
-    const Bundle *animation = nullptr;
-    if (state != nullptr) {
-      const std::optional<BundlePtr> animation_ptr = state->lookup_path<BundlePtr>("animation");
-      animation = animation_ptr ? animation_ptr->get() : nullptr;
-    }
-    const std::string armature_name = animation != nullptr ?
-                                          animation->lookup_path<std::string>("armature_name")
-                                              .value_or("") :
-                                          "";
-    const std::string action_name = animation != nullptr ?
-                                        animation->lookup_path<std::string>("action_name")
-                                            .value_or("") :
-                                        "";
-    float frame_start = animation != nullptr ?
-                            animation->lookup_path<float>("frame_start").value_or(1.0f) :
-                            1.0f;
-    float frame_end = animation != nullptr ?
-                          animation->lookup_path<float>("frame_end").value_or(frame_start + 1.0f) :
-                          frame_start + 1.0f;
-    const float fps = animation != nullptr ?
-                          animation->lookup_path<float>("fps").value_or(24.0f) :
-                          24.0f;
-    const float anim_speed = animation != nullptr ?
-                                 animation->lookup_path<float>("speed").value_or(1.0f) :
-                                 1.0f;
-    const float anim_phase = animation != nullptr ?
-                                 animation->lookup_path<float>("phase").value_or(0.0f) :
-                                 0.0f;
-    const bool anim_loop = animation != nullptr ?
-                               animation->lookup_path<bool>("loop").value_or(true) :
-                               true;
-    const bool root_motion = animation != nullptr &&
-                             animation->lookup_path<int>("root_motion").value_or(0) != 0;
-    /* The state may override the clip's playback settings. */
-    const float state_speed = state != nullptr ?
-                                  state->lookup_path<float>("speed").value_or(1.0f) :
-                                  1.0f;
-    const bool state_loop = state != nullptr ?
-                                state->lookup_path<bool>("loop").value_or(anim_loop) :
-                                anim_loop;
-    const float loop_speed_scale = std::max(anim_speed, 0.0f) * std::max(state_speed, 0.0f);
-
-    Object *armature = armature_name.empty() ?
-                           nullptr :
-                           (Object *)BKE_libblock_find_name(
-                               bmain, ID_OB, armature_name.c_str());
-    bAction *action = action_name.empty() ?
-                          nullptr :
-                          (bAction *)BKE_libblock_find_name(bmain, ID_AC, action_name.c_str());
-    if (action == nullptr && armature != nullptr && armature->adt != nullptr) {
-      action = armature->adt->action;
-    }
-
-    animrig::EvaluationResult evaluated;
-    float action_frame = frame_start;
-    if (action != nullptr && armature != nullptr && armature->adt != nullptr) {
-      const float clip_frames = std::max(frame_end - frame_start, 1.0f);
-      const float phase = phases[point] + anim_phase;
-      float time_frames = (time * fps * loop_speed_scale * std::max(speeds[point], 0.0f)) +
-                          phase * clip_frames;
-      if (state_loop) {
-        time_frames = std::fmod(time_frames, clip_frames);
-        if (time_frames < 0.0f) {
-          time_frames += clip_frames;
-        }
-      }
-      else {
-        time_frames = math::clamp(time_frames, 0.0f, clip_frames);
-      }
-      action_frame = frame_start + time_frames;
-      /* The action may not be the one currently assigned to the armature, so its slot handle can
-       * differ. Prefer the armature's slot when it belongs to this action, else the first object
-       * slot of the action. */
-      animrig::slot_handle_t slot_handle = armature->adt->slot_handle;
-      animrig::Action &action_ref = action->wrap();
-      if (action_ref.slot_for_handle(slot_handle) == nullptr) {
-        slot_handle = animrig::Slot::unassigned;
-        for (const animrig::Slot *slot : action_ref.slots()) {
-          if (slot->idtype == ID_OB) {
-            slot_handle = slot->handle;
-            break;
-          }
-        }
-        if (slot_handle == animrig::Slot::unassigned && !action_ref.slots().is_empty()) {
-          slot_handle = action_ref.slots()[0]->handle;
-        }
-      }
-      if (slot_handle != animrig::Slot::unassigned) {
-        PointerRNA armature_ptr = RNA_id_pointer_create(&armature->id);
-        const AnimationEvalContext eval_context = BKE_animsys_eval_context_construct(
-            const_cast<Depsgraph *>(params.depsgraph()), action_frame);
-        evaluated = animrig::evaluate_action(armature_ptr, action_ref, slot_handle, eval_context);
-      }
     }
 
     /* Rest skeleton data. */
@@ -422,57 +428,125 @@ static void node_geo_exec(GeoNodeExecParams params)
 
     const float scale = std::max(scales[point], 1.0e-4f);
     const float4x4 point_transform = math::from_loc_rot_scale<float4x4>(
-        positions[point], rotations ? math::normalize(rotations[point]) : math::Quaternion::identity(),
+        positions[point],
+        rotations ? math::normalize(rotations[point]) : math::Quaternion::identity(),
         float3(scale));
     const int root_bone = order.is_empty() ? 0 : order[0];
     const float4x4 root_rest = rest_matrices[root_bone];
     /* The point is the spawn anchor; the bone channels carry the animation relative to rest. */
     const float4x4 instance_root = point_transform * math::invert(root_rest);
 
-    Vector<float4x4> pose_matrices(bone_count, float4x4::identity());
-    Vector<int> sample_index(bone_count, -1);
+    /* Resolve the current and previous states. */
+    const std::string state_name = state_names_attr ? crowd::read_string(state_names_attr[point]) :
+                                                      "";
+    const std::string prev_state_name = prev_states ? crowd::read_string(prev_states[point]) : "";
+    const Bundle *state = find_state(templ,
+                                     fallback_states ? fallback_states.get() : nullptr,
+                                     state_name,
+                                     state_ids[point]);
+
+    auto evaluate_clip = [&](const Bundle *clip_state) -> Vector<float4x4> {
+      Vector<float4x4> pose_matrices(bone_count, float4x4::identity());
+      const ClipInfo clip = read_clip(clip_state, templ);
+      Object *armature = clip.armature_name.empty() ?
+                             nullptr :
+                             (Object *)BKE_libblock_find_name(
+                                 bmain, ID_OB, clip.armature_name.c_str());
+      bAction *action = find_clip_action(bmain, clip, armature);
+
+      animrig::EvaluationResult evaluated;
+      if (action != nullptr && armature != nullptr && armature->adt != nullptr) {
+        const float action_frame = clip_frame(clip, time, phases[point], speeds[point]);
+        const animrig::slot_handle_t slot_handle = find_clip_slot(action, armature);
+        if (slot_handle != animrig::Slot::unassigned) {
+          PointerRNA armature_ptr = RNA_id_pointer_create(&armature->id);
+          const AnimationEvalContext eval_context = BKE_animsys_eval_context_construct(
+              const_cast<Depsgraph *>(params.depsgraph()), action_frame);
+          evaluated = animrig::evaluate_action(
+              armature_ptr, action->wrap(), slot_handle, eval_context);
+        }
+      }
+
+      Vector<int> sample_index(bone_count, -1);
+      for (const int i : order) {
+        const std::string bone_name = crowd::read_string(names[i]);
+        const std::string path = fmt::format("pose.bones[\"{}\"].", bone_name);
+        /* In Place: ignore the animated translation of root bones (the point anchors the crowd). */
+        const bool strip_root_motion = !clip.root_motion && bone_parents[i] < 0;
+        const float3 location = strip_root_motion ?
+                                    float3(0.0f) :
+                                    float3(channel_value(evaluated, path + "location", 0, 0.0f),
+                                           channel_value(evaluated, path + "location", 1, 0.0f),
+                                           channel_value(evaluated, path + "location", 2, 0.0f));
+        const float3 size(channel_value(evaluated, path + "scale", 0, 1.0f),
+                          channel_value(evaluated, path + "scale", 1, 1.0f),
+                          channel_value(evaluated, path + "scale", 2, 1.0f));
+        const math::Quaternion rotation = channel_rotation(evaluated, armature, bone_name);
+        const float4x4 chan = math::from_loc_rot_scale<float4x4>(location, rotation, size);
+
+        const int parent_bone = bone_parents[i];
+        const int *parent_point = parent_bone >= 0 ? index_of_bone.lookup_ptr(parent_bone) :
+                                                     nullptr;
+        const bool has_parent = parent_point != nullptr && sample_index[*parent_point] >= 0;
+        const float4x4 rest_local = has_parent ?
+                                        math::invert(rest_matrices[*parent_point]) *
+                                            rest_matrices[i] :
+                                        float4x4::identity();
+        const float4x4 pose = has_parent ?
+                                  pose_matrices[*parent_point] * rest_local * chan :
+                                  instance_root * rest_matrices[i] * chan;
+
+        pose_matrices[i] = pose;
+        sample_index[i] = i;
+      }
+      return pose_matrices;
+    };
+
+    Vector<float4x4> pose_matrices = evaluate_clip(state);
+    const float state_time = state_times ? state_times[point] : 0.0f;
+    const float blend_in = state != nullptr ?
+                               state->lookup_path<float>("blend_in").value_or(0.0f) :
+                               0.0f;
+    if (!prev_state_name.empty() && prev_state_name != state_name && blend_in > 0.0f &&
+        state_time < blend_in)
+    {
+      const Bundle *prev_state = find_state(templ,
+                                            fallback_states ? fallback_states.get() : nullptr,
+                                            prev_state_name,
+                                            -1);
+      if (prev_state != nullptr && prev_state != state) {
+        const Vector<float4x4> previous_pose = evaluate_clip(prev_state);
+        float blend = math::clamp(state_time / std::max(blend_in, 1.0e-6f), 0.0f, 1.0f);
+        blend = blend * blend * (3.0f - 2.0f * blend);
+        for (const int i : IndexRange(bone_count)) {
+          float3 loc_a, loc_b, scale_a, scale_b;
+          math::Quaternion rot_a, rot_b;
+          math::to_loc_rot_scale<true>(pose_matrices[i], loc_a, rot_a, scale_a);
+          math::to_loc_rot_scale<true>(previous_pose[i], loc_b, rot_b, scale_b);
+          pose_matrices[i] = math::from_loc_rot_scale<float4x4>(
+              math::interpolate(loc_a, loc_b, blend),
+              math::interpolate(rot_a, rot_b, blend),
+              math::interpolate(scale_a, scale_b, blend));
+        }
+      }
+    }
+
     for (const int i : order) {
-      const std::string bone_name = crowd::read_string(names[i]);
-      const std::string path = fmt::format("pose.bones[\"{}\"].", bone_name);
-      /* In Place: ignore the animated translation of root bones (the point anchors the crowd). */
-      const bool strip_root_motion = !root_motion && bone_parents[i] < 0;
-      const float3 location = strip_root_motion ?
-                                  float3(0.0f) :
-                                  float3(channel_value(evaluated, path + "location", 0, 0.0f),
-                                         channel_value(evaluated, path + "location", 1, 0.0f),
-                                         channel_value(evaluated, path + "location", 2, 0.0f));
-      const float3 size(channel_value(evaluated, path + "scale", 0, 1.0f),
-                        channel_value(evaluated, path + "scale", 1, 1.0f),
-                        channel_value(evaluated, path + "scale", 2, 1.0f));
-      const math::Quaternion rotation = channel_rotation(evaluated, armature, bone_name);
-      const float4x4 chan = math::from_loc_rot_scale<float4x4>(location, rotation, size);
-
-      const int parent_bone = bone_parents[i];
-      const int *parent_point = parent_bone >= 0 ? index_of_bone.lookup_ptr(parent_bone) :
-                                                   nullptr;
-      const bool has_parent = parent_point != nullptr && sample_index[*parent_point] >= 0;
-      const float4x4 rest_local = has_parent ?
-                                      math::invert(rest_matrices[*parent_point]) * rest_matrices[i] :
-                                      float4x4::identity();
-      const float4x4 pose = has_parent ?
-                                pose_matrices[*parent_point] * rest_local * chan :
-                                instance_root * rest_matrices[i] * chan;
-
-      pose_matrices[i] = pose;
-      sample_index[i] = samples.size();
+      const float4x4 pose = pose_matrices[i];
       samples.append({});
       BoneSample &sample = samples.last();
       sample.position = pose.location();
       sample.pose = pose;
       sample.rest = instance_root * rest_matrices[i];
       sample.bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
-      sample.bone_parent = parent_bone;
+      sample.bone_parent = bone_parents[i];
       sample.length = lengths[i];
       sample.name = names[i];
       sample.agent_id = agent_ids[point];
       sample.template_id = templ.template_id;
       sample.animated = physics_modes[point] == 0;
     }
+
   }
 
   PointCloud *result = BKE_pointcloud_new_nomain(samples.size());

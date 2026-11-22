@@ -15,6 +15,8 @@
 
 #include <algorithm>
 
+#include "DNA_object_types.h"
+
 #include "node_geometry_util.hh"
 
 namespace blender::nodes::node_geo_create_crowd_agent_cc {
@@ -27,6 +29,10 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "Rest/bind skeleton of the template (Armature Bones with Space = Rest), not one frame "
           "of the animation");
+  b.add_input<decl::Object>("Armature"_ustr)
+      .description(
+          "Evaluation rig for the template's Actions. Only supplies the pose channels used to "
+          "resolve the Action F-curve paths; the animation itself is read from the Action");
   b.add_input<decl::Bundle>("States"_ustr)
       .description("State table from Crowd Agent States that this template supports");
   b.add_input<decl::Int>("Spawn Group"_ustr)
@@ -49,6 +55,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet mesh = params.extract_input<GeometrySet>("Mesh"_ustr);
   GeometrySet bones = params.extract_input<GeometrySet>("Bones"_ustr);
+  Object *armature = params.extract_input<Object *>("Armature"_ustr);
   BundlePtr states = params.extract_input<BundlePtr>("States"_ustr);
   const int spawn_group = std::max(params.extract_input<int>("Spawn Group"_ustr), 0);
   const float weight = std::max(params.extract_input<float>("Weight"_ustr), 0.0f);
@@ -59,6 +66,10 @@ static void node_geo_exec(GeoNodeExecParams params)
   agent.add(*BundleKey::from_str("Type"), std::string(crowd::AGENT_TYPE));
   agent.add(*BundleKey::from_str("mesh"), mesh);
   agent.add(*BundleKey::from_str("bones"), bones);
+  if (armature != nullptr) {
+    agent.add(*BundleKey::from_str("armature_name"),
+              std::string(armature->id.name + 2));
+  }
   if (states) {
     agent.add(*BundleKey::from_str("states"), states);
   }

@@ -5,10 +5,11 @@
 /** \file
  * \ingroup nodes
  *
- * `Animation Info`: describe one animation clip for `Crowd Agent States`.
+ * `Animation Info`: describe one animation clip for `Crowd State`.
  *
- * The crowd animation evaluator (C2b) reads `action_name` / frame range / speed / phase and
- * evaluates the action's F-curves per agent. Only the action channels are evaluated; bone
+ * The animation is read from an **Action data-block** in the blend file, not from an armature's
+ * active action. This lets several clips live side by side and keeps `Crowd Bones` independent of
+ * whichever armature is selected in the viewport. Only the action's F-curves are evaluated; bone
  * constraints and drivers are not, so non-baked rigs should be baked first.
  */
 
@@ -22,13 +23,11 @@
 #include "BLI_string_ref.hh"
 
 #include "BKE_action.hh"
-#include "BKE_anim_data.hh"
+#include "BKE_lib_id.hh"
 
 #include "DEG_depsgraph_query.hh"
 
 #include "DNA_action_types.h"
-#include "DNA_anim_types.h"
-#include "DNA_object_types.h"
 #include "DNA_scene_types.h"
 
 #include "node_geometry_util.hh"
@@ -56,8 +55,10 @@ static const EnumPropertyItem root_motion_items[] = {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Object>("Armature"_ustr)
-      .description("Optional: read the action name / frame range from this armature");
+  b.add_input<decl::String>("Action"_ustr)
+      .description(
+          "Name of the Action data-block in this blend file (for example `Walk`). The clip's "
+          "manual frame range is used when available");
   b.add_input<decl::Float>("Frame Start"_ustr)
       .default_value(1.0f)
       .description("First frame of the clip (overridden by the action's frame range when available)");
@@ -81,7 +82,7 @@ static void node_declare(NodeDeclarationBuilder &b)
 
 static void node_geo_exec(GeoNodeExecParams params)
 {
-  Object *armature = params.extract_input<Object *>("Armature"_ustr);
+  std::string action_name = params.extract_input<std::string>("Action"_ustr);
   float frame_start = params.extract_input<float>("Frame Start"_ustr);
   float frame_end = params.extract_input<float>("Frame End"_ustr);
   float fps = params.extract_input<float>("FPS"_ustr);
@@ -90,19 +91,23 @@ static void node_geo_exec(GeoNodeExecParams params)
   const bool loop = params.extract_input<bool>("Loop"_ustr);
   const int root_motion = params.extract_input<MenuValue>("Root Motion"_ustr).value;
 
-  std::string action_name;
-  std::string armature_name;
-  if (armature != nullptr) {
-    armature_name = std::string(armature->id.name + 2);
-  }
-  if (armature != nullptr && armature->adt != nullptr && armature->adt->action != nullptr) {
-    const bAction *action = armature->adt->action;
+  Main *bmain = DEG_get_bmain(params.depsgraph());
+  bAction *action = action_name.empty() ? nullptr :
+                                          (bAction *)BKE_libblock_find_name(
+                                              bmain, ID_AC, action_name.c_str());
+  if (action != nullptr) {
     action_name = std::string(action->id.name + 2);
     if (action->frame_start < action->frame_end) {
       frame_start = action->frame_start;
       frame_end = action->frame_end;
     }
   }
+  else if (!action_name.empty()) {
+    params.error_message_add(
+        NodeWarningType::Warning,
+        TIP_("Animation Info: action data-block not found (check the Action name)"));
+  }
+
   if (const Scene *scene = DEG_get_input_scene(params.depsgraph())) {
     if (fps <= 0.0f) {
       fps = float(scene->r.frs_sec) / std::max(1.0f, float(scene->r.frs_sec_base));
@@ -121,7 +126,6 @@ static void node_geo_exec(GeoNodeExecParams params)
   animation.add(*BundleKey::from_str("loop"), loop);
   animation.add(*BundleKey::from_str("root_motion"), root_motion);
   animation.add(*BundleKey::from_str("action_name"), action_name);
-  animation.add(*BundleKey::from_str("armature_name"), armature_name);
   params.set_output("Animation"_ustr, std::move(animation_ptr));
 }
 
@@ -132,7 +136,8 @@ static void node_register()
   geo_node_type_base(&ntype, "GeometryNodeCrowdAnimationInfo"_ustr);
   ntype.ui_name = "Animation Info";
   ntype.ui_description =
-      "Describe an animation clip (frame range, speed, phase, loop, root motion) for a crowd state";
+      "Describe an animation clip (Action data-block, frame range, speed, phase, loop, root "
+      "motion) for a crowd state";
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.declare = node_declare;
   ntype.geometry_node_execute = node_geo_exec;

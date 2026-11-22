@@ -10703,7 +10703,9 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeCreateCrowdAgent");
   define("GeometryNode", "GeometryNodeCrowdAnimationInfo");
   define("GeometryNode", "GeometryNodeCrowdBones");
+  define("GeometryNode", "GeometryNodeCrowdMotion");
   define("GeometryNode", "GeometryNodeCrowdState");
+  define("GeometryNode", "GeometryNodeCrowdStateSwitch");
   define("GeometryNode", "GeometryNodeCubeGridTopology");
   define("GeometryNode", "GeometryNodeCurveArc");
   define("GeometryNode", "GeometryNodeCurveEndpointSelection");
