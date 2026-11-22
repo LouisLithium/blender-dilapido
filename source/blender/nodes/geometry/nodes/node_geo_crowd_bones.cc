@@ -382,6 +382,8 @@ static void node_geo_exec(GeoNodeExecParams params)
         rest_attributes.lookup_or_default<int>("bone_index", AttrDomain::Point, -1).varray;
     const VArray<int> bone_parents =
         rest_attributes.lookup_or_default<int>("bone_parent", AttrDomain::Point, -1).varray;
+    const VArray<bool> bone_connected =
+        rest_attributes.lookup_or_default<bool>("bone_connected", AttrDomain::Point, false).varray;
     const VArray<float> lengths =
         rest_attributes.lookup_or_default<float>("bone_length", AttrDomain::Point, 1.0f).varray;
     const VArray<float4x4> rest_matrices = rest_attributes
@@ -470,13 +472,16 @@ static void node_geo_exec(GeoNodeExecParams params)
       for (const int i : order) {
         const std::string bone_name = crowd::read_string(names[i]);
         const std::string path = fmt::format("pose.bones[\"{}\"].", bone_name);
-        /* In Place: ignore the animated translation of root bones (the point anchors the crowd). */
+        /* In Place: ignore the animated translation of root bones (the point anchors the crowd).
+         * Connected bones also ignore `loc` in Blender (`BKE_pchan_to_mat4`), otherwise the child
+         * would slide away from its parent and stretch the skin. */
         const bool strip_root_motion = !clip.root_motion && bone_parents[i] < 0;
-        const float3 location = strip_root_motion ?
-                                    float3(0.0f) :
+        const bool apply_location = !strip_root_motion && !bone_connected[i];
+        const float3 location = apply_location ?
                                     float3(channel_value(evaluated, path + "location", 0, 0.0f),
                                            channel_value(evaluated, path + "location", 1, 0.0f),
-                                           channel_value(evaluated, path + "location", 2, 0.0f));
+                                           channel_value(evaluated, path + "location", 2, 0.0f)) :
+                                    float3(0.0f);
         const float3 size(channel_value(evaluated, path + "scale", 0, 1.0f),
                           channel_value(evaluated, path + "scale", 1, 1.0f),
                           channel_value(evaluated, path + "scale", 2, 1.0f));
