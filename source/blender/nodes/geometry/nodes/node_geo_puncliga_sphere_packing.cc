@@ -23,6 +23,8 @@
 #include <optional>
 #include <string>
 
+#include <openvdb/openvdb.h>
+
 #include "BKE_attribute.hh"
 #include "BKE_bvhutils.hh"
 #include "BKE_geometry_fields.hh"

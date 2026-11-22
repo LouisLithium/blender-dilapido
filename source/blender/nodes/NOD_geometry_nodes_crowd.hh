@@ -42,6 +42,7 @@ namespace blender::nodes::crowd {
 
 inline constexpr StringRefNull AGENT_TYPE = "Blender.CrowdAgent";
 inline constexpr StringRefNull AGENTS_TYPE = "Blender.CrowdAgents";
+inline constexpr StringRefNull STATE_TYPE = "Blender.CrowdState";
 inline constexpr StringRefNull STATES_TYPE = "Blender.CrowdStates";
 inline constexpr StringRefNull ANIMATION_TYPE = "Blender.CrowdAnimation";
 

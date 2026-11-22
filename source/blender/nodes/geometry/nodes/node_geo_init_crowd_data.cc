@@ -253,16 +253,23 @@ static void node_geo_exec(GeoNodeExecParams params)
       if (requested.empty()) {
         requested = default_state;
       }
-      for (const int i : state_list.index_range()) {
-        if (state_list[i].name == requested) {
-          state_id = i;
-          state_name = state_list[i].name;
-          break;
+      const auto find_state = [&](const std::string &name) -> int {
+        for (const int i : state_list.index_range()) {
+          if (state_list[i].name == name) {
+            return i;
+          }
         }
+        return -1;
+      };
+      state_id = find_state(requested);
+      if (state_id < 0 && !default_state.empty()) {
+        state_id = find_state(default_state);
       }
       if (state_id < 0 && !state_list.is_empty()) {
         state_id = 0;
-        state_name = state_list[0].name;
+      }
+      if (state_id >= 0) {
+        state_name = state_list[state_id].name;
       }
     }
 

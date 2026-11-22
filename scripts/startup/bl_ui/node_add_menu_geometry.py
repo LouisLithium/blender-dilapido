@@ -1173,7 +1173,8 @@ class NODE_MT_gn_dilapido_crowd_base(node_add_menu.NodeMenu):
         layout = self.layout
         self.node_operator(layout, "GeometryNodeCreateCrowdAgent")
         self.node_operator(layout, "GeometryNodeJoinCrowdAgents")
-        self.node_operator(layout, "GeometryNodeCrowdAgentStates")
+        self.node_operator(layout, "GeometryNodeCrowdState")
+        self.node_operator(layout, "GeometryNodeJoinCrowdStates")
         self.node_operator(layout, "GeometryNodeCrowdAnimationInfo")
         self.node_operator(layout, "GeometryNodeInitCrowdData")
 
