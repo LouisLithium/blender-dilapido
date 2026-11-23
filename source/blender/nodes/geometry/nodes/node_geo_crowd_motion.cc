@@ -226,13 +226,23 @@ static bool sample_navigation(const NavSampler &nav,
       r_distance = nearest_distance;
       return true;
     }
+    /* At/near the goal the flow is zero, but the distance is still meaningful for arrival. */
+    if (nearest_distance <= nav.cell_size * 2.0f) {
+      r_flow = float3(0.0f);
+      r_distance = nearest_distance;
+      return true;
+    }
   }
 
-  /* Nearest reachable cell fallback (also handles blocked cells). */
+  /* Nearest reachable cell fallback (also handles blocked cells). Prefer a cell that still has a
+   * direction; otherwise return the nearest reachable distance so an agent can stop at the goal.
+   */
   constexpr int MAX_RING = 4;
   for (int ring = 0; ring <= MAX_RING; ring++) {
-    int best = -1;
-    float best_length_sq = 0.0f;
+    int best_flow = -1;
+    float best_flow_length_sq = 0.0f;
+    int best_any = -1;
+    float best_any_length_sq = 0.0f;
     for (int dy = -ring; dy <= ring; dy++) {
       for (int dx = -ring; dx <= ring; dx++) {
         if (ring > 0 && std::max(std::abs(dx), std::abs(dy)) != ring) {
@@ -247,21 +257,30 @@ static bool sample_navigation(const NavSampler &nav,
         if (!nav.reachable[index]) {
           continue;
         }
+        const float length_sq = float(dx * dx + dy * dy);
+        if (best_any < 0 || length_sq < best_any_length_sq) {
+          best_any = index;
+          best_any_length_sq = length_sq;
+        }
         const float3 flow = nav.flow[index];
         const float flow_length_sq = math::length_squared(float2(flow.x, flow.y));
         if (flow_length_sq <= 1.0e-8f) {
           continue;
         }
-        const float length_sq = float(dx * dx + dy * dy);
-        if (best < 0 || length_sq < best_length_sq) {
-          best = index;
-          best_length_sq = length_sq;
+        if (best_flow < 0 || length_sq < best_flow_length_sq) {
+          best_flow = index;
+          best_flow_length_sq = length_sq;
         }
       }
     }
-    if (best >= 0) {
-      r_flow = nav.flow[best];
-      r_distance = nav.distance[best];
+    if (best_flow >= 0) {
+      r_flow = nav.flow[best_flow];
+      r_distance = nav.distance[best_flow];
+      return true;
+    }
+    if (best_any >= 0) {
+      r_flow = float3(0.0f);
+      r_distance = nav.distance[best_any];
       return true;
     }
   }
@@ -414,8 +433,9 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Crowd points from Init Crowd Data (one point per agent)");
   b.add_input<decl::Geometry>("Targets"_ustr)
       .description(
-          "Target point cloud. Points may carry a `target_group` attribute; an agent targets the "
-          "nearest point in its own group");
+          "Optional target point cloud when `Navigation` is connected. With navigation the goals "
+          "come from the navigation field; targets are only used as a direct-steering fallback. "
+          "Points may carry a `target_group` attribute");
   b.add_input<decl::Bundle>("States"_ustr)
       .description("State table used to look up each state's Move Speed");
   b.add_input<decl::Float>("Delta Time"_ustr).default_value(1.0f / 24.0f).min(0.0f);
@@ -432,7 +452,8 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Float>("Arrive Radius"_ustr)
       .default_value(0.5f)
       .min(0.0f)
-      .description("Slow down and stop inside this distance from the target");
+      .description(
+          "Slow down and stop inside this distance. With Navigation this uses the path distance");
 
   b.add_input<decl::Float>("Agent Radius"_ustr)
       .default_value(0.25f)
@@ -456,7 +477,9 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value(1.0f)
       .min(0.0f)
       .max(1.0f)
-      .description("Blend between direct steering (0) and the navigation flow (1)");
+      .description(
+          "With Targets connected, blends direct steering (0) with the navigation flow (1). With "
+          "only Navigation, acts as a throttle (0 = stop, 1 = full speed)");
 
   b.add_output<decl::Geometry>("Points"_ustr);
 }
@@ -631,61 +654,84 @@ static void node_geo_exec(GeoNodeExecParams params)
 
       const std::string state_name = src_states ? crowd::read_string(src_states[i]) : "";
       const float state_move_speed = move_speeds.lookup_default(state_name, 1.0f);
-      const float target_distance = target_of[i] >= 0 ?
-                                        math::length(targets[target_of[i]].position -
-                                                     positions[i]) :
-                                        1.0e9f;
-      target_distance_writer.span[i] = target_distance;
-      float3 desired_velocity = float3(0.0f);
-      if (target_of[i] >= 0) {
+
+      const bool has_target = target_of[i] >= 0;
+      float direct_distance = 1.0e9f;
+      float3 direct_direction(0.0f);
+      if (has_target) {
         const float3 to_target = targets[target_of[i]].position - positions[i];
-        const float distance = math::length(float3(to_target.x, to_target.y, 0.0f));
-        if (distance > arrive_radius) {
-          float3 direction = float3(to_target.x, to_target.y, 0.0f) / std::max(distance, 1.0e-6f);
-          if (navigation_sampler.valid && navigation_strength > 0.0f) {
-            float3 flow;
-            float3 push;
-            float path_distance = 1.0e9f;
-            if (sample_navigation(
-                    navigation_sampler, positions[i], target_groups[i], flow, push, path_distance))
-            {
-              /* Remove the part of the flow that points into the obstacle and add a small
-               * outward component, so agents follow the wall instead of grinding into it. */
-              const float2 push_2d(push.x, push.y);
-              const float push_length = math::length(push_2d);
-              if (push_length > 1.0e-4f) {
-                const float2 normal = push_2d / push_length;
-                float2 tangent(flow.x, flow.y);
-                const float inward = std::min(math::dot(tangent, normal), 0.0f);
-                tangent -= normal * inward;
-                if (math::length(tangent) > 1.0e-4f) {
-                  tangent = math::normalize(tangent);
-                }
-                flow = float3(tangent.x, tangent.y, 0.0f) +
-                       float3(normal.x, normal.y, 0.0f) * 0.35f;
-                const float length = math::length(flow);
-                if (length > 1.0e-4f) {
-                  flow /= length;
-                }
-              }
-              float3 blended = direction * (1.0f - navigation_strength) +
-                               flow * navigation_strength;
+        direct_distance = math::length(float3(to_target.x, to_target.y, 0.0f));
+        if (direct_distance > 1.0e-6f) {
+          direct_direction = float3(to_target.x, to_target.y, 0.0f) / direct_distance;
+        }
+      }
+
+      float target_distance = has_target ? direct_distance : 1.0e9f;
+      float steer_distance = has_target ? direct_distance : 1.0e9f;
+      float3 steer_direction = direct_direction;
+      float throttle = 1.0f;
+
+      if (navigation_sampler.valid) {
+        float3 flow;
+        float3 push;
+        float path_distance = 1.0e9f;
+        if (sample_navigation(
+                navigation_sampler, positions[i], target_groups[i], flow, push, path_distance))
+        {
+          target_distance = path_distance;
+          /* Remove the part of the flow that points into the obstacle and add a small outward
+           * component, so agents follow the wall instead of grinding into it. */
+          const float2 push_2d(push.x, push.y);
+          const float push_length = math::length(push_2d);
+          if (push_length > 1.0e-4f) {
+            const float2 normal = push_2d / push_length;
+            float2 tangent(flow.x, flow.y);
+            const float inward = std::min(math::dot(tangent, normal), 0.0f);
+            tangent -= normal * inward;
+            if (math::length(tangent) > 1.0e-4f) {
+              tangent = math::normalize(tangent);
+            }
+            flow = float3(tangent.x, tangent.y, 0.0f) + float3(normal.x, normal.y, 0.0f) * 0.35f;
+            const float length = math::length(flow);
+            if (length > 1.0e-4f) {
+              flow /= length;
+            }
+          }
+          if (has_target) {
+            if (navigation_strength > 0.0f) {
+              const float3 blended = direct_direction * (1.0f - navigation_strength) +
+                                     flow * navigation_strength;
               const float blended_length = math::length(blended);
               if (blended_length > 1.0e-5f) {
-                direction = blended / blended_length;
+                steer_direction = blended / blended_length;
+                steer_distance = path_distance;
               }
             }
           }
-          float speed = max_speed * std::max(point_speeds[i], 0.0f) *
-                        std::max(state_move_speed, 0.0f);
-          if (arrive_radius > 0.0f) {
-            const float slowdown = math::clamp(
-                (distance - arrive_radius) / arrive_radius, 0.0f, 1.0f);
-            speed *= slowdown;
+          else {
+            /* Navigation is the only movement input: it supplies both the direction and the
+             * arrival distance, and `Navigation Strength` acts as a throttle. */
+            steer_direction = flow;
+            steer_distance = path_distance;
+            throttle = navigation_strength;
           }
-          desired_velocity = direction * speed;
         }
       }
+
+      float3 desired_velocity = float3(0.0f);
+      if (steer_distance > arrive_radius &&
+          math::length(float2(steer_direction.x, steer_direction.y)) > 1.0e-5f)
+      {
+        float speed = max_speed * std::max(point_speeds[i], 0.0f) *
+                      std::max(state_move_speed, 0.0f) * throttle;
+        if (arrive_radius > 0.0f) {
+          const float slowdown = math::clamp(
+              (steer_distance - arrive_radius) / arrive_radius, 0.0f, 1.0f);
+          speed *= slowdown;
+        }
+        desired_velocity = steer_direction * speed;
+      }
+      target_distance_writer.span[i] = target_distance;
 
       float3 velocity = velocities[i];
       const float3 delta_v = desired_velocity - velocity;

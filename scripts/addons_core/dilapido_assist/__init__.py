@@ -442,7 +442,6 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     motion.inputs["Separation Strength"].default_value = 4.0
     motion.inputs["Hard Separation"].default_value = True
     links.new(sim_geometry, motion.inputs["Points"])
-    links.new(target_info.outputs["Geometry"], motion.inputs["Targets"])
     links.new(join_states.outputs["States"], motion.inputs["States"])
     links.new(navigation.outputs["Navigation"], motion.inputs["Navigation"])
     links.new(sim_delta, motion.inputs["Delta Time"])
