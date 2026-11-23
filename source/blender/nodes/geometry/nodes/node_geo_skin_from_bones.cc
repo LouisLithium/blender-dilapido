@@ -7,15 +7,24 @@
  *
  * `Skin From Bones`: deform a mesh with the transforms of simulated bone bodies.
  *
- * The mesh's vertex groups are matched to the bone names of the `Bones` input (an instance set from
- * `Init Ragdoll Bodies`, or the point cloud from `Armature Bones`). For every bone the deform
+ * The mesh's vertex groups are matched to the bone names of the `Bones` input (an instance set
+ * from `Init Ragdoll Bodies`, or the point cloud from `Armature Bones`). For every bone the deform
  * matrix is `pose * inverse(rest)`, i.e. the usual armature skinning relation, so a mesh that is
  * already rigged can be driven by the ragdoll without writing the pose back to the armature.
  *
  * Two modes: linear blend skinning (fast, can collapse on twists) and dual quaternion skinning
  * (keeps volume on twists, the default for ragdolls).
+ *
+ * Performance notes:
+ * - Vertex group weights are read from the mesh's `MDeformVert` data (the actual storage), so a
+ *   vertex only visits its own few influences instead of every vertex group of the character.
+ *   Going through `AttributeAccessor::lookup(name)` per group would scan each vertex's weights
+ *   once **per bone**.
+ * - The per-vertex loop runs in parallel; every vertex writes only its own position.
+ * - The hot loop reads a compact `BoneSkin` array (no strings) to stay cache friendly.
  */
 
+#include <array>
 #include <cmath>
 
 #include "BLI_array.hh"
@@ -26,6 +35,7 @@
 #include "BLI_math_quaternion.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_string.h"
+#include "BLI_task.hh"
 #include "BLI_vector.hh"
 
 #include "BKE_attribute.hh"
@@ -58,18 +68,39 @@ static const EnumPropertyItem mode_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
+/** Compact per-bone data used in the per-vertex hot loop. */
+struct BoneSkin {
+  float4x4 deform;
+  math::Quaternion rotation;
+  math::Quaternion dual;
+};
+
 struct BoneTransform {
   std::string name;
   int agent = 0;
-  float4x4 deform;
-  math::Quaternion rotation;
-  float3 translation;
-  math::Quaternion dual;
+  BoneSkin skin;
 };
+
+struct Influence {
+  int bone;
+  float weight;
+};
+
+static constexpr int MAX_INFLUENCES = 8;
 
 static std::string string_from_property(const MStringProperty &property)
 {
   return std::string(property.s, size_t(property.s_len));
+}
+
+static void fill_bone_skin(BoneTransform &bone, const float4x4 &pose, const float4x4 &rest)
+{
+  bone.skin.deform = pose * math::invert(rest);
+  bone.skin.rotation = math::normalize(math::to_quaternion(bone.skin.deform));
+  const float3 translation = bone.skin.deform.location();
+  bone.skin.dual = math::Quaternion(
+                       0.0f, translation.x * 0.5f, translation.y * 0.5f, translation.z * 0.5f) *
+                   bone.skin.rotation;
 }
 
 /** Read the bone names, transforms and rest matrices from instances or a point cloud. */
@@ -87,11 +118,11 @@ static bool read_bones(const GeometrySet &bones,
     }
     const VArray<int> agents =
         attributes.lookup_or_default<int>("agent_id", AttrDomain::Instance, 0).varray;
-    const VArray<float4x4> rests =
-        attributes
-            .lookup_or_default<float4x4>(
-                "bone_rest_matrix", AttrDomain::Instance, float4x4::identity())
-            .varray;
+    const VArray<float4x4> rests = attributes
+                                       .lookup_or_default<float4x4>("bone_rest_matrix",
+                                                                    AttrDomain::Instance,
+                                                                    float4x4::identity())
+                                       .varray;
     const Span<float4x4> transforms = instances.transforms();
     const int count = instances.instances_num();
     r_bones.resize(count);
@@ -99,14 +130,7 @@ static bool read_bones(const GeometrySet &bones,
       BoneTransform &bone = r_bones[i];
       bone.name = string_from_property(names[i]);
       bone.agent = agents[i];
-      bone.deform = transforms[i] * math::invert(rests[i]);
-      bone.rotation = math::normalize(math::to_quaternion(bone.deform));
-      bone.translation = bone.deform.location();
-      bone.dual = math::Quaternion(0.0f,
-                                   bone.translation.x * 0.5f,
-                                   bone.translation.y * 0.5f,
-                                   bone.translation.z * 0.5f) *
-                  bone.rotation;
+      fill_bone_skin(bone, transforms[i], rests[i]);
     }
     return true;
   }
@@ -119,44 +143,124 @@ static bool read_bones(const GeometrySet &bones,
     }
     const VArray<int> agents =
         attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
-    const VArray<float4x4> poses =
-        attributes
-            .lookup_or_default<float4x4>(
-                "bone_pose_matrix", AttrDomain::Point, float4x4::identity())
-            .varray;
-    const VArray<float4x4> rests =
-        attributes
-            .lookup_or_default<float4x4>(
-                "bone_rest_matrix", AttrDomain::Point, float4x4::identity())
-            .varray;
+    const VArray<float4x4> poses = attributes
+                                       .lookup_or_default<float4x4>("bone_pose_matrix",
+                                                                    AttrDomain::Point,
+                                                                    float4x4::identity())
+                                       .varray;
+    const VArray<float4x4> rests = attributes
+                                       .lookup_or_default<float4x4>("bone_rest_matrix",
+                                                                    AttrDomain::Point,
+                                                                    float4x4::identity())
+                                       .varray;
     const int count = bones.get_pointcloud()->totpoint;
     r_bones.resize(count);
     for (const int i : IndexRange(count)) {
       BoneTransform &bone = r_bones[i];
       bone.name = string_from_property(names[i]);
       bone.agent = agents[i];
-      bone.deform = poses[i] * math::invert(rests[i]);
-      bone.rotation = math::normalize(math::to_quaternion(bone.deform));
-      bone.translation = bone.deform.location();
-      bone.dual = math::Quaternion(0.0f,
-                                   bone.translation.x * 0.5f,
-                                   bone.translation.y * 0.5f,
-                                   bone.translation.z * 0.5f) *
-                  bone.rotation;
+      fill_bone_skin(bone, poses[i], rests[i]);
     }
     return true;
   }
-  r_error = "Bones has to be the instance set from Init Ragdoll Bodies or the point cloud from "
-            "Armature Bones";
+  r_error =
+      "Bones has to be the instance set from Init Ragdoll Bodies or the point cloud from "
+      "Armature Bones";
   return false;
 }
 
+/** Keep at most `max` influences, preferring the largest weights. */
+static void add_influence(
+    Influence *influences, int &r_count, const int max, const int bone, const float weight)
+{
+  if (!(weight > 0.0f)) {
+    return;
+  }
+  if (r_count < max) {
+    influences[r_count++] = {bone, weight};
+    return;
+  }
+  int smallest = 0;
+  for (const int i : IndexRange::from_begin_end(1, r_count)) {
+    if (influences[i].weight < influences[smallest].weight) {
+      smallest = i;
+    }
+  }
+  if (weight > influences[smallest].weight) {
+    influences[smallest] = {bone, weight};
+  }
+}
+
+static void apply_skin(const Span<BoneSkin> &skins,
+                       const int mode,
+                       const Influence *influences,
+                       const int count,
+                       const float inv_total,
+                       const float3 rest,
+                       float3 &r_position)
+{
+  if (mode == int(SkinMode::Linear)) {
+    float3 result_position(0.0f);
+    for (const int i : IndexRange(count)) {
+      const Influence &influence = influences[i];
+      result_position += math::transform_point(skins[influence.bone].deform, rest) *
+                         (influence.weight * inv_total);
+    }
+    r_position = result_position;
+    return;
+  }
+
+  /* Dual quaternion skinning. */
+  const math::Quaternion reference_rotation = skins[influences[0].bone].rotation;
+  math::Quaternion real(0.0f, 0.0f, 0.0f, 0.0f);
+  math::Quaternion dual(0.0f, 0.0f, 0.0f, 0.0f);
+  for (const int i : IndexRange(count)) {
+    const Influence &influence = influences[i];
+    const BoneSkin &skin = skins[influence.bone];
+    math::Quaternion bone_real = skin.rotation;
+    math::Quaternion bone_dual = skin.dual;
+    if (math::dot(bone_real, reference_rotation) < 0.0f) {
+      bone_real = bone_real * -1.0f;
+      bone_dual = bone_dual * -1.0f;
+    }
+    const float weight = influence.weight * inv_total;
+    real.w += bone_real.w * weight;
+    real.x += bone_real.x * weight;
+    real.y += bone_real.y * weight;
+    real.z += bone_real.z * weight;
+    dual.w += bone_dual.w * weight;
+    dual.x += bone_dual.x * weight;
+    dual.y += bone_dual.y * weight;
+    dual.z += bone_dual.z * weight;
+  }
+  const float length = math::sqrt(math::dot(real, real));
+  if (!(length > 1.0e-6f)) {
+    return;
+  }
+  real = real * (1.0f / length);
+  dual = dual * (1.0f / length);
+  const math::Quaternion translation_quat = dual * math::conjugate(real) * 2.0f;
+  const float3 translation(translation_quat.x, translation_quat.y, translation_quat.z);
+  const float3x3 rotation = math::from_rotation<float3x3>(real);
+  r_position = math::transform_direction(rotation, rest) + translation;
+}
+
+/** Weights resolved per agent: group index -> bone index, or -1 when the group is unused. */
+struct AgentGroups {
+  Array<int> group_to_bone;
+  bool valid = false;
+};
+
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Geometry>("Mesh"_ustr).description("Mesh to deform, with vertex groups named "
-                                                       "after the bones");
-  b.add_input<decl::Geometry>("Bones"_ustr).description("Bone transforms (instances or a bone "
-                                                        "point cloud)");
+  b.add_input<decl::Geometry>("Mesh"_ustr)
+      .description(
+          "Mesh to deform, with vertex groups named "
+          "after the bones");
+  b.add_input<decl::Geometry>("Bones"_ustr)
+      .description(
+          "Bone transforms (instances or a bone "
+          "point cloud)");
   b.add_input<decl::Menu>("Mode"_ustr)
       .static_items(mode_items)
       .default_value(MenuValue(int(SkinMode::DualQuaternion)))
@@ -164,7 +268,7 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Int>("Max Influences"_ustr)
       .default_value(4)
       .min(1)
-      .max(8)
+      .max(MAX_INFLUENCES)
       .description("Maximum number of bone weights per vertex");
   b.add_input<decl::Bool>("Normalize Weights"_ustr)
       .default_value(true)
@@ -193,7 +297,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   const int mode = params.extract_input<MenuValue>("Mode"_ustr).value;
-  const int max_influences = math::clamp(params.extract_input<int>("Max Influences"_ustr), 1, 8);
+  const int max_influences = math::clamp(
+      params.extract_input<int>("Max Influences"_ustr), 1, MAX_INFLUENCES);
   const bool normalize = params.extract_input<bool>("Normalize Weights"_ustr);
 
   Map<int, Map<std::string, int>> bones_by_agent;
@@ -203,10 +308,6 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   const bke::AttributeAccessor attributes = mesh->attributes();
-  struct WeightChannel {
-    int bone_index;
-    VArray<float> weights;
-  };
   const bool has_vertex_agents = attributes.contains("agent_id");
   const VArray<int> vertex_agents =
       attributes.lookup_or_default<int>("agent_id", AttrDomain::Point, 0).varray;
@@ -233,33 +334,40 @@ static void node_geo_exec(GeoNodeExecParams params)
     slot_agents[item.value] = item.key;
   }
 
-  Vector<Vector<WeightChannel>> channels_by_agent(agent_slots.size());
-  int channel_count = 0;
+  /* One group-index -> bone-index table per agent. This is resolved once, not per vertex. */
+  const int group_count = BLI_listbase_count(&mesh->vertex_group_names);
+  Vector<AgentGroups> agent_groups(agent_slots.size());
+  bool has_any_group = false;
   for (const int slot : slot_agents.index_range()) {
     const Map<std::string, int> *by_name = bones_by_agent.lookup_ptr(slot_agents[slot]);
     if (by_name == nullptr) {
       continue;
     }
-    Vector<WeightChannel> &channels = channels_by_agent[slot];
+    AgentGroups &groups = agent_groups[slot];
+    groups.group_to_bone = Array<int>(group_count, -1);
+    int group_index = 0;
     for (const bDeformGroup &group : mesh->vertex_group_names) {
       const int *bone_index = by_name->lookup_ptr(std::string(group.name));
-      if (!bone_index) {
-        continue;
+      if (bone_index != nullptr) {
+        groups.group_to_bone[group_index] = *bone_index;
+        groups.valid = true;
+        has_any_group = true;
       }
-      const VArray<float> weights = attributes.lookup<float>(group.name, AttrDomain::Point).varray;
-      if (!weights) {
-        continue;
-      }
-      channels.append({*bone_index, weights});
+      group_index++;
     }
-    channel_count += int(channels.size());
   }
-  if (channel_count == 0) {
+  if (!has_any_group) {
     params.error_message_add(
         NodeWarningType::Info,
-        TIP_("Skin From Bones: no vertex group matches a bone name, returning the mesh unchanged"));
+        TIP_(
+            "Skin From Bones: no vertex group matches a bone name, returning the mesh unchanged"));
     params.set_output("Mesh"_ustr, std::move(mesh_geometry));
     return;
+  }
+
+  Array<BoneSkin> skins(bones.size());
+  for (const int i : bones.index_range()) {
+    skins[i] = bones[i].skin;
   }
 
   Mesh *result = BKE_mesh_copy_for_eval(*mesh);
@@ -267,95 +375,136 @@ static void node_geo_exec(GeoNodeExecParams params)
   const Span<float3> rest_positions = mesh->vert_positions();
   const int vertex_count = std::min(positions.size(), rest_positions.size());
 
-  struct Influence {
-    int bone;
-    float weight;
-  };
-  Array<Influence> influences(max_influences);
+  const float3 *rest_data = rest_positions.data();
+  float3 *position_data = positions.data();
+  const AgentGroups *agent_data = agent_groups.data();
+  const int *slot_data = vertex_slot.data();
+  const BoneSkin *skin_data = skins.data();
+  const Span<BoneSkin> skin_span(skin_data, skins.size());
+  const int mode_value = mode;
 
-  for (const int vertex : IndexRange(vertex_count)) {
-    const Vector<WeightChannel> &channels = channels_by_agent[vertex_slot[vertex]];
-    int count = 0;
-    for (const WeightChannel &channel : channels) {
-      const float weight = channel.weights[vertex];
-      if (!(weight > 0.0f)) {
-        continue;
-      }
-      if (count < max_influences) {
-        influences[count++] = {channel.bone_index, weight};
-      }
-      else {
-        /* Keep the largest influences: replace the smallest one if this weight is larger. */
-        int smallest = 0;
-        for (const int i : IndexRange::from_begin_end(1, count)) {
-          if (influences[i].weight < influences[smallest].weight) {
-            smallest = i;
-          }
-        }
-        if (weight > influences[smallest].weight) {
-          influences[smallest] = {channel.bone_index, weight};
-        }
-      }
-    }
+  auto deform_vertex = [&](const int vertex, const Influence *influences, const int count) {
     if (count == 0) {
-      continue;
+      return;
     }
     float selected_total = 0.0f;
     for (const int i : IndexRange(count)) {
       selected_total += influences[i].weight;
     }
     if (!(selected_total > 0.0f)) {
-      continue;
+      return;
     }
     const float inv_total = normalize ? 1.0f / selected_total : 1.0f;
-    const float3 rest = rest_positions[vertex];
+    apply_skin(skin_span,
+               mode_value,
+               influences,
+               count,
+               inv_total,
+               rest_data[vertex],
+               position_data[vertex]);
+  };
 
-    if (mode == int(SkinMode::Linear)) {
-      float3 result_position(0.0f);
-      for (const int i : IndexRange(count)) {
-        const Influence &influence = influences[i];
-        result_position += math::transform_point(bones[influence.bone].deform, rest) *
-                           (influence.weight * inv_total);
+  /* Fast path: read the actual deform weights, so each vertex visits only its own influences. */
+  const Span<MDeformVert> deform_verts = mesh->deform_verts();
+  if (deform_verts.size() >= vertex_count && vertex_count > 0) {
+    const MDeformVert *deform_data = deform_verts.data();
+    threading::parallel_for(IndexRange(vertex_count), 1024, [&](const IndexRange range) {
+      for (const int vertex : range) {
+        const AgentGroups &groups = agent_data[slot_data[vertex]];
+        if (!groups.valid) {
+          continue;
+        }
+        const Array<int> &group_to_bone = groups.group_to_bone;
+        if (group_to_bone.is_empty()) {
+          continue;
+        }
+        const MDeformVert &dvert = deform_data[vertex];
+        std::array<Influence, MAX_INFLUENCES> influences;
+        int count = 0;
+        for (const MDeformWeight &weight : Span<MDeformWeight>(dvert.dw, dvert.totweight)) {
+          const int group = weight.def_nr;
+          if (group < 0 || group >= group_to_bone.size()) {
+            continue;
+          }
+          const int bone = group_to_bone[group];
+          if (bone < 0) {
+            continue;
+          }
+          add_influence(influences.data(), count, max_influences, bone, weight.weight);
+        }
+        deform_vertex(vertex, influences.data(), count);
       }
-      positions[vertex] = result_position;
-      continue;
-    }
-
-    /* Dual quaternion skinning. */
-    const int reference = influences[0].bone;
-    math::Quaternion real(0.0f, 0.0f, 0.0f, 0.0f);
-    math::Quaternion dual(0.0f, 0.0f, 0.0f, 0.0f);
-    for (const int i : IndexRange(count)) {
-      const Influence &influence = influences[i];
-      math::Quaternion bone_real = bones[influence.bone].rotation;
-      math::Quaternion bone_dual = bones[influence.bone].dual;
-      if (math::dot(bone_real, bones[reference].rotation) < 0.0f) {
-        bone_real = bone_real * -1.0f;
-        bone_dual = bone_dual * -1.0f;
-      }
-      const float weight = influence.weight * inv_total;
-      real.w += bone_real.w * weight;
-      real.x += bone_real.x * weight;
-      real.y += bone_real.y * weight;
-      real.z += bone_real.z * weight;
-      dual.w += bone_dual.w * weight;
-      dual.x += bone_dual.x * weight;
-      dual.y += bone_dual.y * weight;
-      dual.z += bone_dual.z * weight;
-    }
-    const float length = math::sqrt(math::dot(real, real));
-    if (!(length > 1.0e-6f)) {
-      continue;
-    }
-    real = real * (1.0f / length);
-    dual = dual * (1.0f / length);
-    const math::Quaternion translation_quat = dual * math::conjugate(real) * 2.0f;
-    const float3 translation(translation_quat.x,
-                             translation_quat.y,
-                             translation_quat.z);
-    const float3x3 rotation = math::from_rotation<float3x3>(real);
-    positions[vertex] = math::transform_direction(rotation, rest) + translation;
+    });
+    result->tag_positions_changed();
+    params.set_output("Mesh"_ustr, GeometrySet::from_mesh(result));
+    return;
   }
+
+  /* Fallback: weights are generic float attributes. Build one channel list per agent, reusing
+   * the group->bone table above. */
+  struct WeightChannel {
+    int bone_index;
+    VArray<float> weights;
+    Span<const float> span;
+  };
+  Vector<Vector<WeightChannel>> channels_by_agent(agent_slots.size());
+  int channel_count = 0;
+  for (const int slot : slot_agents.index_range()) {
+    const AgentGroups &groups = agent_groups[slot];
+    if (!groups.valid) {
+      continue;
+    }
+    Vector<WeightChannel> &channels = channels_by_agent[slot];
+    int group_index = 0;
+    for (const bDeformGroup &group : mesh->vertex_group_names) {
+      const int bone_index = groups.group_to_bone[group_index++];
+      if (bone_index < 0) {
+        continue;
+      }
+      const VArray<float> weights = attributes.lookup<float>(group.name, AttrDomain::Point).varray;
+      if (!weights) {
+        continue;
+      }
+      WeightChannel channel;
+      channel.bone_index = bone_index;
+      channel.weights = weights;
+      if (weights.is_span()) {
+        const Span<float> span = weights.get_internal_span();
+        if (span.size() >= vertex_count) {
+          channel.span = Span<const float>(span.data(), span.size());
+        }
+      }
+      channels.append(channel);
+    }
+    channel_count += int(channels.size());
+  }
+  if (channel_count == 0) {
+    params.error_message_add(
+        NodeWarningType::Info,
+        TIP_(
+            "Skin From Bones: no vertex group matches a bone name, returning the mesh unchanged"));
+    params.set_output("Mesh"_ustr, std::move(mesh_geometry));
+    return;
+  }
+
+  const Vector<WeightChannel> *channels_data = channels_by_agent.data();
+  threading::parallel_for(IndexRange(vertex_count), 1024, [&](const IndexRange range) {
+    for (const int vertex : range) {
+      const int slot = slot_data[vertex];
+      const Vector<WeightChannel> &channels = channels_data[slot];
+      if (channels.is_empty()) {
+        continue;
+      }
+      std::array<Influence, MAX_INFLUENCES> influences;
+      int count = 0;
+      for (const WeightChannel &channel : channels) {
+        const float weight = channel.span.is_empty() ? channel.weights[vertex] :
+                                                       channel.span[vertex];
+        add_influence(influences.data(), count, max_influences, channel.bone_index, weight);
+      }
+      deform_vertex(vertex, influences.data(), count);
+    }
+  });
 
   result->tag_positions_changed();
   params.set_output("Mesh"_ustr, GeometrySet::from_mesh(result));
@@ -378,4 +527,3 @@ static void node_register()
 NOD_REGISTER_NODE(node_register)
 
 }  // namespace blender::nodes::node_geo_skin_from_bones_cc
-
