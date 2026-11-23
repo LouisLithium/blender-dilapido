@@ -618,6 +618,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_add_for_write_span<float>("target_distance", domain);
   bke::SpanAttributeWriter<float> blend_duration_writer =
       attributes.lookup_or_add_for_write_span<float>("blend_duration", domain);
+  bke::SpanAttributeWriter<float> speed_ratio_writer =
+      attributes.lookup_or_add_for_write_span<float>("speed_ratio", domain);
 
   const bke::AttributeAccessor src_attributes = points->attributes();
   const VArray<int> target_groups =
@@ -677,6 +679,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   build_agent_grid(positions, cell_size, grid);
 
   Array<float3> separation(count, float3(0.0f));
+  Array<float> nominal_speeds(count, 0.0f);
   if (separation_strength > 0.0f && avoidance_radius > 0.0f) {
     threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
       for (const int i : range) {
@@ -849,6 +852,9 @@ static void node_geo_exec(GeoNodeExecParams params)
       if (speed_now > speed_limit) {
         velocity *= speed_limit / speed_now;
       }
+      nominal_speeds[i] = state_move_speed > 1.0e-4f ?
+                              state_move_speed * std::max(point_speeds[i], 0.0f) :
+                              0.0f;
 
       float3 new_position = positions[i] + velocity * delta_time;
 
@@ -980,12 +986,23 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
   }
 
+  for (const int i : IndexRange(count)) {
+    const float nominal = nominal_speeds[i];
+    float ratio = 1.0f;
+    if (nominal > 1.0e-4f) {
+      ratio = math::clamp(
+          math::length(float2(velocities[i].x, velocities[i].y)) / nominal, 0.0f, 3.0f);
+    }
+    speed_ratio_writer.span[i] = ratio;
+  }
+
   position_writer.finish();
   velocity_writer.finish();
   rotation_writer.finish();
   state_time_writer.finish();
   target_distance_writer.finish();
   blend_duration_writer.finish();
+  speed_ratio_writer.finish();
   result->tag_positions_changed();
 
   params.set_output("Points"_ustr, GeometrySet::from_pointcloud(result));

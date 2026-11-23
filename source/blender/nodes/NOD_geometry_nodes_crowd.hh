@@ -24,6 +24,11 @@
  *   `agent_id` (int, stable), `template_id` (int, -1 = unassigned), `spawn_group` (int),
  *   `state` (string), `state_id` (int), `phase` (float 0..1), `speed` (float), `scale` (float),
  *   `active` (bool), `physics_mode` (int, 0 = kinematic, 1 = ragdoll, 2 = disabled).
+ *
+ * Attributes written by `Crowd Motion` / `Crowd State Switch`:
+ *   `velocity`, `rotation`, `state_time`, `target_distance`, `blend_duration` (running transition
+ *   duration), `speed_ratio` (actual horizontal speed / nominal state speed), `prev_state`,
+ *   `prev_phase`.
  */
 
 #pragma once

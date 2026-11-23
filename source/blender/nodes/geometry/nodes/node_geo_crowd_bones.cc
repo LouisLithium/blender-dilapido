@@ -8,10 +8,12 @@
  * `Crowd Bones`: evaluate the per-state action once per agent and emit the posed bone cloud for
  * the whole crowd.
  *
- * C2b-1 handles a single state per agent (no cross-fade yet). The action is evaluated through the
- * animation system (`animrig::evaluate_action`) against the template armature, so only the
- * action's F-curves are used; bone constraints/drivers are not evaluated. Each agent's `phase`
- * offsets the clip in seconds/frames, and the point transform replaces the template armature root.
+ * The action is evaluated through the animation system (`animrig::evaluate_action`) against the
+ * template armature, so only the action's F-curves are used; bone constraints/drivers are not
+ * evaluated. Each agent's `phase` offsets the clip in seconds/frames, and the point transform
+ * replaces the template armature root. `prev_state` / `prev_phase` / `state_time` drive the
+ * cross-fade, and `speed_ratio` (written by `Crowd Motion`) can scale playback and thigh swing so
+ * the feet keep up with the actual movement speed.
  *
  * Output point attributes match `Skin From Bones` / `Init Ragdoll Bodies`:
  * `position`, `bone_pose_matrix`, `bone_rest_matrix`, `bone_index`, `bone_parent`, `bone_length`,
@@ -19,6 +21,7 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <optional>
 #include <string>
@@ -143,6 +146,27 @@ static const Bundle *find_state(const TemplateInfo &templ,
   return state_by_index(states, state_id);
 }
 
+/** Bones whose rotation deviation from rest drives the stride (thigh / upper leg). */
+static Vector<bool> find_stride_bones(const VArray<MStringProperty> &names, const int count)
+{
+  Vector<bool> result(count, false);
+  for (const int i : IndexRange(count)) {
+    if (!names[i].s_len) {
+      continue;
+    }
+    std::string name = crowd::read_string(names[i]);
+    std::transform(name.begin(), name.end(), name.begin(), [](const unsigned char c) {
+      return char(std::tolower(c));
+    });
+    if (name.find("thigh") != std::string::npos || name.find("upleg") != std::string::npos ||
+        name.find("upperleg") != std::string::npos || name.find("upper_leg") != std::string::npos)
+    {
+      result[i] = true;
+    }
+  }
+  return result;
+}
+
 static float channel_value(const animrig::EvaluationResult &result,
                            const std::string &path,
                            const int index,
@@ -189,6 +213,34 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Float>("Time"_ustr)
       .default_value(0.0f)
       .description("Animation time in seconds (e.g. Scene Time > Seconds)");
+  b.add_input<decl::Bool>("Speed Match"_ustr)
+      .default_value(true)
+      .description(
+          "Scale playback and stride from the `speed_ratio` attribute written by Crowd Motion "
+          "(actual speed / nominal state speed)");
+  b.add_input<decl::Float>("Stride Scale"_ustr)
+      .default_value(0.35f)
+      .min(0.0f)
+      .max(1.0f)
+      .description(
+          "How much of a speed mismatch is taken by stride length instead of playback rate "
+          "(0 = frequency only, 1 = stride only)");
+  b.add_input<decl::Float>("Min Playback"_ustr)
+      .default_value(0.5f)
+      .min(0.01f)
+      .description("Lower clamp for the playback rate");
+  b.add_input<decl::Float>("Max Playback"_ustr)
+      .default_value(1.8f)
+      .min(0.01f)
+      .description("Upper clamp for the playback rate");
+  b.add_input<decl::Float>("Min Stride"_ustr)
+      .default_value(0.75f)
+      .min(0.05f)
+      .description("Lower clamp for the stride amplitude");
+  b.add_input<decl::Float>("Max Stride"_ustr)
+      .default_value(1.3f)
+      .min(0.05f)
+      .description("Upper clamp for the stride amplitude");
 
   b.add_output<decl::Geometry>("Bones"_ustr);
 }
@@ -300,6 +352,14 @@ static void node_geo_exec(GeoNodeExecParams params)
   BundlePtr fallback_states = params.extract_input<BundlePtr>("States"_ustr);
   GeometrySet instances_geometry = params.extract_input<GeometrySet>("Instances"_ustr);
   const float time = params.extract_input<float>("Time"_ustr);
+  const bool speed_match = params.extract_input<bool>("Speed Match"_ustr);
+  const float stride_scale = math::clamp(
+      params.extract_input<float>("Stride Scale"_ustr), 0.0f, 1.0f);
+  const float min_playback = std::max(params.extract_input<float>("Min Playback"_ustr), 0.01f);
+  const float max_playback = std::max(params.extract_input<float>("Max Playback"_ustr),
+                                      min_playback);
+  const float min_stride = std::max(params.extract_input<float>("Min Stride"_ustr), 0.05f);
+  const float max_stride = std::max(params.extract_input<float>("Max Stride"_ustr), min_stride);
 
   const PointCloud *instances = instances_geometry.get_pointcloud();
   if (!instances || !agents) {
@@ -339,6 +399,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   const VArray<float> phases =
       attributes.lookup_or_default<float>("phase", AttrDomain::Point, 0.0f).varray;
   const VArray<float> prev_phases = attributes.lookup<float>("prev_phase").varray;
+  const VArray<float> speed_ratios =
+      attributes.lookup_or_default<float>("speed_ratio", AttrDomain::Point, 1.0f).varray;
   const VArray<float> speeds =
       attributes.lookup_or_default<float>("speed", AttrDomain::Point, 1.0f).varray;
   const VArray<float> scales =
@@ -393,6 +455,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     if (!names) {
       continue;
     }
+    const Vector<bool> stride_bones = find_stride_bones(names, bone_count);
 
     Map<int, int> index_of_bone;
     for (const int i : IndexRange(bone_count)) {
@@ -443,7 +506,9 @@ static void node_geo_exec(GeoNodeExecParams params)
         templ, fallback_states ? fallback_states.get() : nullptr, state_name, state_ids[point]);
 
     auto evaluate_clip = [&](const Bundle *clip_state,
-                             const float point_phase) -> Vector<float4x4> {
+                             const float point_phase,
+                             const float playback_rate,
+                             const float stride) -> Vector<float4x4> {
       Vector<float4x4> pose_matrices(bone_count, float4x4::identity());
       const ClipInfo clip = read_clip(clip_state, templ);
       Object *armature = clip.armature_name.empty() ?
@@ -454,7 +519,8 @@ static void node_geo_exec(GeoNodeExecParams params)
 
       animrig::EvaluationResult evaluated;
       if (action != nullptr && armature != nullptr && armature->adt != nullptr) {
-        const float action_frame = clip_frame(clip, time, point_phase, speeds[point]);
+        const float action_frame = clip_frame(
+            clip, time, point_phase, speeds[point] * playback_rate);
         const animrig::slot_handle_t slot_handle = find_clip_slot(action, armature);
         if (slot_handle != animrig::Slot::unassigned) {
           PointerRNA armature_ptr = RNA_id_pointer_create(&armature->id);
@@ -483,7 +549,17 @@ static void node_geo_exec(GeoNodeExecParams params)
                           channel_value(evaluated, path + "scale", 1, 1.0f),
                           channel_value(evaluated, path + "scale", 2, 1.0f));
         const math::Quaternion rotation = channel_rotation(evaluated, armature, bone_name);
-        const float4x4 chan = math::from_loc_rot_scale<float4x4>(location, rotation, size);
+        float4x4 chan = math::from_loc_rot_scale<float4x4>(location, rotation, size);
+        if (stride != 1.0f && stride_bones[i]) {
+          /* Scale the hip swing around the rest pose. The leg chain inherits it, so the foot
+           * travels farther while the knee/foot pose stays authored. */
+          float3 chan_location;
+          float3 chan_scale;
+          math::Quaternion chan_rotation;
+          math::to_loc_rot_scale<true>(chan, chan_location, chan_rotation, chan_scale);
+          chan_rotation = math::interpolate(math::Quaternion::identity(), chan_rotation, stride);
+          chan = math::from_loc_rot_scale<float4x4>(chan_location, chan_rotation, chan_scale);
+        }
 
         const int parent_bone = bone_parents[i];
         const int *parent_point = parent_bone >= 0 ? index_of_bone.lookup_ptr(parent_bone) :
@@ -501,7 +577,17 @@ static void node_geo_exec(GeoNodeExecParams params)
       return pose_matrices;
     };
 
-    Vector<float4x4> pose_matrices = evaluate_clip(state, phases[point]);
+    const float state_move_speed = state != nullptr ?
+                                       state->lookup_path<float>("move_speed").value_or(0.0f) :
+                                       0.0f;
+    const float speed_ratio = (speed_match && state_move_speed > 1.0e-4f) ?
+                                  math::clamp(speed_ratios[point], 0.0f, 3.0f) :
+                                  1.0f;
+    const float playback_rate = math::clamp(
+        std::pow(speed_ratio, 1.0f - stride_scale), min_playback, max_playback);
+    const float stride = math::clamp(std::pow(speed_ratio, stride_scale), min_stride, max_stride);
+
+    Vector<float4x4> pose_matrices = evaluate_clip(state, phases[point], playback_rate, stride);
     const float state_time = state_times ? state_times[point] : 0.0f;
     const float blend_in = state != nullptr ?
                                state->lookup_path<float>("blend_in").value_or(0.0f) :
@@ -520,7 +606,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       if (prev_state != nullptr && prev_state != state && duration > 0.0f && state_time < duration)
       {
         const Vector<float4x4> previous_pose = evaluate_clip(
-            prev_state, prev_phases ? prev_phases[point] : phases[point]);
+            prev_state, prev_phases ? prev_phases[point] : phases[point], playback_rate, stride);
         float blend = math::clamp(state_time / std::max(duration, 1.0e-6f), 0.0f, 1.0f);
         blend = blend * blend * (3.0f - 2.0f * blend);
         /* `blend` is the weight of the *target* state: 0 = previous pose, 1 = current pose. */

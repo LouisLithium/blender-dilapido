@@ -488,6 +488,7 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
 
     bones = nodes.new("GeometryNodeCrowdBones")
     bones.label = "Crowd Bones"
+    bones.inputs["Speed Match"].default_value = True
     links.new(join_agents.outputs["Agents"], bones.inputs["Agents"])
     links.new(join_states.outputs["States"], bones.inputs["States"])
     links.new(sim_output_geometry, bones.inputs["Instances"])
