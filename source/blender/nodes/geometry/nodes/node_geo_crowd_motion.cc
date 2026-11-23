@@ -17,6 +17,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include "NOD_geometry_nodes_bundle.hh"
@@ -285,6 +286,77 @@ static bool sample_navigation(const NavSampler &nav,
     }
   }
   return false;
+}
+
+/**
+ * Position correction that keeps an agent out of the blocked navigation cells. The navigation
+ * grid already rasterizes the obstacles with the navigation agent radius, so the center of a free
+ * cell is a walkable spot. When the center is inside a blocked cell (typically because hard
+ * separation pushed the agent sideways), move it to the nearest free cell center.
+ */
+static float3 navigation_escape(const NavSampler &nav, const float3 position)
+{
+  if (!nav.valid) {
+    return float3(0.0f);
+  }
+  const float gx = (position.x - nav.min.x) / nav.cell_size;
+  const float gy = (position.y - nav.min.y) / nav.cell_size;
+  const int x = int(std::floor(gx));
+  const int y = int(std::floor(gy));
+  if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+    return float3(0.0f);
+  }
+  if (!nav.blocked[y * nav.dims_x + x]) {
+    return float3(0.0f);
+  }
+
+  /* Chebyshev rings grow by one cell; an outer ring can never be closer than a cell found in the
+   * current one, so the first ring with a free cell is enough. */
+  constexpr int MAX_RING = 16;
+  int best_x = -1;
+  int best_y = -1;
+  float best_distance_sq = std::numeric_limits<float>::max();
+  for (int ring = 1; ring <= MAX_RING; ring++) {
+    for (int dy = -ring; dy <= ring; dy++) {
+      for (int dx = -ring; dx <= ring; dx++) {
+        if (std::max(std::abs(dx), std::abs(dy)) != ring) {
+          continue;
+        }
+        const int cx = x + dx;
+        const int cy = y + dy;
+        if (cx < 0 || cy < 0 || cx >= nav.dims_x || cy >= nav.dims_y) {
+          continue;
+        }
+        if (nav.blocked[cy * nav.dims_x + cx]) {
+          continue;
+        }
+        const float2 center = nav.min + float2((float(cx) + 0.5f) * nav.cell_size,
+                                               (float(cy) + 0.5f) * nav.cell_size);
+        const float distance_sq = math::length_squared(center - float2(position.x, position.y));
+        if (distance_sq < best_distance_sq) {
+          best_distance_sq = distance_sq;
+          best_x = cx;
+          best_y = cy;
+        }
+      }
+    }
+    if (best_x >= 0) {
+      break;
+    }
+  }
+  if (best_x < 0) {
+    return float3(0.0f);
+  }
+
+  const float2 target = nav.min + float2((float(best_x) + 0.5f) * nav.cell_size,
+                                         (float(best_y) + 0.5f) * nav.cell_size);
+  float2 push = target - float2(position.x, position.y);
+  const float max_push = nav.cell_size * 2.0f;
+  const float length = math::length(push);
+  if (length > max_push) {
+    push *= max_push / std::max(length, 1.0e-6f);
+  }
+  return float3(push.x, push.y, 0.0f);
 }
 
 struct AgentGrid {
@@ -774,7 +846,8 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   /* Hard non-overlap, Jacobi style: every agent pushes itself away from all overlapping
    * neighbours, then all pushes are applied together (deterministic, independent of thread
-   * scheduling). */
+   * scheduling). Writing only the agent's own push avoids cross-thread writes: a pair
+   * contributes half the overlap to each side. */
   if (hard_separation) {
     for (int iteration = 0; iteration < 2; iteration++) {
       Array<float3> push(count, float3(0.0f));
@@ -784,6 +857,7 @@ static void node_geo_exec(GeoNodeExecParams params)
             continue;
           }
           const int2 center = grid.cell_of(positions[i]);
+          int found = 0;
           for (int dy = -1; dy <= 1; dy++) {
             const int y = center.y + dy;
             if (y < 0 || y >= grid.dims.y) {
@@ -799,7 +873,7 @@ static void node_geo_exec(GeoNodeExecParams params)
               const int end = grid.offsets[cell + 1];
               for (const int slot : IndexRange(begin, end - begin)) {
                 const int other = grid.indices[slot];
-                if (other <= i) {
+                if (other == i) {
                   continue;
                 }
                 const float3 delta = positions[i] - positions[other];
@@ -812,8 +886,17 @@ static void node_geo_exec(GeoNodeExecParams params)
                 const float3 direction = distance > 1.0e-6f ? delta / distance :
                                                               float3(1.0f, 0.0f, 0.0f);
                 push[i] += direction * (overlap * 0.5f);
-                push[other] -= direction * (overlap * 0.5f);
+                found++;
+                if (found >= max_neighbors) {
+                  break;
+                }
               }
+              if (found >= max_neighbors) {
+                break;
+              }
+            }
+            if (found >= max_neighbors) {
+              break;
             }
           }
         }
@@ -823,6 +906,48 @@ static void node_geo_exec(GeoNodeExecParams params)
         position_writer.span[i] = positions[i];
       }
       build_agent_grid(positions, cell_size, grid);
+    }
+  }
+
+  /* Walkable constraint, after the agent-agent pushes: separation can squeeze agents into the
+   * clearance band around an obstacle. Moving the center to a free navigation cell is a hard
+   * constraint, so it runs last and is not mixed with separation. */
+  if (navigation_sampler.valid) {
+    for (int iteration = 0; iteration < 3; iteration++) {
+      Array<float3> push(count, float3(0.0f));
+      threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
+        for (const int i : range) {
+          if (!actives[i]) {
+            continue;
+          }
+          const float3 escape = navigation_escape(navigation_sampler, positions[i]);
+          push[i] = escape;
+          const float2 escape_2d(escape.x, escape.y);
+          const float escape_length = math::length(escape_2d);
+          if (escape_length > 1.0e-5f) {
+            /* Let the agent slide along the obstacle instead of re-entering it next frame. */
+            const float2 direction = escape_2d / escape_length;
+            const float inward = std::min(
+                math::dot(float2(velocities[i].x, velocities[i].y), direction), 0.0f);
+            velocities[i] -= float3(direction.x, direction.y, 0.0f) * inward;
+          }
+        }
+      });
+      bool moved = false;
+      for (const int i : IndexRange(count)) {
+        if (math::length_squared(push[i]) <= 0.0f) {
+          continue;
+        }
+        moved = true;
+        positions[i] += push[i];
+        position_writer.span[i] = positions[i];
+      }
+      if (!moved) {
+        break;
+      }
+    }
+    for (const int i : IndexRange(count)) {
+      velocity_writer.span[i] = velocities[i];
     }
   }
 

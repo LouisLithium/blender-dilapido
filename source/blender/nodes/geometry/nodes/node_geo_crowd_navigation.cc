@@ -262,6 +262,7 @@ static float2 cell_center(const NavResult &nav, const int2 cell)
 static void rasterize_obstacles(const Mesh *mesh, NavResult &nav, const BuildParams &params)
 {
   const Span<float3> positions = mesh->vert_positions();
+  const Span<int> corner_verts = mesh->corner_verts();
   const Span<int3> tris = mesh->corner_tris();
   const int dims_x = nav.dims_x;
   const int dims_y = nav.dims_y;
@@ -271,9 +272,10 @@ static void rasterize_obstacles(const Mesh *mesh, NavResult &nav, const BuildPar
   const float high = params.ground_z + params.agent_height;
 
   for (const int3 &tri : tris) {
-    const float3 &p0 = positions[tri.x];
-    const float3 &p1 = positions[tri.y];
-    const float3 &p2 = positions[tri.z];
+    /* `corner_tris` stores corner indices; map them through `corner_verts`. */
+    const float3 &p0 = positions[corner_verts[tri.x]];
+    const float3 &p1 = positions[corner_verts[tri.y]];
+    const float3 &p2 = positions[corner_verts[tri.z]];
     const float z_min = std::min({p0.z, p1.z, p2.z});
     const float z_max = std::max({p0.z, p1.z, p2.z});
     /* Entirely below the step height: the crowd can walk over it. */
