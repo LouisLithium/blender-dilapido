@@ -457,9 +457,15 @@ static void read_targets(const GeometrySet &geometry, Vector<Target> &r_targets)
   }
 }
 
-static Map<std::string, float> read_move_speeds(const Bundle *states)
+struct StateInfo {
+  float move_speed = 1.0f;
+  float blend_in = 0.0f;
+  float blend_out = 0.0f;
+};
+
+static Map<std::string, StateInfo> read_state_info(const Bundle *states)
 {
-  Map<std::string, float> result;
+  Map<std::string, StateInfo> result;
   if (states == nullptr) {
     return result;
   }
@@ -474,7 +480,11 @@ static Map<std::string, float> read_move_speeds(const Bundle *states)
     if (name.empty()) {
       continue;
     }
-    result.add(name, (*state)->lookup_path<float>("move_speed").value_or(1.0f));
+    StateInfo info;
+    info.move_speed = (*state)->lookup_path<float>("move_speed").value_or(1.0f);
+    info.blend_in = std::max((*state)->lookup_path<float>("blend_in").value_or(0.0f), 0.0f);
+    info.blend_out = std::max((*state)->lookup_path<float>("blend_out").value_or(0.0f), 0.0f);
+    result.add(name, info);
   }
   return result;
 }
@@ -588,7 +598,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   Vector<Target> targets;
   read_targets(targets_geometry, targets);
-  const Map<std::string, float> move_speeds = read_move_speeds(states.get());
+  const Map<std::string, StateInfo> state_info = read_state_info(states.get());
   NavSampler navigation_sampler;
   read_navigation(navigation.get(), navigation_sampler);
 
@@ -606,6 +616,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_add_for_write_span<float>("state_time", domain);
   bke::SpanAttributeWriter<float> target_distance_writer =
       attributes.lookup_or_add_for_write_span<float>("target_distance", domain);
+  bke::SpanAttributeWriter<float> blend_duration_writer =
+      attributes.lookup_or_add_for_write_span<float>("blend_duration", domain);
 
   const bke::AttributeAccessor src_attributes = points->attributes();
   const VArray<int> target_groups =
@@ -618,6 +630,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       src_attributes.lookup_or_default<bool>("active", AttrDomain::Point, true).varray;
   const VArray<MStringProperty> src_states =
       src_attributes.lookup<MStringProperty>("state").varray;
+  const VArray<MStringProperty> src_prev_states =
+      src_attributes.lookup<MStringProperty>("prev_state").varray;
   const VArray<float> src_state_times =
       src_attributes.lookup_or_default<float>("state_time", AttrDomain::Point, 0.0f).varray;
   const VArray<math::Quaternion> src_rotations = src_attributes
@@ -712,6 +726,22 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
     for (const int i : range) {
+      const std::string state_name = src_states ? crowd::read_string(src_states[i]) : "";
+      const StateInfo info = state_info.lookup_default(state_name, StateInfo());
+      /* Duration of the transition that is currently running: the target's Blend In and the
+       * previous state's Blend Out, whichever is longer. `Crowd State Switch` uses this to wait
+       * until the blend has finished. */
+      float blend_duration = 0.0f;
+      if (!state_name.empty()) {
+        const std::string prev_name = src_prev_states ? crowd::read_string(src_prev_states[i]) :
+                                                        "";
+        if (!prev_name.empty() && prev_name != state_name) {
+          const StateInfo prev_info = state_info.lookup_default(prev_name, StateInfo());
+          blend_duration = std::max(info.blend_in, prev_info.blend_out);
+        }
+      }
+      blend_duration_writer.span[i] = blend_duration;
+
       if (!actives[i]) {
         state_time_writer.span[i] = src_state_times[i];
         position_writer.span[i] = positions[i];
@@ -724,8 +754,7 @@ static void node_geo_exec(GeoNodeExecParams params)
         continue;
       }
 
-      const std::string state_name = src_states ? crowd::read_string(src_states[i]) : "";
-      const float state_move_speed = move_speeds.lookup_default(state_name, 1.0f);
+      const float state_move_speed = info.move_speed;
 
       const bool has_target = target_of[i] >= 0;
       float direct_distance = 1.0e9f;
@@ -956,6 +985,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   rotation_writer.finish();
   state_time_writer.finish();
   target_distance_writer.finish();
+  blend_duration_writer.finish();
   result->tag_positions_changed();
 
   params.set_output("Points"_ustr, GeometrySet::from_pointcloud(result));

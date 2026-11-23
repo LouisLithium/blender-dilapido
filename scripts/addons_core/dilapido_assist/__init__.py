@@ -468,14 +468,18 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     switch_idle = nodes.new("GeometryNodeCrowdStateSwitch")
     switch_idle.label = "Reached -> Idle"
     switch_idle.inputs["State"].default_value = "Idle"
+    switch_idle.inputs["Wait For Blend"].default_value = True
     links.new(motion.outputs["Points"], switch_idle.inputs["Points"])
     links.new(close_compare.outputs["Result"], switch_idle.inputs["Condition"])
+    links.new(join_states.outputs["States"], switch_idle.inputs["States"])
 
     switch_walk = nodes.new("GeometryNodeCrowdStateSwitch")
     switch_walk.label = "Leaving -> Walk"
     switch_walk.inputs["State"].default_value = "Walk"
+    switch_walk.inputs["Wait For Blend"].default_value = True
     links.new(switch_idle.outputs["Points"], switch_walk.inputs["Points"])
     links.new(far_compare.outputs["Result"], switch_walk.inputs["Condition"])
+    links.new(join_states.outputs["States"], switch_walk.inputs["States"])
     links.new(switch_walk.outputs["Points"], sim_output_input)
 
     # ---------------------------------------------------------------- animation and skinning

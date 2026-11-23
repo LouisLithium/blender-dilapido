@@ -5,13 +5,13 @@
 /** \file
  * \ingroup nodes
  *
- * `Crowd Bones`: evaluate the per-state action once per agent and emit the posed bone cloud for the
- * whole crowd.
+ * `Crowd Bones`: evaluate the per-state action once per agent and emit the posed bone cloud for
+ * the whole crowd.
  *
  * C2b-1 handles a single state per agent (no cross-fade yet). The action is evaluated through the
- * animation system (`animrig::evaluate_action`) against the template armature, so only the action's
- * F-curves are used; bone constraints/drivers are not evaluated. Each agent's `phase` offsets the
- * clip in seconds/frames, and the point transform replaces the template armature root.
+ * animation system (`animrig::evaluate_action`) against the template armature, so only the
+ * action's F-curves are used; bone constraints/drivers are not evaluated. Each agent's `phase`
+ * offsets the clip in seconds/frames, and the point transform replaces the template armature root.
  *
  * Output point attributes match `Skin From Bones` / `Init Ragdoll Bodies`:
  * `position`, `bone_pose_matrix`, `bone_rest_matrix`, `bone_index`, `bone_parent`, `bone_length`,
@@ -85,8 +85,8 @@ static void read_templates(const Bundle &agents, Vector<TemplateInfo> &r_templat
 {
   const int count = agents.lookup_path<int>("count").value_or(0);
   for (const int i : IndexRange(count)) {
-    const std::optional<BundlePtr> agent = agents.lookup_path<BundlePtr>(
-        "agent_" + std::to_string(i));
+    const std::optional<BundlePtr> agent = agents.lookup_path<BundlePtr>("agent_" +
+                                                                         std::to_string(i));
     if (!agent || !*agent) {
       continue;
     }
@@ -109,8 +109,8 @@ static const Bundle *state_by_index(const Bundle *states, const int state_id)
   if (states == nullptr || state_id < 0) {
     return nullptr;
   }
-  const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>(
-      "state_" + std::to_string(state_id));
+  const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>("state_" +
+                                                                        std::to_string(state_id));
   return state ? state->get() : nullptr;
 }
 
@@ -130,8 +130,8 @@ static const Bundle *find_state(const TemplateInfo &templ,
   if (!name.empty()) {
     const int count = states->lookup_path<int>("count").value_or(0);
     for (const int i : IndexRange(count)) {
-      const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>(
-          "state_" + std::to_string(i));
+      const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>("state_" +
+                                                                            std::to_string(i));
       if (!state || !*state) {
         continue;
       }
@@ -185,8 +185,7 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Bundle>("Agents"_ustr).description("Agent set from Join Agents");
   b.add_input<decl::Bundle>("States"_ustr)
       .description("Fallback state table when the template does not carry one");
-  b.add_input<decl::Geometry>("Instances"_ustr)
-      .description("Points from Init Crowd Data");
+  b.add_input<decl::Geometry>("Instances"_ustr).description("Points from Init Crowd Data");
   b.add_input<decl::Float>("Time"_ustr)
       .default_value(0.0f)
       .description("Animation time in seconds (e.g. Scene Time > Seconds)");
@@ -219,20 +218,20 @@ static ClipInfo read_clip(const Bundle *state, const TemplateInfo &templ)
   const float state_speed = state->lookup_path<float>("speed").value_or(1.0f);
   if (clip.animation != nullptr) {
     clip.frame_start = clip.animation->lookup_path<float>("frame_start").value_or(1.0f);
-    clip.frame_end = clip.animation->lookup_path<float>("frame_end")
-                         .value_or(clip.frame_start + 1.0f);
+    clip.frame_end =
+        clip.animation->lookup_path<float>("frame_end").value_or(clip.frame_start + 1.0f);
     clip.fps = clip.animation->lookup_path<float>("fps").value_or(24.0f);
     clip.speed = clip.animation->lookup_path<float>("speed").value_or(1.0f) *
                  std::max(state_speed, 0.0f);
     clip.phase = clip.animation->lookup_path<float>("phase").value_or(0.0f);
-    clip.loop = state->lookup_path<bool>("loop")
-                    .value_or(clip.animation->lookup_path<bool>("loop").value_or(true));
+    clip.loop = state->lookup_path<bool>("loop").value_or(
+        clip.animation->lookup_path<bool>("loop").value_or(true));
     clip.root_motion = clip.animation->lookup_path<int>("root_motion").value_or(0) != 0;
     clip.action_name = clip.animation->lookup_path<std::string>("action_name").value_or("");
-    clip.armature_name = !templ.armature_name.empty() ?
-                             templ.armature_name :
-                             clip.animation->lookup_path<std::string>("armature_name")
-                                 .value_or("");
+    clip.armature_name =
+        !templ.armature_name.empty() ?
+            templ.armature_name :
+            clip.animation->lookup_path<std::string>("armature_name").value_or("");
   }
   else {
     clip.loop = state->lookup_path<bool>("loop").value_or(true);
@@ -295,7 +294,6 @@ static animrig::slot_handle_t find_clip_slot(bAction *action, Object *armature)
   return animrig::Slot::unassigned;
 }
 
-
 static void node_geo_exec(GeoNodeExecParams params)
 {
   BundlePtr agents = params.extract_input<BundlePtr>("Agents"_ustr);
@@ -340,6 +338,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_default<float>("state_time", AttrDomain::Point, 0.0f).varray;
   const VArray<float> phases =
       attributes.lookup_or_default<float>("phase", AttrDomain::Point, 0.0f).varray;
+  const VArray<float> prev_phases = attributes.lookup<float>("prev_phase").varray;
   const VArray<float> speeds =
       attributes.lookup_or_default<float>("speed", AttrDomain::Point, 1.0f).varray;
   const VArray<float> scales =
@@ -349,11 +348,11 @@ static void node_geo_exec(GeoNodeExecParams params)
   const VArray<int> physics_modes =
       attributes.lookup_or_default<int>("physics_mode", AttrDomain::Point, 0).varray;
   const VArray<math::Quaternion> rotations = attributes
-                                                  .lookup_or_default<math::Quaternion>(
-                                                      "rotation",
-                                                      AttrDomain::Point,
-                                                      math::Quaternion::identity())
-                                                  .varray;
+                                                 .lookup_or_default<math::Quaternion>(
+                                                     "rotation",
+                                                     AttrDomain::Point,
+                                                     math::Quaternion::identity())
+                                                 .varray;
   const Span<float3> positions = instances->positions();
 
   Main *bmain = DEG_get_bmain(params.depsgraph());
@@ -387,10 +386,9 @@ static void node_geo_exec(GeoNodeExecParams params)
     const VArray<float> lengths =
         rest_attributes.lookup_or_default<float>("bone_length", AttrDomain::Point, 1.0f).varray;
     const VArray<float4x4> rest_matrices = rest_attributes
-                                               .lookup_or_default<float4x4>(
-                                                   "bone_rest_matrix",
-                                                   AttrDomain::Point,
-                                                   float4x4::identity())
+                                               .lookup_or_default<float4x4>("bone_rest_matrix",
+                                                                            AttrDomain::Point,
+                                                                            float4x4::identity())
                                                .varray;
     if (!names) {
       continue;
@@ -441,12 +439,11 @@ static void node_geo_exec(GeoNodeExecParams params)
     const std::string state_name = state_names_attr ? crowd::read_string(state_names_attr[point]) :
                                                       "";
     const std::string prev_state_name = prev_states ? crowd::read_string(prev_states[point]) : "";
-    const Bundle *state = find_state(templ,
-                                     fallback_states ? fallback_states.get() : nullptr,
-                                     state_name,
-                                     state_ids[point]);
+    const Bundle *state = find_state(
+        templ, fallback_states ? fallback_states.get() : nullptr, state_name, state_ids[point]);
 
-    auto evaluate_clip = [&](const Bundle *clip_state) -> Vector<float4x4> {
+    auto evaluate_clip = [&](const Bundle *clip_state,
+                             const float point_phase) -> Vector<float4x4> {
       Vector<float4x4> pose_matrices(bone_count, float4x4::identity());
       const ClipInfo clip = read_clip(clip_state, templ);
       Object *armature = clip.armature_name.empty() ?
@@ -457,7 +454,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 
       animrig::EvaluationResult evaluated;
       if (action != nullptr && armature != nullptr && armature->adt != nullptr) {
-        const float action_frame = clip_frame(clip, time, phases[point], speeds[point]);
+        const float action_frame = clip_frame(clip, time, point_phase, speeds[point]);
         const animrig::slot_handle_t slot_handle = find_clip_slot(action, armature);
         if (slot_handle != animrig::Slot::unassigned) {
           PointerRNA armature_ptr = RNA_id_pointer_create(&armature->id);
@@ -492,13 +489,11 @@ static void node_geo_exec(GeoNodeExecParams params)
         const int *parent_point = parent_bone >= 0 ? index_of_bone.lookup_ptr(parent_bone) :
                                                      nullptr;
         const bool has_parent = parent_point != nullptr && sample_index[*parent_point] >= 0;
-        const float4x4 rest_local = has_parent ?
-                                        math::invert(rest_matrices[*parent_point]) *
-                                            rest_matrices[i] :
-                                        float4x4::identity();
-        const float4x4 pose = has_parent ?
-                                  pose_matrices[*parent_point] * rest_local * chan :
-                                  instance_root * rest_matrices[i] * chan;
+        const float4x4 rest_local = has_parent ? math::invert(rest_matrices[*parent_point]) *
+                                                     rest_matrices[i] :
+                                                 float4x4::identity();
+        const float4x4 pose = has_parent ? pose_matrices[*parent_point] * rest_local * chan :
+                                           instance_root * rest_matrices[i] * chan;
 
         pose_matrices[i] = pose;
         sample_index[i] = i;
@@ -506,31 +501,38 @@ static void node_geo_exec(GeoNodeExecParams params)
       return pose_matrices;
     };
 
-    Vector<float4x4> pose_matrices = evaluate_clip(state);
+    Vector<float4x4> pose_matrices = evaluate_clip(state, phases[point]);
     const float state_time = state_times ? state_times[point] : 0.0f;
     const float blend_in = state != nullptr ?
                                state->lookup_path<float>("blend_in").value_or(0.0f) :
                                0.0f;
-    if (!prev_state_name.empty() && prev_state_name != state_name && blend_in > 0.0f &&
-        state_time < blend_in)
-    {
-      const Bundle *prev_state = find_state(templ,
-                                            fallback_states ? fallback_states.get() : nullptr,
-                                            prev_state_name,
-                                            -1);
-      if (prev_state != nullptr && prev_state != state) {
-        const Vector<float4x4> previous_pose = evaluate_clip(prev_state);
-        float blend = math::clamp(state_time / std::max(blend_in, 1.0e-6f), 0.0f, 1.0f);
+    if (!prev_state_name.empty() && prev_state_name != state_name) {
+      const Bundle *prev_state = find_state(
+          templ, fallback_states ? fallback_states.get() : nullptr, prev_state_name, -1);
+      const float blend_out = prev_state != nullptr ?
+                                  std::max(
+                                      prev_state->lookup_path<float>("blend_out").value_or(0.0f),
+                                      0.0f) :
+                                  0.0f;
+      /* Blend In belongs to the target state, Blend Out to the state being left. The transition
+       * lasts for the longer of the two, so both inputs are honoured. */
+      const float duration = std::max(std::max(blend_in, 0.0f), blend_out);
+      if (prev_state != nullptr && prev_state != state && duration > 0.0f && state_time < duration)
+      {
+        const Vector<float4x4> previous_pose = evaluate_clip(
+            prev_state, prev_phases ? prev_phases[point] : phases[point]);
+        float blend = math::clamp(state_time / std::max(duration, 1.0e-6f), 0.0f, 1.0f);
         blend = blend * blend * (3.0f - 2.0f * blend);
+        /* `blend` is the weight of the *target* state: 0 = previous pose, 1 = current pose. */
         for (const int i : IndexRange(bone_count)) {
           float3 loc_a, loc_b, scale_a, scale_b;
           math::Quaternion rot_a, rot_b;
           math::to_loc_rot_scale<true>(pose_matrices[i], loc_a, rot_a, scale_a);
           math::to_loc_rot_scale<true>(previous_pose[i], loc_b, rot_b, scale_b);
           pose_matrices[i] = math::from_loc_rot_scale<float4x4>(
-              math::interpolate(loc_a, loc_b, blend),
-              math::interpolate(rot_a, rot_b, blend),
-              math::interpolate(scale_a, scale_b, blend));
+              math::interpolate(loc_b, loc_a, blend),
+              math::interpolate(rot_b, rot_a, blend),
+              math::interpolate(scale_b, scale_a, blend));
         }
       }
     }
@@ -550,7 +552,6 @@ static void node_geo_exec(GeoNodeExecParams params)
       sample.template_id = templ.template_id;
       sample.animated = physics_modes[point] == 0;
     }
-
   }
 
   PointCloud *result = BKE_pointcloud_new_nomain(samples.size());
@@ -570,10 +571,10 @@ static void node_geo_exec(GeoNodeExecParams params)
       out_attributes.lookup_or_add_for_write_span<float>("bone_length", domain);
   bke::SpanAttributeWriter<MStringProperty> name_writer =
       out_attributes.lookup_or_add_for_write_span<MStringProperty>("bone_name", domain);
-  bke::SpanAttributeWriter<int> agent_writer =
-      out_attributes.lookup_or_add_for_write_span<int>("agent_id", domain);
-  bke::SpanAttributeWriter<int> template_writer =
-      out_attributes.lookup_or_add_for_write_span<int>("template_id", domain);
+  bke::SpanAttributeWriter<int> agent_writer = out_attributes.lookup_or_add_for_write_span<int>(
+      "agent_id", domain);
+  bke::SpanAttributeWriter<int> template_writer = out_attributes.lookup_or_add_for_write_span<int>(
+      "template_id", domain);
   bke::SpanAttributeWriter<bool> animated_writer =
       out_attributes.lookup_or_add_for_write_span<bool>("animated", domain);
 
