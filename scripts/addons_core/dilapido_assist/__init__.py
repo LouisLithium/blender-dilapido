@@ -206,6 +206,8 @@ def build_quick_crowd_walk(node_tree):
                              "Surface to scatter the crowd spawn points on")
     _ensure_interface_socket(node_tree, "Target", "INPUT", "NodeSocketGeometry",
                              "Target point/geometry the crowd walks towards")
+    _ensure_interface_socket(node_tree, "Obstacles", "INPUT", "NodeSocketGeometry",
+                             "Optional obstacle mesh. Leave unconnected for open walking")
     _ensure_interface_socket(node_tree, "Geometry", "OUTPUT", "NodeSocketGeometry")
 
     # ---------------------------------------------------------------- states
@@ -264,6 +266,14 @@ def build_quick_crowd_walk(node_tree):
     links.new(join_states.outputs["States"], init.inputs["States"])
 
     # ---------------------------------------------------------------- simulation zone
+    navigation = nodes.new("GeometryNodeCrowdNavigation")
+    navigation.label = "Navigation"
+    navigation.inputs["Agent Radius"].default_value = 0.35
+    navigation.inputs["Max Step Height"].default_value = 0.35
+    links.new(group_input.outputs["Obstacles"], navigation.inputs["Obstacles"])
+    links.new(group_input.outputs["Target"], navigation.inputs["Goals"])
+    links.new(group_input.outputs["Spawn Surface"], navigation.inputs["Bounds Geometry"])
+
     sim_input = nodes.new("GeometryNodeSimulationInput")
     sim_output = nodes.new("GeometryNodeSimulationOutput")
     sim_input.pair_with_output(sim_output)
@@ -289,6 +299,7 @@ def build_quick_crowd_walk(node_tree):
     links.new(sim_geometry, motion.inputs["Points"])
     links.new(group_input.outputs["Target"], motion.inputs["Targets"])
     links.new(join_states.outputs["States"], motion.inputs["States"])
+    links.new(navigation.outputs["Navigation"], motion.inputs["Navigation"])
     links.new(sim_delta, motion.inputs["Delta Time"])
 
     distance_attr = nodes.new("GeometryNodeInputNamedAttribute")
@@ -367,6 +378,7 @@ def build_quick_crowd_walk(node_tree):
     join_agents.location = (-60.0, 80.0)
     scatter.location = (-300.0, -420.0)
     init.location = (160.0, -40.0)
+    navigation.location = (160.0, -260.0)
     motion.location = (560.0, 120.0)
     distance_attr.location = (800.0, 420.0)
     close_compare.location = (980.0, 480.0)

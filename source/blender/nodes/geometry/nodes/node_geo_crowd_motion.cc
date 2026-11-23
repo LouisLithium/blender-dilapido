@@ -17,6 +17,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #include "NOD_geometry_nodes_bundle.hh"
 #include "NOD_geometry_nodes_crowd.hh"
@@ -47,6 +48,225 @@ struct Target {
   float3 position;
   int group = -1;
 };
+
+/** Read-only view of the `Blender.CrowdNavigation` bundle. */
+struct NavSampler {
+  bool valid = false;
+  float2 min = float2(0.0f);
+  float cell_size = 0.0f;
+  int dims_x = 0;
+  int dims_y = 0;
+  int cells = 0;
+  Vector<int> groups;
+  Map<int, int> group_to_layer;
+  VArray<float3> flow;
+  VArray<float> distance;
+  VArray<bool> reachable;
+  VArray<bool> blocked;
+};
+
+static bool read_navigation(const Bundle *navigation, NavSampler &r_sampler)
+{
+  if (navigation == nullptr) {
+    return false;
+  }
+  const std::optional<GeometrySet> geometry = navigation->lookup_path<GeometrySet>("geometry");
+  const PointCloud *points = geometry ? geometry->get_pointcloud() : nullptr;
+  if (points == nullptr) {
+    return false;
+  }
+  const float3 min = navigation->lookup_path<float3>("min").value_or(float3(0.0f));
+  const float cell_size = navigation->lookup_path<float>("cell_size").value_or(0.0f);
+  const int dims_x = navigation->lookup_path<int>("dims_x").value_or(0);
+  const int dims_y = navigation->lookup_path<int>("dims_y").value_or(0);
+  const int group_count = navigation->lookup_path<int>("group_count").value_or(0);
+  if (cell_size <= 0.0f || dims_x <= 0 || dims_y <= 0 || group_count <= 0) {
+    return false;
+  }
+  NavSampler sampler;
+  sampler.min = float2(min.x, min.y);
+  sampler.cell_size = cell_size;
+  sampler.dims_x = dims_x;
+  sampler.dims_y = dims_y;
+  sampler.cells = dims_x * dims_y;
+  for (const int i : IndexRange(group_count)) {
+    const int group = navigation->lookup_path<int>("group_" + std::to_string(i)).value_or(-1);
+    sampler.group_to_layer.add(group, i);
+    sampler.groups.append(group);
+  }
+  sampler.flow = points->attributes()
+                     .lookup_or_default<float3>("flow", AttrDomain::Point, float3(0.0f))
+                     .varray;
+  sampler.distance = points->attributes()
+                         .lookup_or_default<float>("nav_distance", AttrDomain::Point, 1.0e9f)
+                         .varray;
+  sampler.reachable =
+      points->attributes().lookup_or_default<bool>("reachable", AttrDomain::Point, false).varray;
+  sampler.blocked =
+      points->attributes().lookup_or_default<bool>("blocked", AttrDomain::Point, false).varray;
+  if (sampler.flow.size() < int64_t(sampler.cells) * group_count ||
+      sampler.reachable.size() < int64_t(sampler.cells) * group_count ||
+      sampler.blocked.size() < sampler.cells)
+  {
+    return false;
+  }
+  sampler.valid = true;
+  r_sampler = std::move(sampler);
+  return true;
+}
+
+static int navigation_layer(const NavSampler &nav, const int target_group)
+{
+  if (const int *layer = nav.group_to_layer.lookup_ptr(target_group)) {
+    return *layer;
+  }
+  if (const int *layer = nav.group_to_layer.lookup_ptr(-1)) {
+    return *layer;
+  }
+  return 0;
+}
+
+/**
+ * Sample the flow field at a world position. Prefers a bilinear average of the surrounding cell
+ * flows; falls back to the nearest reachable cell, which also pushes an agent that was shoved
+ * inside an obstacle back out.
+ */
+static bool sample_navigation(const NavSampler &nav,
+                              const float3 position,
+                              const int target_group,
+                              float3 &r_flow,
+                              float3 &r_push,
+                              float &r_distance)
+{
+  r_push = float3(0.0f);
+  if (!nav.valid) {
+    return false;
+  }
+  const int layer = navigation_layer(nav, target_group);
+  const int offset = layer * nav.cells;
+  const float gx = (position.x - nav.min.x) / nav.cell_size - 0.5f;
+  const float gy = (position.y - nav.min.y) / nav.cell_size - 0.5f;
+  const int x0 = int(std::floor(gx));
+  const int y0 = int(std::floor(gy));
+  const float fx = gx - float(x0);
+  const float fy = gy - float(y0);
+
+  /* Push away from nearby blocked cells. Flow fields alone can lead an agent into the clearance
+   * band along a wall; this keeps it off the obstacle while the flow still decides the direction.
+   */
+  const int push_radius = 2;
+  const float push_reach = nav.cell_size * 3.5f;
+  const int base_x = math::clamp(int(std::round(gx)), 0, nav.dims_x - 1);
+  const int base_y = math::clamp(int(std::round(gy)), 0, nav.dims_y - 1);
+  for (int dy = -push_radius; dy <= push_radius; dy++) {
+    for (int dx = -push_radius; dx <= push_radius; dx++) {
+      const int x = base_x + dx;
+      const int y = base_y + dy;
+      if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+        continue;
+      }
+      if (!nav.blocked[y * nav.dims_x + x]) {
+        continue;
+      }
+      const float2 center = nav.min + float2((float(x) + 0.5f) * nav.cell_size,
+                                             (float(y) + 0.5f) * nav.cell_size);
+      const float2 delta = float2(position.x, position.y) - center;
+      const float distance = math::length(delta);
+      const float weight = math::clamp(1.0f - distance / push_reach, 0.0f, 1.0f);
+      if (weight <= 0.0f) {
+        continue;
+      }
+      const float2 direction = distance > 1.0e-5f ? delta / distance : float2(1.0f, 0.0f);
+      r_push.x += direction.x * weight;
+      r_push.y += direction.y * weight;
+    }
+  }
+  if (math::length(float2(r_push.x, r_push.y)) > 1.0e-4f) {
+    const float2 direction = math::normalize(float2(r_push.x, r_push.y));
+    r_push.x = direction.x;
+    r_push.y = direction.y;
+  }
+  else {
+    r_push = float3(0.0f);
+  }
+
+  float3 sum = float3(0.0f);
+  float weight_sum = 0.0f;
+  float nearest_distance = 1.0e9f;
+  for (int dy = 0; dy <= 1; dy++) {
+    for (int dx = 0; dx <= 1; dx++) {
+      const int x = x0 + dx;
+      const int y = y0 + dy;
+      if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+        continue;
+      }
+      const int index = offset + y * nav.dims_x + x;
+      if (!nav.reachable[index]) {
+        continue;
+      }
+      const float weight = (dx == 0 ? 1.0f - fx : fx) * (dy == 0 ? 1.0f - fy : fy);
+      if (weight <= 1.0e-4f) {
+        continue;
+      }
+      const float3 flow = nav.flow[index];
+      if (math::length_squared(float2(flow.x, flow.y)) <= 1.0e-8f) {
+        nearest_distance = std::min(nearest_distance, nav.distance[index]);
+        continue;
+      }
+      sum += flow * weight;
+      weight_sum += weight;
+      nearest_distance = std::min(nearest_distance, nav.distance[index]);
+    }
+  }
+  if (weight_sum > 0.2f) {
+    const float2 direction = float2(sum.x, sum.y);
+    const float length = math::length(direction);
+    if (length > 1.0e-5f) {
+      r_flow = float3(direction.x / length, direction.y / length, 0.0f);
+      r_distance = nearest_distance;
+      return true;
+    }
+  }
+
+  /* Nearest reachable cell fallback (also handles blocked cells). */
+  constexpr int MAX_RING = 4;
+  for (int ring = 0; ring <= MAX_RING; ring++) {
+    int best = -1;
+    float best_length_sq = 0.0f;
+    for (int dy = -ring; dy <= ring; dy++) {
+      for (int dx = -ring; dx <= ring; dx++) {
+        if (ring > 0 && std::max(std::abs(dx), std::abs(dy)) != ring) {
+          continue;
+        }
+        const int x = base_x + dx;
+        const int y = base_y + dy;
+        if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+          continue;
+        }
+        const int index = offset + y * nav.dims_x + x;
+        if (!nav.reachable[index]) {
+          continue;
+        }
+        const float3 flow = nav.flow[index];
+        const float flow_length_sq = math::length_squared(float2(flow.x, flow.y));
+        if (flow_length_sq <= 1.0e-8f) {
+          continue;
+        }
+        const float length_sq = float(dx * dx + dy * dy);
+        if (best < 0 || length_sq < best_length_sq) {
+          best = index;
+          best_length_sq = length_sq;
+        }
+      }
+    }
+    if (best >= 0) {
+      r_flow = nav.flow[best];
+      r_distance = nav.distance[best];
+      return true;
+    }
+  }
+  return false;
+}
 
 struct AgentGrid {
   float2 min;
@@ -154,8 +374,8 @@ static Map<std::string, float> read_move_speeds(const Bundle *states)
   }
   const int count = states->lookup_path<int>("count").value_or(0);
   for (const int i : IndexRange(count)) {
-    const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>(
-        "state_" + std::to_string(i));
+    const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>("state_" +
+                                                                          std::to_string(i));
     if (!state || !*state) {
       continue;
     }
@@ -228,6 +448,16 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Push agents apart after integration so they do not overlap");
   b.add_input<decl::Int>("Max Neighbors"_ustr).default_value(16).min(1).max(64);
 
+  b.add_input<decl::Bundle>("Navigation"_ustr)
+      .description(
+          "Optional `Crowd Navigation` flow field. When connected, agents follow the flow around "
+          "obstacles instead of walking straight at the target");
+  b.add_input<decl::Float>("Navigation Strength"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(1.0f)
+      .description("Blend between direct steering (0) and the navigation flow (1)");
+
   b.add_output<decl::Geometry>("Points"_ustr);
 }
 
@@ -243,6 +473,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   BundlePtr states = params.extract_input<BundlePtr>("States"_ustr);
+  BundlePtr navigation = params.extract_input<BundlePtr>("Navigation"_ustr);
+  const float navigation_strength = math::clamp(
+      params.extract_input<float>("Navigation Strength"_ustr), 0.0f, 1.0f);
   GeometrySet targets_geometry = params.extract_input<GeometrySet>("Targets"_ustr);
   const float delta_time = std::max(params.extract_input<float>("Delta Time"_ustr), 0.0f);
   const float max_speed = std::max(params.extract_input<float>("Max Speed"_ustr), 0.0f);
@@ -261,6 +494,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   Vector<Target> targets;
   read_targets(targets_geometry, targets);
   const Map<std::string, float> move_speeds = read_move_speeds(states.get());
+  NavSampler navigation_sampler;
+  read_navigation(navigation.get(), navigation_sampler);
 
   PointCloud *result = BKE_pointcloud_copy_for_eval(points);
   bke::MutableAttributeAccessor attributes = result->attributes_for_write();
@@ -290,11 +525,12 @@ static void node_geo_exec(GeoNodeExecParams params)
       src_attributes.lookup<MStringProperty>("state").varray;
   const VArray<float> src_state_times =
       src_attributes.lookup_or_default<float>("state_time", AttrDomain::Point, 0.0f).varray;
-  const VArray<math::Quaternion> src_rotations =
-      src_attributes.lookup_or_default<math::Quaternion>("rotation",
+  const VArray<math::Quaternion> src_rotations = src_attributes
+                                                     .lookup_or_default<math::Quaternion>(
+                                                         "rotation",
                                                          AttrDomain::Point,
                                                          math::Quaternion::identity())
-          .varray;
+                                                     .varray;
   const VArray<float3> src_velocities =
       src_attributes.lookup_or_default<float3>("velocity", AttrDomain::Point, float3(0.0f)).varray;
 
@@ -322,13 +558,11 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   /* Spatial hash for the soft force and the hard non-overlap. */
-  const float max_radius = count > 0 ?
-                               *std::max_element(radii.begin(),
-                                                 radii.end(),
-                                                 [](const float a, const float b) {
-                                                   return a < b;
-                                                 }) :
-                               default_radius;
+  const float max_radius = count > 0 ? *std::max_element(
+                                           radii.begin(),
+                                           radii.end(),
+                                           [](const float a, const float b) { return a < b; }) :
+                                       default_radius;
   const float cell_size = std::max({avoidance_radius, 2.0f * max_radius, 1.0e-3f});
   AgentGrid grid;
   build_agent_grid(positions, cell_size, grid);
@@ -407,14 +641,46 @@ static void node_geo_exec(GeoNodeExecParams params)
         const float3 to_target = targets[target_of[i]].position - positions[i];
         const float distance = math::length(float3(to_target.x, to_target.y, 0.0f));
         if (distance > arrive_radius) {
-          const float3 direction = float3(to_target.x, to_target.y, 0.0f) /
-                                   std::max(distance, 1.0e-6f);
+          float3 direction = float3(to_target.x, to_target.y, 0.0f) / std::max(distance, 1.0e-6f);
+          if (navigation_sampler.valid && navigation_strength > 0.0f) {
+            float3 flow;
+            float3 push;
+            float path_distance = 1.0e9f;
+            if (sample_navigation(
+                    navigation_sampler, positions[i], target_groups[i], flow, push, path_distance))
+            {
+              /* Remove the part of the flow that points into the obstacle and add a small
+               * outward component, so agents follow the wall instead of grinding into it. */
+              const float2 push_2d(push.x, push.y);
+              const float push_length = math::length(push_2d);
+              if (push_length > 1.0e-4f) {
+                const float2 normal = push_2d / push_length;
+                float2 tangent(flow.x, flow.y);
+                const float inward = std::min(math::dot(tangent, normal), 0.0f);
+                tangent -= normal * inward;
+                if (math::length(tangent) > 1.0e-4f) {
+                  tangent = math::normalize(tangent);
+                }
+                flow = float3(tangent.x, tangent.y, 0.0f) +
+                       float3(normal.x, normal.y, 0.0f) * 0.35f;
+                const float length = math::length(flow);
+                if (length > 1.0e-4f) {
+                  flow /= length;
+                }
+              }
+              float3 blended = direction * (1.0f - navigation_strength) +
+                               flow * navigation_strength;
+              const float blended_length = math::length(blended);
+              if (blended_length > 1.0e-5f) {
+                direction = blended / blended_length;
+              }
+            }
+          }
           float speed = max_speed * std::max(point_speeds[i], 0.0f) *
                         std::max(state_move_speed, 0.0f);
           if (arrive_radius > 0.0f) {
-            const float slowdown = math::clamp((distance - arrive_radius) / arrive_radius,
-                                               0.0f,
-                                               1.0f);
+            const float slowdown = math::clamp(
+                (distance - arrive_radius) / arrive_radius, 0.0f, 1.0f);
             speed *= slowdown;
           }
           desired_velocity = direction * speed;
@@ -447,9 +713,8 @@ static void node_geo_exec(GeoNodeExecParams params)
         const float yaw = std::atan2(forward.x, -forward.y);
         const math::Quaternion target_rotation = math::to_quaternion(
             math::EulerXYZ(float3(0.0f, 0.0f, yaw)));
-        rotations[i] = math::interpolate(rotations[i],
-                                         target_rotation,
-                                         std::min(1.0f, turn_rate * delta_time));
+        rotations[i] = math::interpolate(
+            rotations[i], target_rotation, std::min(1.0f, turn_rate * delta_time));
       }
 
       positions[i] = new_position;
@@ -461,8 +726,9 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
   });
 
-  /* Hard non-overlap, Jacobi style: every agent pushes itself away from all overlapping neighbours,
-   * then all pushes are applied together (deterministic, independent of thread scheduling). */
+  /* Hard non-overlap, Jacobi style: every agent pushes itself away from all overlapping
+   * neighbours, then all pushes are applied together (deterministic, independent of thread
+   * scheduling). */
   if (hard_separation) {
     for (int iteration = 0; iteration < 2; iteration++) {
       Array<float3> push(count, float3(0.0f));
@@ -497,9 +763,8 @@ static void node_geo_exec(GeoNodeExecParams params)
                 if (overlap <= 0.0f) {
                   continue;
                 }
-                const float3 direction = distance > 1.0e-6f ?
-                                             delta / distance :
-                                             float3(1.0f, 0.0f, 0.0f);
+                const float3 direction = distance > 1.0e-6f ? delta / distance :
+                                                              float3(1.0f, 0.0f, 0.0f);
                 push[i] += direction * (overlap * 0.5f);
                 push[other] -= direction * (overlap * 0.5f);
               }

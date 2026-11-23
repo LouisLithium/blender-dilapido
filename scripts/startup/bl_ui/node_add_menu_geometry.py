@@ -1180,6 +1180,7 @@ class NODE_MT_gn_dilapido_crowd_base(node_add_menu.NodeMenu):
         self.node_operator(layout, "GeometryNodeCrowdBones")
         self.node_operator(layout, "GeometryNodeCrowdStateSwitch")
         self.node_operator(layout, "GeometryNodeCrowdMotion")
+        self.node_operator(layout, "GeometryNodeCrowdNavigation")
         self.node_operator(layout, "GeometryNodeInitCrowdData")
 
 
