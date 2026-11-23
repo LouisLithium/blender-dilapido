@@ -137,7 +137,8 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Geometry>("Upstream"_ustr)
       .description(
           "Optional: the pieces *before* the simulation zone. The bodies that are marked as "
-          "animated in Init Rigid Body take their pose from here, and the `active` flag is read from "
+          "animated in Init Rigid Body take their pose from here, and the `active` flag is read "
+          "from "
           "here as well: the zone state only reads its inputs on the first frame, so changes to "
           "those flags would otherwise never reach the solver. This input has to come from inside "
           "the simulation zone");
@@ -173,8 +174,9 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(50.0f)
         .min(0.0f)
         .subtype(PROP_VELOCITY)
-        .description("Speed ceiling in m/s, used when Speed Limit is on (the angular speed is "
-                     "limited to 0.6 times this)");
+        .description(
+            "Speed ceiling in m/s, used when Speed Limit is on (the angular speed is "
+            "limited to 0.6 times this)");
     solver_panel.add_input<decl::Float>("Velocity Transfer"_ustr)
         .default_value(1.0f)
         .min(0.0f)
@@ -191,7 +193,8 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(30.0f)
         .min(0.0f)
         .subtype(PROP_VELOCITY)
-        .description("Upper bound for the animation-derived angular velocity (rad/s); 0 disables it");
+        .description(
+            "Upper bound for the animation-derived angular velocity (rad/s); 0 disables it");
     solver_panel.add_input<decl::Int>("Threads"_ustr)
         .default_value(1)
         .description(
@@ -202,7 +205,8 @@ static void node_declare(NodeDeclarationBuilder &b)
     solver_panel.add_input<decl::Bool>("Allow Sleeping"_ustr)
         .default_value(true)
         .description(
-            "Let resting bodies go to sleep. A sleeping pile costs almost nothing, which matters a "
+            "Let resting bodies go to sleep. A sleeping pile costs almost nothing, which matters "
+            "a "
             "lot for thousands of fragments; the bodies wake up when something touches them");
     solver_panel.add_input<decl::Bool>("Wake All"_ustr)
         .default_value(false)
@@ -213,7 +217,8 @@ static void node_declare(NodeDeclarationBuilder &b)
         .subtype(PROP_VELOCITY)
         .description(
             "Point velocity below which a body may fall asleep, in m/s. Raise it to let a slowly "
-            "creeping pile settle (and cost nothing), lower it when a nearly stopped pile still has "
+            "creeping pile settle (and cost nothing), lower it when a nearly stopped pile still "
+            "has "
             "to keep sliding");
     solver_panel.add_input<decl::Float>("Time Before Sleep"_ustr)
         .default_value(0.5f)
@@ -224,24 +229,28 @@ static void node_declare(NodeDeclarationBuilder &b)
     solver_panel.add_input<decl::Bool>("Ignore Initial Overlap"_ustr)
         .default_value(true)
         .description(
-            "Take body pairs that already interpenetrate when the world is built out of collision. "
+            "Take body pairs that already interpenetrate when the world is built out of "
+            "collision. "
             "Without this the contact solver pushes them apart with a huge impulse on the first "
             "frame, which looks like the pile exploding on its own");
     solver_panel.add_input<decl::Bool>("Sweep Colliders"_ustr)
         .default_value(true)
         .description(
-            "Sweep a collider that moved between frames through the substeps. The collider geometry "
+            "Sweep a collider that moved between frames through the substeps. The collider "
+            "geometry "
             "is sampled once per frame, so without this a fast moving collider jumps past the "
             "bodies and never collides with them");
     solver_panel.add_input<decl::Bool>("Wake On Break"_ustr)
         .default_value(true)
         .description(
-            "Wake both bodies when a constraint breaks. Off means a sleeping body stays asleep even "
+            "Wake both bodies when a constraint breaks. Off means a sleeping body stays asleep "
+            "even "
             "when its glue lets go, which is only useful for debugging");
     solver_panel.add_input<decl::Bool>("Warm Start"_ustr)
         .default_value(true)
         .description(
-            "Keep the physics world alive between frames so Jolt can reuse contacts and constraint "
+            "Keep the physics world alive between frames so Jolt can reuse contacts and "
+            "constraint "
             "impulses. The world is rebuilt whenever the structure or the incoming state changes");
     solver_panel.add_input<decl::Bool>("Glued Pieces Collide"_ustr)
         .default_value(false)
@@ -252,7 +261,8 @@ static void node_declare(NodeDeclarationBuilder &b)
     solver_panel.add_input<decl::Bool>("Rebase Joints"_ustr)
         .default_value(true)
         .description(
-            "When a body switches from animated to simulated, re-express its angular joints in the "
+            "When a body switches from animated to simulated, re-express its angular joints in "
+            "the "
             "pose it has at the switch (instead of the pose the joints were authored in), so a "
             "ragdoll captured mid-animation does not snap back when the animation is turned off");
     solver_panel.add_input<decl::Vector>("Gravity"_ustr)
@@ -293,29 +303,24 @@ static Array<BodyState> read_point_body_states(const PointCloud &pointcloud)
   const bke::AttributeAccessor attributes = pointcloud.attributes();
   const VArray<float3> positions =
       attributes.lookup_or_default<float3>("position", AttrDomain::Point, float3(0.0f)).varray;
-  const VArray<math::Quaternion> rotations =
-      attributes
-          .lookup_or_default<math::Quaternion>(
-              "rotation", AttrDomain::Point, math::Quaternion::identity())
-          .varray;
+  const VArray<math::Quaternion> rotations = attributes
+                                                 .lookup_or_default<math::Quaternion>(
+                                                     "rotation",
+                                                     AttrDomain::Point,
+                                                     math::Quaternion::identity())
+                                                 .varray;
   const VArray<float3> linear_velocities =
       attributes.lookup_or_default<float3>("velocity", AttrDomain::Point, float3(0.0f)).varray;
-  const VArray<float3> angular_velocities = attributes
-                                                .lookup_or_default<float3>(
-                                                    "angular_velocity",
-                                                    AttrDomain::Point,
-                                                    float3(0.0f))
-                                                .varray;
+  const VArray<float3> angular_velocities =
+      attributes.lookup_or_default<float3>("angular_velocity", AttrDomain::Point, float3(0.0f))
+          .varray;
   const VArray<float3> external_forces = attributes
                                              .lookup_or_default<float3>(
                                                  "external_force", AttrDomain::Point, float3(0.0f))
                                              .varray;
-  const VArray<float3> external_torques = attributes
-                                              .lookup_or_default<float3>(
-                                                  "external_torque",
-                                                  AttrDomain::Point,
-                                                  float3(0.0f))
-                                              .varray;
+  const VArray<float3> external_torques =
+      attributes.lookup_or_default<float3>("external_torque", AttrDomain::Point, float3(0.0f))
+          .varray;
   const VArray<float> radii =
       attributes.lookup_or_default<float>("radius", AttrDomain::Point, 0.1f).varray;
   const VArray<float> masses =
@@ -355,8 +360,8 @@ static void write_point_body_states(PointCloud &pointcloud, Span<BodyState> stat
       attributes.lookup_or_add_for_write_span<float3>("angular_velocity", AttrDomain::Point);
   /* The flag is written back too: next frame it is the *previous* state of the body, which is how
    * the solver tells "this body was animated last frame" from "it has always been simulated". */
-  bke::SpanAttributeWriter<bool> animated =
-      attributes.lookup_or_add_for_write_span<bool>("animated", AttrDomain::Point);
+  bke::SpanAttributeWriter<bool> animated = attributes.lookup_or_add_for_write_span<bool>(
+      "animated", AttrDomain::Point);
 
   for (const int i : states.index_range()) {
     const BodyState &state = states[i];
@@ -386,24 +391,15 @@ static Array<BodyState> read_instance_body_states(const bke::Instances &instance
   const bke::AttributeAccessor attributes = instances.attributes();
   const VArray<float3> linear_velocities =
       attributes.lookup_or_default<float3>("velocity", AttrDomain::Instance, float3(0.0f)).varray;
-  const VArray<float3> angular_velocities = attributes
-                                                .lookup_or_default<float3>(
-                                                    "angular_velocity",
-                                                    AttrDomain::Instance,
-                                                    float3(0.0f))
-                                                .varray;
-  const VArray<float3> external_forces = attributes
-                                             .lookup_or_default<float3>(
-                                                 "external_force",
-                                                 AttrDomain::Instance,
-                                                 float3(0.0f))
-                                             .varray;
-  const VArray<float3> external_torques = attributes
-                                              .lookup_or_default<float3>(
-                                                  "external_torque",
-                                                  AttrDomain::Instance,
-                                                  float3(0.0f))
-                                              .varray;
+  const VArray<float3> angular_velocities =
+      attributes.lookup_or_default<float3>("angular_velocity", AttrDomain::Instance, float3(0.0f))
+          .varray;
+  const VArray<float3> external_forces =
+      attributes.lookup_or_default<float3>("external_force", AttrDomain::Instance, float3(0.0f))
+          .varray;
+  const VArray<float3> external_torques =
+      attributes.lookup_or_default<float3>("external_torque", AttrDomain::Instance, float3(0.0f))
+          .varray;
   const VArray<float> radii =
       attributes.lookup_or_default<float>("radius", AttrDomain::Instance, 0.1f).varray;
   const VArray<float> masses =
@@ -451,12 +447,13 @@ static void write_instance_body_states(bke::Instances &instances, Span<BodyState
       attributes.lookup_or_add_for_write_span<float3>("velocity", AttrDomain::Instance);
   bke::SpanAttributeWriter<float3> angular_velocities =
       attributes.lookup_or_add_for_write_span<float3>("angular_velocity", AttrDomain::Instance);
-  bke::SpanAttributeWriter<bool> sleeping =
-      attributes.lookup_or_add_for_write_span<bool>("sleeping", AttrDomain::Instance);
-  /* Keep the animated flag in the state: it is compared with the live flag next frame to detect the
-   * switch from animation to simulation (and only then re-base the joints and copy the switch pose). */
-  bke::SpanAttributeWriter<bool> animated =
-      attributes.lookup_or_add_for_write_span<bool>("animated", AttrDomain::Instance);
+  bke::SpanAttributeWriter<bool> sleeping = attributes.lookup_or_add_for_write_span<bool>(
+      "sleeping", AttrDomain::Instance);
+  /* Keep the animated flag in the state: it is compared with the live flag next frame to detect
+   * the switch from animation to simulation (and only then re-base the joints and copy the switch
+   * pose). */
+  bke::SpanAttributeWriter<bool> animated = attributes.lookup_or_add_for_write_span<bool>(
+      "animated", AttrDomain::Instance);
   for (const int i : states.index_range()) {
     linear_velocities.span[i] = states[i].linear_velocity;
     angular_velocities.span[i] = states[i].angular_velocity;
@@ -625,12 +622,14 @@ static void read_body_forces(const PointCloud &pointcloud,
   }
   const VArray<int> piece_ids =
       attributes.lookup_or_default<int>("piece_id", AttrDomain::Point, -1).varray;
-  const VArray<float3> forces =
-      attributes.lookup_or_default<float3>("external_force", AttrDomain::Point, float3(0.0f))
-          .varray;
-  const VArray<float3> torques =
-      attributes.lookup_or_default<float3>("external_torque", AttrDomain::Point, float3(0.0f))
-          .varray;
+  const VArray<float3> forces = attributes
+                                    .lookup_or_default<float3>(
+                                        "external_force", AttrDomain::Point, float3(0.0f))
+                                    .varray;
+  const VArray<float3> torques = attributes
+                                     .lookup_or_default<float3>(
+                                         "external_torque", AttrDomain::Point, float3(0.0f))
+                                     .varray;
 
   for (const int i : IndexRange(pointcloud.totpoint)) {
     if (piece_ids[i] < 0) {
@@ -650,8 +649,10 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
 {
   Vector<RawConstraint> constraints;
   const bke::AttributeAccessor attributes = pointcloud.attributes();
-  const VArray<int> body_a = attributes.lookup_or_default<int>("body_a", AttrDomain::Point, -1).varray;
-  const VArray<int> body_b = attributes.lookup_or_default<int>("body_b", AttrDomain::Point, -1).varray;
+  const VArray<int> body_a =
+      attributes.lookup_or_default<int>("body_a", AttrDomain::Point, -1).varray;
+  const VArray<int> body_b =
+      attributes.lookup_or_default<int>("body_b", AttrDomain::Point, -1).varray;
   const VArray<bool> enabled =
       attributes.lookup_or_default<bool>("enabled", AttrDomain::Point, true).varray;
   const bool has_anchors = attributes.contains("anchor_a") && attributes.contains("anchor_b");
@@ -677,16 +678,18 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
   const VArray<float> harden_accums =
       attributes.lookup_or_default<float>("harden_accum", AttrDomain::Point, 0.0f).varray;
   const bool has_frames = attributes.contains("frame_a") && attributes.contains("frame_b");
-  const VArray<math::Quaternion> frame_a =
-      attributes
-          .lookup_or_default<math::Quaternion>(
-              "frame_a", AttrDomain::Point, math::Quaternion::identity())
-          .varray;
-  const VArray<math::Quaternion> frame_b =
-      attributes
-          .lookup_or_default<math::Quaternion>(
-              "frame_b", AttrDomain::Point, math::Quaternion::identity())
-          .varray;
+  const VArray<math::Quaternion> frame_a = attributes
+                                               .lookup_or_default<math::Quaternion>(
+                                                   "frame_a",
+                                                   AttrDomain::Point,
+                                                   math::Quaternion::identity())
+                                               .varray;
+  const VArray<math::Quaternion> frame_b = attributes
+                                               .lookup_or_default<math::Quaternion>(
+                                                   "frame_b",
+                                                   AttrDomain::Point,
+                                                   math::Quaternion::identity())
+                                               .varray;
   const VArray<float> swing_limits =
       attributes.lookup_or_default<float>("swing_limit", AttrDomain::Point, 0.0f).varray;
   const VArray<float> twist_limits =
@@ -695,9 +698,11 @@ static Vector<RawConstraint> read_constraints(const PointCloud &pointcloud, cons
       attributes.lookup_or_default<float>("hinge_min", AttrDomain::Point, -float(M_PI)).varray;
   const VArray<float> hinge_maxs =
       attributes.lookup_or_default<float>("hinge_max", AttrDomain::Point, float(M_PI)).varray;
-  const VArray<float3> hinge_axes =
-      attributes.lookup_or_default<float3>("hinge_axis", AttrDomain::Point, float3(1.0f, 0.0f, 0.0f))
-          .varray;
+  const VArray<float3> hinge_axes = attributes
+                                        .lookup_or_default<float3>("hinge_axis",
+                                                                   AttrDomain::Point,
+                                                                   float3(1.0f, 0.0f, 0.0f))
+                                        .varray;
   const VArray<float> distance_mins =
       attributes.lookup_or_default<float>("distance_min", AttrDomain::Point, 0.0f).varray;
   const VArray<float> distance_maxs =
@@ -763,11 +768,12 @@ static void read_motors(const PointCloud &pointcloud, Vector<RawMotor> &r_motors
   const bke::AttributeAccessor attributes = pointcloud.attributes();
   const VArray<int> piece_ids =
       attributes.lookup_or_default<int>("piece_id", AttrDomain::Point, -1).varray;
-  const VArray<math::Quaternion> targets =
-      attributes
-          .lookup_or_default<math::Quaternion>(
-              "target_rotation", AttrDomain::Point, math::Quaternion::identity())
-          .varray;
+  const VArray<math::Quaternion> targets = attributes
+                                               .lookup_or_default<math::Quaternion>(
+                                                   "target_rotation",
+                                                   AttrDomain::Point,
+                                                   math::Quaternion::identity())
+                                               .varray;
   const VArray<float> strengths =
       attributes.lookup_or_default<float>("strength", AttrDomain::Point, 0.0f).varray;
   const VArray<float> dampings =
@@ -797,8 +803,7 @@ static Array<int> read_body_ids(const GeometrySet &geometry, const int body_num)
   if (geometry.has_instances()) {
     const bke::Instances *instances = geometry.get_instances();
     const VArray<int> piece_ids = instances->attributes()
-                                      .lookup_or_default<int>(
-                                          "piece_id", AttrDomain::Instance, -1)
+                                      .lookup_or_default<int>("piece_id", AttrDomain::Instance, -1)
                                       .varray;
     for (const int i : ids.index_range()) {
       ids[i] = piece_ids[i] < 0 ? i : piece_ids[i];
@@ -847,53 +852,52 @@ static void collect_colliders(const Bundle &world,
   }
 
   for (const ColliderPaths &group : groups) {
-  const bool use_box = group.use_box;
-  for (const StringRef path : group.paths) {
-    const BundlePtr *bundle_ptr = world.lookup_path_ptr<BundlePtr>(path);
-    if (!bundle_ptr || !*bundle_ptr) {
-      continue;
-    }
-    const Bundle &bundle = **bundle_ptr;
-    const std::optional<GeometrySet> geometry = bundle.lookup<GeometrySet>(
-        *BundleKey::from_str("geometry"));
-    if (!geometry) {
-      continue;
-    }
-    const Mesh *mesh = geometry->get_mesh();
-    if (!mesh) {
-      continue;
-    }
+    const bool use_box = group.use_box;
+    for (const StringRef path : group.paths) {
+      const BundlePtr *bundle_ptr = world.lookup_path_ptr<BundlePtr>(path);
+      if (!bundle_ptr || !*bundle_ptr) {
+        continue;
+      }
+      const Bundle &bundle = **bundle_ptr;
+      const std::optional<GeometrySet> geometry = bundle.lookup<GeometrySet>(
+          *BundleKey::from_str("geometry"));
+      if (!geometry) {
+        continue;
+      }
+      const Mesh *mesh = geometry->get_mesh();
+      if (!mesh) {
+        continue;
+      }
 
-    StaticCollider collider;
-    collider.use_box = use_box;
-    collider.vertices_start = int(r_vertices.size());
-    for (const float3 &p : mesh->vert_positions()) {
-      r_vertices.append(p);
-    }
-    collider.vertices_count = int(r_vertices.size()) - collider.vertices_start;
+      StaticCollider collider;
+      collider.use_box = use_box;
+      collider.vertices_start = int(r_vertices.size());
+      for (const float3 &p : mesh->vert_positions()) {
+        r_vertices.append(p);
+      }
+      collider.vertices_count = int(r_vertices.size()) - collider.vertices_start;
 
-    collider.indices_start = int(r_indices.size());
-    /* `corner_tris()` contains corner indices; map them to vertex indices first. */
-    Array<int3> vert_tris(mesh->corner_tris().size());
-    bke::mesh::vert_tris_from_corner_tris(
-        mesh->corner_verts(), mesh->corner_tris(), vert_tris);
-    for (const int3 &tri : vert_tris) {
-      r_indices.append(tri.x);
-      r_indices.append(tri.y);
-      r_indices.append(tri.z);
-    }
-    collider.indices_count = int(r_indices.size()) - collider.indices_start;
+      collider.indices_start = int(r_indices.size());
+      /* `corner_tris()` contains corner indices; map them to vertex indices first. */
+      Array<int3> vert_tris(mesh->corner_tris().size());
+      bke::mesh::vert_tris_from_corner_tris(mesh->corner_verts(), mesh->corner_tris(), vert_tris);
+      for (const int3 &tri : vert_tris) {
+        r_indices.append(tri.x);
+        r_indices.append(tri.y);
+        r_indices.append(tri.z);
+      }
+      collider.indices_count = int(r_indices.size()) - collider.indices_start;
 
-    collider.friction = bundle.lookup<float>(*BundleKey::from_str("friction")).value_or(0.5f);
-    /* Convex hull colliders use the mesh bundle type with this flag set. */
-    collider.convex = bundle.lookup<bool>(*BundleKey::from_str("convex")).value_or(false);
-    const bool enough_geometry = use_box ? collider.vertices_count >= 3
-                                         : (collider.vertices_count >= 3 &&
-                                            collider.indices_count >= 3);
-    if (enough_geometry) {
-      r_colliders.append(collider);
+      collider.friction = bundle.lookup<float>(*BundleKey::from_str("friction")).value_or(0.5f);
+      /* Convex hull colliders use the mesh bundle type with this flag set. */
+      collider.convex = bundle.lookup<bool>(*BundleKey::from_str("convex")).value_or(false);
+      const bool enough_geometry = use_box ? collider.vertices_count >= 3 :
+                                             (collider.vertices_count >= 3 &&
+                                              collider.indices_count >= 3);
+      if (enough_geometry) {
+        r_colliders.append(collider);
+      }
     }
-  }
   }
 }
 
@@ -933,7 +937,8 @@ static void write_body_force_positions(Bundle &world,
   }
 }
 
-static void node_geo_exec(GeoNodeExecParams params){
+static void node_geo_exec(GeoNodeExecParams params)
+{
   BundlePtr world_ptr = params.get_input<BundlePtr>("World"_ustr);
   if (!world_ptr) {
     params.set_default_remaining_outputs();
@@ -973,8 +978,8 @@ static void node_geo_exec(GeoNodeExecParams params){
   /* A collider that already contains rigid bodies is almost always a collider built from an object
    * in *local* space (for example `Object Info > Geometry` without `Object Info > Transform`:
    * the geometry then sits at the object's original position instead of following it). The bodies
-   * inside get pushed out every frame, which looks like a pile that twitches and whose glued pieces
-   * break without anything touching them, so warn about it instead of leaving it silent. */
+   * inside get pushed out every frame, which looks like a pile that twitches and whose glued
+   * pieces break without anything touching them, so warn about it instead of leaving it silent. */
   if (!colliders.is_empty() && !paths.is_empty()) {
     int overlapping = 0;
     for (const int i : colliders.index_range()) {
@@ -1019,12 +1024,13 @@ static void node_geo_exec(GeoNodeExecParams params){
       fflush(stdout);
     }
     if (overlapping > 0) {
-      std::string message = std::to_string(overlapping) +
-                            " collider(s) already contain rigid bodies at their current position. "
-                            "If the collider is built from an object, connect Object Info > Transform "
-                            "to the shape's Transform input: without it the collider stays in the "
-                            "object's local space, sits in the wrong place and keeps pushing the "
-                            "bodies (this shows up as a twitching pile that breaks on its own).";
+      std::string message =
+          std::to_string(overlapping) +
+          " collider(s) already contain rigid bodies at their current position. "
+          "If the collider is built from an object, connect Object Info > Transform "
+          "to the shape's Transform input: without it the collider stays in the "
+          "object's local space, sits in the wrong place and keeps pushing the "
+          "bodies (this shows up as a twitching pile that breaks on its own).";
       params.error_message_add(NodeWarningType::Warning, message);
     }
   }
@@ -1072,15 +1078,15 @@ static void node_geo_exec(GeoNodeExecParams params){
   settings.gravity = gravity;
   settings.delta_time = delta_time;
   settings.substeps = substeps;
-  settings.constraint_iterations = std::max(1, params.get_input<int>("Constraint Iterations"_ustr));
+  settings.constraint_iterations = std::max(1,
+                                            params.get_input<int>("Constraint Iterations"_ustr));
   settings.disable_glued_collisions = !params.get_input<bool>("Glued Pieces Collide"_ustr);
   settings.warm_start = params.get_input<bool>("Warm Start"_ustr);
   settings.threads = params.get_input<int>("Threads"_ustr);
   settings.allow_sleeping = params.get_input<bool>("Allow Sleeping"_ustr);
   settings.wake_all = params.get_input<bool>("Wake All"_ustr);
   settings.sleep_threshold = std::max(params.get_input<float>("Sleep Threshold"_ustr), 0.0f);
-  settings.time_before_sleep = std::max(
-      params.get_input<float>("Time Before Sleep"_ustr), 0.0f);
+  settings.time_before_sleep = std::max(params.get_input<float>("Time Before Sleep"_ustr), 0.0f);
   settings.wake_on_break = params.get_input<bool>("Wake On Break"_ustr);
   settings.sweep_colliders = params.get_input<bool>("Sweep Colliders"_ustr);
   settings.ignore_initial_overlap = params.get_input<bool>("Ignore Initial Overlap"_ustr);
@@ -1104,9 +1110,9 @@ static void node_geo_exec(GeoNodeExecParams params){
 
   /* One persistent physics world per solver node. The key must not be the compute context: that
    * one changes while descending into nested node groups and between the evaluations of a frame,
-   * which gave the node several worlds that all wrote the same state. Each of them then rebuilt the
-   * world (losing warm starting and re-welding the glue to its original rest pose) every frame,
-   * which showed up as a pile that twitched periodically. */
+   * which gave the node several worlds that all wrote the same state. Each of them then rebuilt
+   * the world (losing warm starting and re-welding the glue to its original rest pose) every
+   * frame, which showed up as a pile that twitched periodically. */
   SolverWorldKey solver_key;
   if (const GeoNodesUserData *user_data = params.user_data()) {
     if (user_data->call_data != nullptr) {
@@ -1127,8 +1133,8 @@ static void node_geo_exec(GeoNodeExecParams params){
   }
   SolverHandle *solver_handle = settings.warm_start ? acquire_solver_handle(solver_key) : nullptr;
 
-
-  RBD_TRACE("rbd trace: paths=%d raw_constraints=%d\n", int(paths.size()), int(raw_constraints.size()));
+  RBD_TRACE(
+      "rbd trace: paths=%d raw_constraints=%d\n", int(paths.size()), int(raw_constraints.size()));
   for (const StringRef path : paths) {
     GeometrySet *geometry = world.lookup_path_for_write_ptr<GeometrySet>(path);
     if (!geometry) {
@@ -1184,11 +1190,12 @@ static void node_geo_exec(GeoNodeExecParams params){
           }
         }
         if (massless > 0) {
-          std::string message = std::to_string(massless) +
-                                " rigid body/bodies have no mass (their pieces have no usable "
-                                "volume or area). They are given 10 g so they still fall, but check "
-                                "the geometry: empty or degenerate pieces can not be simulated "
-                                "properly";
+          std::string message =
+              std::to_string(massless) +
+              " rigid body/bodies have no mass (their pieces have no usable "
+              "volume or area). They are given 10 g so they still fall, but check "
+              "the geometry: empty or degenerate pieces can not be simulated "
+              "properly";
           params.error_message_add(NodeWarningType::Warning, message);
         }
       }
@@ -1199,8 +1206,8 @@ static void node_geo_exec(GeoNodeExecParams params){
         const bke::Instances &upstream_instances = *upstream_geometry.get_instances();
         const Span<float4x4> upstream_transforms = upstream_instances.transforms();
         /* Both flags are taken from here: they live on the *pre-zone* pieces, and the zone state
-         * would otherwise keep the values it had on the first frame (so switching the animation, or
-         * the active flag, would never reach the solver). */
+         * would otherwise keep the values it had on the first frame (so switching the animation,
+         * or the active flag, would never reach the solver). */
         const VArray<bool> animated_flags = upstream_instances.attributes()
                                                 .lookup_or_default<bool>(
                                                     "animated", AttrDomain::Instance, false)
@@ -1216,6 +1223,11 @@ static void node_geo_exec(GeoNodeExecParams params){
           const bool was_animated = states[i].animated;
           states[i].animated = animated_flags[i];
           states[i].active = active_flags[i];
+          if (states[i].animated && !was_animated) {
+            /* Recovery: the body becomes kinematic again. Re-base the angular joints for the
+             * blended pose so a later ragdoll switch does not snap back to the bind pose. */
+            switched_bodies[i] = true;
+          }
           if (!states[i].animated) {
             if (was_animated) {
               /* First simulated frame: start at the pose the animation has *now* instead of the
@@ -1247,7 +1259,10 @@ static void node_geo_exec(GeoNodeExecParams params){
 
     const int body_num = int(states.size());
     RBD_TRACE("rbd trace: path=%s body_num=%d inst=%d points=%d\n",
-              path.data(), body_num, int(has_instances), int(has_points));
+              path.data(),
+              body_num,
+              int(has_instances),
+              int(has_points));
     const Array<int> body_ids = read_body_ids(*geometry, body_num);
     RBD_TRACE("rbd trace: body_ids done constraint_num=%d\n", int(raw_constraints.size()));
     Map<int, int> id_to_index;
@@ -1267,7 +1282,8 @@ static void node_geo_exec(GeoNodeExecParams params){
     }
 
     /* Active ragdoll servos: the target orientation comes from the live armature and may change
-     * every frame, so it is applied as a torque and deliberately not part of the world signature. */
+     * every frame, so it is applied as a torque and deliberately not part of the world signature.
+     */
     for (const RawMotor &motor : raw_motors) {
       const int *index = id_to_index.lookup_ptr(motor.piece_id);
       if (!index) {
@@ -1362,7 +1378,9 @@ static void node_geo_exec(GeoNodeExecParams params){
     collect_body_shapes(*geometry, body_num, shapes, shape_points);
 
     RBD_TRACE("rbd trace: before simulate bodies=%d shapes=%d points=%d\n",
-              int(states.size()), int(shapes.size()), int(shape_points.size()));
+              int(states.size()),
+              int(shapes.size()),
+              int(shape_points.size()));
     simulate_bodies(states,
                     Span<BodyShape>(shapes.data(), shapes.size()),
                     Span<const float3>(shape_points.data(), shape_points.size()),
@@ -1442,7 +1460,8 @@ static void node_geo_exec(GeoNodeExecParams params){
           enabled.span[point] = false;
         }
         else if (feedback.result == ConstraintResult::SoftFallback) {
-          /* A soft fallback is permanent: the constraint becomes a spring and does not break again. */
+          /* A soft fallback is permanent: the constraint becomes a spring and does not break
+           * again. */
           types.span[point] = 1;
           enabled.span[point] = true;
         }
@@ -1463,9 +1482,11 @@ static void node_geo_exec(GeoNodeExecParams params){
        * ragdoll. Only clouds that actually carry joint frames get touched. */
       if (attributes.contains("frame_a") && attributes.contains("frame_b")) {
         bke::SpanAttributeWriter<math::Quaternion> frame_a =
-            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_a", AttrDomain::Point);
+            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_a",
+                                                                      AttrDomain::Point);
         bke::SpanAttributeWriter<math::Quaternion> frame_b =
-            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_b", AttrDomain::Point);
+            attributes.lookup_or_add_for_write_span<math::Quaternion>("frame_b",
+                                                                      AttrDomain::Point);
         for (const int raw_i : raw_constraints.index_range()) {
           if (!frames_rebased[raw_i]) {
             continue;
@@ -1525,9 +1546,3 @@ static void node_register()
 NOD_REGISTER_NODE(node_register)
 
 }  // namespace blender::nodes::node_geo_rigid_body_solver_cc
-
-
-
-
-
-

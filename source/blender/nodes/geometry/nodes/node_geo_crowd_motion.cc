@@ -638,6 +638,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       src_attributes.lookup_or_default<float>("agent_radius", AttrDomain::Point, 0.0f).varray;
   const VArray<bool> actives =
       src_attributes.lookup_or_default<bool>("active", AttrDomain::Point, true).varray;
+  const VArray<int> physics_modes =
+      src_attributes.lookup_or_default<int>("physics_mode", AttrDomain::Point, 0).varray;
   const VArray<MStringProperty> src_states =
       src_attributes.lookup<MStringProperty>("state").varray;
   const VArray<MStringProperty> src_prev_states =
@@ -692,7 +694,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   if (separation_strength > 0.0f && avoidance_radius > 0.0f) {
     threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
       for (const int i : range) {
-        if (!actives[i]) {
+        if (!actives[i] || physics_modes[i] != 0) {
           continue;
         }
         float3 force = float3(0.0f);
@@ -714,7 +716,7 @@ static void node_geo_exec(GeoNodeExecParams params)
             int found = 0;
             for (const int slot : IndexRange(begin, end - begin)) {
               const int other = grid.indices[slot];
-              if (other == i) {
+              if (other == i || physics_modes[other] != 0) {
                 continue;
               }
               const float3 delta = positions[i] - positions[other];
@@ -754,15 +756,13 @@ static void node_geo_exec(GeoNodeExecParams params)
       }
       blend_duration_writer.span[i] = blend_duration;
 
-      if (!actives[i]) {
+      if (!actives[i] || physics_modes[i] != 0) {
         state_time_writer.span[i] = src_state_times[i];
         position_writer.span[i] = positions[i];
-        velocity_writer.span[i] = velocities[i];
+        velocity_writer.span[i] = float3(0.0f);
         rotation_writer.span[i] = rotations[i];
-        target_distance_writer.span[i] = target_of[i] >= 0 ?
-                                             math::length(targets[target_of[i]].position -
-                                                          positions[i]) :
-                                             1.0e9f;
+        target_distance_writer.span[i] = 1.0e9f;
+        nominal_speeds[i] = 0.0f;
         continue;
       }
 
@@ -897,7 +897,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       Array<float3> push(count, float3(0.0f));
       threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
         for (const int i : range) {
-          if (!actives[i] || radii[i] <= 0.0f) {
+          if (!actives[i] || physics_modes[i] != 0 || radii[i] <= 0.0f) {
             continue;
           }
           const int2 center = grid.cell_of(positions[i]);
@@ -917,7 +917,7 @@ static void node_geo_exec(GeoNodeExecParams params)
               const int end = grid.offsets[cell + 1];
               for (const int slot : IndexRange(begin, end - begin)) {
                 const int other = grid.indices[slot];
-                if (other == i) {
+                if (other == i || physics_modes[other] != 0) {
                   continue;
                 }
                 const float3 delta = positions[i] - positions[other];
@@ -961,7 +961,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       Array<float3> push(count, float3(0.0f));
       threading::parallel_for(IndexRange(count), 512, [&](const IndexRange range) {
         for (const int i : range) {
-          if (!actives[i]) {
+          if (!actives[i] || physics_modes[i] != 0) {
             continue;
           }
           const float3 escape = navigation_escape(navigation_sampler, positions[i]);

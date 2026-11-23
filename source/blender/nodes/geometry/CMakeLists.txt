@@ -36,6 +36,7 @@ set(SRC
   nodes/node_geo_attribute_statistic.cc
   nodes/node_geo_bake.cc
   nodes/node_geo_blur_attribute.cc
+  nodes/node_geo_blend_bones.cc
   nodes/node_geo_bone_info.cc
   nodes/node_geo_boolean.cc
   nodes/node_geo_bounding_box.cc
@@ -54,6 +55,7 @@ set(SRC
   nodes/node_geo_crowd_bones.cc
   nodes/node_geo_crowd_motion.cc
   nodes/node_geo_crowd_navigation.cc
+  nodes/node_geo_crowd_ragdoll_switch.cc
   nodes/node_geo_crowd_state.cc
   nodes/node_geo_crowd_state_switch.cc
   nodes/node_geo_cube_grid_topology.cc

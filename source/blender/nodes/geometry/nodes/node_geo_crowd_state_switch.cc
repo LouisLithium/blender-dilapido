@@ -147,6 +147,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       points->attributes().lookup<MStringProperty>("prev_state").varray;
   const VArray<float> state_times =
       points->attributes().lookup_or_default<float>("state_time", domain, 0.0f).varray;
+  const VArray<int> physics_modes =
+      points->attributes().lookup_or_default<int>("physics_mode", domain, 0).varray;
   const VArray<float> blend_durations =
       points->attributes().lookup<float>("blend_duration").varray;
   const VArray<float> src_phases =
@@ -162,6 +164,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   }
 
   switched.foreach_index([&](const int i) {
+    if (physics_modes[i] != 0) {
+      return;
+    }
     const std::string previous = previous_states ? crowd::read_string(previous_states[i]) : "";
     if (previous == target_state) {
       return;

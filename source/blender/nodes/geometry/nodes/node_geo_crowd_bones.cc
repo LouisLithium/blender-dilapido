@@ -81,6 +81,8 @@ struct BoneSample {
   MStringProperty name;
   int agent_id;
   int template_id;
+  int physics_mode;
+  float recover_weight;
   bool animated;
 };
 
@@ -418,6 +420,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_default<bool>("active", AttrDomain::Point, true).varray;
   const VArray<int> physics_modes =
       attributes.lookup_or_default<int>("physics_mode", AttrDomain::Point, 0).varray;
+  const VArray<float> recover_weights =
+      attributes.lookup_or_default<float>("recover_weight", AttrDomain::Point, 0.0f).varray;
   const VArray<math::Quaternion> rotations = attributes
                                                  .lookup_or_default<math::Quaternion>(
                                                      "rotation",
@@ -645,6 +649,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       sample.name = names[i];
       sample.agent_id = agent_ids[point];
       sample.template_id = templ.template_id;
+      sample.physics_mode = physics_modes[point];
+      sample.recover_weight = recover_weights[point];
       sample.animated = physics_modes[point] == 0;
     }
   }
@@ -672,6 +678,10 @@ static void node_geo_exec(GeoNodeExecParams params)
       "template_id", domain);
   bke::SpanAttributeWriter<bool> animated_writer =
       out_attributes.lookup_or_add_for_write_span<bool>("animated", domain);
+  bke::SpanAttributeWriter<int> physics_mode_writer =
+      out_attributes.lookup_or_add_for_write_span<int>("physics_mode", domain);
+  bke::SpanAttributeWriter<float> recover_weight_writer =
+      out_attributes.lookup_or_add_for_write_span<float>("recover_weight", domain);
 
   for (const int i : samples.index_range()) {
     const BoneSample &sample = samples[i];
@@ -685,6 +695,8 @@ static void node_geo_exec(GeoNodeExecParams params)
     agent_writer.span[i] = sample.agent_id;
     template_writer.span[i] = sample.template_id;
     animated_writer.span[i] = sample.animated;
+    physics_mode_writer.span[i] = sample.physics_mode;
+    recover_weight_writer.span[i] = sample.recover_weight;
   }
   positions_writer.finish();
   pose_writer.finish();
@@ -696,6 +708,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   agent_writer.finish();
   template_writer.finish();
   animated_writer.finish();
+  physics_mode_writer.finish();
+  recover_weight_writer.finish();
   result->tag_positions_changed();
 
   params.set_output("Bones"_ustr, GeometrySet::from_pointcloud(result));

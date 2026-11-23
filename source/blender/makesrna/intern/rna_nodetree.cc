@@ -10686,6 +10686,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeAttributeDomainSize");
   define("GeometryNode", "GeometryNodeAttributeStatistic");
   define("GeometryNode", "GeometryNodeBake", rna_def_geo_bake);
+  define("GeometryNode", "GeometryNodeBlendBones");
   define("GeometryNode", "GeometryNodeBlurAttribute");
   define("GeometryNode", "GeometryNodeBoneInfo");
   define("GeometryNode", "GeometryNodeBoundBox");
@@ -10705,6 +10706,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeCrowdBones");
   define("GeometryNode", "GeometryNodeCrowdMotion");
   define("GeometryNode", "GeometryNodeCrowdNavigation");
+  define("GeometryNode", "GeometryNodeCrowdRagdollSwitch");
   define("GeometryNode", "GeometryNodeCrowdState");
   define("GeometryNode", "GeometryNodeCrowdStateSwitch");
   define("GeometryNode", "GeometryNodeCubeGridTopology");
