@@ -562,6 +562,12 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "With Targets connected, blends direct steering (0) with the navigation flow (1). With "
           "only Navigation, acts as a throttle (0 = stop, 1 = full speed)");
+  b.add_input<decl::Float>("Speed Ratio Smoothing"_ustr)
+      .default_value(0.25f)
+      .min(0.0f)
+      .description(
+          "Time constant in seconds for `speed_ratio`. Larger values remove sudden playback "
+          "changes when the agent turns, changes state or is pushed (0 = instant)");
 
   b.add_output<decl::Geometry>("Points"_ustr);
 }
@@ -583,6 +589,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       params.extract_input<float>("Navigation Strength"_ustr), 0.0f, 1.0f);
   GeometrySet targets_geometry = params.extract_input<GeometrySet>("Targets"_ustr);
   const float delta_time = std::max(params.extract_input<float>("Delta Time"_ustr), 0.0f);
+  const float speed_ratio_smoothing = std::max(
+      params.extract_input<float>("Speed Ratio Smoothing"_ustr), 0.0f);
   const float max_speed = std::max(params.extract_input<float>("Max Speed"_ustr), 0.0f);
   const float max_acceleration = std::max(params.extract_input<float>("Max Acceleration"_ustr),
                                           0.0f);
@@ -634,6 +642,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       src_attributes.lookup<MStringProperty>("state").varray;
   const VArray<MStringProperty> src_prev_states =
       src_attributes.lookup<MStringProperty>("prev_state").varray;
+  const VArray<float> src_speed_ratios = src_attributes.lookup<float>("speed_ratio").varray;
   const VArray<float> src_state_times =
       src_attributes.lookup_or_default<float>("state_time", AttrDomain::Point, 0.0f).varray;
   const VArray<math::Quaternion> src_rotations = src_attributes
@@ -990,8 +999,14 @@ static void node_geo_exec(GeoNodeExecParams params)
     const float nominal = nominal_speeds[i];
     float ratio = 1.0f;
     if (nominal > 1.0e-4f) {
-      ratio = math::clamp(
+      const float instant = math::clamp(
           math::length(float2(velocities[i].x, velocities[i].y)) / nominal, 0.0f, 3.0f);
+      ratio = instant;
+      if (speed_ratio_smoothing > 0.0f && src_speed_ratios && delta_time > 0.0f) {
+        const float alpha = 1.0f - std::exp(-delta_time / speed_ratio_smoothing);
+        ratio = math::clamp(
+            src_speed_ratios[i] + (instant - src_speed_ratios[i]) * alpha, 0.0f, 3.0f);
+      }
     }
     speed_ratio_writer.span[i] = ratio;
   }

@@ -213,6 +213,13 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Float>("Time"_ustr)
       .default_value(0.0f)
       .description("Animation time in seconds (e.g. Scene Time > Seconds)");
+  b.add_input<decl::Float>("Phase Offset"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(1.0f)
+      .description(
+          "Multiplier for each agent's animation phase offset (0 = all agents in sync, "
+          "1 = the full offset stored by Init Crowd Data)");
   b.add_input<decl::Bool>("Speed Match"_ustr)
       .default_value(true)
       .description(
@@ -352,6 +359,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   BundlePtr fallback_states = params.extract_input<BundlePtr>("States"_ustr);
   GeometrySet instances_geometry = params.extract_input<GeometrySet>("Instances"_ustr);
   const float time = params.extract_input<float>("Time"_ustr);
+  const float phase_offset_scale = math::clamp(
+      params.extract_input<float>("Phase Offset"_ustr), 0.0f, 1.0f);
   const bool speed_match = params.extract_input<bool>("Speed Match"_ustr);
   const float stride_scale = math::clamp(
       params.extract_input<float>("Stride Scale"_ustr), 0.0f, 1.0f);
@@ -520,7 +529,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       animrig::EvaluationResult evaluated;
       if (action != nullptr && armature != nullptr && armature->adt != nullptr) {
         const float action_frame = clip_frame(
-            clip, time, point_phase, speeds[point] * playback_rate);
+            clip, time, point_phase * phase_offset_scale, speeds[point] * playback_rate);
         const animrig::slot_handle_t slot_handle = find_clip_slot(action, armature);
         if (slot_handle != animrig::Slot::unassigned) {
           PointerRNA armature_ptr = RNA_id_pointer_create(&armature->id);

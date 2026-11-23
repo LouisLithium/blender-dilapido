@@ -57,8 +57,8 @@ static void read_templates(const Bundle &agents, Vector<TemplateInfo> &r_templat
   const int count = agents.lookup_path<int>("count").value_or(0);
   r_templates.reserve(count);
   for (const int i : IndexRange(count)) {
-    const std::optional<BundlePtr> agent = agents.lookup_path<BundlePtr>(
-        "agent_" + std::to_string(i));
+    const std::optional<BundlePtr> agent = agents.lookup_path<BundlePtr>("agent_" +
+                                                                         std::to_string(i));
     if (!agent || !*agent) {
       continue;
     }
@@ -78,8 +78,8 @@ static void read_states(const Bundle *states, Vector<StateInfo> &r_states)
   const int count = states->lookup_path<int>("count").value_or(0);
   r_states.reserve(count);
   for (const int i : IndexRange(count)) {
-    const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>(
-        "state_" + std::to_string(i));
+    const std::optional<BundlePtr> state = states->lookup_path<BundlePtr>("state_" +
+                                                                          std::to_string(i));
     if (!state || !*state) {
       continue;
     }
@@ -100,6 +100,13 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Int>("Seed"_ustr)
       .default_value(0)
       .description("Seed for template choice and random phase");
+  b.add_input<decl::Float>("Phase Spread"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(1.0f)
+      .description(
+          "Range of the per-agent animation phase offset (0 = every agent starts in sync, "
+          "1 = full cycle)");
   b.add_input<decl::Bool>("Fallback To Any Group"_ustr)
       .default_value(true)
       .description("Use any template when no template matches the point's spawn group");
@@ -119,6 +126,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   BundlePtr agents = params.extract_input<BundlePtr>("Agents"_ustr);
   BundlePtr states = params.extract_input<BundlePtr>("States"_ustr);
   const int seed = params.extract_input<int>("Seed"_ustr);
+  const float phase_spread = math::clamp(
+      params.extract_input<float>("Phase Spread"_ustr), 0.0f, 1.0f);
   const bool fallback_any = params.extract_input<bool>("Fallback To Any Group"_ustr);
   const std::string default_state = params.extract_input<std::string>("Default State"_ustr);
 
@@ -146,17 +155,14 @@ static void node_geo_exec(GeoNodeExecParams params)
   read_states(states.get(), state_list);
 
   const bke::AttributeAccessor src_attributes = points->attributes();
-  const VArray<int> spawn_groups = src_attributes.contains("spawn_group") ?
-                                       src_attributes
-                                           .lookup_or_default<int>(
-                                               "spawn_group", AttrDomain::Point, 0)
-                                           .varray :
-                                       src_attributes
-                                           .lookup_or_default<int>("group_id", AttrDomain::Point, 0)
-                                           .varray;
+  const VArray<int> spawn_groups =
+      src_attributes.contains("spawn_group") ?
+          src_attributes.lookup_or_default<int>("spawn_group", AttrDomain::Point, 0).varray :
+          src_attributes.lookup_or_default<int>("group_id", AttrDomain::Point, 0).varray;
   const VArray<MStringProperty> requested_states =
       src_attributes.lookup<MStringProperty>("state").varray;
-  const VArray<int> ids = src_attributes.lookup_or_default<int>("id", AttrDomain::Point, -1).varray;
+  const VArray<int> ids =
+      src_attributes.lookup_or_default<int>("id", AttrDomain::Point, -1).varray;
   const VArray<float> phases =
       src_attributes.lookup_or_default<float>("phase", AttrDomain::Point, -1.0f).varray;
   const VArray<float> speeds =
@@ -171,24 +177,26 @@ static void node_geo_exec(GeoNodeExecParams params)
   PointCloud *result = BKE_pointcloud_copy_for_eval(points);
   bke::MutableAttributeAccessor out_attributes = result->attributes_for_write();
   const AttrDomain domain = AttrDomain::Point;
-  bke::SpanAttributeWriter<int> agent_id_writer =
-      out_attributes.lookup_or_add_for_write_span<int>("agent_id", domain);
+  bke::SpanAttributeWriter<int> agent_id_writer = out_attributes.lookup_or_add_for_write_span<int>(
+      "agent_id", domain);
   bke::SpanAttributeWriter<int> template_id_writer =
       out_attributes.lookup_or_add_for_write_span<int>("template_id", domain);
   bke::SpanAttributeWriter<int> spawn_group_writer =
       out_attributes.lookup_or_add_for_write_span<int>("spawn_group", domain);
-  bke::SpanAttributeWriter<int> state_id_writer =
-      out_attributes.lookup_or_add_for_write_span<int>("state_id", domain);
+  bke::SpanAttributeWriter<int> state_id_writer = out_attributes.lookup_or_add_for_write_span<int>(
+      "state_id", domain);
   bke::SpanAttributeWriter<MStringProperty> state_writer =
       out_attributes.lookup_or_add_for_write_span<MStringProperty>("state", domain);
   bke::SpanAttributeWriter<float> phase_writer =
       out_attributes.lookup_or_add_for_write_span<float>("phase", domain);
+  bke::SpanAttributeWriter<float> phase_offset_writer =
+      out_attributes.lookup_or_add_for_write_span<float>("phase_offset", domain);
   bke::SpanAttributeWriter<float> speed_writer =
       out_attributes.lookup_or_add_for_write_span<float>("speed", domain);
   bke::SpanAttributeWriter<float> scale_writer =
       out_attributes.lookup_or_add_for_write_span<float>("scale", domain);
-  bke::SpanAttributeWriter<bool> active_writer =
-      out_attributes.lookup_or_add_for_write_span<bool>("active", domain);
+  bke::SpanAttributeWriter<bool> active_writer = out_attributes.lookup_or_add_for_write_span<bool>(
+      "active", domain);
   bke::SpanAttributeWriter<int> physics_mode_writer =
       out_attributes.lookup_or_add_for_write_span<int>("physics_mode", domain);
 
@@ -275,8 +283,7 @@ static void node_geo_exec(GeoNodeExecParams params)
 
     float phase = phases[point];
     if (!(phase >= 0.0f)) {
-      phase = crowd::hash_to_unit(
-          crowd::hash_ids(seed ^ 0x5bd1, stable_id));
+      phase = crowd::hash_to_unit(crowd::hash_ids(seed ^ 0x5bd1, stable_id)) * phase_spread;
     }
     phase -= std::floor(phase);
 
@@ -286,6 +293,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     state_id_writer.span[point] = state_id;
     crowd::write_string(state_writer.span[point], state_name);
     phase_writer.span[point] = phase;
+    phase_offset_writer.span[point] = phase;
     speed_writer.span[point] = std::max(speeds[point], 0.0f);
     scale_writer.span[point] = std::max(scales[point], 1.0e-4f);
     active_writer.span[point] = actives[point] && has_template;
@@ -318,6 +326,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   state_id_writer.finish();
   state_writer.finish();
   phase_writer.finish();
+  phase_offset_writer.finish();
   speed_writer.finish();
   scale_writer.finish();
   active_writer.finish();

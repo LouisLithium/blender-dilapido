@@ -136,6 +136,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_add_for_write_span<float>("state_time", domain);
   bke::SpanAttributeWriter<float> phase_writer = attributes.lookup_or_add_for_write_span<float>(
       "phase", domain);
+  bke::SpanAttributeWriter<float> phase_offset_writer =
+      attributes.lookup_or_add_for_write_span<float>("phase_offset", domain);
   bke::SpanAttributeWriter<float> prev_phase_writer =
       attributes.lookup_or_add_for_write_span<float>("prev_phase", domain);
 
@@ -149,6 +151,15 @@ static void node_geo_exec(GeoNodeExecParams params)
       points->attributes().lookup<float>("blend_duration").varray;
   const VArray<float> src_phases =
       points->attributes().lookup_or_default<float>("phase", domain, 0.0f).varray;
+  const VArray<float> src_phase_offsets =
+      points->attributes().lookup<float>("phase_offset").varray;
+  if (!src_phase_offsets) {
+    /* Migrate old point clouds: the current phase becomes the stable per-agent offset, so a
+     * state switch no longer syncs every agent to phase 0. */
+    for (const int i : IndexRange(points->totpoint)) {
+      phase_offset_writer.span[i] = src_phases[i];
+    }
+  }
 
   switched.foreach_index([&](const int i) {
     const std::string previous = previous_states ? crowd::read_string(previous_states[i]) : "";
@@ -180,7 +191,9 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     /* Keep the phase the previous clip was playing at, so Crowd Bones can continue it during the
      * blend out even when `Reset Phase` restarts the target state. */
+    const float phase_offset = src_phase_offsets ? src_phase_offsets[i] : src_phases[i];
     prev_phase_writer.span[i] = src_phases[i];
+    phase_offset_writer.span[i] = phase_offset;
     if (!previous.empty()) {
       prev_state_writer.span[i] = previous_states[i];
     }
@@ -192,7 +205,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       state_time_writer.span[i] = 0.0f;
     }
     if (reset_phase) {
-      phase_writer.span[i] = 0.0f;
+      phase_writer.span[i] = phase_offset;
     }
   });
 
@@ -201,6 +214,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   state_id_writer.finish();
   state_time_writer.finish();
   phase_writer.finish();
+  phase_offset_writer.finish();
   prev_phase_writer.finish();
 
   params.set_output("Points"_ustr, GeometrySet::from_pointcloud(result));
