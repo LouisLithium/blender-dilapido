@@ -11,7 +11,11 @@ The panel lives in the sidebar of the Geometry Nodes editor and offers two butto
 - `Quick Crowd Walk` builds a walking crowd template: three states, spawn scattering,
   `Crowd Motion` with local separation, navigation, `Crowd Bones` and skinning. The crowd stays
   instanced (`Skin From Bones` deforms each instance) so no `Realize Instances` runs per frame. It
-  uses the native nodes directly (no asset group).
+  uses the native nodes directly (no asset group) and does **not** change the group interface:
+  external geometry/objects are picked on `Object Info` / `Object` nodes, and numeric defaults are
+  `Value` nodes.
+- `Auto Arrange` arranges selected nodes (or all) with the Node Arrange extension
+  (`bpy.ops.node.na_arrange_selected()`), falling back to a built-in layered layout.
 
 Everything is wired, so a modifier that has this node tree runs right away; the sizes are sensible
 defaults that can be tweaked afterwards.
@@ -183,6 +187,132 @@ def _ensure_interface_socket(node_tree, name, in_out, socket_type, description="
         socket.description = description
 
 
+def _node_height_estimate(node):
+    def counts(sockets):
+        try:
+            return len(sockets)
+        except TypeError:
+            return 0
+
+    return max(90.0, 40.0 + 22.0 * max(counts(node.inputs), counts(node.outputs)))
+
+
+def _fallback_arrange(node_tree, nodes, column_gap=90.0, row_gap=60.0):
+    """Layered (Sugiyama-style) layout used when the Node Arrange extension is unavailable."""
+    nodes = list(nodes)
+    if not nodes:
+        return
+    node_set = set(nodes)
+    links = [
+        link for link in node_tree.links
+        if link.from_node in node_set and link.to_node in node_set
+    ]
+
+    # Longest path from a source: every node ends up right of all of its inputs.
+    depth = {node: 0 for node in nodes}
+    for _ in range(len(nodes)):
+        changed = False
+        for link in links:
+            source_depth = depth.get(link.from_node, 0) + 1
+            if depth.get(link.to_node, 0) < source_depth:
+                depth[link.to_node] = source_depth
+                changed = True
+        if not changed:
+            break
+
+    inputs_of = {node: [] for node in nodes}
+    outputs_of = {node: [] for node in nodes}
+    for link in links:
+        inputs_of[link.to_node].append(link.from_node)
+        outputs_of[link.from_node].append(link.to_node)
+
+    columns = {}
+    for node in nodes:
+        columns.setdefault(depth[node], []).append(node)
+
+    def row_of(node):
+        column_nodes = columns.get(depth.get(node, 0))
+        if column_nodes is None:
+            return 0
+        try:
+            return column_nodes.index(node)
+        except ValueError:
+            return 0
+
+    for _ in range(6):
+        for column in sorted(columns)[1:]:
+            items = columns[column]
+            rows = {node: index for index, node in enumerate(items)}
+
+            def forward_key(node, rows=rows):
+                neighbours = inputs_of[node]
+                if not neighbours:
+                    return rows[node]
+                return sum(row_of(n) for n in neighbours) / len(neighbours)
+
+            items.sort(key=forward_key)
+        for column in reversed(sorted(columns)[:-1]):
+            items = columns[column]
+            rows = {node: index for index, node in enumerate(items)}
+
+            def backward_key(node, rows=rows):
+                neighbours = outputs_of[node]
+                if not neighbours:
+                    return rows[node]
+                return sum(row_of(n) for n in neighbours) / len(neighbours)
+
+            items.sort(key=backward_key)
+
+    x = 0.0
+    for column in sorted(columns):
+        items = columns[column]
+        heights = [_node_height_estimate(node) for node in items]
+        total = sum(heights) + row_gap * (len(items) - 1)
+        y = total * 0.5
+        for node, height in zip(items, heights):
+            node.location = (x, y - height * 0.5)
+            y -= height + row_gap
+        x += max(180.0, max(getattr(node, "width", 0.0) for node in items)) + column_gap
+
+
+def _arrange_nodes(node_tree, nodes=None):
+    """Arrange nodes with the Node Arrange extension, falling back to a built-in layout.
+
+    Returns True when the extension did the work. When `nodes` is None, selected nodes are
+    arranged, or the whole tree if nothing is selected.
+    """
+    if nodes is None:
+        selected = [node for node in node_tree.nodes if node.select]
+        target = selected if selected else list(node_tree.nodes)
+    else:
+        target = list(nodes)
+    if not target:
+        return True
+
+    old_selection = [(node, node.select) for node in node_tree.nodes]
+    for node in node_tree.nodes:
+        node.select = node in target
+
+    used_extension = False
+    space = getattr(bpy.context, "space_data", None)
+    if space is not None and getattr(space, "edit_tree", None) == node_tree:
+        try:
+            result = bpy.ops.node.na_arrange_selected()
+            used_extension = "FINISHED" in result
+        except (AttributeError, RuntimeError, TypeError):
+            used_extension = False
+        finally:
+            for node, selected in old_selection:
+                node.select = selected
+    else:
+        for node, selected in old_selection:
+            node.select = selected
+
+    if not used_extension:
+        _fallback_arrange(node_tree, target)
+    return used_extension
+
+
 def build_quick_crowd_walk(node_tree, realize_output=False):
     """Build the fixed `Crowd Walk` template tree (no asset group, no rigid bodies).
 
@@ -201,20 +331,29 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
         node.label = label
         return node
 
-    group_input = find_or_add("NodeGroupInput", "Crowd Inputs")
     group_output = find_or_add("NodeGroupOutput", "Crowd Output")
-    _ensure_interface_socket(
-        node_tree, "Mesh", "INPUT", "NodeSocketGeometry",
-        "Character mesh. Its vertex groups must be named after the bones")
-    _ensure_interface_socket(node_tree, "Armature", "INPUT", "NodeSocketObject",
-                             "Rest rig used for the skeleton and Action evaluation")
-    _ensure_interface_socket(node_tree, "Spawn Surface", "INPUT", "NodeSocketGeometry",
-                             "Surface to scatter the crowd spawn points on")
-    _ensure_interface_socket(node_tree, "Target", "INPUT", "NodeSocketGeometry",
-                             "Target point/geometry the crowd walks towards")
-    _ensure_interface_socket(node_tree, "Obstacles", "INPUT", "NodeSocketGeometry",
-                             "Optional obstacle mesh. Leave unconnected for open walking")
-    _ensure_interface_socket(node_tree, "Geometry", "OUTPUT", "NodeSocketGeometry")
+
+    # External inputs are node pickers, not group interface sockets. The tree is self-contained.
+    mesh_info = nodes.new("GeometryNodeObjectInfo")
+    mesh_info.label = "Crowd Mesh"
+    spawn_info = nodes.new("GeometryNodeObjectInfo")
+    spawn_info.label = "Spawn Surface"
+    target_info = nodes.new("GeometryNodeObjectInfo")
+    target_info.label = "Crowd Target"
+    obstacles_info = nodes.new("GeometryNodeObjectInfo")
+    obstacles_info.label = "Crowd Obstacles"
+    armature_input = nodes.new("GeometryNodeInputObject")
+    armature_input.label = "Crowd Armature"
+
+    spacing_value = nodes.new("ShaderNodeValue")
+    spacing_value.label = "Spawn Spacing"
+    spacing_value.outputs[0].default_value = 2.0
+    speed_value = nodes.new("ShaderNodeValue")
+    speed_value.label = "Max Speed"
+    speed_value.outputs[0].default_value = 2.0
+    radius_value = nodes.new("ShaderNodeValue")
+    radius_value.label = "Agent Radius"
+    radius_value.outputs[0].default_value = 0.35
 
     # ---------------------------------------------------------------- states
     state_nodes = []
@@ -244,13 +383,13 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     # ---------------------------------------------------------------- template
     armature_bones = nodes.new("GeometryNodeArmatureBones")
     armature_bones.label = "Rest Bones"
-    links.new(group_input.outputs["Armature"], armature_bones.inputs["Armature"])
+    links.new(armature_input.outputs["Object"], armature_bones.inputs["Armature"])
 
     agent = nodes.new("GeometryNodeCreateCrowdAgent")
     agent.label = "Agent Template"
-    links.new(group_input.outputs["Mesh"], agent.inputs["Mesh"])
+    links.new(mesh_info.outputs["Geometry"], agent.inputs["Mesh"])
     links.new(armature_bones.outputs["Bones"], agent.inputs["Bones"])
-    links.new(group_input.outputs["Armature"], agent.inputs["Armature"])
+    links.new(armature_input.outputs["Object"], agent.inputs["Armature"])
     links.new(join_states.outputs["States"], agent.inputs["States"])
 
     join_agents = nodes.new("GeometryNodeJoinCrowdAgents")
@@ -260,8 +399,8 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     # ---------------------------------------------------------------- spawn
     scatter = nodes.new("GeometryNodeDistributePoints")
     scatter.label = "Spawn Points"
-    scatter.inputs["Spacing"].default_value = 2.0
-    links.new(group_input.outputs["Spawn Surface"], scatter.inputs["Geometry"])
+    links.new(spacing_value.outputs[0], scatter.inputs["Spacing"])
+    links.new(spawn_info.outputs["Geometry"], scatter.inputs["Geometry"])
 
     init = nodes.new("GeometryNodeInitCrowdData")
     init.label = "Init Crowd"
@@ -274,11 +413,11 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     # ---------------------------------------------------------------- simulation zone
     navigation = nodes.new("GeometryNodeCrowdNavigation")
     navigation.label = "Navigation"
-    navigation.inputs["Agent Radius"].default_value = 0.35
+    links.new(radius_value.outputs[0], navigation.inputs["Agent Radius"])
     navigation.inputs["Max Step Height"].default_value = 0.35
-    links.new(group_input.outputs["Obstacles"], navigation.inputs["Obstacles"])
-    links.new(group_input.outputs["Target"], navigation.inputs["Goals"])
-    links.new(group_input.outputs["Spawn Surface"], navigation.inputs["Bounds Geometry"])
+    links.new(obstacles_info.outputs["Geometry"], navigation.inputs["Obstacles"])
+    links.new(target_info.outputs["Geometry"], navigation.inputs["Goals"])
+    links.new(spawn_info.outputs["Geometry"], navigation.inputs["Bounds Geometry"])
 
     sim_input = nodes.new("GeometryNodeSimulationInput")
     sim_output = nodes.new("GeometryNodeSimulationOutput")
@@ -294,16 +433,16 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
 
     motion = nodes.new("GeometryNodeCrowdMotion")
     motion.label = "Walk"
-    motion.inputs["Max Speed"].default_value = 2.0
+    links.new(speed_value.outputs[0], motion.inputs["Max Speed"])
     motion.inputs["Max Acceleration"].default_value = 12.0
     motion.inputs["Turn Rate"].default_value = 8.0
     motion.inputs["Arrive Radius"].default_value = 0.8
-    motion.inputs["Agent Radius"].default_value = 0.35
+    links.new(radius_value.outputs[0], motion.inputs["Agent Radius"])
     motion.inputs["Avoidance Radius"].default_value = 1.6
     motion.inputs["Separation Strength"].default_value = 4.0
     motion.inputs["Hard Separation"].default_value = True
     links.new(sim_geometry, motion.inputs["Points"])
-    links.new(group_input.outputs["Target"], motion.inputs["Targets"])
+    links.new(target_info.outputs["Geometry"], motion.inputs["Targets"])
     links.new(join_states.outputs["States"], motion.inputs["States"])
     links.new(navigation.outputs["Navigation"], motion.inputs["Navigation"])
     links.new(sim_delta, motion.inputs["Delta Time"])
@@ -353,7 +492,7 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
 
     instance = nodes.new("GeometryNodeInstanceOnPoints")
     instance.label = "Instance Agents"
-    links.new(group_input.outputs["Mesh"], instance.inputs["Instance"])
+    links.new(mesh_info.outputs["Geometry"], instance.inputs["Instance"])
     links.new(sim_output_geometry, instance.inputs["Points"])
 
     rotation_attr = nodes.new("GeometryNodeInputNamedAttribute")
@@ -373,54 +512,45 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
         realize = nodes.new("GeometryNodeRealizeInstances")
         realize.label = "Realize Crowd"
         links.new(skin.outputs["Mesh"], realize.inputs["Geometry"])
-        links.new(realize.outputs["Geometry"], group_output.inputs["Geometry"])
-    else:
-        links.new(skin.outputs["Mesh"], group_output.inputs["Geometry"])
+
+    final_socket = realize.outputs["Geometry"] if realize is not None else skin.outputs["Mesh"]
+    output_index = next(
+        (index for index, socket in enumerate(group_output.inputs) if socket.type == "GEOMETRY"),
+        None,
+    )
+    output_linked = output_index is not None
+    if output_linked:
+        links.new(final_socket, group_output.inputs[output_index])
 
     # ---------------------------------------------------------------- layout
-    group_input.location = (-700.0, 100.0)
-    for index, (state, animation) in enumerate(state_nodes):
-        animation.location = (-520.0, 420.0 - index * 220.0)
-        state.location = (-300.0, 420.0 - index * 220.0)
-    join_states.location = (-60.0, 380.0)
-    armature_bones.location = (-520.0, -220.0)
-    agent.location = (-260.0, 80.0)
-    join_agents.location = (-60.0, 80.0)
-    scatter.location = (-300.0, -420.0)
-    init.location = (160.0, -40.0)
-    navigation.location = (160.0, -260.0)
-    motion.location = (560.0, 120.0)
-    distance_attr.location = (800.0, 420.0)
-    close_compare.location = (980.0, 480.0)
-    far_compare.location = (980.0, 300.0)
-    switch_idle.location = (1200.0, 420.0)
-    switch_walk.location = (1420.0, 360.0)
-    sim_output.location = (1500.0, 160.0)
-    scene_time.location = (1500.0, -260.0)
-    bones.location = (1750.0, 260.0)
-    instance.location = (1750.0, -60.0)
-    rotation_attr.location = (1500.0, -500.0)
-    if realize is not None:
-        realize.location = (1980.0, -60.0)
-        skin.location = (2220.0, 80.0)
-        group_output.location = (2480.0, 80.0)
-    else:
-        skin.location = (2020.0, 80.0)
-        group_output.location = (2280.0, 80.0)
-
     nodes_to_size = [state_nodes[0][0], state_nodes[1][0], state_nodes[2][0], join_states,
-                     agent, join_agents, init, motion, bones, instance, skin]
+                     agent, join_agents, init, motion, navigation, bones, instance, skin]
     if realize is not None:
         nodes_to_size.append(realize)
     for node in nodes_to_size:
         node.width = 200.0
+    for node in (mesh_info, spawn_info, target_info, obstacles_info, armature_input):
+        node.width = 180.0
+
+    # Use the Node Arrange extension (same algorithm as `bpy.ops.node.na_arrange_selected()`),
+    # falling back to the built-in layered layout when it is unavailable (headless/tests).
+    _arrange_nodes(node_tree)
+
     return {
         "init": init,
         "motion": motion,
         "bones": bones,
         "skin": skin,
+        "navigation": navigation,
+        "instance": instance,
+        "mesh_info": mesh_info,
+        "spawn_info": spawn_info,
+        "target_info": target_info,
+        "obstacles_info": obstacles_info,
+        "armature_input": armature_input,
         "sim_input": sim_input,
         "sim_output": sim_output,
+        "output_linked": output_linked,
     }
 
 
@@ -471,11 +601,44 @@ class DILAPIDO_OT_quick_crowd_walk(Operator):
     def execute(self, context):
         node_tree = context.space_data.edit_tree
         try:
-            build_quick_crowd_walk(node_tree, realize_output=self.realize_output)
+            created = build_quick_crowd_walk(node_tree, realize_output=self.realize_output)
+            if created is not None and not created.get("output_linked", True):
+                self.report(
+                    {"WARNING"},
+                    "The crowd tree was created but no Geometry output socket exists. Add one to "
+                    "the group and connect 'Skin Crowd'",
+                )
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, f"Could not build Quick Crowd Walk: {exc}")
             return {"CANCELLED"}
         self.report({"INFO"}, "Crowd walk template created")
+        return {"FINISHED"}
+
+
+class DILAPIDO_OT_auto_arrange(Operator):
+    """Arrange the selected nodes (or every node) in the current geometry node tree"""
+
+    bl_idname = "dilapido.auto_arrange"
+    bl_label = "Auto Arrange"
+    bl_description = (
+        "Arrange selected nodes, or all nodes when nothing is selected. Uses the Node Arrange "
+        "extension when available and a built-in layered layout otherwise"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return (space is not None and space.type == "NODE_EDITOR" and
+                space.tree_type == "GeometryNodeTree" and space.edit_tree is not None)
+
+    def execute(self, context):
+        node_tree = context.space_data.edit_tree
+        used_extension = _arrange_nodes(node_tree)
+        if used_extension:
+            self.report({"INFO"}, "Nodes arranged")
+        else:
+            self.report({"INFO"}, "Nodes arranged with the built-in layout")
         return {"FINISHED"}
 
 
@@ -498,14 +661,19 @@ class DILAPIDO_PT_assist(Panel):
         column = layout.column(align=True)
         column.operator("dilapido.quick_rbd", icon="NODETREE")
         column.operator("dilapido.quick_crowd_walk", icon="COMMUNITY")
+        column.separator()
+        column.operator("dilapido.auto_arrange", icon="NODETREE")
         layout.label(text="Quick RBD: fracture, clusters, constraints and the solver.", icon="INFO")
         layout.label(text="Quick Crowd Walk: states, target motion, separation and skinning.",
+                     icon="INFO")
+        layout.label(text="Auto Arrange: selected nodes, or all nodes when nothing is selected.",
                      icon="INFO")
 
 
 classes = (
     DILAPIDO_OT_quick_rbd,
     DILAPIDO_OT_quick_crowd_walk,
+    DILAPIDO_OT_auto_arrange,
     DILAPIDO_PT_assist,
 )
 
