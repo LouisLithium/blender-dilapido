@@ -9,8 +9,9 @@ The panel lives in the sidebar of the Geometry Nodes editor and offers two butto
 - `Quick RBD` builds a working rigid body setup in the current node tree:
   `Group Input -> Voronoi Fracture -> Fracture Cluster -> Init Rigid Body -> Rigid Body Dynamics`.
 - `Quick Crowd Walk` builds a walking crowd template: three states, spawn scattering,
-  `Crowd Motion` with local separation, `Crowd Bones` and skinning. It uses the native nodes
-  directly (no asset group).
+  `Crowd Motion` with local separation, navigation, `Crowd Bones` and skinning. The crowd stays
+  instanced (`Skin From Bones` deforms each instance) so no `Realize Instances` runs per frame. It
+  uses the native nodes directly (no asset group).
 
 Everything is wired, so a modifier that has this node tree runs right away; the sizes are sensible
 defaults that can be tweaked afterwards.
@@ -182,8 +183,13 @@ def _ensure_interface_socket(node_tree, name, in_out, socket_type, description="
         socket.description = description
 
 
-def build_quick_crowd_walk(node_tree):
-    """Build the fixed `Crowd Walk` template tree (no asset group, no rigid bodies)."""
+def build_quick_crowd_walk(node_tree, realize_output=False):
+    """Build the fixed `Crowd Walk` template tree (no asset group, no rigid bodies).
+
+    With `realize_output=False` (default) the crowd stays instanced: `Skin From Bones` skins every
+    instance directly, so no `Realize Instances` runs per frame. Set `realize_output=True` to keep
+    the old single-mesh output.
+    """
     nodes = node_tree.nodes
     links = node_tree.links
 
@@ -356,16 +362,20 @@ def build_quick_crowd_walk(node_tree):
     rotation_attr.inputs["Name"].default_value = "rotation"
     links.new(rotation_attr.outputs["Attribute"], instance.inputs["Rotation"])
 
-    realize = nodes.new("GeometryNodeRealizeInstances")
-    realize.label = "Realize Crowd"
-    links.new(instance.outputs["Instances"], realize.inputs["Geometry"])
-
     skin = nodes.new("GeometryNodeSkinFromBones")
     skin.label = "Skin Crowd"
     skin.inputs["Mode"].default_value = "Dual Quaternion"
-    links.new(realize.outputs["Geometry"], skin.inputs["Mesh"])
+    links.new(instance.outputs["Instances"], skin.inputs["Mesh"])
     links.new(bones.outputs["Bones"], skin.inputs["Bones"])
-    links.new(skin.outputs["Mesh"], group_output.inputs["Geometry"])
+
+    realize = None
+    if realize_output:
+        realize = nodes.new("GeometryNodeRealizeInstances")
+        realize.label = "Realize Crowd"
+        links.new(skin.outputs["Mesh"], realize.inputs["Geometry"])
+        links.new(realize.outputs["Geometry"], group_output.inputs["Geometry"])
+    else:
+        links.new(skin.outputs["Mesh"], group_output.inputs["Geometry"])
 
     # ---------------------------------------------------------------- layout
     group_input.location = (-700.0, 100.0)
@@ -390,12 +400,19 @@ def build_quick_crowd_walk(node_tree):
     bones.location = (1750.0, 260.0)
     instance.location = (1750.0, -60.0)
     rotation_attr.location = (1500.0, -500.0)
-    realize.location = (1980.0, -60.0)
-    skin.location = (2220.0, 80.0)
-    group_output.location = (2480.0, 80.0)
+    if realize is not None:
+        realize.location = (1980.0, -60.0)
+        skin.location = (2220.0, 80.0)
+        group_output.location = (2480.0, 80.0)
+    else:
+        skin.location = (2020.0, 80.0)
+        group_output.location = (2280.0, 80.0)
 
-    for node in (state_nodes[0][0], state_nodes[1][0], state_nodes[2][0], join_states,
-                 agent, join_agents, init, motion, bones, instance, realize, skin):
+    nodes_to_size = [state_nodes[0][0], state_nodes[1][0], state_nodes[2][0], join_states,
+                     agent, join_agents, init, motion, bones, instance, skin]
+    if realize is not None:
+        nodes_to_size.append(realize)
+    for node in nodes_to_size:
         node.width = 200.0
     return {
         "init": init,
@@ -438,6 +455,13 @@ class DILAPIDO_OT_quick_crowd_walk(Operator):
     bl_label = "Quick Crowd Walk"
     bl_options = {"REGISTER", "UNDO"}
 
+    realize_output: bpy.props.BoolProperty(
+        name="Realize Output",
+        description=("Merge the skinned crowd into one mesh. Slower with many agents; leave off "
+                     "to keep the crowd instanced"),
+        default=False,
+    )
+
     @classmethod
     def poll(cls, context):
         space = context.space_data
@@ -447,7 +471,7 @@ class DILAPIDO_OT_quick_crowd_walk(Operator):
     def execute(self, context):
         node_tree = context.space_data.edit_tree
         try:
-            build_quick_crowd_walk(node_tree)
+            build_quick_crowd_walk(node_tree, realize_output=self.realize_output)
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, f"Could not build Quick Crowd Walk: {exc}")
             return {"CANCELLED"}

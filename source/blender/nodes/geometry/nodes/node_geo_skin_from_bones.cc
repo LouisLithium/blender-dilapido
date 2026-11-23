@@ -93,14 +93,19 @@ static std::string string_from_property(const MStringProperty &property)
   return std::string(property.s, size_t(property.s_len));
 }
 
+static void set_bone_skin_from_deform(BoneSkin &skin, const float4x4 &deform)
+{
+  skin.deform = deform;
+  skin.rotation = math::normalize(math::to_quaternion(skin.deform));
+  const float3 translation = skin.deform.location();
+  skin.dual = math::Quaternion(
+                  0.0f, translation.x * 0.5f, translation.y * 0.5f, translation.z * 0.5f) *
+              skin.rotation;
+}
+
 static void fill_bone_skin(BoneTransform &bone, const float4x4 &pose, const float4x4 &rest)
 {
-  bone.skin.deform = pose * math::invert(rest);
-  bone.skin.rotation = math::normalize(math::to_quaternion(bone.skin.deform));
-  const float3 translation = bone.skin.deform.location();
-  bone.skin.dual = math::Quaternion(
-                       0.0f, translation.x * 0.5f, translation.y * 0.5f, translation.z * 0.5f) *
-                   bone.skin.rotation;
+  set_bone_skin_from_deform(bone.skin, pose * math::invert(rest));
 }
 
 /** Read the bone names, transforms and rest matrices from instances or a point cloud. */
@@ -251,12 +256,337 @@ struct AgentGroups {
   bool valid = false;
 };
 
+struct WeightChannel {
+  int bone_index;
+  VArray<float> weights;
+  Span<const float> span;
+};
+
+/** All data needed to skin vertices of one template mesh. */
+struct TemplateSkin {
+  const Mesh *mesh = nullptr;
+  Span<float3> rest_positions;
+  Span<MDeformVert> deform_verts;
+  Vector<AgentGroups> agent_groups;
+  /** Generic-attribute fallback; only filled when the mesh has no MDeformVert data. */
+  Vector<Vector<WeightChannel>> channels_by_slot;
+  bool has_any_group = false;
+};
+
+static Vector<AgentGroups> build_agent_groups(
+    const Mesh &mesh,
+    const Map<int, Map<std::string, int>> &bones_by_agent,
+    const Span<int> slot_agents,
+    bool &r_has_any_group)
+{
+  const int group_count = BLI_listbase_count(&mesh.vertex_group_names);
+  Vector<AgentGroups> agent_groups(slot_agents.size());
+  for (const int slot : slot_agents.index_range()) {
+    const Map<std::string, int> *by_name = bones_by_agent.lookup_ptr(slot_agents[slot]);
+    if (by_name == nullptr) {
+      continue;
+    }
+    AgentGroups &groups = agent_groups[slot];
+    groups.group_to_bone = Array<int>(group_count, -1);
+    int group_index = 0;
+    for (const bDeformGroup &group : mesh.vertex_group_names) {
+      const int *bone_index = by_name->lookup_ptr(std::string(group.name));
+      if (bone_index != nullptr) {
+        groups.group_to_bone[group_index] = *bone_index;
+        groups.valid = true;
+        r_has_any_group = true;
+      }
+      group_index++;
+    }
+  }
+  return agent_groups;
+}
+
+static std::unique_ptr<TemplateSkin> build_template_skin(
+    const Mesh &mesh,
+    const Map<int, Map<std::string, int>> &bones_by_agent,
+    const Span<int> slot_agents)
+{
+  auto tpl = std::make_unique<TemplateSkin>();
+  tpl->mesh = &mesh;
+  tpl->rest_positions = mesh.vert_positions();
+  tpl->deform_verts = mesh.deform_verts();
+  tpl->agent_groups = build_agent_groups(mesh, bones_by_agent, slot_agents, tpl->has_any_group);
+  if (!tpl->has_any_group || tpl->deform_verts.size() >= tpl->rest_positions.size()) {
+    return tpl;
+  }
+
+  /* Without MDeformVert data, resolve the generic attributes once per agent slot. */
+  tpl->channels_by_slot.resize(tpl->agent_groups.size());
+  const bke::AttributeAccessor attributes = mesh.attributes();
+  Vector<StringRefNull> group_names;
+  for (const bDeformGroup &group : mesh.vertex_group_names) {
+    group_names.append(group.name);
+  }
+  for (const int slot : tpl->agent_groups.index_range()) {
+    const AgentGroups &groups = tpl->agent_groups[slot];
+    if (!groups.valid) {
+      continue;
+    }
+    Vector<WeightChannel> &channels = tpl->channels_by_slot[slot];
+    for (const int i : group_names.index_range()) {
+      const int bone_index = groups.group_to_bone[i];
+      if (bone_index < 0) {
+        continue;
+      }
+      const VArray<float> weights =
+          attributes.lookup<float>(group_names[i], AttrDomain::Point).varray;
+      if (!weights) {
+        continue;
+      }
+      WeightChannel channel;
+      channel.bone_index = bone_index;
+      channel.weights = weights;
+      if (weights.is_span()) {
+        const Span<float> span = weights.get_internal_span();
+        if (span.size() >= tpl->rest_positions.size()) {
+          channel.span = Span<const float>(span.data(), span.size());
+        }
+      }
+      channels.append(channel);
+    }
+  }
+  return tpl;
+}
+
+/** Deform one template mesh for a single agent slot (used by the instances path). */
+static void deform_template_slot(const TemplateSkin &tpl,
+                                 const Span<BoneSkin> &skins,
+                                 const int slot,
+                                 const int mode,
+                                 const int max_influences,
+                                 const bool normalize,
+                                 const MutableSpan<float3> positions)
+{
+  const int vertex_count = std::min(int(tpl.rest_positions.size()), int(positions.size()));
+  if (slot < 0 || slot >= tpl.agent_groups.size() || vertex_count == 0) {
+    return;
+  }
+  const AgentGroups &groups = tpl.agent_groups[slot];
+  if (!groups.valid) {
+    return;
+  }
+  const bool use_deform_verts = tpl.deform_verts.size() >= tpl.rest_positions.size();
+  const Vector<WeightChannel> *channels = (slot < tpl.channels_by_slot.size() &&
+                                           !tpl.channels_by_slot[slot].is_empty()) ?
+                                              &tpl.channels_by_slot[slot] :
+                                              nullptr;
+  if (!use_deform_verts && channels == nullptr) {
+    return;
+  }
+
+  std::array<Influence, MAX_INFLUENCES> influences;
+  for (const int vertex : IndexRange(vertex_count)) {
+    int count = 0;
+    if (use_deform_verts) {
+      const MDeformVert &dvert = tpl.deform_verts[vertex];
+      for (const MDeformWeight &weight : Span<MDeformWeight>(dvert.dw, dvert.totweight)) {
+        const int group = weight.def_nr;
+        if (group < 0 || group >= groups.group_to_bone.size()) {
+          continue;
+        }
+        const int bone = groups.group_to_bone[group];
+        if (bone < 0) {
+          continue;
+        }
+        add_influence(influences.data(), count, max_influences, bone, weight.weight);
+      }
+    }
+    else {
+      for (const WeightChannel &channel : *channels) {
+        const float weight = channel.span.is_empty() ? channel.weights[vertex] :
+                                                       channel.span[vertex];
+        add_influence(influences.data(), count, max_influences, channel.bone_index, weight);
+      }
+    }
+    if (count == 0) {
+      continue;
+    }
+    float selected_total = 0.0f;
+    for (const int i : IndexRange(count)) {
+      selected_total += influences[i].weight;
+    }
+    if (!(selected_total > 0.0f)) {
+      continue;
+    }
+    const float inv_total = normalize ? 1.0f / selected_total : 1.0f;
+    apply_skin(skins,
+               mode,
+               influences.data(),
+               count,
+               inv_total,
+               tpl.rest_positions[vertex],
+               positions[vertex]);
+  }
+}
+
+static Array<BoneSkin> make_local_skins(const Span<BoneSkin> &world_skins,
+                                        const float4x4 &transform)
+{
+  const float4x4 inverse = math::invert(transform);
+  Array<BoneSkin> local_skins(world_skins.size());
+  for (const int i : world_skins.index_range()) {
+    set_bone_skin_from_deform(local_skins[i], inverse * world_skins[i].deform * transform);
+  }
+  return local_skins;
+}
+
+/**
+ * Skin each instance of a template mesh and keep the result as instances.
+ *
+ * This avoids `Realize Instances`: every instance gets its own deformed mesh, but the vertex
+ * weights, topology and other attributes are shared with the template instead of being copied
+ * per agent. The node output therefore stays an `Instances` component.
+ */
+static void skin_instances(GeoNodeExecParams &params,
+                           const GeometrySet &input,
+                           const bke::Instances &instances,
+                           const Span<BoneTransform> &bones,
+                           const int mode,
+                           const int max_influences,
+                           const bool normalize)
+{
+  const int instance_count = instances.instances_num();
+  if (instance_count == 0) {
+    params.set_output("Mesh"_ustr, input);
+    return;
+  }
+
+  Map<int, Map<std::string, int>> bones_by_agent;
+  bones_by_agent.reserve(bones.size());
+  for (const int i : bones.index_range()) {
+    bones_by_agent.lookup_or_add_default(bones[i].agent).add(bones[i].name, i);
+  }
+
+  const VArray<int> instance_agents =
+      instances.attributes().lookup_or_default<int>("agent_id", AttrDomain::Instance, 0).varray;
+
+  Map<int, int> agent_slots;
+  Vector<int> slot_agents;
+  auto ensure_agent = [&](const int agent) {
+    if (!agent_slots.contains(agent)) {
+      agent_slots.add(agent, int(slot_agents.size()));
+      slot_agents.append(agent);
+    }
+  };
+  for (const BoneTransform &bone : bones) {
+    ensure_agent(bone.agent);
+  }
+  for (const int i : IndexRange(instance_count)) {
+    ensure_agent(instance_agents[i]);
+  }
+
+  Array<int> instance_slots(instance_count, -1);
+  for (const int i : IndexRange(instance_count)) {
+    if (const int *slot = agent_slots.lookup_ptr(instance_agents[i])) {
+      instance_slots[i] = *slot;
+    }
+  }
+
+  Array<BoneSkin> world_skins(bones.size());
+  for (const int i : bones.index_range()) {
+    world_skins[i] = bones[i].skin;
+  }
+
+  const Span<int> instance_handles = instances.reference_handles();
+  const Span<bke::InstanceReference> references = instances.references();
+  Map<int, std::unique_ptr<TemplateSkin>> templates;
+  for (const int i : IndexRange(instance_count)) {
+    const int handle = instance_handles[i];
+    if (templates.contains(handle)) {
+      continue;
+    }
+    if (handle < 0 || handle >= references.size()) {
+      continue;
+    }
+    const bke::InstanceReference &reference = references[handle];
+    if (reference.type() != bke::InstanceReference::Type::GeometrySet) {
+      continue;
+    }
+    const Mesh *template_mesh = reference.geometry_set().get_mesh();
+    if (template_mesh == nullptr) {
+      continue;
+    }
+    templates.add(handle, build_template_skin(*template_mesh, bones_by_agent, slot_agents));
+  }
+
+  auto result = std::make_unique<bke::Instances>(instance_count);
+  result->transforms_for_write().copy_from(instances.transforms());
+  bke::copy_attributes(instances.attributes(),
+                       AttrDomain::Instance,
+                       AttrDomain::Instance,
+                       bke::AttributeFilter{},
+                       result->attributes_for_write());
+
+  Array<Mesh *> deformed_meshes(instance_count, nullptr);
+  threading::parallel_for(IndexRange(instance_count), 1, [&](const IndexRange range) {
+    for (const int i : range) {
+      const int handle = instance_handles[i];
+      const std::unique_ptr<TemplateSkin> *template_ptr = templates.lookup_ptr(handle);
+      if (template_ptr == nullptr || !template_ptr->get()->has_any_group) {
+        continue;
+      }
+      const TemplateSkin &tpl = *template_ptr->get();
+      const int slot = instance_slots[i];
+      if (slot < 0 || slot >= tpl.agent_groups.size() || !tpl.agent_groups[slot].valid) {
+        continue;
+      }
+      Mesh *deformed = BKE_mesh_copy_for_eval(*tpl.mesh);
+      const Array<BoneSkin> local_skins = make_local_skins(world_skins, instances.transforms()[i]);
+      deform_template_slot(tpl,
+                           local_skins,
+                           slot,
+                           mode,
+                           max_influences,
+                           normalize,
+                           deformed->vert_positions_for_write());
+      deformed->tag_positions_changed();
+      deformed_meshes[i] = deformed;
+    }
+  });
+
+  bool skinned_any = false;
+  MutableSpan<int> handles = result->reference_handles_for_write();
+  for (const int i : IndexRange(instance_count)) {
+    if (deformed_meshes[i] != nullptr) {
+      const int new_handle = result->add_new_reference(
+          bke::InstanceReference(GeometrySet::from_mesh(deformed_meshes[i])));
+      handles[i] = new_handle;
+      skinned_any = true;
+    }
+    else {
+      const int original_handle = instance_handles[i];
+      if (original_handle >= 0 && original_handle < references.size()) {
+        handles[i] = result->add_reference(references[original_handle]);
+      }
+    }
+  }
+
+  if (!skinned_any) {
+    params.error_message_add(
+        NodeWarningType::Info,
+        TIP_("Skin From Bones: no instance mesh has vertex groups matching a bone name, returning "
+             "the instances unchanged"));
+    params.set_output("Mesh"_ustr, input);
+    return;
+  }
+
+  GeometrySet output = input;
+  output.replace_instances(result.release(), bke::GeometryOwnershipType::Owned);
+  params.set_output("Mesh"_ustr, std::move(output));
+}
+
 static void node_declare(NodeDeclarationBuilder &b)
 {
   b.add_input<decl::Geometry>("Mesh"_ustr)
       .description(
-          "Mesh to deform, with vertex groups named "
-          "after the bones");
+          "Mesh or Instances to deform. With Instances, every instance is skinned into "
+          "its own mesh, avoiding `Realize Instances`");
   b.add_input<decl::Geometry>("Bones"_ustr)
       .description(
           "Bone transforms (instances or a bone "
@@ -280,13 +610,6 @@ static void node_declare(NodeDeclarationBuilder &b)
 static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet mesh_geometry = params.extract_input<GeometrySet>("Mesh"_ustr);
-  const Mesh *mesh = mesh_geometry.get_mesh();
-  if (!mesh) {
-    params.error_message_add(NodeWarningType::Info,
-                             TIP_("Skin From Bones: the Mesh input is not a mesh"));
-    params.set_output("Mesh"_ustr, std::move(mesh_geometry));
-    return;
-  }
   GeometrySet bones_geometry = params.extract_input<GeometrySet>("Bones"_ustr);
   Vector<BoneTransform> bones;
   std::string error;
@@ -300,6 +623,22 @@ static void node_geo_exec(GeoNodeExecParams params)
   const int max_influences = math::clamp(
       params.extract_input<int>("Max Influences"_ustr), 1, MAX_INFLUENCES);
   const bool normalize = params.extract_input<bool>("Normalize Weights"_ustr);
+
+  /* Input can be a mesh or an instance set. Keeping instances avoids `Realize Instances`; every
+   * instance is skinned into its own mesh while topology and weights stay shared. */
+  if (const bke::Instances *instances = mesh_geometry.get_instances()) {
+    skin_instances(params, mesh_geometry, *instances, bones, mode, max_influences, normalize);
+    return;
+  }
+
+  const Mesh *mesh = mesh_geometry.get_mesh();
+  if (!mesh) {
+    params.error_message_add(
+        NodeWarningType::Info,
+        TIP_("Skin From Bones: the Mesh input is neither a mesh nor an instance set"));
+    params.set_output("Mesh"_ustr, std::move(mesh_geometry));
+    return;
+  }
 
   Map<int, Map<std::string, int>> bones_by_agent;
   bones_by_agent.reserve(bones.size());
