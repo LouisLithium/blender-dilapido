@@ -26,6 +26,7 @@
 
 #include <array>
 #include <cmath>
+#include <utility>
 
 #include "BLI_array.hh"
 #include "BLI_listbase.h"
@@ -78,6 +79,8 @@ struct BoneSkin {
 struct BoneTransform {
   std::string name;
   int agent = 0;
+  float4x4 bind = float4x4::identity();
+  bool has_bind = false;
   BoneSkin skin;
 };
 
@@ -128,6 +131,8 @@ static bool read_bones(const GeometrySet &bones,
                                                                     AttrDomain::Instance,
                                                                     float4x4::identity())
                                        .varray;
+    const VArray<float4x4> binds =
+        attributes.lookup<float4x4>("bind_matrix", AttrDomain::Instance).varray;
     const Span<float4x4> transforms = instances.transforms();
     const int count = instances.instances_num();
     r_bones.resize(count);
@@ -135,6 +140,10 @@ static bool read_bones(const GeometrySet &bones,
       BoneTransform &bone = r_bones[i];
       bone.name = string_from_property(names[i]);
       bone.agent = agents[i];
+      if (binds) {
+        bone.bind = binds[i];
+        bone.has_bind = true;
+      }
       fill_bone_skin(bone, transforms[i], rests[i]);
     }
     return true;
@@ -426,12 +435,18 @@ static void deform_template_slot(const TemplateSkin &tpl,
 }
 
 static Array<BoneSkin> make_local_skins(const Span<BoneSkin> &world_skins,
-                                        const float4x4 &transform)
+                                        const float4x4 &transform,
+                                        const float4x4 &bind,
+                                        const bool has_bind)
 {
   const float4x4 inverse = math::invert(transform);
+  /* The mesh instance is placed with the current point transform, while the bone rest matrices
+   * were captured at the bind pose. `bind` is that bind transform; without it the old behaviour
+   * (use the current transform) is kept for files created before it existed. */
+  const float4x4 anchor = has_bind ? bind : transform;
   Array<BoneSkin> local_skins(world_skins.size());
   for (const int i : world_skins.index_range()) {
-    set_bone_skin_from_deform(local_skins[i], inverse * world_skins[i].deform * transform);
+    set_bone_skin_from_deform(local_skins[i], inverse * world_skins[i].deform * anchor);
   }
   return local_skins;
 }
@@ -459,8 +474,12 @@ static void skin_instances(GeoNodeExecParams &params,
 
   Map<int, Map<std::string, int>> bones_by_agent;
   bones_by_agent.reserve(bones.size());
+  Map<int, std::pair<float4x4, bool>> bind_by_agent;
   for (const int i : bones.index_range()) {
     bones_by_agent.lookup_or_add_default(bones[i].agent).add(bones[i].name, i);
+    if (!bind_by_agent.contains(bones[i].agent)) {
+      bind_by_agent.add(bones[i].agent, {bones[i].bind, bones[i].has_bind});
+    }
   }
 
   const VArray<int> instance_agents =
@@ -537,7 +556,14 @@ static void skin_instances(GeoNodeExecParams &params,
         continue;
       }
       Mesh *deformed = BKE_mesh_copy_for_eval(*tpl.mesh);
-      const Array<BoneSkin> local_skins = make_local_skins(world_skins, instances.transforms()[i]);
+      float4x4 bind = float4x4::identity();
+      bool has_bind = false;
+      if (const auto *entry = bind_by_agent.lookup_ptr(instance_agents[i])) {
+        bind = entry->first;
+        has_bind = entry->second;
+      }
+      const Array<BoneSkin> local_skins = make_local_skins(
+          world_skins, instances.transforms()[i], bind, has_bind);
       deform_template_slot(tpl,
                            local_skins,
                            slot,

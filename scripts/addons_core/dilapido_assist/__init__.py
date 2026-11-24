@@ -418,6 +418,9 @@ def build_quick_crowd_walk(node_tree, realize_output=False):
     links.new(obstacles_info.outputs["Geometry"], navigation.inputs["Obstacles"])
     links.new(target_info.outputs["Geometry"], navigation.inputs["Goals"])
     links.new(spawn_info.outputs["Geometry"], navigation.inputs["Bounds Geometry"])
+    navmesh_info = nodes.new("GeometryNodeObjectInfo")
+    navmesh_info.label = "Crowd Nav Mesh"
+    links.new(navmesh_info.outputs["Geometry"], navigation.inputs["Walkable Surface"])
 
     sim_input = nodes.new("GeometryNodeSimulationInput")
     sim_output = nodes.new("GeometryNodeSimulationOutput")
@@ -759,6 +762,9 @@ def build_quick_crowd_ragdoll(node_tree, realize_output=False):
     links.new(obstacles_info.outputs["Geometry"], navigation.inputs["Obstacles"])
     links.new(target_info.outputs["Geometry"], navigation.inputs["Goals"])
     links.new(spawn_info.outputs["Geometry"], navigation.inputs["Bounds Geometry"])
+    navmesh_info = nodes.new("GeometryNodeObjectInfo")
+    navmesh_info.label = "Crowd Nav Mesh"
+    links.new(navmesh_info.outputs["Geometry"], navigation.inputs["Walkable Surface"])
 
     motion = nodes.new("GeometryNodeCrowdMotion")
     motion.label = "Walk"

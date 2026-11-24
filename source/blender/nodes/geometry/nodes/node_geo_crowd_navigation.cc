@@ -85,6 +85,9 @@ struct NavResult {
   Array<uint8_t> reachable;
   /** Size = cells; shared by all layers. */
   Array<uint8_t> blocked;
+  /** Surface height per cell (only when a walkable surface was given). */
+  Array<float> height;
+  bool has_height = false;
 
   int cell_count() const
   {
@@ -549,7 +552,92 @@ static void build_layer(NavResult &nav,
   (void)params;
 }
 
+/** Mark the cells covered by the walkable surface free and store the surface height there. A
+ * walkable surface inverts the default: everything outside its footprint is blocked, so agents
+ * stay on the given navigation mesh instead of roaming the whole XY plane. */
+static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav)
+{
+  const Span<float3> positions = mesh.vert_positions();
+  const Span<int> corner_verts = mesh.corner_verts();
+  const Span<int3> corner_tris = mesh.corner_tris();
+  if (positions.is_empty() || corner_tris.is_empty()) {
+    return;
+  }
+  const float cell = nav.cell_size;
+  const float inv_cell = 1.0f / cell;
+  const int dims_x = nav.dims_x;
+  const int dims_y = nav.dims_y;
+  const int cells = nav.cell_count();
+  if (nav.height.size() != cells) {
+    nav.height = Array<float>(cells, -FLT_MAX);
+  }
+
+  auto mark_pass = [&](const float tolerance) {
+    int marked = 0;
+    for (const int3 &tri : corner_tris) {
+      const float3 &v0 = positions[corner_verts[tri.x]];
+      const float3 &v1 = positions[corner_verts[tri.y]];
+      const float3 &v2 = positions[corner_verts[tri.z]];
+      const float2 a{v0.x, v0.y};
+      const float2 b{v1.x, v1.y};
+      const float2 c{v2.x, v2.y};
+      const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+      if (std::abs(area) <= 1.0e-12f) {
+        continue;
+      }
+      const float2 bmin = math::min(math::min(a, b), c) - float2(tolerance);
+      const float2 bmax = math::max(math::max(a, b), c) + float2(tolerance);
+      const int ix_min = std::max(int(std::ceil((bmin.x - nav.min.x) * inv_cell - 0.5f)), 0);
+      const int ix_max = std::min(int(std::floor((bmax.x - nav.min.x) * inv_cell - 0.5f)),
+                                  dims_x - 1);
+      const int iy_min = std::max(int(std::ceil((bmin.y - nav.min.y) * inv_cell - 0.5f)), 0);
+      const int iy_max = std::min(int(std::floor((bmax.y - nav.min.y) * inv_cell - 0.5f)),
+                                  dims_y - 1);
+      if (ix_max < ix_min || iy_max < iy_min) {
+        continue;
+      }
+      for (const int iy : IndexRange(iy_min, iy_max - iy_min + 1)) {
+        for (const int ix : IndexRange(ix_min, ix_max - ix_min + 1)) {
+          const float2 p{nav.min.x + (float(ix) + 0.5f) * cell,
+                         nav.min.y + (float(iy) + 0.5f) * cell};
+          float w0 = ((b.x - p.x) * (c.y - p.y) - (b.y - p.y) * (c.x - p.x)) / area;
+          float w1 = ((c.x - p.x) * (a.y - p.y) - (c.y - p.y) * (a.x - p.x)) / area;
+          float w2 = 1.0f - w0 - w1;
+          const float eps = 1.0e-5f;
+          bool inside = w0 >= -eps && w1 >= -eps && w2 >= -eps;
+          if (!inside && tolerance > 0.0f) {
+            inside = distance_to_triangle_2d(p, a, b, c) <= tolerance;
+          }
+          if (!inside) {
+            continue;
+          }
+          w0 = std::max(w0, 0.0f);
+          w1 = std::max(w1, 0.0f);
+          w2 = std::max(w2, 0.0f);
+          const float wsum = w0 + w1 + w2;
+          if (wsum <= 1.0e-12f) {
+            continue;
+          }
+          const float height = (w0 * v0.z + w1 * v1.z + w2 * v2.z) / wsum;
+          const int index = iy * dims_x + ix;
+          nav.blocked[index] = 0;
+          nav.height[index] = std::max(nav.height[index], height);
+          marked++;
+        }
+      }
+    }
+    return marked;
+  };
+
+  /* Thin surfaces (a single cell wide) can miss every cell center; retry with one cell of
+   * tolerance so they still produce a usable strip. */
+  if (mark_pass(0.0f) == 0) {
+    mark_pass(cell);
+  }
+}
+
 static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
+                                                   const Mesh *walkable,
                                                    const Span<Goal> goals,
                                                    const Span<float2> extra_bounds,
                                                    const BuildParams &params,
@@ -580,6 +668,11 @@ static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
     has_bounds = true;
   }
   else {
+    if (walkable != nullptr) {
+      for (const float3 &position : walkable->vert_positions()) {
+        include_point(float2(position.x, position.y));
+      }
+    }
     if (obstacles != nullptr) {
       for (const float3 &position : obstacles->vert_positions()) {
         include_point(float2(position.x, position.y));
@@ -626,6 +719,12 @@ static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
   nav->cell_size = cell_size;
   const int cells = nav->cell_count();
   nav->blocked = Array<uint8_t>(cells, 0);
+  if (walkable != nullptr) {
+    /* Everything outside the navigation mesh is blocked; obstacles below punch holes in it. */
+    nav->blocked.fill(1);
+    nav->has_height = true;
+    rasterize_walkable_surface(*walkable, *nav);
+  }
   if (obstacles != nullptr) {
     rasterize_obstacles(obstacles, *nav, params);
   }
@@ -676,6 +775,7 @@ static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
 /* -------------------------------------------------------------------- cache key */
 
 static uint64_t navigation_hash(const Mesh *obstacles,
+                                const Mesh *walkable,
                                 const Span<Goal> goals,
                                 const Span<float2> extra_bounds,
                                 const BuildParams &params,
@@ -692,6 +792,18 @@ static uint64_t navigation_hash(const Mesh *obstacles,
   }
   else {
     hash_value(hash, -1);
+  }
+  if (walkable != nullptr) {
+    const Span<float3> positions = walkable->vert_positions();
+    const Span<int3> tris = walkable->corner_tris();
+    hash_value(hash, 1);
+    hash_value(hash, int(positions.size()));
+    hash_bytes(hash, positions.data(), positions.size() * sizeof(float3));
+    hash_value(hash, int(tris.size()));
+    hash_bytes(hash, tris.data(), tris.size() * sizeof(int3));
+  }
+  else {
+    hash_value(hash, 0);
   }
   hash_value(hash, int(goals.size()));
   for (const Goal &goal : goals) {
@@ -743,6 +855,8 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
       "nav_layer", domain);
   bke::SpanAttributeWriter<int> cell_indices = attributes.lookup_or_add_for_write_span<int>(
       "nav_cell", domain);
+  bke::SpanAttributeWriter<float> heights = attributes.lookup_or_add_for_write_span<float>(
+      "height", domain);
 
   int index = 0;
   for (const int layer : IndexRange(layers)) {
@@ -751,7 +865,12 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
       for (const int x : IndexRange(nav.dims_x)) {
         const int cell = y * nav.dims_x + x;
         const float2 center = cell_center(nav, int2(x, y));
-        positions.span[index] = float3(center.x, center.y, ground_z);
+        float height = ground_z;
+        if (nav.has_height && cell < nav.height.size() && nav.height[cell] > -1.0e30f) {
+          height = nav.height[cell];
+        }
+        positions.span[index] = float3(center.x, center.y, height);
+        heights.span[index] = height;
         flows.span[index] = nav.flow[offset + cell];
         distances.span[index] = nav.reachable[offset + cell] ? nav.distance[offset + cell] :
                                                                UNREACHABLE_DISTANCE;
@@ -773,6 +892,7 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
   groups.finish();
   layer_indices.finish();
   cell_indices.finish();
+  heights.finish();
   points->tag_positions_changed();
   return points;
 }
@@ -825,6 +945,11 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "Optional geometry the grid must cover, such as the crowd spawn surface. Ignored when "
           "Use Custom Bounds is on");
+  b.add_input<decl::Geometry>("Walkable Surface"_ustr)
+      .description(
+          "Optional navigation mesh. Agents are kept on its footprint (everything outside is "
+          "blocked) and follow its height, so crowds can walk on ramps and terrain instead of the "
+          "XY plane. Obstacles still apply on top");
 
   b.add_output<decl::Bundle>("Navigation"_ustr).description("Flow field consumed by Crowd Motion");
   b.add_output<decl::Geometry>("Grid"_ustr)
@@ -836,6 +961,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const GeometrySet obstacles_geometry = params.extract_input<GeometrySet>("Obstacles"_ustr);
   const GeometrySet goals_geometry = params.extract_input<GeometrySet>("Goals"_ustr);
   const GeometrySet bounds_geometry = params.extract_input<GeometrySet>("Bounds Geometry"_ustr);
+  const GeometrySet walkable_geometry = params.extract_input<GeometrySet>("Walkable Surface"_ustr);
 
   BuildParams build_params;
   build_params.agent_radius = std::max(params.extract_input<float>("Agent Radius"_ustr), 0.01f);
@@ -852,6 +978,17 @@ static void node_geo_exec(GeoNodeExecParams params)
   const Mesh *obstacles = obstacles_geometry.get_mesh();
   if (obstacles != nullptr && !mesh_has_data(obstacles)) {
     obstacles = nullptr;
+  }
+
+  const Mesh *walkable = walkable_geometry.get_mesh();
+  if (walkable != nullptr && !mesh_has_data(walkable)) {
+    walkable = nullptr;
+  }
+  if (!walkable_geometry.is_empty() && walkable == nullptr) {
+    params.error_message_add(
+        NodeWarningType::Info,
+        TIP_("Crowd Navigation: the Walkable Surface input has to be a mesh; using the full XY "
+             "plane instead"));
   }
 
   Vector<Goal> goals;
@@ -880,13 +1017,14 @@ static void node_geo_exec(GeoNodeExecParams params)
     bounds[0] = float2(build_params.bounds_min.x, build_params.bounds_min.y);
     bounds[1] = float2(build_params.bounds_max.x, build_params.bounds_max.y);
   }
-  const uint64_t key = navigation_hash(obstacles, goals, extra_bounds, build_params, bounds);
+  const uint64_t key = navigation_hash(
+      obstacles, walkable, goals, extra_bounds, build_params, bounds);
 
   std::shared_ptr<const NavResult> nav = cache_lookup(key);
   if (!nav) {
     std::string error;
     std::shared_ptr<NavResult> built = build_navigation(
-        obstacles, goals, extra_bounds, build_params, error);
+        obstacles, walkable, goals, extra_bounds, build_params, error);
     if (!built) {
       params.error_message_add(NodeWarningType::Warning,
                                std::string(TIP_("Crowd Navigation: ")) + error);
@@ -930,6 +1068,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   bundle.add(*BundleKey::from_str("cell_size"), nav->cell_size);
   bundle.add(*BundleKey::from_str("dims_x"), nav->dims_x);
   bundle.add(*BundleKey::from_str("dims_y"), nav->dims_y);
+  bundle.add(*BundleKey::from_str("has_heights"), nav->has_height);
   bundle.add(*BundleKey::from_str("group_count"), int(nav->groups.size()));
   for (const int i : nav->groups.index_range()) {
     bundle.add(*BundleKey::from_str("group_" + std::to_string(i)), nav->groups[i]);

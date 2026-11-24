@@ -5,13 +5,14 @@
 /** \file
  * \ingroup nodes
  *
- * `Init Ragdoll Bodies`: turn the bone points from `Armature Bones` into one capsule body per bone.
+ * `Init Ragdoll Bodies`: turn the bone points from `Armature Bones` into one capsule body per
+ * bone.
  *
  * The body origin is the bone head and the capsule is shifted half a bone length along local Y, so
  * the simulated transform maps back to a pose bone with a pure translation and rotation. Mass,
- * radius and damping are written as instance attributes, which is what the rigid body solver reads.
- * The capsule shape itself is described by `shape_*` attributes: the solver builds a Jolt capsule
- * instead of a convex hull of the display mesh.
+ * radius and damping are written as instance attributes, which is what the rigid body solver
+ * reads. The capsule shape itself is described by `shape_*` attributes: the solver builds a Jolt
+ * capsule instead of a convex hull of the display mesh.
  */
 
 #include <cmath>
@@ -124,7 +125,8 @@ static Mesh *make_capsule_mesh(const float half_height, const float radius)
     side_quad(top_first_ring + ring, top_first_ring + ring + 1);
   }
   for (const int i : IndexRange(segments)) {
-    add_triangle(top_pole, ring_vertex(top_first_ring + top_ring_count - 1, i + 1),
+    add_triangle(top_pole,
+                 ring_vertex(top_first_ring + top_ring_count - 1, i + 1),
                  ring_vertex(top_first_ring + top_ring_count - 1, i));
   }
 
@@ -192,14 +194,8 @@ static void node_declare(NodeDeclarationBuilder &b)
       .min(0.0f)
       .structure_type(StructureType::Field)
       .description("Mass per bone; 0 computes it from the capsule volume and density");
-  b.add_input<decl::Float>("Linear Damping"_ustr)
-      .default_value(0.05f)
-      .min(0.0f)
-      .max(1.0f);
-  b.add_input<decl::Float>("Angular Damping"_ustr)
-      .default_value(0.05f)
-      .min(0.0f)
-      .max(1.0f);
+  b.add_input<decl::Float>("Linear Damping"_ustr).default_value(0.05f).min(0.0f).max(1.0f);
+  b.add_input<decl::Float>("Angular Damping"_ustr).default_value(0.05f).min(0.0f).max(1.0f);
   b.add_input<decl::Int>("Group ID"_ustr)
       .default_value(0)
       .min(0)
@@ -242,17 +238,17 @@ static void node_geo_exec(GeoNodeExecParams params)
 
   const int count = bones->totpoint;
   const float density = std::max(params.extract_input<float>("Density"_ustr), 0.0f);
-  const float linear_damping = math::clamp(params.extract_input<float>("Linear Damping"_ustr),
-                                           0.0f,
-                                           1.0f);
-  const float angular_damping = math::clamp(params.extract_input<float>("Angular Damping"_ustr),
-                                            0.0f,
-                                            1.0f);
+  const float linear_damping = math::clamp(
+      params.extract_input<float>("Linear Damping"_ustr), 0.0f, 1.0f);
+  const float angular_damping = math::clamp(
+      params.extract_input<float>("Angular Damping"_ustr), 0.0f, 1.0f);
 
   const bke::AttributeAccessor attributes = bones->attributes();
-  const VArray<float4x4> pose_matrices =
-      attributes.lookup_or_default<float4x4>("bone_pose_matrix", AttrDomain::Point, float4x4::identity())
-          .varray;
+  const VArray<float4x4> pose_matrices = attributes
+                                             .lookup_or_default<float4x4>("bone_pose_matrix",
+                                                                          AttrDomain::Point,
+                                                                          float4x4::identity())
+                                             .varray;
   const VArray<float> lengths =
       attributes.lookup_or_default<float>("bone_length", AttrDomain::Point, 1.0f).varray;
   const VArray<int> bone_indices =
@@ -263,9 +259,13 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup<MStringProperty>("bone_name").varray;
   const VArray<float4x4> bone_rest_matrices =
       attributes
-          .lookup_or_default<float4x4>(
-              "bone_rest_matrix", AttrDomain::Point, float4x4::identity())
+          .lookup_or_default<float4x4>("bone_rest_matrix", AttrDomain::Point, float4x4::identity())
           .varray;
+  const VArray<float4x4> bind_matrices = attributes
+                                             .lookup_or_default<float4x4>("bind_matrix",
+                                                                          AttrDomain::Point,
+                                                                          float4x4::identity())
+                                             .varray;
 
   bke::GeometryFieldContext field_context(*bones, AttrDomain::Point);
   fn::FieldEvaluator evaluator(field_context, count);
@@ -365,18 +365,21 @@ static void node_geo_exec(GeoNodeExecParams params)
         instance_attributes.lookup_or_add_for_write_span<int>("shape", AttrDomain::Instance);
     bke::SpanAttributeWriter<float> half_height_writer =
         instance_attributes.lookup_or_add_for_write_span<float>("shape_half_height",
-                                                               AttrDomain::Instance);
+                                                                AttrDomain::Instance);
     bke::SpanAttributeWriter<float> shape_radius_writer =
         instance_attributes.lookup_or_add_for_write_span<float>("shape_radius",
-                                                               AttrDomain::Instance);
+                                                                AttrDomain::Instance);
     bke::SpanAttributeWriter<float3> shape_offset_writer =
         instance_attributes.lookup_or_add_for_write_span<float3>("shape_offset",
-                                                                AttrDomain::Instance);
+                                                                 AttrDomain::Instance);
     bke::SpanAttributeWriter<MStringProperty> bone_name_writer =
         instance_attributes.lookup_or_add_for_write_span<MStringProperty>("bone_name",
                                                                           AttrDomain::Instance);
     bke::SpanAttributeWriter<float4x4> bone_rest_writer =
         instance_attributes.lookup_or_add_for_write_span<float4x4>("bone_rest_matrix",
+                                                                   AttrDomain::Instance);
+    bke::SpanAttributeWriter<float4x4> bind_writer =
+        instance_attributes.lookup_or_add_for_write_span<float4x4>("bind_matrix",
                                                                    AttrDomain::Instance);
 
     for (const int i : IndexRange(count)) {
@@ -400,6 +403,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       shape_offset_writer.span[i] = float3(0.0f, half_heights[i] + body_radii[i], 0.0f);
       bone_name_writer.span[i] = bone_names ? bone_names[i] : MStringProperty{};
       bone_rest_writer.span[i] = bone_rest_matrices[i];
+      bind_writer.span[i] = bind_matrices[i];
     }
 
     piece_id_writer.finish();
@@ -421,6 +425,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     shape_offset_writer.finish();
     bone_name_writer.finish();
     bone_rest_writer.finish();
+    bind_writer.finish();
   }
 
   /* A point per bone, so the official force assets can evaluate per-bone forces and the solver can

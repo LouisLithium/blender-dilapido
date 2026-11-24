@@ -75,6 +75,7 @@ struct BoneSample {
   float3 position;
   float4x4 pose;
   float4x4 rest;
+  float4x4 bind;
   int bone_index;
   int bone_parent;
   float length;
@@ -643,6 +644,7 @@ static void node_geo_exec(GeoNodeExecParams params)
       sample.position = pose.location();
       sample.pose = pose;
       sample.rest = instance_root * rest_matrices[i];
+      sample.bind = point_transform;
       sample.bone_index = bone_indices[i] >= 0 ? bone_indices[i] : i;
       sample.bone_parent = bone_parents[i];
       sample.length = lengths[i];
@@ -664,6 +666,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       out_attributes.lookup_or_add_for_write_span<float4x4>("bone_pose_matrix", domain);
   bke::SpanAttributeWriter<float4x4> rest_writer =
       out_attributes.lookup_or_add_for_write_span<float4x4>("bone_rest_matrix", domain);
+  bke::SpanAttributeWriter<float4x4> bind_writer =
+      out_attributes.lookup_or_add_for_write_span<float4x4>("bind_matrix", domain);
   bke::SpanAttributeWriter<int> bone_index_writer =
       out_attributes.lookup_or_add_for_write_span<int>("bone_index", domain);
   bke::SpanAttributeWriter<int> bone_parent_writer =
@@ -688,6 +692,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     positions_writer.span[i] = sample.position;
     pose_writer.span[i] = sample.pose;
     rest_writer.span[i] = sample.rest;
+    bind_writer.span[i] = sample.bind;
     bone_index_writer.span[i] = sample.bone_index;
     bone_parent_writer.span[i] = sample.bone_parent;
     length_writer.span[i] = sample.length;
@@ -701,6 +706,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   positions_writer.finish();
   pose_writer.finish();
   rest_writer.finish();
+  bind_writer.finish();
   bone_index_writer.finish();
   bone_parent_writer.finish();
   length_writer.finish();

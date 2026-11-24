@@ -64,6 +64,8 @@ struct NavSampler {
   VArray<float> distance;
   VArray<bool> reachable;
   VArray<bool> blocked;
+  VArray<float> height;
+  bool has_height = false;
 };
 
 static bool read_navigation(const Bundle *navigation, NavSampler &r_sampler)
@@ -105,9 +107,15 @@ static bool read_navigation(const Bundle *navigation, NavSampler &r_sampler)
       points->attributes().lookup_or_default<bool>("reachable", AttrDomain::Point, false).varray;
   sampler.blocked =
       points->attributes().lookup_or_default<bool>("blocked", AttrDomain::Point, false).varray;
+  sampler.has_height = navigation->lookup_path<bool>("has_heights").value_or(false);
+  if (sampler.has_height) {
+    sampler.height =
+        points->attributes().lookup_or_default<float>("height", AttrDomain::Point, 0.0f).varray;
+  }
   if (sampler.flow.size() < int64_t(sampler.cells) * group_count ||
       sampler.reachable.size() < int64_t(sampler.cells) * group_count ||
-      sampler.blocked.size() < sampler.cells)
+      sampler.blocked.size() < sampler.cells ||
+      (sampler.has_height && sampler.height.size() < sampler.cells))
   {
     return false;
   }
@@ -286,6 +294,73 @@ static bool sample_navigation(const NavSampler &nav,
     }
   }
   return false;
+}
+
+/**
+ * Height of the walkable surface at a position (bilinear over free cells). Only valid when the
+ * navigation bundle was built from a walkable surface.
+ */
+static bool sample_navigation_height(const NavSampler &nav, const float3 position, float &r_height)
+{
+  if (!nav.valid || !nav.has_height || nav.height.size() < nav.cells) {
+    return false;
+  }
+  const float gx = (position.x - nav.min.x) / nav.cell_size - 0.5f;
+  const float gy = (position.y - nav.min.y) / nav.cell_size - 0.5f;
+  const int x0 = int(std::floor(gx));
+  const int y0 = int(std::floor(gy));
+  const float fx = gx - float(x0);
+  const float fy = gy - float(y0);
+  float sum = 0.0f;
+  float weight_sum = 0.0f;
+  for (int dy = 0; dy <= 1; dy++) {
+    for (int dx = 0; dx <= 1; dx++) {
+      const int x = x0 + dx;
+      const int y = y0 + dy;
+      if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+        continue;
+      }
+      const int cell = y * nav.dims_x + x;
+      if (nav.blocked[cell]) {
+        continue;
+      }
+      const float weight = (dx == 0 ? 1.0f - fx : fx) * (dy == 0 ? 1.0f - fy : fy);
+      if (weight <= 1.0e-4f) {
+        continue;
+      }
+      sum += nav.height[cell] * weight;
+      weight_sum += weight;
+    }
+  }
+  if (weight_sum > 1.0e-5f) {
+    r_height = sum / weight_sum;
+    return true;
+  }
+  /* Boundary / obstacle cell: take the nearest free cell instead. */
+  const int base_x = math::clamp(int(std::round(gx)), 0, nav.dims_x - 1);
+  const int base_y = math::clamp(int(std::round(gy)), 0, nav.dims_y - 1);
+  float best_distance = FLT_MAX;
+  for (int dy = -3; dy <= 3; dy++) {
+    for (int dx = -3; dx <= 3; dx++) {
+      const int x = base_x + dx;
+      const int y = base_y + dy;
+      if (x < 0 || y < 0 || x >= nav.dims_x || y >= nav.dims_y) {
+        continue;
+      }
+      const int cell = y * nav.dims_x + x;
+      if (nav.blocked[cell]) {
+        continue;
+      }
+      const float2 center = nav.min + float2((float(x) + 0.5f) * nav.cell_size,
+                                             (float(y) + 0.5f) * nav.cell_size);
+      const float distance = math::length_squared(float2(position.x, position.y) - center);
+      if (distance < best_distance) {
+        best_distance = distance;
+        r_height = nav.height[cell];
+      }
+    }
+  }
+  return best_distance < FLT_MAX;
 }
 
 /**
@@ -568,6 +643,12 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "Time constant in seconds for `speed_ratio`. Larger values remove sudden playback "
           "changes when the agent turns, changes state or is pushed (0 = instant)");
+  b.add_input<decl::Float>("Surface Offset"_ustr)
+      .default_value(0.0f)
+      .subtype(PROP_DISTANCE)
+      .description(
+          "Vertical offset above the navigation mesh surface (only used when Crowd Navigation has "
+          "a Walkable Surface). Raise it when the agent's origin is below its feet");
 
   b.add_output<decl::Geometry>("Points"_ustr);
 }
@@ -591,6 +672,7 @@ static void node_geo_exec(GeoNodeExecParams params)
   const float delta_time = std::max(params.extract_input<float>("Delta Time"_ustr), 0.0f);
   const float speed_ratio_smoothing = std::max(
       params.extract_input<float>("Speed Ratio Smoothing"_ustr), 0.0f);
+  const float surface_offset = params.extract_input<float>("Surface Offset"_ustr);
   const float max_speed = std::max(params.extract_input<float>("Max Speed"_ustr), 0.0f);
   const float max_acceleration = std::max(params.extract_input<float>("Max Acceleration"_ustr),
                                           0.0f);
@@ -992,6 +1074,21 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     for (const int i : IndexRange(count)) {
       velocity_writer.span[i] = velocities[i];
+    }
+  }
+
+  /* Follow the walkable surface height after all XY corrections, so ramps/terrain are walked
+   * instead of keeping the crowd on the XY plane. */
+  if (navigation_sampler.valid && navigation_sampler.has_height) {
+    for (const int i : IndexRange(count)) {
+      if (!actives[i] || physics_modes[i] != 0) {
+        continue;
+      }
+      float height = 0.0f;
+      if (sample_navigation_height(navigation_sampler, positions[i], height)) {
+        positions[i].z = height + surface_offset;
+        position_writer.span[i] = positions[i];
+      }
     }
   }
 
