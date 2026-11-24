@@ -56,6 +56,7 @@
 #include "GEO_xpbd_fluid.hh"
 
 #include "GEO_ha_context.hh"
+#include "GEO_ha_hair.hh"
 #include "GEO_ha_status.hh"
 #include "GEO_ha_xpbd.hh"
 
@@ -546,6 +547,20 @@ struct FluidChunkData {
    * depenetration does not turn into a bounce (see #update_linear_velocities).
    */
   Array<float3> coupled_push;
+};
+
+/**
+ * Per chunk state of the hair solve on the compute backend (stage 1). When `gpu_active` the
+ * substep steps of this chunk (predict, the rod/pin iterations, the velocity update and the
+ * damping) run on the device and the CPU constraints of the chunk are skipped.
+ */
+struct HairChunkData {
+  /** The chunk is a curve geometry that is not a fluid (see #prepare_hair_gpu). */
+  bool active = false;
+  geometry::ha::HaXpbdHair gpu_hair;
+  bool gpu_active = false;
+  /** Wall clock when the device work of the current frame started, for the debug log. */
+  double gpu_start_ms = 0.0;
 };
 
 /**
@@ -1512,6 +1527,7 @@ struct ChunkData {
   CoupledFaceContacts coupled_face_contacts;
 
   FluidChunkData fluid;
+  HairChunkData hair;
 };
 
 struct ConstraintsInfo {
@@ -1742,6 +1758,7 @@ class XpbdSolverStep {
     this->prepare_hair_solid_contacts();
     this->prepare_guide_tethers();
     this->prepare_fluid_gpu();
+    this->prepare_hair_gpu();
 
     if (profile) {
       ms_prepare = ms_since(phase_start);
@@ -4416,26 +4433,44 @@ class XpbdSolverStep {
     geometry::ha::HaNodeStatus status;
     status.backend = geometry::ha::ha_gpu_backend_name();
     bool has_fluid = false;
+    bool has_hair = false;
+    bool has_device = false;
     for (const ChunkData &chunk_data : chunks_data_) {
       const FluidChunkData &fluid = chunk_data.fluid;
-      if (!fluid.active) {
-        continue;
+      if (fluid.active) {
+        has_fluid = true;
+        if (fluid.gpu_active) {
+          status.state = geometry::ha::HaNodeState::Device;
+          status.elements = fluid.gpu_fluid.particle_count();
+          has_device = true;
+          break;
+        }
       }
-      has_fluid = true;
-      if (fluid.gpu_active) {
-        status.state = geometry::ha::HaNodeState::Device;
-        status.elements = fluid.gpu_fluid.particle_count();
-        break;
+      const HairChunkData &hair = chunk_data.hair;
+      if (hair.active) {
+        has_hair = true;
+        if (hair.gpu_active) {
+          status.state = geometry::ha::HaNodeState::Device;
+          status.elements = hair.gpu_hair.point_count();
+          has_device = true;
+          break;
+        }
       }
     }
-    if (status.state != geometry::ha::HaNodeState::Device) {
-      if (!has_fluid) {
+    if (!has_device) {
+      if (!has_fluid && !has_hair) {
         /* Nothing to accelerate: no badge at all. */
         geometry::ha::ha_status_clear(tree, node);
         return;
       }
       status.state = geometry::ha::HaNodeState::Fallback;
       status.reason = gpu_rejection_reason_;
+      if (!hair_gpu_rejection_reason_.empty()) {
+        if (!status.reason.empty()) {
+          status.reason += "; ";
+        }
+        status.reason += "hair: " + hair_gpu_rejection_reason_;
+      }
     }
     geometry::ha::ha_status_set(tree, node, status);
   }
@@ -4451,7 +4486,7 @@ class XpbdSolverStep {
      * would activate the context again otherwise. Nested guards are free. */
     std::optional<geometry::ha::HaContextGuard> device_guard;
     for (const ChunkData &chunk_data : chunks_data_) {
-      if (chunk_data.fluid.gpu_active) {
+      if (chunk_data.fluid.gpu_active || chunk_data.hair.gpu_active) {
         device_guard.emplace();
         break;
       }
@@ -4510,7 +4545,8 @@ class XpbdSolverStep {
           }
 
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
-          this->simulate__velocity_solve__chunk(chunk_i, solver_refs_i);
+          this->simulate__velocity_solve__chunk(
+              chunk_i, solver_refs_i, substep_i + 1 == substeps_);
           if (prof) {
             prof_velocity_ += since(mark);
           }
@@ -4586,7 +4622,7 @@ class XpbdSolverStep {
         this->parallel_for_each_chunk(16, [&](const int chunk_i) {
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
         });
-        this->simulate__velocity_solve(solver_refs_i);
+        this->simulate__velocity_solve(solver_refs_i, substep_i + 1 == substeps_);
         if (prof) {
           prof_velocity_ += since(mark);
           mark = std::chrono::steady_clock::now();
@@ -4717,6 +4753,15 @@ class XpbdSolverStep {
   {
     if (chunks_data_[chunk_i].fluid.gpu_active) {
       /* The device already did the predict step for this chunk. */
+      return;
+    }
+    HairChunkData &hair = chunks_data_[chunk_i].hair;
+    if (hair.gpu_active) {
+      /* The device keeps its own previous/current state, so `prev_positions` of the solver stays
+       * untouched until the download at the end of the frame. */
+      if (!hair.gpu_hair.predict()) {
+        this->hair_gpu_fail(chunk_i, hair.gpu_hair.last_error());
+      }
       return;
     }
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
@@ -8128,6 +8173,8 @@ class XpbdSolverStep {
    */
   /** Why the fluid could not use the device in the last evaluation, for the node UI. */
   std::string gpu_rejection_reason_;
+  /** The same for the hair (prefixed with "hair: " when both are shown). */
+  std::string hair_gpu_rejection_reason_;
 
   /** Particle count below which the fluid stays on the CPU (see #fluid_gpu_rejection). */
   int device_min_particles() const
@@ -8786,6 +8833,450 @@ class XpbdSolverStep {
     }
   }
 
+  /**
+   * Particle count below which the hair stays on the CPU. The device path is one dispatch
+   * sequence per chunk (stage 1), so the fixed cost dominates for a very small hairstyle; the
+   * zone still asks for the device and `Backend = Strict` overrides this, exactly like the fluid
+   * threshold. The default is 0, i.e. a `HW Accelerate` zone always runs the hair on the device.
+   */
+  int hair_device_min_points() const
+  {
+    static const int threshold = [] {
+      const char *value = std::getenv("BLENDER_XPBD_HAIR_GPU_MIN_POINTS");
+      if (value != nullptr) {
+        return int(std::atoi(value));
+      }
+      return 0;
+    }();
+    return threshold;
+  }
+
+  /**
+   * Why a chunk cannot run its hair solve on the device, `nullptr` when it can.
+   *
+   * Stage 1 is the per point core: inertial predict, rod stretch/shear, rod bend/twist, pins,
+   * the velocity update and the damping. Everything that needs the whole world or the host side
+   * BVH stays on the CPU:
+   * - hair self collision (segment/segment contacts of all curve geometries),
+   * - the guide tether (child curves attached to guide curves),
+   * - the segment/triangle contacts between the hair and cloth/soft bodies,
+   * - the contacts between the hair and mesh colliders (gathered on the host every substep).
+   *
+   * The three first ones are world wide switches, so any hair using them keeps *all* hair on the
+   * CPU. That is conservative but never silently drops a contact.
+   */
+  const char *hair_gpu_rejection(const int chunk_i, bool &r_soft) const
+  {
+    r_soft = false;
+    const HairChunkData &hair = chunks_data_[chunk_i].hair;
+    if (!hair.active) {
+      return "not a hair";
+    }
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    if (int(chunk.points_range.size()) < this->hair_device_min_points()) {
+      r_soft = true;
+      return "below the device hair threshold";
+    }
+    if (!geo_data.uses_rotation) {
+      return "curves without rotations";
+    }
+    if (hair_contacts_active_ || hair_self_collision_) {
+      return "hair self collision";
+    }
+    if (guide_tether_active_) {
+      return "guide tether";
+    }
+    if (hair_solid_active_) {
+      return "hair/solid contacts";
+    }
+    if (!geo_data.mesh_colliders.is_empty() || !constraints_.collision_contacts.is_empty()) {
+      return "hair collider contacts";
+    }
+    if (!geo_data.static_constraints.is_empty()) {
+      return "static constraints";
+    }
+    return nullptr;
+  }
+
+  /**
+   * Uploads the frame state of one hair chunk and creates its device constraint sets. Returns
+   * `nullptr` on success, otherwise the reason (the device object is then not bound).
+   */
+  const char *prepare_hair_chunk_gpu(const int chunk_i)
+  {
+    HairChunkData &hair = chunks_data_[chunk_i].hair;
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    const IndexRange points = chunk.points_range;
+    const int point_base = points.first();
+    const int point_count = points.size();
+    const bke::CurvesGeometry &curves = *geo_data.curves;
+    const OffsetIndices<int> points_by_curve = curves.points_by_curve();
+    const IndexRange curves_range = chunk.curves_range.value_or(IndexRange(0));
+
+    geometry::ha::HaHairInputs inputs;
+    inputs.positions = geo_data.position_attr.span.slice(points);
+    inputs.velocities = geo_data.velocity_attr.span.slice(points);
+    inputs.external_force = geo_data.external_force_attr.slice(points);
+    if (geo_data.external_acceleration.size() == geo_data.size) {
+      inputs.external_acceleration = geo_data.external_acceleration.as_span().slice(points);
+    }
+    inputs.rotations = geo_data.rotation_attr.span.slice(points);
+    inputs.angular_velocities = geo_data.angular_velocity_attr.span.slice(points);
+    inputs.external_torque = geo_data.external_torque_attr.slice(points);
+    inputs.inv_masses = geo_data.inv_masses.as_span().slice(points);
+    inputs.moments_of_inertia = geo_data.moments_of_inertia.slice(points);
+    inputs.inv_moments_of_inertia = geo_data.inv_moments_of_inertia.as_span().slice(points);
+
+    /* Owned copies of the curves and of the per point values of the sets: the spans of the solver
+     * (`VArrayRangeSpans`) may alias a single shared buffer, so they cannot be handed to `bind`
+     * after another set was built. */
+    struct CurveStorage {
+      Vector<int> curve_first;
+      Vector<int> curve_size;
+    };
+    struct StretchStorage {
+      CurveStorage curves;
+      Vector<float> rest_lengths;
+      Vector<float> compliances;
+    };
+    struct BendStorage {
+      CurveStorage curves;
+      Vector<math::Quaternion> rest_rotations;
+      Vector<float> compliances;
+    };
+    struct DampingStorage {
+      Vector<float> linear;
+      Vector<float> angular;
+    };
+    struct PinStorage {
+      Vector<int> points;
+      Vector<float> compliances;
+    };
+
+    const auto build_curves = [&](CurveStorage &r_storage) {
+      r_storage.curve_first.reserve(curves_range.size());
+      r_storage.curve_size.reserve(curves_range.size());
+      for (const int curve_i : curves_range) {
+        const IndexRange curve_points = points_by_curve[curve_i];
+        r_storage.curve_first.append(curve_points.first() - point_base);
+        r_storage.curve_size.append(curve_points.size());
+      }
+    };
+
+    Vector<StretchStorage> stretch_storage;
+    Vector<geometry::ha::HaHairRodStretchSet> stretch_sets;
+    for (const RodStretchShearConstraintUsage &usage : geo_data.rod_stretch_shear_constraints) {
+      if (!usage.is_valid) {
+        continue;
+      }
+      stretch_storage.append({});
+      StretchStorage &storage = stretch_storage.last();
+      build_curves(storage.curves);
+      storage.rest_lengths.reinitialize(point_count);
+      storage.compliances.reinitialize(point_count);
+      const Span<float> rest_lengths = usage.rest_lengths.slice(points);
+      const Span<float> compliances = usage.compliances.get_span_for_range(points);
+      for (const int i : IndexRange(point_count)) {
+        storage.rest_lengths[i] = rest_lengths[i];
+        storage.compliances[i] = compliances[i];
+      }
+      geometry::ha::HaHairRodStretchSet set;
+      set.curve_first = storage.curves.curve_first.as_span();
+      set.curve_size = storage.curves.curve_size.as_span();
+      set.rest_lengths = storage.rest_lengths.as_span();
+      set.compliances = storage.compliances.as_span();
+      set.lambdas_pos = usage.lambdas_pos.slice(points);
+      set.lambdas_rot = usage.lambdas_rot.slice(points);
+      stretch_sets.append(set);
+    }
+
+    Vector<BendStorage> bend_storage;
+    Vector<geometry::ha::HaHairRodBendSet> bend_sets;
+    for (const RodBendTwistConstraintUsage &usage : geo_data.rod_bend_twist_constraints) {
+      bend_storage.append({});
+      BendStorage &storage = bend_storage.last();
+      build_curves(storage.curves);
+      storage.rest_rotations.reinitialize(point_count);
+      storage.compliances.reinitialize(point_count);
+      const Span<math::Quaternion> rest_rotations = usage.rest_bend_rotations.slice(points);
+      const Span<float> compliances = usage.compliances.get_span_for_range(points);
+      for (const int i : IndexRange(point_count)) {
+        storage.rest_rotations[i] = rest_rotations[i];
+        storage.compliances[i] = compliances[i];
+      }
+      geometry::ha::HaHairRodBendSet set;
+      set.curve_first = storage.curves.curve_first.as_span();
+      set.curve_size = storage.curves.curve_size.as_span();
+      set.rest_rotations = storage.rest_rotations.as_span();
+      set.compliances = storage.compliances.as_span();
+      set.lambdas = usage.lambdas.slice(points);
+      bend_sets.append(set);
+    }
+
+    Vector<DampingStorage> damping_storage;
+    Vector<geometry::ha::HaHairVelocitySet> velocity_sets;
+    for (const DampingConstraintUsage &usage : geo_data.damping_constraints) {
+      damping_storage.append({});
+      DampingStorage &storage = damping_storage.last();
+      storage.linear.reinitialize(point_count);
+      const Span<float> linear = usage.linear_dampings.get_span_for_range(points);
+      for (const int i : IndexRange(point_count)) {
+        storage.linear[i] = linear[i];
+      }
+      geometry::ha::HaHairVelocitySet linear_set;
+      linear_set.angular = false;
+      linear_set.dampings = storage.linear.as_span();
+      linear_set.lambdas = usage.linear_damping_lambdas.slice(points);
+      velocity_sets.append(linear_set);
+      if (geo_data.uses_rotation) {
+        storage.angular.reinitialize(point_count);
+        const Span<float> angular = usage.angular_dampings.get_span_for_range(points);
+        for (const int i : IndexRange(point_count)) {
+          storage.angular[i] = angular[i];
+        }
+        geometry::ha::HaHairVelocitySet angular_set;
+        angular_set.angular = true;
+        angular_set.dampings = storage.angular.as_span();
+        angular_set.lambdas = usage.angular_damping_lambdas.slice(points);
+        velocity_sets.append(angular_set);
+      }
+    }
+
+    Vector<PinStorage> pin_storage;
+    Vector<geometry::ha::HaHairPinPositionSet> pin_position_sets;
+    for (const PinPositionConstraintChunkUsage &chunk_usage :
+         chunks_data_[chunk_i].pin_position_constraints)
+    {
+      const PinPositionConstraintUsage &usage =
+          geo_data.pin_position_constraints[chunk_usage.constraint_usage_i];
+      const IndexRange pin_range = chunk_usage.pin_range;
+      pin_storage.append({});
+      PinStorage &storage = pin_storage.last();
+      storage.points.reinitialize(pin_range.size());
+      storage.compliances.reinitialize(pin_range.size());
+      const Span<float> compliances = usage.compliances.slice(pin_range);
+      for (const int i : IndexRange(pin_range.size())) {
+        storage.points[i] = usage.points[pin_range[i]] - point_base;
+        storage.compliances[i] = compliances[i];
+      }
+      geometry::ha::HaHairPinPositionSet set;
+      set.points = storage.points.as_span();
+      set.targets = usage.current_positions.slice(pin_range);
+      set.compliances = storage.compliances.as_span();
+      set.lambdas = usage.lambdas.slice(pin_range);
+      pin_position_sets.append(set);
+    }
+
+    Vector<PinStorage> pin_rotation_storage;
+    Vector<geometry::ha::HaHairPinRotationSet> pin_rotation_sets;
+    for (const PinRotationConstraintChunkUsage &chunk_usage :
+         chunks_data_[chunk_i].pin_rotation_constraints)
+    {
+      const PinRotationConstraintUsage &usage =
+          geo_data.pin_rotation_constraints[chunk_usage.constraint_usage_i];
+      const IndexRange pin_range = chunk_usage.pin_range;
+      pin_rotation_storage.append({});
+      PinStorage &storage = pin_rotation_storage.last();
+      storage.points.reinitialize(pin_range.size());
+      storage.compliances.reinitialize(pin_range.size());
+      const Span<float> compliances = usage.compliances.slice(pin_range);
+      for (const int i : IndexRange(pin_range.size())) {
+        storage.points[i] = usage.points[pin_range[i]] - point_base;
+        storage.compliances[i] = compliances[i];
+      }
+      geometry::ha::HaHairPinRotationSet set;
+      set.points = storage.points.as_span();
+      set.targets = usage.current_rotations.slice(pin_range);
+      set.compliances = storage.compliances.as_span();
+      set.lambdas = usage.lambdas.slice(pin_range);
+      pin_rotation_sets.append(set);
+    }
+
+    const Span<const geometry::ha::HaHairRodStretchSet> stretch_span(stretch_sets.data(),
+                                                                    stretch_sets.size());
+    const Span<const geometry::ha::HaHairRodBendSet> bend_span(bend_sets.data(),
+                                                               bend_sets.size());
+    const Span<const geometry::ha::HaHairVelocitySet> velocity_span(velocity_sets.data(),
+                                                                    velocity_sets.size());
+    const Span<const geometry::ha::HaHairPinPositionSet> pin_position_span(
+        pin_position_sets.data(), pin_position_sets.size());
+    const Span<const geometry::ha::HaHairPinRotationSet> pin_rotation_span(
+        pin_rotation_sets.data(), pin_rotation_sets.size());
+    const bool bound = hair.gpu_hair.bind(inputs,
+                                          stretch_span,
+                                          bend_span,
+                                          velocity_span,
+                                          pin_position_span,
+                                          pin_rotation_span,
+                                          sub_delta_time_);
+    if (!bound) {
+      return hair.gpu_hair.last_error();
+    }
+    return nullptr;
+  }
+
+  /**
+   * Decides whether the hair chunks of the world can run on the compute backend and uploads
+   * them. Mirrors #prepare_fluid_gpu: the zone request comes with the evaluation data, the
+   * environment variable is the A/B test override, and a rejection is a `Warning` in `Strict`
+   * mode and an `Info` in `Auto` mode.
+   */
+  void prepare_hair_gpu()
+  {
+    hair_gpu_rejection_reason_.clear();
+    const char *force = std::getenv("BLENDER_XPBD_HAIR_GPU");
+    const bool force_gpu = force != nullptr && StringRef(force) == "1";
+    const bool force_cpu = force != nullptr && StringRef(force) == "0";
+    const bool requested = force_cpu ? false :
+                           force_gpu ? true :
+                                       (gpu_backend_request_ == 1 || gpu_backend_request_ == 2 ||
+                                        geometry::ha::ha_scope_allows_gpu());
+    const bool print = std::getenv("XPBD_GPU_DEBUG") != nullptr;
+    bool reported = false;
+    for (const int chunk_i : chunks_data_.index_range()) {
+      HairChunkData &hair = chunks_data_[chunk_i].hair;
+      const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+      const GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+      /* A "hair" is a curve geometry that actually carries the hair constraint bundles. A plain
+       * curve (no rod/pin/damping set) has nothing to accelerate, so it does not produce a status
+       * badge or a fallback message. */
+      hair.active = geo_data.curves != nullptr && geo_data.fluid_constraint_i < 0 &&
+                    (!geo_data.rod_stretch_shear_constraints.is_empty() ||
+                     !geo_data.rod_bend_twist_constraints.is_empty() ||
+                     !geo_data.damping_constraints.is_empty() ||
+                     !geo_data.pin_position_constraints.is_empty() ||
+                     !geo_data.pin_rotation_constraints.is_empty());
+      hair.gpu_active = false;
+      if (!hair.active) {
+        continue;
+      }
+      const int point_count = int(chunk.points_range.size());
+      if (!requested) {
+        debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                      print,
+                      "XPBD_HAIR_GPU backend=cpu points=%d reason=zone not requested\n",
+                      point_count);
+        continue;
+      }
+      bool soft_rejection = false;
+      const char *rejection = this->hair_gpu_rejection(chunk_i, soft_rejection);
+      if (rejection == nullptr) {
+        hair.gpu_start_ms = time_now_ms();
+        rejection = this->prepare_hair_chunk_gpu(chunk_i);
+        /* Same soft/hard split as the fluid: an explicit device request (`Strict` or
+         * `BLENDER_XPBD_HAIR_GPU=1`) overrides the performance threshold, never a correctness
+         * rejection. */
+        if (rejection != nullptr) {
+          hair.gpu_active = false;
+        }
+      }
+      if (rejection != nullptr) {
+        const bool ignore_soft = force_gpu || gpu_backend_request_ == 2;
+        if (ignore_soft && soft_rejection) {
+          /* The threshold was the only objection: retry without it. This cannot loop because
+           * `hair_gpu_rejection` is only called once. */
+          hair.gpu_start_ms = time_now_ms();
+          rejection = this->prepare_hair_chunk_gpu(chunk_i);
+        }
+      }
+      if (rejection != nullptr) {
+        if (hair_gpu_rejection_reason_.empty()) {
+          hair_gpu_rejection_reason_ = rejection;
+        }
+        debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                      print,
+                      "XPBD_HAIR_GPU backend=cpu points=%d reason=%s\n",
+                      point_count,
+                      rejection);
+        if (!reported) {
+          reported = true;
+          if (gpu_backend_request_ == 2) {
+            this->report(NodeWarningType::Warning,
+                         fmt::format("HW Accelerate zone (Strict): the hair is solved on the CPU "
+                                     "({})",
+                                     rejection));
+          }
+          else if (gpu_backend_request_ == 1) {
+            this->report(NodeWarningType::Info,
+                         fmt::format("HW Accelerate zone: the hair is solved on the CPU ({})",
+                                     rejection));
+          }
+        }
+        continue;
+      }
+      hair.gpu_active = true;
+      debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                    print,
+                    "XPBD_HAIR_GPU backend=device points=%d substeps=%d iterations=%d\n",
+                    point_count,
+                    substeps_,
+                    constraint_iterations_);
+    }
+  }
+
+  /** Copies the device state of a hair chunk back into the solver buffers. */
+  bool hair_gpu_download(const int chunk_i, const int solver_refs_i, const bool log_stats)
+  {
+    HairChunkData &hair = chunks_data_[chunk_i].hair;
+    const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
+    GeometryData &geo_data = *geometries_.data[chunk.data_key_i];
+    const IndexRange points = chunk.points_range;
+    xpbd::GeometryRef &ref = geometries_.solver_refs[solver_refs_i][chunk.data_key_i];
+
+    const Span<float3> positions_span = ref.positions;
+    MutableSpan<float3> positions(const_cast<float3 *>(positions_span.data()),
+                                  positions_span.size());
+    positions = positions.slice(points);
+    MutableSpan<float3> velocities = geo_data.velocity_attr.span.slice(points);
+    MutableSpan<math::Quaternion> rotations;
+    if (geo_data.uses_rotation) {
+      const Span<math::Quaternion> rotations_span = ref.rotations;
+      rotations = MutableSpan<math::Quaternion>(
+                      const_cast<math::Quaternion *>(rotations_span.data()), rotations_span.size())
+                      .slice(points);
+    }
+    MutableSpan<float3> angular_velocities = geo_data.angular_velocity_attr.span.slice(points);
+
+    const bool ok = hair.gpu_hair.download(positions, velocities, rotations, angular_velocities);
+    if (ok && log_stats) {
+      const geometry::ha::HaXpbdHairStats &stats = hair.gpu_hair.stats();
+      debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                    std::getenv("XPBD_GPU_DEBUG") != nullptr,
+                    "XPBD_HAIR_GPU frame backend=device points=%d substeps=%d frame_ms=%.2f "
+                    "passes=%d\n",
+                    hair.gpu_hair.point_count(),
+                    substeps_,
+                    time_now_ms() - hair.gpu_start_ms,
+                    stats.passes);
+    }
+    return ok;
+  }
+
+  /**
+   * Turns the device path of one chunk off after a dispatch failed. The CPU state is the one from
+   * the start of the frame, so the rest of the frame simulates a hair that is one frame behind;
+   * this only happens when the GPU context disappears in the middle of a solve.
+   */
+  void hair_gpu_fail(const int chunk_i, const char *reason)
+  {
+    HairChunkData &hair = chunks_data_[chunk_i].hair;
+    hair.gpu_active = false;
+    hair.gpu_hair.free();
+    if (hair_gpu_rejection_reason_.empty()) {
+      hair_gpu_rejection_reason_ = reason != nullptr ? reason : "device dispatch failed";
+    }
+    debug_gpu_log("BLENDER_XPBD_GPU_LOG",
+                  std::getenv("XPBD_GPU_DEBUG") != nullptr,
+                  "XPBD_HAIR_GPU frame backend=cpu reason=%s\n",
+                  reason != nullptr ? reason : "device dispatch failed");
+    this->report(NodeWarningType::Warning,
+                 fmt::format("HW Accelerate: the hair device path failed ({}), the rest of the "
+                             "frame is solved on the CPU",
+                             reason != nullptr ? reason : "device dispatch failed"));
+  }
+
   /** Hands the contacts of the current substep to the device. */
   bool upload_contacts_to_gpu(const int chunk_i, const ExternalFaceContacts &contacts)
   {
@@ -8996,8 +9487,17 @@ class XpbdSolverStep {
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
     ChunkData &chunk_data = chunks_data_[chunk_i];
 
-    for (xpbd::ConstraintSet *constraint : chunk_data.static_constraints) {
-      constraint->solve_sequential_all(solve_params, updater);
+    HairChunkData &hair = chunk_data.hair;
+    if (hair.gpu_active) {
+      /* The device solves the rod, pin and damping sets of this chunk in their CPU order. */
+      if (!hair.gpu_hair.iterate()) {
+        this->hair_gpu_fail(chunk_i, hair.gpu_hair.last_error());
+      }
+    }
+    else {
+      for (xpbd::ConstraintSet *constraint : chunk_data.static_constraints) {
+        constraint->solve_sequential_all(solve_params, updater);
+      }
     }
 
     this->simulate__fluid_position_solve__chunk(chunk_i, solve_params, updater);
@@ -9063,6 +9563,18 @@ class XpbdSolverStep {
       /* The velocities already come from the device, see #simulate__gpu_fluid_substep. */
       return;
     }
+    HairChunkData &hair = chunks_data_[chunk_i].hair;
+    if (hair.gpu_active) {
+      /* `update_linear_velocities` is skipped for a zero time step (the first frame), so the
+       * device keeps the velocities it was bound with. */
+      if (sub_delta_time_ <= 0.0f) {
+        return;
+      }
+      if (!hair.gpu_hair.update_velocities()) {
+        this->hair_gpu_fail(chunk_i, hair.gpu_hair.last_error());
+      }
+      return;
+    }
     if (sub_delta_time_ <= 0.0f) {
       /* This may happen for example on the first frame when no time has passed yet. */
       return;
@@ -9090,17 +9602,32 @@ class XpbdSolverStep {
     }
   }
 
-  void simulate__velocity_solve(const int solver_refs_i)
+  void simulate__velocity_solve(const int solver_refs_i, const bool download_result)
   {
     this->parallel_for_each_chunk(8, [&](const int chunk_i) {
-      this->simulate__velocity_solve__chunk(chunk_i, solver_refs_i);
+      this->simulate__velocity_solve__chunk(chunk_i, solver_refs_i, download_result);
     });
   }
 
-  void simulate__velocity_solve__chunk(const int chunk_i, const int solver_refs_i)
+  void simulate__velocity_solve__chunk(const int chunk_i,
+                                       const int solver_refs_i,
+                                       const bool download_result)
   {
     const GeometryDataChunk &chunk = geometries_.chunks[chunk_i];
     ChunkData &chunk_data = chunks_data_[chunk_i];
+
+    HairChunkData &hair = chunk_data.hair;
+    if (hair.gpu_active) {
+      /* Only the last substep of the frame reads the device state back. */
+      bool ok = hair.gpu_hair.solve_velocity();
+      if (ok && download_result) {
+        ok = this->hair_gpu_download(chunk_i, solver_refs_i, /*log_stats=*/true);
+      }
+      if (!ok) {
+        this->hair_gpu_fail(chunk_i, hair.gpu_hair.last_error());
+      }
+      return;
+    }
 
     const Span<xpbd::GeometryRef> solver_refs = geometries_.solver_refs[solver_refs_i];
     xpbd::ConstraintSetParams params{solver_refs, sub_delta_time_};
