@@ -65,7 +65,9 @@ struct NavSampler {
   VArray<bool> reachable;
   VArray<bool> blocked;
   VArray<float> height;
+  int level_count = 1;
   bool has_height = false;
+  bool has_levels = false;
 };
 
 static bool read_navigation(const Bundle *navigation, NavSampler &r_sampler)
@@ -108,14 +110,17 @@ static bool read_navigation(const Bundle *navigation, NavSampler &r_sampler)
   sampler.blocked =
       points->attributes().lookup_or_default<bool>("blocked", AttrDomain::Point, false).varray;
   sampler.has_height = navigation->lookup_path<bool>("has_heights").value_or(false);
+  sampler.has_levels = navigation->lookup_path<bool>("has_levels").value_or(false);
+  sampler.level_count = std::max(navigation->lookup_path<int>("level_count").value_or(1), 1);
   if (sampler.has_height) {
     sampler.height =
         points->attributes().lookup_or_default<float>("height", AttrDomain::Point, 0.0f).varray;
   }
-  if (sampler.flow.size() < int64_t(sampler.cells) * group_count ||
-      sampler.reachable.size() < int64_t(sampler.cells) * group_count ||
+  const int64_t nodes = int64_t(sampler.cells) * sampler.level_count;
+  if (sampler.flow.size() < int64_t(nodes) * group_count ||
+      sampler.reachable.size() < int64_t(nodes) * group_count ||
       sampler.blocked.size() < sampler.cells ||
-      (sampler.has_height && sampler.height.size() < sampler.cells))
+      (sampler.has_height && sampler.height.size() < nodes))
   {
     return false;
   }
@@ -135,12 +140,43 @@ static int navigation_layer(const NavSampler &nav, const int target_group)
   return 0;
 }
 
+static int navigation_level(const NavSampler &nav, const float3 position)
+{
+  if (!nav.has_levels || nav.level_count <= 1 || !nav.has_height) {
+    return 0;
+  }
+  const int x = math::clamp(
+      int(std::floor((position.x - nav.min.x) / nav.cell_size)), 0, nav.dims_x - 1);
+  const int y = math::clamp(
+      int(std::floor((position.y - nav.min.y) / nav.cell_size)), 0, nav.dims_y - 1);
+  const int cell = y * nav.dims_x + x;
+  int best_level = 0;
+  float best_delta = FLT_MAX;
+  for (const int level : IndexRange(nav.level_count)) {
+    const int index = int64_t(level) * nav.cells + cell;
+    if (index >= nav.height.size()) {
+      break;
+    }
+    const float height = nav.height[index];
+    if (height <= -1.0e30f) {
+      continue;
+    }
+    const float delta = std::abs(height - position.z);
+    if (delta < best_delta) {
+      best_delta = delta;
+      best_level = level;
+    }
+  }
+  return best_level;
+}
+
 /**
  * Sample the flow field at a world position. Prefers a bilinear average of the surrounding cell
  * flows; falls back to the nearest reachable cell, which also pushes an agent that was shoved
  * inside an obstacle back out.
  */
 static bool sample_navigation(const NavSampler &nav,
+                              const int level,
                               const float3 position,
                               const int target_group,
                               float3 &r_flow,
@@ -152,7 +188,7 @@ static bool sample_navigation(const NavSampler &nav,
     return false;
   }
   const int layer = navigation_layer(nav, target_group);
-  const int offset = layer * nav.cells;
+  const int offset = (layer * nav.level_count + level) * nav.cells;
   const float gx = (position.x - nav.min.x) / nav.cell_size - 0.5f;
   const float gy = (position.y - nav.min.y) / nav.cell_size - 0.5f;
   const int x0 = int(std::floor(gx));
@@ -300,9 +336,17 @@ static bool sample_navigation(const NavSampler &nav,
  * Height of the walkable surface at a position (bilinear over free cells). Only valid when the
  * navigation bundle was built from a walkable surface.
  */
-static bool sample_navigation_height(const NavSampler &nav, const float3 position, float &r_height)
+static bool sample_navigation_height(const NavSampler &nav,
+                                     const int level,
+                                     const float3 position,
+                                     float &r_height)
 {
   if (!nav.valid || !nav.has_height || nav.height.size() < nav.cells) {
+    return false;
+  }
+  const int use_level = math::clamp(level, 0, nav.level_count - 1);
+  const int64_t height_base = int64_t(use_level) * nav.cells;
+  if (height_base + nav.cells > nav.height.size()) {
     return false;
   }
   const float gx = (position.x - nav.min.x) / nav.cell_size - 0.5f;
@@ -324,11 +368,15 @@ static bool sample_navigation_height(const NavSampler &nav, const float3 positio
       if (nav.blocked[cell]) {
         continue;
       }
+      const float height = nav.height[height_base + cell];
+      if (height <= -1.0e30f) {
+        continue;
+      }
       const float weight = (dx == 0 ? 1.0f - fx : fx) * (dy == 0 ? 1.0f - fy : fy);
       if (weight <= 1.0e-4f) {
         continue;
       }
-      sum += nav.height[cell] * weight;
+      sum += height * weight;
       weight_sum += weight;
     }
   }
@@ -351,12 +399,16 @@ static bool sample_navigation_height(const NavSampler &nav, const float3 positio
       if (nav.blocked[cell]) {
         continue;
       }
+      const float height = nav.height[height_base + cell];
+      if (height <= -1.0e30f) {
+        continue;
+      }
       const float2 center = nav.min + float2((float(x) + 0.5f) * nav.cell_size,
                                              (float(y) + 0.5f) * nav.cell_size);
       const float distance = math::length_squared(float2(position.x, position.y) - center);
       if (distance < best_distance) {
         best_distance = distance;
-        r_height = nav.height[cell];
+        r_height = height;
       }
     }
   }
@@ -700,6 +752,8 @@ static void node_geo_exec(GeoNodeExecParams params)
       attributes.lookup_or_add_for_write_span<float3>("position", domain);
   bke::SpanAttributeWriter<float3> velocity_writer =
       attributes.lookup_or_add_for_write_span<float3>("velocity", domain);
+  bke::SpanAttributeWriter<int> nav_level_writer = attributes.lookup_or_add_for_write_span<int>(
+      "nav_level", domain);
   bke::SpanAttributeWriter<math::Quaternion> rotation_writer =
       attributes.lookup_or_add_for_write_span<math::Quaternion>("rotation", domain);
   bke::SpanAttributeWriter<float> state_time_writer =
@@ -870,8 +924,14 @@ static void node_geo_exec(GeoNodeExecParams params)
         float3 flow;
         float3 push;
         float path_distance = 1.0e9f;
-        if (sample_navigation(
-                navigation_sampler, positions[i], target_groups[i], flow, push, path_distance))
+        const int nav_level = navigation_level(navigation_sampler, positions[i]);
+        if (sample_navigation(navigation_sampler,
+                              nav_level,
+                              positions[i],
+                              target_groups[i],
+                              flow,
+                              push,
+                              path_distance))
         {
           target_distance = path_distance;
           /* Remove the part of the flow that points into the obstacle and add a small outward
@@ -1085,7 +1145,8 @@ static void node_geo_exec(GeoNodeExecParams params)
         continue;
       }
       float height = 0.0f;
-      if (sample_navigation_height(navigation_sampler, positions[i], height)) {
+      const int level = navigation_level(navigation_sampler, positions[i]);
+      if (sample_navigation_height(navigation_sampler, level, positions[i], height)) {
         positions[i].z = height + surface_offset;
         position_writer.span[i] = positions[i];
       }
@@ -1107,6 +1168,13 @@ static void node_geo_exec(GeoNodeExecParams params)
     }
     speed_ratio_writer.span[i] = ratio;
   }
+
+  for (const int i : IndexRange(count)) {
+    nav_level_writer.span[i] = navigation_sampler.valid ?
+                                   navigation_level(navigation_sampler, positions[i]) :
+                                   0;
+  }
+  nav_level_writer.finish();
 
   position_writer.finish();
   velocity_writer.finish();

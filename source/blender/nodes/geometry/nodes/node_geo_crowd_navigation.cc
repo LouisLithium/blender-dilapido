@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -69,6 +70,7 @@ inline constexpr int MAX_CELLS = 2'000'000;
 
 struct Goal {
   float2 position;
+  float z = 0.0f;
   int group = -1;
 };
 
@@ -85,8 +87,11 @@ struct NavResult {
   Array<uint8_t> reachable;
   /** Size = cells; shared by all layers. */
   Array<uint8_t> blocked;
-  /** Surface height per cell (only when a walkable surface was given). */
-  Array<float> height;
+  /** Walkable surface heights, `level_count` sorted heights per cell
+   * (`level_height[level * cells + cell]`, `-FLT_MAX` when absent). */
+  Array<float> level_height;
+  int level_count = 1;
+  bool layered = false;
   bool has_height = false;
 
   int cell_count() const
@@ -157,7 +162,7 @@ static void read_goals(const GeometrySet &geometry, Vector<Goal> &r_goals)
         points->attributes().lookup_or_default<int>("target_group", AttrDomain::Point, -1).varray;
     const Span<float3> positions = points->positions();
     for (const int i : IndexRange(points->totpoint)) {
-      r_goals.append({float2(positions[i].x, positions[i].y), groups[i]});
+      r_goals.append({float2(positions[i].x, positions[i].y), positions[i].z, groups[i]});
     }
     return;
   }
@@ -166,7 +171,7 @@ static void read_goals(const GeometrySet &geometry, Vector<Goal> &r_goals)
         mesh->attributes().lookup_or_default<int>("target_group", AttrDomain::Point, -1).varray;
     const Span<float3> positions = mesh->vert_positions();
     for (const int i : IndexRange(mesh->verts_num)) {
-      r_goals.append({float2(positions[i].x, positions[i].y), groups[i]});
+      r_goals.append({float2(positions[i].x, positions[i].y), positions[i].z, groups[i]});
     }
   }
 }
@@ -244,6 +249,9 @@ struct BuildParams {
   bool use_bounds = false;
   float3 bounds_min = float3(-10.0f);
   float3 bounds_max = float3(10.0f);
+  bool layered = false;
+  int max_layers = 4;
+  float layer_merge = 0.3f;
 };
 
 static int2 clamp_cell(const int2 cell, const int dims_x, const int dims_y)
@@ -377,10 +385,10 @@ static constexpr NeighborOffset NEIGHBORS[8] = {{1, 0, 1.0f},
                                                 {-1, 1, 1.41421356f},
                                                 {-1, -1, 1.41421356f}};
 
-static void build_layer(NavResult &nav,
-                        const int layer,
-                        const Span<int> goal_cells,
-                        const BuildParams &params)
+static void build_layer_single(NavResult &nav,
+                               const int layer,
+                               const Span<int> goal_cells,
+                               const BuildParams &params)
 {
   const int cells = nav.cell_count();
   const int offset = layer * cells;
@@ -555,7 +563,11 @@ static void build_layer(NavResult &nav,
 /** Mark the cells covered by the walkable surface free and store the surface height there. A
  * walkable surface inverts the default: everything outside its footprint is blocked, so agents
  * stay on the given navigation mesh instead of roaming the whole XY plane. */
-static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav)
+/** Mark the cells covered by the walkable surface free and store the surface height(s) there. A
+ * walkable surface inverts the default: everything outside its footprint is blocked. In layered
+ * mode a cell keeps up to `Max Layers` distinct heights (a bridge above a floor becomes two
+ * levels). */
+static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav, const BuildParams &params)
 {
   const Span<float3> positions = mesh.vert_positions();
   const Span<int> corner_verts = mesh.corner_verts();
@@ -568,9 +580,34 @@ static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav)
   const int dims_x = nav.dims_x;
   const int dims_y = nav.dims_y;
   const int cells = nav.cell_count();
-  if (nav.height.size() != cells) {
-    nav.height = Array<float>(cells, -FLT_MAX);
-  }
+  const int max_layers = std::max(params.max_layers, 1);
+  Array<float> scratch(cells * max_layers, -FLT_MAX);
+
+  auto insert_height = [&](const int cell_index, const float height) {
+    float *column = scratch.data() + int64_t(cell_index) * max_layers;
+    for (int i = 0; i < max_layers; i++) {
+      if (column[i] > -1.0e30f && std::abs(column[i] - height) <= params.layer_merge) {
+        column[i] = std::max(column[i], height);
+        return;
+      }
+    }
+    for (int i = 0; i < max_layers; i++) {
+      if (column[i] <= -1.0e30f) {
+        column[i] = height;
+        return;
+      }
+    }
+    /* More surfaces than levels: drop the highest one, keep the floor. */
+    int highest = 0;
+    for (int i = 1; i < max_layers; i++) {
+      if (column[i] > column[highest]) {
+        highest = i;
+      }
+    }
+    if (height < column[highest]) {
+      column[highest] = height;
+    }
+  };
 
   auto mark_pass = [&](const float tolerance) {
     int marked = 0;
@@ -621,7 +658,7 @@ static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav)
           const float height = (w0 * v0.z + w1 * v1.z + w2 * v2.z) / wsum;
           const int index = iy * dims_x + ix;
           nav.blocked[index] = 0;
-          nav.height[index] = std::max(nav.height[index], height);
+          insert_height(index, height);
           marked++;
         }
       }
@@ -629,10 +666,197 @@ static void rasterize_walkable_surface(const Mesh &mesh, NavResult &nav)
     return marked;
   };
 
-  /* Thin surfaces (a single cell wide) can miss every cell center; retry with one cell of
-   * tolerance so they still produce a usable strip. */
   if (mark_pass(0.0f) == 0) {
+    scratch.fill(-FLT_MAX);
     mark_pass(cell);
+  }
+
+  int level_count = 1;
+  for (const int cell_index : IndexRange(cells)) {
+    float *column = scratch.data() + int64_t(cell_index) * max_layers;
+    std::sort(column, column + max_layers, std::greater<float>());
+    int count = 0;
+    for (int i = 0; i < max_layers; i++) {
+      if (column[i] > -1.0e30f) {
+        count++;
+      }
+    }
+    if (params.layered) {
+      level_count = std::max(level_count, count);
+    }
+  }
+  nav.level_count = level_count;
+  nav.layered = params.layered && level_count > 1;
+  nav.has_height = true;
+  nav.level_height = Array<float>(cells * level_count, -FLT_MAX);
+  for (const int cell_index : IndexRange(cells)) {
+    const float *column = scratch.data() + int64_t(cell_index) * max_layers;
+    int count = 0;
+    for (int i = 0; i < max_layers; i++) {
+      if (column[i] > -1.0e30f) {
+        count++;
+      }
+    }
+    if (!params.layered) {
+      /* Height field: one height per cell (the highest surface). */
+      if (count > 0) {
+        nav.level_height[cell_index] = column[0];
+      }
+      continue;
+    }
+    /* `column` is sorted high -> low; store low -> high in the level slots. */
+    const int kept = std::min(count, level_count);
+    for (int i = 0; i < kept; i++) {
+      nav.level_height[int64_t(i) * cells + cell_index] = column[kept - 1 - i];
+    }
+  }
+}
+
+/** Layered Dijkstra: nodes are `(level, cell)`, connected horizontally when the height difference
+ * is walkable and vertically inside the same cell. Flow points to the neighbouring node with the
+ * smallest distance (a gradient over heights is ill-defined). */
+static void build_layer_layered(NavResult &nav,
+                                const int group_index,
+                                const Span<int> goal_nodes,
+                                const BuildParams &params)
+{
+  const int cells = nav.cell_count();
+  const int levels = nav.level_count;
+  const int nodes = levels * cells;
+  const int offset = group_index * nodes;
+  for (const int i : IndexRange(nodes)) {
+    nav.distance[offset + i] = UNREACHABLE_DISTANCE;
+    nav.reachable[offset + i] = 0;
+    nav.flow[offset + i] = float3(0.0f);
+  }
+  if (goal_nodes.is_empty()) {
+    return;
+  }
+
+  const float step = std::max(params.max_step_height, 1.0e-4f);
+  auto height_at = [&](const int level, const int cell) {
+    return nav.level_height[int64_t(level) * cells + cell];
+  };
+  auto node_valid = [&](const int level, const int cell) {
+    return !nav.blocked[cell] && height_at(level, cell) > -1.0e30f;
+  };
+
+  using QueueItem = std::pair<float, int>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> queue;
+  for (const int node : goal_nodes) {
+    if (node < 0 || node >= nodes) {
+      continue;
+    }
+    if (!node_valid(node / cells, node % cells)) {
+      continue;
+    }
+    if (nav.distance[offset + node] > 0.0f) {
+      nav.distance[offset + node] = 0.0f;
+      queue.emplace(0.0f, node);
+    }
+  }
+  const float cell_size = nav.cell_size;
+  while (!queue.empty()) {
+    const auto [distance, node] = queue.top();
+    queue.pop();
+    if (distance > nav.distance[offset + node]) {
+      continue;
+    }
+    const int level = node / cells;
+    const int cell = node % cells;
+    const int cx = cell % nav.dims_x;
+    const int cy = cell / nav.dims_x;
+    const float height = height_at(level, cell);
+    for (const NeighborOffset &neighbor : NEIGHBORS) {
+      const int nx = cx + neighbor.dx;
+      const int ny = cy + neighbor.dy;
+      if (nx < 0 || ny < 0 || nx >= nav.dims_x || ny >= nav.dims_y) {
+        continue;
+      }
+      const int next_cell = ny * nav.dims_x + nx;
+      if (nav.blocked[next_cell]) {
+        continue;
+      }
+      if (neighbor.dx != 0 && neighbor.dy != 0) {
+        if (nav.blocked[cy * nav.dims_x + nx] || nav.blocked[ny * nav.dims_x + cx]) {
+          continue;
+        }
+      }
+      for (const int next_level : IndexRange(levels)) {
+        if (!node_valid(next_level, next_cell)) {
+          continue;
+        }
+        const float dz = std::abs(height_at(next_level, next_cell) - height);
+        if (dz > step) {
+          continue;
+        }
+        const int next_node = next_level * cells + next_cell;
+        const float next_distance = distance + neighbor.scale * cell_size + dz * 0.5f;
+        if (next_distance < nav.distance[offset + next_node]) {
+          nav.distance[offset + next_node] = next_distance;
+          queue.emplace(next_distance, next_node);
+        }
+      }
+    }
+    /* Vertical link inside one cell (a short step / stair). */
+    for (const int next_level : IndexRange(levels)) {
+      if (next_level == level || !node_valid(next_level, cell)) {
+        continue;
+      }
+      const float dz = std::abs(height_at(next_level, cell) - height);
+      if (dz > step) {
+        continue;
+      }
+      const int next_node = next_level * cells + cell;
+      const float next_distance = distance + dz;
+      if (next_distance < nav.distance[offset + next_node]) {
+        nav.distance[offset + next_node] = next_distance;
+        queue.emplace(next_distance, next_node);
+      }
+    }
+  }
+
+  /* Flow towards the best neighbouring node. */
+  for (const int level : IndexRange(levels)) {
+    for (const int y : IndexRange(nav.dims_y)) {
+      for (const int x : IndexRange(nav.dims_x)) {
+        const int cell = y * nav.dims_x + x;
+        const int node = level * cells + cell;
+        const float d = nav.distance[offset + node];
+        if (!node_valid(level, cell) || d >= UNREACHABLE_DISTANCE) {
+          continue;
+        }
+        nav.reachable[offset + node] = 1;
+        float best_distance = d;
+        float3 best_flow = float3(0.0f);
+        for (const NeighborOffset &neighbor : NEIGHBORS) {
+          const int nx = x + neighbor.dx;
+          const int ny = y + neighbor.dy;
+          if (nx < 0 || ny < 0 || nx >= nav.dims_x || ny >= nav.dims_y) {
+            continue;
+          }
+          const int next_cell = ny * nav.dims_x + nx;
+          if (nav.blocked[next_cell]) {
+            continue;
+          }
+          for (const int next_level : IndexRange(levels)) {
+            if (!node_valid(next_level, next_cell)) {
+              continue;
+            }
+            const float next_distance = nav.distance[offset + next_level * cells + next_cell];
+            if (next_distance + 1.0e-4f >= best_distance) {
+              continue;
+            }
+            best_distance = next_distance;
+            best_flow = float3(float(neighbor.dx), float(neighbor.dy), 0.0f);
+          }
+        }
+        if (math::length_squared(float2(best_flow.x, best_flow.y)) > 1.0e-8f) {
+          best_flow = math::normalize(best_flow);
+        }
+        nav.flow[offset + node] = best_flow;
+      }
+    }
   }
 }
 
@@ -723,7 +947,7 @@ static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
     /* Everything outside the navigation mesh is blocked; obstacles below punch holes in it. */
     nav->blocked.fill(1);
     nav->has_height = true;
-    rasterize_walkable_surface(*walkable, *nav);
+    rasterize_walkable_surface(*walkable, *nav, params);
   }
   if (obstacles != nullptr) {
     rasterize_obstacles(obstacles, *nav, params);
@@ -751,23 +975,46 @@ static std::shared_ptr<NavResult> build_navigation(const Mesh *obstacles,
   }
   nav->groups = group_values;
   const int layers = int(group_values.size());
-  nav->flow = Array<float3>(layers * cells, float3(0.0f));
-  nav->distance = Array<float>(layers * cells, UNREACHABLE_DISTANCE);
-  nav->reachable = Array<uint8_t>(layers * cells, 0);
+  const int levels = nav->level_count;
+  nav->flow = Array<float3>(layers * levels * cells, float3(0.0f));
+  nav->distance = Array<float>(layers * levels * cells, UNREACHABLE_DISTANCE);
+  nav->reachable = Array<uint8_t>(layers * levels * cells, 0);
 
   for (const int layer : IndexRange(layers)) {
     const int group = group_values[layer];
     Vector<int> goal_cells;
+    Vector<int> goal_nodes;
     for (const Goal &goal : goals) {
       if (group >= 0 && goal.group != group) {
         continue;
       }
       const int cell = find_goal_cell(*nav, goal.position);
-      if (cell >= 0) {
-        goal_cells.append(cell);
+      if (cell < 0) {
+        continue;
       }
+      goal_cells.append(cell);
+      /* Pick the level whose height is nearest to the goal's z. */
+      int best_level = 0;
+      float best_delta = FLT_MAX;
+      for (const int level : IndexRange(levels)) {
+        const float height = nav->level_height[int64_t(level) * cells + cell];
+        if (height <= -1.0e30f) {
+          continue;
+        }
+        const float delta = std::abs(height - goal.z);
+        if (delta < best_delta) {
+          best_delta = delta;
+          best_level = level;
+        }
+      }
+      goal_nodes.append(best_level * cells + cell);
     }
-    build_layer(*nav, layer, goal_cells, params);
+    if (levels > 1) {
+      build_layer_layered(*nav, layer, goal_nodes, params);
+    }
+    else {
+      build_layer_single(*nav, layer, goal_cells, params);
+    }
   }
   return nav;
 }
@@ -808,6 +1055,7 @@ static uint64_t navigation_hash(const Mesh *obstacles,
   hash_value(hash, int(goals.size()));
   for (const Goal &goal : goals) {
     hash_value(hash, goal.position);
+    hash_value(hash, goal.z);
     hash_value(hash, goal.group);
   }
   hash_value(hash, int(extra_bounds.size()));
@@ -823,6 +1071,9 @@ static uint64_t navigation_hash(const Mesh *obstacles,
   hash_value(hash, int(params.use_bounds));
   hash_value(hash, params.bounds_min);
   hash_value(hash, params.bounds_max);
+  hash_value(hash, int(params.layered));
+  hash_value(hash, params.max_layers);
+  hash_value(hash, params.layer_merge);
   hash_value(hash, bounds[0]);
   hash_value(hash, bounds[1]);
   return hash;
@@ -834,7 +1085,8 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
 {
   const int cells = nav.cell_count();
   const int layers = int(nav.groups.size());
-  const int total = cells * layers;
+  const int levels = nav.level_count;
+  const int total = cells * layers * levels;
   PointCloud *points = BKE_pointcloud_new_nomain(total);
   bke::MutableAttributeAccessor attributes = points->attributes_for_write();
   const AttrDomain domain = AttrDomain::Point;
@@ -853,6 +1105,8 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
                                                                                       domain);
   bke::SpanAttributeWriter<int> layer_indices = attributes.lookup_or_add_for_write_span<int>(
       "nav_layer", domain);
+  bke::SpanAttributeWriter<int> level_indices = attributes.lookup_or_add_for_write_span<int>(
+      "nav_level", domain);
   bke::SpanAttributeWriter<int> cell_indices = attributes.lookup_or_add_for_write_span<int>(
       "nav_cell", domain);
   bke::SpanAttributeWriter<float> heights = attributes.lookup_or_add_for_write_span<float>(
@@ -860,26 +1114,34 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
 
   int index = 0;
   for (const int layer : IndexRange(layers)) {
-    const int offset = layer * cells;
-    for (const int y : IndexRange(nav.dims_y)) {
-      for (const int x : IndexRange(nav.dims_x)) {
-        const int cell = y * nav.dims_x + x;
-        const float2 center = cell_center(nav, int2(x, y));
-        float height = ground_z;
-        if (nav.has_height && cell < nav.height.size() && nav.height[cell] > -1.0e30f) {
-          height = nav.height[cell];
+    for (const int level : IndexRange(levels)) {
+      const int offset = (layer * levels + level) * cells;
+      for (const int y : IndexRange(nav.dims_y)) {
+        for (const int x : IndexRange(nav.dims_x)) {
+          const int cell = y * nav.dims_x + x;
+          const float2 center = cell_center(nav, int2(x, y));
+          float height = ground_z;
+          bool has_level = true;
+          if (nav.has_height) {
+            has_level = level < nav.level_count &&
+                        nav.level_height[int64_t(level) * cells + cell] > -1.0e30f;
+            if (has_level) {
+              height = nav.level_height[int64_t(level) * cells + cell];
+            }
+          }
+          positions.span[index] = float3(center.x, center.y, height);
+          heights.span[index] = height;
+          flows.span[index] = nav.flow[offset + cell];
+          distances.span[index] = nav.reachable[offset + cell] ? nav.distance[offset + cell] :
+                                                                 UNREACHABLE_DISTANCE;
+          reachable.span[index] = nav.reachable[offset + cell] != 0;
+          blocked.span[index] = nav.blocked[cell] != 0 || !has_level;
+          groups.span[index] = nav.groups[layer];
+          layer_indices.span[index] = layer;
+          level_indices.span[index] = level;
+          cell_indices.span[index] = cell;
+          index++;
         }
-        positions.span[index] = float3(center.x, center.y, height);
-        heights.span[index] = height;
-        flows.span[index] = nav.flow[offset + cell];
-        distances.span[index] = nav.reachable[offset + cell] ? nav.distance[offset + cell] :
-                                                               UNREACHABLE_DISTANCE;
-        reachable.span[index] = nav.reachable[offset + cell] != 0;
-        blocked.span[index] = nav.blocked[cell] != 0;
-        groups.span[index] = nav.groups[layer];
-        layer_indices.span[index] = layer;
-        cell_indices.span[index] = cell;
-        index++;
       }
     }
   }
@@ -891,6 +1153,7 @@ static PointCloud *create_navigation_points(const NavResult &nav, const float gr
   blocked.finish();
   groups.finish();
   layer_indices.finish();
+  level_indices.finish();
   cell_indices.finish();
   heights.finish();
   points->tag_positions_changed();
@@ -950,6 +1213,25 @@ static void node_declare(NodeDeclarationBuilder &b)
           "Optional navigation mesh. Agents are kept on its footprint (everything outside is "
           "blocked) and follow its height, so crowds can walk on ramps and terrain instead of the "
           "XY plane. Obstacles still apply on top");
+  b.add_input<decl::Bool>("Layered"_ustr)
+      .default_value(false)
+      .description(
+          "Keep every distinct surface height per cell instead of a single height field. Bridges, "
+          "floors and overlapping walkable surfaces become separate levels; agents choose the "
+          "level "
+          "nearest to their z");
+  b.add_input<decl::Int>("Max Layers"_ustr)
+      .default_value(4)
+      .min(1)
+      .max(8)
+      .description("Maximum number of walkable heights kept per grid cell in layered mode");
+  b.add_input<decl::Float>("Layer Merge"_ustr)
+      .default_value(0.3f)
+      .min(0.0f)
+      .subtype(PROP_DISTANCE)
+      .description(
+          "Surface heights closer than this are treated as the same level (avoids duplicates from "
+          "adjacent triangles)");
 
   b.add_output<decl::Bundle>("Navigation"_ustr).description("Flow field consumed by Crowd Motion");
   b.add_output<decl::Geometry>("Grid"_ustr)
@@ -974,6 +1256,9 @@ static void node_geo_exec(GeoNodeExecParams params)
   build_params.use_bounds = params.extract_input<bool>("Use Custom Bounds"_ustr);
   build_params.bounds_min = params.extract_input<float3>("Bounds Min"_ustr);
   build_params.bounds_max = params.extract_input<float3>("Bounds Max"_ustr);
+  build_params.layered = params.extract_input<bool>("Layered"_ustr);
+  build_params.max_layers = std::max(params.extract_input<int>("Max Layers"_ustr), 1);
+  build_params.layer_merge = std::max(params.extract_input<float>("Layer Merge"_ustr), 0.0f);
 
   const Mesh *obstacles = obstacles_geometry.get_mesh();
   if (obstacles != nullptr && !mesh_has_data(obstacles)) {
@@ -1069,6 +1354,8 @@ static void node_geo_exec(GeoNodeExecParams params)
   bundle.add(*BundleKey::from_str("dims_x"), nav->dims_x);
   bundle.add(*BundleKey::from_str("dims_y"), nav->dims_y);
   bundle.add(*BundleKey::from_str("has_heights"), nav->has_height);
+  bundle.add(*BundleKey::from_str("has_levels"), nav->layered);
+  bundle.add(*BundleKey::from_str("level_count"), nav->level_count);
   bundle.add(*BundleKey::from_str("group_count"), int(nav->groups.size()));
   for (const int i : nav->groups.index_range()) {
     bundle.add(*BundleKey::from_str("group_" + std::to_string(i)), nav->groups[i]);
