@@ -4,7 +4,7 @@
 
 """Dilapido Assist: helpers for the Jolt rigid body and crowd geometry nodes.
 
-The panel lives in the sidebar of the Geometry Nodes editor and offers two buttons:
+The panel lives in the sidebar of the Geometry Nodes editor and offers:
 
 - `Quick RBD` builds a working rigid body setup in the current node tree:
   `Group Input -> Voronoi Fracture -> Fracture Cluster -> Init Rigid Body -> Rigid Body Dynamics`.
@@ -14,8 +14,13 @@ The panel lives in the sidebar of the Geometry Nodes editor and offers two butto
   uses the native nodes directly (no asset group) and does **not** change the group interface:
   external geometry/objects are picked on `Object Info` / `Object` nodes, and numeric defaults are
   `Value` nodes.
+- `Quick Crowd Ragdoll` builds the same walk crowd plus a shared ragdoll world, switch and
+  recovery blend.
 - `Auto Arrange` arranges selected nodes (or all) with the Node Arrange extension
   (`bpy.ops.node.na_arrange_selected()`), falling back to a built-in layered layout.
+- `Update Selected Node Group` refreshes the asset behind the selected group node: linked copies
+  reload their library (in place), appended copies are replaced with a fresh copy from the shipped
+  asset and every user is switched over with the links restored by socket name.
 
 Everything is wired, so a modifier that has this node tree runs right away; the sizes are sensible
 defaults that can be tweaked afterwards.
@@ -24,14 +29,15 @@ defaults that can be tweaked afterwards.
 bl_info = {
     "name": "Dilapido Assist",
     "author": "Dilapido",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 2, 0),
     "location": "Geometry Nodes editor > Sidebar > Dilapido",
-    "description": "One click rigid body and crowd setups with the Jolt solver",
+    "description": "One click rigid body and crowd setups plus asset updates with the Jolt solver",
     "category": "Node",
 }
 
 import os
+import re
 
 import bpy
 from bpy.types import Operator, Panel
@@ -62,6 +68,191 @@ def ensure_asset_group(name=ASSET_GROUP_NAME):
     except (OSError, RuntimeError):
         return None
     return bpy.data.node_groups.get(name)
+
+
+#: Cache for `_asset_file_for_group()`; cleared every time the update operator runs.
+_ASSET_FILE_CACHE = {}
+
+
+def _asset_blend_files():
+    """Every installed .blend that may contain an asset node group."""
+    roots = []
+    datafiles = bpy.utils.system_resource("DATAFILES")
+    if datafiles:
+        roots.append(os.path.join(datafiles, "assets"))
+    for library in bpy.context.preferences.filepaths.asset_libraries:
+        path = bpy.path.abspath(library.path)
+        if path:
+            roots.append(path)
+
+    files = []
+    seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for directory, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                if not filename.endswith(".blend"):
+                    continue
+                path = os.path.join(directory, filename)
+                key = os.path.normcase(os.path.normpath(path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                files.append(path)
+    return files
+
+
+def _asset_file_for_group(name):
+    """Return the .blend that contains a node group called `name`, or None."""
+    if name in _ASSET_FILE_CACHE:
+        return _ASSET_FILE_CACHE[name]
+    path = None
+    for candidate in _asset_blend_files():
+        try:
+            with bpy.data.libraries.load(candidate, link=False) as (data_from, _data_to):
+                if name in data_from.node_groups:
+                    path = candidate
+                    break
+        except (OSError, RuntimeError):
+            continue
+    _ASSET_FILE_CACHE[name] = path
+    return path
+
+
+def _asset_source_name(name):
+    """Return the source name and file for a local copy, which may carry a `.001` suffix."""
+    candidates = [name]
+    stripped = re.sub(r"\.\d{3}$", "", name)
+    if stripped != name:
+        candidates.append(stripped)
+    for candidate in candidates:
+        path = _asset_file_for_group(candidate)
+        if path is not None:
+            return candidate, path
+    return None, None
+
+
+def _group_node_users(group):
+    """Group nodes that instantiate `group`, with their links recorded by socket name."""
+    users = []
+    for node_tree in bpy.data.node_groups:
+        for node in node_tree.nodes:
+            if node.bl_idname != "GeometryNodeGroup" or node.node_tree is not group:
+                continue
+            inputs = [(socket.name, link.from_socket)
+                      for socket in node.inputs for link in socket.links]
+            outputs = [(socket.name, link.to_socket)
+                       for socket in node.outputs for link in socket.links]
+            users.append((node_tree, node, inputs, outputs))
+    return users
+
+
+def _append_asset_group(source_name, path):
+    """Append a fresh copy of `source_name` from `path` (including its dependencies)."""
+    before = set(bpy.data.node_groups)
+    try:
+        bpy.ops.wm.append(
+            filepath=os.path.join(path, "NodeTree"),
+            directory=os.path.join(path, "NodeTree") + os.sep,
+            filename=source_name,
+            do_reuse_local_id=False,
+        )
+    except RuntimeError:
+        return None
+    for group in bpy.data.node_groups:
+        if group in before:
+            continue
+        if group.name == source_name or group.name.startswith(source_name + "."):
+            return group
+    return None
+
+
+def _replace_appended_group(group):
+    """Replace an appended asset group with a fresh copy, keeping every user connected."""
+    source_name, path = _asset_source_name(group.name)
+    if source_name is None:
+        return False
+    users = _group_node_users(group)
+    fresh = _append_asset_group(source_name, path)
+    if fresh is None:
+        return False
+
+    for node_tree, node, inputs, outputs in users:
+        node.node_tree = fresh
+        for socket_name, from_socket in inputs:
+            socket = node.inputs.get(socket_name)
+            if socket is None or from_socket is None:
+                continue
+            if not any(link.from_socket == from_socket for link in socket.links):
+                node_tree.links.new(from_socket, socket)
+        for socket_name, to_socket in outputs:
+            socket = node.outputs.get(socket_name)
+            if socket is None or to_socket is None:
+                continue
+            if not any(link.from_socket == socket for link in to_socket.links):
+                node_tree.links.new(socket, to_socket)
+
+    if group.users:
+        group.user_remap(fresh)
+    fresh.asset_clear()
+    fresh.use_fake_user = group.use_fake_user
+    local_name = group.name
+    bpy.data.node_groups.remove(group)
+    fresh.name = local_name
+    return True
+
+
+def update_node_groups(groups):
+    """Refresh node groups from their asset source.
+
+    Linked groups reload their library, which updates every group of that file in place.
+    Appended groups get a fresh copy from the shipped asset, every node/modifier using them is
+    switched over, and the links are restored by socket name.
+
+    Returns `(linked, appended, skipped)`.
+    """
+    linked = 0
+    appended = 0
+    skipped = 0
+    reloaded = set()
+    seen = set()
+    for group in groups:
+        key = group.as_pointer()
+        if key in seen:
+            continue
+        seen.add(key)
+        if group.library is not None:
+            library = group.library
+            if library.name in reloaded:
+                linked += 1
+                continue
+            try:
+                library.reload()
+            except (RuntimeError, OSError):
+                skipped += 1
+                continue
+            reloaded.add(library.name)
+            linked += 1
+        elif _replace_appended_group(group):
+            appended += 1
+        else:
+            skipped += 1
+    return linked, appended, skipped
+
+
+def _selected_group_nodes(context):
+    """The selected group nodes of the active node editor."""
+    space = context.space_data
+    node_tree = getattr(space, "edit_tree", None)
+    if node_tree is None:
+        return []
+    nodes = getattr(context, "selected_nodes", None)
+    if not nodes:
+        nodes = [node for node in node_tree.nodes if node.select]
+    return [node for node in nodes
+            if node.bl_idname == "GeometryNodeGroup" and node.node_tree is not None]
 
 
 def _socket(node, name, kind=None):
@@ -1092,6 +1283,53 @@ class DILAPIDO_OT_auto_arrange(Operator):
         return {"FINISHED"}
 
 
+class DILAPIDO_OT_update_selected_node_group(Operator):
+    """Update the asset node group used by the selected group node(s)"""
+
+    bl_idname = "dilapido.update_selected_node_group"
+    bl_label = "Update Selected Node Group"
+    bl_description = (
+        "Refresh the asset behind the selected group node: linked copies reload their library, "
+        "appended copies are replaced with a fresh copy from the installed asset. Connections "
+        "are restored by socket name"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        if not (space is not None and space.type == "NODE_EDITOR" and
+                space.tree_type == "GeometryNodeTree" and space.edit_tree is not None):
+            return False
+        return bool(_selected_group_nodes(context))
+
+    def execute(self, context):
+        groups = []
+        seen = set()
+        for node in _selected_group_nodes(context):
+            group = node.node_tree
+            key = group.as_pointer()
+            if key in seen:
+                continue
+            seen.add(key)
+            groups.append(group)
+        if not groups:
+            self.report({"WARNING"}, "Select a node that instantiates an asset node group")
+            return {"CANCELLED"}
+
+        _ASSET_FILE_CACHE.clear()
+        linked, appended, skipped = update_node_groups(groups)
+        if linked + appended == 0:
+            self.report({"WARNING"},
+                        "No installed asset was found for the selected node group(s)")
+            return {"CANCELLED"}
+        message = f"Updated {appended} appended and {linked} linked node group(s)"
+        if skipped:
+            message += f" ({skipped} without an installed asset)"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
 class DILAPIDO_PT_assist(Panel):
     """Rigid body and crowd helpers"""
 
@@ -1113,6 +1351,7 @@ class DILAPIDO_PT_assist(Panel):
         column.operator("dilapido.quick_crowd_walk", icon="COMMUNITY")
         column.operator("dilapido.quick_crowd_ragdoll", icon="PHYSICS")
         column.separator()
+        column.operator("dilapido.update_selected_node_group", icon="FILE_REFRESH")
         column.operator("dilapido.auto_arrange", icon="NODETREE")
         layout.label(text="Quick RBD: fracture, clusters, constraints and the solver.", icon="INFO")
         layout.label(text="Quick Crowd Walk: states, target motion, separation and skinning.",
@@ -1120,6 +1359,8 @@ class DILAPIDO_PT_assist(Panel):
         layout.label(text="Quick Crowd Ragdoll: the walk crowd plus a shared ragdoll switch.",
                      icon="INFO")
         layout.label(text="Ragdoll colliders/floor are not created: add them to the world bundle.",
+                     icon="INFO")
+        layout.label(text="Update Selected Node Group: refresh an asset node after it changed.",
                      icon="INFO")
         layout.label(text="Auto Arrange: selected nodes, or all nodes when nothing is selected.",
                      icon="INFO")
@@ -1130,6 +1371,7 @@ classes = (
     DILAPIDO_OT_quick_crowd_walk,
     DILAPIDO_OT_quick_crowd_ragdoll,
     DILAPIDO_OT_auto_arrange,
+    DILAPIDO_OT_update_selected_node_group,
     DILAPIDO_PT_assist,
 )
 

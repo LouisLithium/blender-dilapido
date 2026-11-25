@@ -218,6 +218,34 @@ const FlatBundleTypePtr &ShapeMatchingBundle::get_bundle_type()
   return bundle_type;
 }
 
+const FlatBundleTypePtr &GrainBundle::get_bundle_type()
+{
+  static const FlatBundleTypePtr bundle_type = []() {
+    FlatBundleTypeBuilder b(GrainBundle::name);
+    add_filter(b);
+    b.add<decl::Float>("softness"_ustr).default_value(0.0f).min(0.0f).max(1.0f);
+    b.add<decl::Float>("restitution"_ustr).default_value(0.0f).min(0.0f).max(1.0f);
+    b.add<decl::Float>("contact_thickness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE);
+    b.add<decl::Bool>("clump"_ustr).default_value(false);
+    b.add<decl::Float>("clump_radius"_ustr).default_value(0.05f).min(0.0f).subtype(PROP_DISTANCE);
+    b.add<decl::Float>("clump_strength"_ustr).default_value(0.5f).min(0.0f).max(1.0f);
+    b.add<decl::Float>("break_strain"_ustr).default_value(0.2f).min(0.0f);
+    b.add<decl::Float>("break_fraction"_ustr).default_value(0.5f).min(0.0f).max(1.0f);
+    b.add<decl::Float>("reclump_delay"_ustr).default_value(0.5f).min(0.0f);
+    b.add<decl::Int>("clump_min_size"_ustr).default_value(4).min(1);
+    b.add<decl::Int>("clump_max_size"_ustr).default_value(64).min(1);
+    b.add<decl::Float>("clump_speed"_ustr).default_value(1.0f).min(0.0f);
+    b.add<decl::Float>("error_threshold"_ustr).default_value(1e-3f).min(1e-5f);
+    const FlatBundleTypePtr bundle_type = b.build();
+    BundleTypeRegistry::register_type(bundle_type);
+    return bundle_type;
+  }();
+  return bundle_type;
+}
+
 const FlatBundleTypePtr &CrossEdgeLengthConstraintBundle::get_bundle_type()
 {
   static const FlatBundleTypePtr bundle_type = []() {

@@ -42,6 +42,7 @@
 #include "GEO_xpbd_constraint_distance.hh"
 #include "GEO_xpbd_constraint_friction_edge.hh"
 #include "GEO_xpbd_constraint_friction_face.hh"
+#include "GEO_xpbd_constraint_grain.hh"
 #include "GEO_xpbd_constraint_guide_tether.hh"
 #include "GEO_xpbd_constraint_pin_position.hh"
 #include "GEO_xpbd_constraint_pin_rotation.hh"
@@ -101,6 +102,20 @@ constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
 constexpr StringRefNull shape_matching = "puncliga_shape_matching";
 constexpr StringRefNull shape_group = "puncliga_shape_group";
 constexpr StringRefNull shape_stiffness = "puncliga_shape_stiffness";
+constexpr StringRefNull grain_softness = "puncliga_grain_softness";
+constexpr StringRefNull grain_restitution = "puncliga_grain_restitution";
+constexpr StringRefNull grain_clump = "puncliga_grain_clump";
+constexpr StringRefNull grain_clump_radius = "puncliga_grain_clump_radius";
+constexpr StringRefNull grain_clump_strength = "puncliga_grain_clump_strength";
+constexpr StringRefNull grain_break_strain = "puncliga_grain_break_strain";
+constexpr StringRefNull grain_break_fraction = "puncliga_grain_break_fraction";
+constexpr StringRefNull grain_reclump_delay = "puncliga_grain_reclump_delay";
+constexpr StringRefNull grain_clump_min_size = "puncliga_grain_clump_min_size";
+constexpr StringRefNull grain_clump_max_size = "puncliga_grain_clump_max_size";
+constexpr StringRefNull grain_clump_speed = "puncliga_grain_clump_speed";
+constexpr StringRefNull grain_clump_id = "puncliga_grain_clump_id";
+constexpr StringRefNull grain_clump_rest = "puncliga_grain_clump_rest";
+constexpr StringRefNull grain_clump_cooldown = "puncliga_grain_clump_cooldown";
 
 }  // namespace attribute_names
 
@@ -142,6 +157,7 @@ static NestedBundleTypePtr make_world_type()
   types.append(CrossEdgeLengthConstraintBundle::get_bundle_type());
   types.append(ShapeMatchingBundle::get_bundle_type());
   types.append(FluidBundle::get_bundle_type());
+  types.append(GrainBundle::get_bundle_type());
 
   /* Not actually used by the node but only registered here. */
   ForceBundle::get_bundle_type();
@@ -441,6 +457,24 @@ struct FluidConstraint {
   float error_threshold = 1e-2f;
 };
 
+/** Granular material parameters, gathered from a `Blender.Constraint.Grain` bundle. */
+struct GrainConstraint {
+  std::string path;
+  float softness = 0.0f;
+  float restitution = 0.0f;
+  float contact_thickness = 0.0f;
+  bool clump = false;
+  float clump_radius = 0.05f;
+  float clump_strength = 0.5f;
+  float break_strain = 0.2f;
+  float break_fraction = 0.5f;
+  float reclump_delay = 0.5f;
+  int clump_min_size = 4;
+  int clump_max_size = 64;
+  float clump_speed = 1.0f;
+  float error_threshold = 1e-3f;
+};
+
 /** Per chunk state of the fluid solve pass. */
 struct FluidChunkData {
   bool active = false;
@@ -714,6 +748,8 @@ struct GeometryData {
 
   /** Index into #ConstraintsInfo::fluid_constraints, -1 when this geometry is not a fluid. */
   int fluid_constraint_i = -1;
+  /** Index into #ConstraintsInfo::grain_constraints, -1 when this geometry is not grain. */
+  int grain_constraint_i = -1;
   /** Materialized mass per point, only initialized for fluids. */
   Array<float> fluid_masses;
   /** Materialized particle radius per point, only initialized for fluids. */
@@ -1104,6 +1140,77 @@ struct SelfContacts {
   Array<int> island_ids;
   xpbd::ConstraintColoring coloring;
   std::optional<xpbd::PointContactConstraintSet> constraint_set;
+
+  bool is_empty() const
+  {
+    return point_geo.is_empty();
+  }
+};
+
+/**
+ * The granular particles of all `Blender.Constraint.Grain` geometries.
+ *
+ * The contact pairs are rebuilt every substep. The clump groups are built once per frame from the
+ * current positions: particles that are close form a block with a rest shape, which is kept by a
+ * shape matching constraint. When a block is deformed too much its most stretched particles get a
+ * cooldown and become free grains again; after the cooldown they can join a new block.
+ */
+struct GrainContacts {
+  Vector<int> geometry_data_key;
+  Vector<int> geometry_start;
+  Vector<int> geometry_size;
+  Vector<int> affected_geo_indices;
+
+  Vector<int> point_geo;
+  Vector<int> point_local;
+  Vector<float> point_radius;
+  Vector<float> point_thickness;
+  Vector<float> point_inv_mass;
+  Vector<float> point_friction;
+  Vector<float> point_softness;
+  Vector<float> point_restitution;
+  Vector<float> point_speed;
+  Array<float3> positions;
+
+  /** Persistent clump state, written back into the geometry attributes after the frame. */
+  Vector<int> clump_id;
+  Vector<float3> clump_rest;
+  Vector<float> clump_cooldown;
+
+  /** Per point clump parameters (from `Init Puncliga Data > Grain`). */
+  Vector<uint8_t> clump_enabled;
+  Vector<float> clump_radius;
+  Vector<float> clump_strength;
+  Vector<float> break_strain;
+  Vector<float> break_fraction;
+  Vector<float> clump_speed;
+  float reclump_delay = 0.0f;
+  int clump_min_size = 0;
+  int clump_max_size = 1;
+
+  /** Contacts of the current substep. */
+  Array<int2> point_pairs;
+  Array<float> min_distances;
+  Array<float> compliances;
+  Array<float> frictions;
+  Array<float> lambdas;
+  xpbd::ConstraintColoring coloring;
+  std::optional<xpbd::GrainContactConstraintSet> constraint_set;
+
+  /** Clumps of this frame. The arrays outlive the constraint set, which only holds spans. */
+  Vector<int> group_offsets;
+  Vector<int> group_points;
+  Vector<int> group_point_geo;
+  Vector<int> group_point_local;
+  Vector<float3> group_rest_offsets;
+  Vector<float> group_masses;
+  Vector<float> group_stiffnesses;
+  Vector<float> group_rest_radii;
+  Vector<float> group_break_strains;
+  Vector<float> group_break_fractions;
+  Array<uint8_t> break_flags;
+  xpbd::ConstraintColoring clump_coloring;
+  std::optional<xpbd::GrainClumpConstraintSet> clump_set;
 
   bool is_empty() const
   {
@@ -1543,6 +1650,7 @@ struct ConstraintsInfo {
   Vector<CrossEdgeLengthConstraint> cross_edge_length_constraints;
   Vector<ShapeMatchingConstraint> shape_matching_constraints;
   Vector<FluidConstraint> fluid_constraints;
+  Vector<GrainConstraint> grain_constraints;
 };
 
 class XpbdSolverStep {
@@ -1639,6 +1747,13 @@ class XpbdSolverStep {
   bool guide_tether_active_ = false;
   std::unique_ptr<ResourceScope> guide_tether_memory_;
 
+  /** Granular particles and their contacts/clumps. */
+  GrainContacts grain_contacts_;
+  bool grain_contacts_active_ = false;
+  bool grain_clump_break_checked_ = false;
+  std::unique_ptr<ResourceScope> grain_contact_memory_;
+  std::unique_ptr<ResourceScope> grain_clump_memory_;
+
   /** Point to point contacts of the solids with themselves (empty when disabled). */
   SelfContacts self_contacts_;
   /** Whether at least one geometry enabled `Self Collision` for this frame. */
@@ -1715,6 +1830,7 @@ class XpbdSolverStep {
     this->gather_nested_bundle_paths();
     this->gather_from_world__geometries();
     this->gather_from_world__fluids();
+    this->gather_from_world__grains();
     this->prepare_geometry_chunks();
     this->prepare_inverse_masses();
     this->prepare_inverse_moments_of_inertia();
@@ -1754,6 +1870,7 @@ class XpbdSolverStep {
     this->prepare_fluid_boundaries();
     this->prepare_coupled_surfaces();
     this->prepare_self_contacts();
+    this->prepare_grain_contacts();
     this->prepare_hair_contacts();
     this->prepare_hair_solid_contacts();
     this->prepare_guide_tethers();
@@ -1804,6 +1921,7 @@ class XpbdSolverStep {
       phase_start = now();
     }
     this->report_fluid_density_warnings();
+    this->write_back_grain_state();
     this->write_back__pin_positions();
     this->write_back__rod_stretch_shear();
 
@@ -1969,8 +2087,14 @@ class XpbdSolverStep {
       geo_data.temp_rotations.reinitialize(geo_data.size);
       geo_data.position_attr = this->ensure_attribute<float3>(
           geo_data.attributes, attribute_names::position, domain);
+      const bool had_velocity = geo_data.attributes.contains(attribute_names::velocity);
       geo_data.velocity_attr = this->ensure_attribute<float3>(
           geo_data.attributes, attribute_names::velocity, domain);
+      if (!had_velocity) {
+        /* A newly created velocity attribute must start at rest. Otherwise the clump speed filter
+         * and the inertial update read whatever the attribute buffer happened to contain. */
+        geo_data.velocity_attr.span.fill(float3(0.0f));
+      }
       geo_data.external_force_attr = this->lookup_attribute_default<float3>(
           data_key_i, attribute_names::external_force, domain, float3(0, 0, 0));
       geo_data.masses = this->lookup_attribute_default<float>(
@@ -2200,6 +2324,80 @@ class XpbdSolverStep {
           continue;
         }
         geo_data.fluid_constraint_i = constraint_i;
+      }
+    }
+  }
+
+  /**
+   * Gathers `Blender.Constraint.Grain` bundles. The bundle only marks the geometry (and provides
+   * fallbacks for a hand built world); the per point parameters come from the attributes that
+   * `Init Puncliga Data > Grain` writes.
+   */
+  void gather_from_world__grains()
+  {
+    const Span<std::string> paths = nested_bundle_paths_.lookup_as(GrainBundle::name);
+    for (const StringRef path : paths) {
+      const BundlePtr *bundle_ptr = world_.lookup_path_ptr<BundlePtr>(path);
+      if (!bundle_ptr || !*bundle_ptr) {
+        continue;
+      }
+      const Bundle &bundle = **bundle_ptr;
+      GrainConstraint grain;
+      grain.path = path;
+      grain.softness = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("softness")).value_or(0.0f), 0.0f, 1.0f);
+      grain.restitution = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("restitution")).value_or(0.0f), 0.0f, 1.0f);
+      grain.contact_thickness = std::max(
+          0.0f,
+          bundle.lookup<float>(*BundleKey::from_str("contact_thickness")).value_or(0.0f));
+      grain.clump = bundle.lookup<bool>(*BundleKey::from_str("clump")).value_or(false);
+      grain.clump_radius = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("clump_radius")).value_or(0.05f));
+      grain.clump_strength = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("clump_strength")).value_or(0.5f), 0.0f, 1.0f);
+      grain.break_strain = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("break_strain")).value_or(0.2f));
+      grain.break_fraction = math::clamp(
+          bundle.lookup<float>(*BundleKey::from_str("break_fraction")).value_or(0.5f), 0.0f, 1.0f);
+      grain.reclump_delay = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("reclump_delay")).value_or(0.5f));
+      grain.clump_min_size = std::max(
+          1, bundle.lookup<int>(*BundleKey::from_str("clump_min_size")).value_or(4));
+      grain.clump_max_size = std::max(
+          grain.clump_min_size,
+          bundle.lookup<int>(*BundleKey::from_str("clump_max_size")).value_or(64));
+      grain.clump_speed = std::max(
+          0.0f, bundle.lookup<float>(*BundleKey::from_str("clump_speed")).value_or(1.0f));
+      grain.error_threshold =
+          bundle.lookup<float>(*BundleKey::from_str("error_threshold")).value_or(1e-3f);
+
+      const int constraint_i = constraints_.grain_constraints.append_and_get_index(
+          std::move(grain));
+
+      for (const int data_key_i : geometries_.data_keys.index_range()) {
+        GeometryData &geo_data = *geometries_.data[data_key_i];
+        if (geo_data.domain != AttrDomain::Point) {
+          continue;
+        }
+        if (!this->effector_applies_to_geometry(path, bundle, data_key_i)) {
+          continue;
+        }
+        if (geo_data.fluid_constraint_i >= 0) {
+          this->report(NodeWarningType::Warning,
+                       fmt::format("Geometry \"{}\" is both a fluid and a grain material, using the "
+                                   "fluid",
+                                   geometries_.geometry_sets[geometries_.data_keys[data_key_i]
+                                                                .geo_bundle_i]
+                                       .path));
+          continue;
+        }
+        if (geo_data.grain_constraint_i >= 0) {
+          continue;
+        }
+        this->ensure_radius_loaded(data_key_i);
+        this->ensure_friction_loaded(data_key_i);
+        geo_data.grain_constraint_i = constraint_i;
       }
     }
   }
@@ -4596,6 +4794,7 @@ class XpbdSolverStep {
           mark = std::chrono::steady_clock::now();
         }
         this->simulate__update_self_contacts(solver_refs_i);
+        this->simulate__update_grain_contacts(solver_refs_i);
         this->simulate__update_hair_contacts(solver_refs_i);
         this->simulate__update_hair_solid_contacts(solver_refs_i);
         this->simulate__gather_dynamic_constraints(substep, solver_refs_i);
@@ -4623,6 +4822,7 @@ class XpbdSolverStep {
           this->simulate__update_velocities__chunk(chunk_i, solver_refs_i);
         });
         this->simulate__velocity_solve(solver_refs_i, substep_i + 1 == substeps_);
+        this->simulate__grain_velocity_solve(solver_refs_i);
         if (prof) {
           prof_velocity_ += since(mark);
           mark = std::chrono::steady_clock::now();
@@ -4646,6 +4846,11 @@ class XpbdSolverStep {
      * the substep loop that owns the whole world (the multi chunk path solves every chunk
      * independently). */
     if (self_contacts_active_ || self_collision_) {
+      return false;
+    }
+    /* Grain contacts and clumps span all grain geometries, and the clump state is tied to the
+     * whole world substep loop. */
+    if (grain_contacts_active_) {
       return false;
     }
     /* The hair contacts also span all curve geometries, so they need the whole world loop. */
@@ -5951,6 +6156,11 @@ class XpbdSolverStep {
       if (geo_data.fluid_constraint_i >= 0) {
         continue;
       }
+      /* Granular particles have their own contact pass with friction. Including them here would
+       * solve every grain contact twice (once without friction). */
+      if (geo_data.grain_constraint_i >= 0) {
+        continue;
+      }
       /* Hair and other curve networks have their own segment/segment contacts. The point/point pass
        * is for meshes (cloth, soft bodies); mixing both contact sets on the same curve points is
        * redundant and makes `Self Collision` depend on the hair solver. */
@@ -6181,6 +6391,636 @@ class XpbdSolverStep {
           std::sort(list.begin(), list.end());
         }
       });
+    }
+  }
+
+  /**
+   * Gathers the granular particles of every geometry with a `Blender.Constraint.Grain` bundle and
+   * builds the clumps of this frame. The contact pairs are rebuilt every substep.
+   */
+  void prepare_grain_contacts()
+  {
+    GrainContacts &contacts = grain_contacts_;
+    contacts = {};
+    grain_contacts_active_ = false;
+    grain_clump_break_checked_ = false;
+
+    for (const int data_key_i : geometries_.data_keys.index_range()) {
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      if (geo_data.grain_constraint_i < 0 || geo_data.domain != AttrDomain::Point ||
+          geo_data.size == 0 || geo_data.inv_masses.size() != geo_data.size)
+      {
+        continue;
+      }
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometrySetData &geo_set_data = geometries_.geometry_sets[data_key.geo_bundle_i];
+      GeometrySet &geometry = geo_set_data.geometry;
+      if (!geometry.has(data_key.type)) {
+        continue;
+      }
+      const Span<float3> positions = geometry_component_positions(geometry, data_key.type);
+      if (positions.size() != geo_data.size) {
+        continue;
+      }
+      const GrainConstraint &grain = constraints_.grain_constraints[geo_data.grain_constraint_i];
+
+      Array<float> thickness;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::contact_thickness,
+                                    grain.contact_thickness,
+                                    0.0f,
+                                    1.0e9f,
+                                    thickness);
+      Array<float> softness;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_softness,
+                                    grain.softness,
+                                    0.0f,
+                                    1.0f,
+                                    softness);
+      Array<float> restitution;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_restitution,
+                                    grain.restitution,
+                                    0.0f,
+                                    1.0f,
+                                    restitution);
+      Array<float> clump_radius;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_clump_radius,
+                                    grain.clump_radius,
+                                    0.0f,
+                                    1.0e9f,
+                                    clump_radius);
+      Array<float> clump_strength;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_clump_strength,
+                                    grain.clump_strength,
+                                    0.0f,
+                                    1.0f,
+                                    clump_strength);
+      Array<float> break_strain;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_break_strain,
+                                    grain.break_strain,
+                                    0.0f,
+                                    1.0e9f,
+                                    break_strain);
+      Array<float> break_fraction;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_break_fraction,
+                                    grain.break_fraction,
+                                    0.0f,
+                                    1.0f,
+                                    break_fraction);
+      Array<float> clump_speed;
+      this->materialize_float_param(data_key_i,
+                                    attribute_names::grain_clump_speed,
+                                    grain.clump_speed,
+                                    0.0f,
+                                    1.0e9f,
+                                    clump_speed);
+
+      Array<bool> clump_flags;
+      this->materialize_bool_param(data_key_i,
+                                   attribute_names::grain_clump,
+                                   grain.clump,
+                                   clump_flags);
+
+      this->ensure_radius_loaded(data_key_i);
+      this->ensure_friction_loaded(data_key_i);
+      const VArraySpan<float> radii = geo_data.radii;
+      const VArraySpan<float> frictions = geo_data.static_frictions;
+      const VArray<int> clump_ids_attr = *geo_data.attributes.lookup<int>(
+          attribute_names::grain_clump_id, AttrDomain::Point);
+      const VArray<float3> clump_rest_attr = *geo_data.attributes.lookup<float3>(
+          attribute_names::grain_clump_rest, AttrDomain::Point);
+      const VArray<float> cooldown_attr = *geo_data.attributes.lookup<float>(
+          attribute_names::grain_clump_cooldown, AttrDomain::Point);
+
+      const int size = geo_data.size;
+      if (clump_radius.size() != size || clump_strength.size() != size ||
+          break_strain.size() != size || break_fraction.size() != size ||
+          clump_speed.size() != size || thickness.size() != size || softness.size() != size ||
+          restitution.size() != size)
+      {
+        continue;
+      }
+      const int start = contacts.point_geo.size();
+      contacts.geometry_data_key.append(data_key_i);
+      contacts.geometry_start.append(start);
+      contacts.geometry_size.append(size);
+      contacts.affected_geo_indices.append(data_key_i);
+
+      for (const int point_i : IndexRange(size)) {
+        contacts.point_geo.append(data_key_i);
+        contacts.point_local.append(point_i);
+        contacts.point_radius.append(radii[point_i]);
+        contacts.point_thickness.append(thickness[point_i]);
+        contacts.point_inv_mass.append(geo_data.is_hard_pinned[point_i] ?
+                                           0.0f :
+                                           geo_data.inv_masses[point_i]);
+        contacts.point_friction.append(frictions[point_i]);
+        contacts.point_softness.append(softness[point_i]);
+        contacts.point_restitution.append(restitution[point_i]);
+        contacts.point_speed.append(math::length(geo_data.velocity_attr.span[point_i]));
+        contacts.clump_enabled.append(clump_flags.is_empty() ?
+                                          (grain.clump ? 1u : 0u) :
+                                          (clump_flags[point_i] ? 1u : 0u));
+        contacts.clump_radius.append(clump_radius[point_i]);
+        contacts.clump_strength.append(clump_strength[point_i]);
+        contacts.break_strain.append(break_strain[point_i]);
+        contacts.break_fraction.append(break_fraction[point_i]);
+        contacts.clump_speed.append(clump_speed[point_i]);
+        contacts.clump_id.append(clump_ids_attr ? clump_ids_attr[point_i] : -1);
+        contacts.clump_rest.append(clump_rest_attr ? clump_rest_attr[point_i] : positions[point_i]);
+        contacts.clump_cooldown.append(cooldown_attr ? cooldown_attr[point_i] : 0.0f);
+      }
+
+      const auto first_int = [&](const StringRef name, const int fallback) {
+        const VArray<int> values = *geo_data.attributes.lookup<int>(name, AttrDomain::Point);
+        return values.is_empty() ? fallback : values[0];
+      };
+      const auto first_float = [&](const StringRef name, const float fallback) {
+        const VArray<float> values = *geo_data.attributes.lookup<float>(name, AttrDomain::Point);
+        return values.is_empty() ? fallback : values[0];
+      };
+      contacts.clump_min_size = std::max(
+          contacts.clump_min_size, first_int(attribute_names::grain_clump_min_size,
+                                             grain.clump_min_size));
+      contacts.clump_max_size = std::max(
+          contacts.clump_max_size, first_int(attribute_names::grain_clump_max_size,
+                                             grain.clump_max_size));
+      contacts.reclump_delay = std::max(
+          contacts.reclump_delay, first_float(attribute_names::grain_reclump_delay,
+                                              grain.reclump_delay));
+    }
+
+    const int points_num = contacts.point_geo.size();
+    if (points_num == 0) {
+      return;
+    }
+    grain_contacts_active_ = true;
+    contacts.positions.reinitialize(points_num);
+    for (const int i : IndexRange(contacts.geometry_data_key.size())) {
+      const int data_key_i = contacts.geometry_data_key[i];
+      const DataKey &data_key = geometries_.data_keys[data_key_i];
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      const Span<float3> positions = geometry_component_positions(
+          geometries_.geometry_sets[data_key.geo_bundle_i].geometry, data_key.type);
+      const IndexRange slice(contacts.geometry_start[i], contacts.geometry_size[i]);
+      contacts.positions.as_mutable_span().slice(slice).copy_from(positions);
+
+      /* A geometry created by joining loose point meshes can have a handful of uninitialized
+       * positions. Never let that poison the contact/clump state: fall back to the rest position
+       * written by `Init Puncliga Data` and write the repaired value back to the live geometry. */
+      const VArray<float3> rest_attr = this->lookup_rest_positions(data_key_i);
+      for (const int local_i : IndexRange(slice.size())) {
+        const int global_i = slice[local_i];
+        float3 &position = contacts.positions[global_i];
+        if (std::isfinite(position.x) && std::isfinite(position.y) &&
+            std::isfinite(position.z))
+        {
+          continue;
+        }
+        float3 fallback(0.0f);
+        if (rest_attr && rest_attr.size() == geo_data.size) {
+          fallback = rest_attr[local_i];
+        }
+        if (!(std::isfinite(fallback.x) && std::isfinite(fallback.y) &&
+              std::isfinite(fallback.z)))
+        {
+          fallback = float3(0.0f);
+        }
+        position = fallback;
+        geo_data.position_attr.span[local_i] = fallback;
+        if (!(std::isfinite(contacts.clump_rest[global_i].x) &&
+              std::isfinite(contacts.clump_rest[global_i].y) &&
+              std::isfinite(contacts.clump_rest[global_i].z)))
+        {
+          contacts.clump_rest[global_i] = fallback;
+        }
+        if (!std::isfinite(contacts.point_speed[global_i])) {
+          contacts.point_speed[global_i] = 0.0f;
+        }
+      }
+    }
+
+    this->assign_grain_clumps();
+  }
+
+  /** Builds the clumps of this frame from the current grain positions. */
+  void assign_grain_clumps()
+  {
+    GrainContacts &contacts = grain_contacts_;
+    const int points_num = contacts.clump_id.size();
+    if (points_num == 0) {
+      return;
+    }
+    const float frame_dt = sub_delta_time_ * float(substeps_);
+    for (float &cooldown : contacts.clump_cooldown) {
+      cooldown = std::max(0.0f, cooldown - frame_dt);
+    }
+
+    contacts.clump_max_size = std::max(contacts.clump_max_size, contacts.clump_min_size);
+    float cell_size = 0.0f;
+    for (const int i : IndexRange(points_num)) {
+      cell_size = std::max(cell_size, 2.0f * contacts.clump_radius[i]);
+      cell_size = std::max(cell_size, 2.0f * contacts.point_radius[i]);
+    }
+    if (!(cell_size > 0.0f)) {
+      return;
+    }
+
+    /* The previous velocities are still in the velocity attribute at this point: a clump only
+     * forms between particles that are not flying apart. */
+    Array<int3> cells(points_num);
+    Array<int> order(points_num);
+    for (const int i : IndexRange(points_num)) {
+      const float3 &position = contacts.positions[i];
+      cells[i] = int3(int(std::floor(position.x / cell_size)),
+                      int(std::floor(position.y / cell_size)),
+                      int(std::floor(position.z / cell_size)));
+      order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](const int a, const int b) {
+      if (cells[a].x != cells[b].x) {
+        return cells[a].x < cells[b].x;
+      }
+      if (cells[a].y != cells[b].y) {
+        return cells[a].y < cells[b].y;
+      }
+      if (cells[a].z != cells[b].z) {
+        return cells[a].z < cells[b].z;
+      }
+      return a < b;
+    });
+
+    const auto clump_id_for_cell = [](const int3 &cell, const int split) {
+      uint32_t hash = BLI_hash_int_3d(uint32_t(cell.x), uint32_t(cell.y), uint32_t(cell.z));
+      if (split > 0) {
+        hash = BLI_hash_int_2d(hash, uint32_t(split));
+      }
+      return int(hash & 0x7fffffffu);
+    };
+
+    int start = 0;
+    while (start < points_num) {
+      int end = start + 1;
+      while (end < points_num && cells[order[end]] == cells[order[start]]) {
+        end++;
+      }
+
+      Vector<int> members;
+      for (int i = start; i < end; i++) {
+        const int point_i = order[i];
+        if (contacts.clump_enabled[point_i] == 0 || contacts.clump_cooldown[point_i] > 0.0f ||
+            contacts.point_speed[point_i] > contacts.clump_speed[point_i])
+        {
+          contacts.clump_id[point_i] = -1;
+          contacts.clump_rest[point_i] = contacts.positions[point_i];
+          continue;
+        }
+        members.append(point_i);
+      }
+
+      if (members.size() < contacts.clump_min_size) {
+        for (const int point_i : members) {
+          contacts.clump_id[point_i] = -1;
+          contacts.clump_rest[point_i] = contacts.positions[point_i];
+        }
+      }
+      else {
+        int split = 0;
+        for (int member_start = 0; member_start < int(members.size());
+             member_start += contacts.clump_max_size, split++)
+        {
+          const int member_end = std::min(member_start + contacts.clump_max_size,
+                                          int(members.size()));
+          const int clump_id = clump_id_for_cell(cells[order[start]], split);
+          for (int i = member_start; i < member_end; i++) {
+            const int point_i = members[i];
+            if (contacts.clump_id[point_i] != clump_id) {
+              contacts.clump_rest[point_i] = contacts.positions[point_i];
+            }
+            contacts.clump_id[point_i] = clump_id;
+          }
+        }
+      }
+      start = end;
+    }
+
+    /* Build the shape matching groups from the assigned ids. */
+    contacts.group_offsets.clear();
+    contacts.group_offsets.append(0);
+    contacts.group_points.clear();
+    contacts.group_point_geo.clear();
+    contacts.group_point_local.clear();
+    contacts.group_rest_offsets.clear();
+    contacts.group_masses.clear();
+    contacts.group_stiffnesses.clear();
+    contacts.group_rest_radii.clear();
+    contacts.group_break_strains.clear();
+    contacts.group_break_fractions.clear();
+
+    Map<int, int> group_by_id;
+    Vector<Vector<int>> groups;
+    for (const int point_i : IndexRange(points_num)) {
+      const int clump_id = contacts.clump_id[point_i];
+      if (clump_id < 0) {
+        continue;
+      }
+      const int *group_i = group_by_id.lookup_ptr(clump_id);
+      if (group_i == nullptr) {
+        const int new_group = int(groups.size());
+        group_by_id.add_new(clump_id, new_group);
+        groups.append(Vector<int>());
+        groups[new_group].append(point_i);
+      }
+      else {
+        groups[*group_i].append(point_i);
+      }
+    }
+
+    for (const Vector<int> &group : groups) {
+      if (int(group.size()) < contacts.clump_min_size) {
+        continue;
+      }
+      float total_mass = 0.0f;
+      float3 center(0.0f);
+      for (const int point_i : group) {
+        const float inv_mass = contacts.point_inv_mass[point_i];
+        const float mass = inv_mass > 0.0f ? 1.0f / inv_mass : 0.0f;
+        if (!(mass > 0.0f)) {
+          continue;
+        }
+        total_mass += mass;
+        center += mass * contacts.clump_rest[point_i];
+      }
+      if (!(total_mass > 0.0f)) {
+        continue;
+      }
+      center /= total_mass;
+      float weighted_radius_sq = 0.0f;
+      for (const int point_i : group) {
+        const float inv_mass = contacts.point_inv_mass[point_i];
+        const float mass = inv_mass > 0.0f ? 1.0f / inv_mass : 0.0f;
+        weighted_radius_sq += mass *
+                              math::length_squared(contacts.clump_rest[point_i] - center);
+      }
+      const float rest_radius = math::sqrt(weighted_radius_sq / total_mass);
+      if (!(rest_radius > 1e-6f)) {
+        continue;
+      }
+      const int group_i = int(contacts.group_rest_radii.size());
+      for (const int point_i : group) {
+        const float inv_mass = contacts.point_inv_mass[point_i];
+        const float mass = inv_mass > 0.0f ? 1.0f / inv_mass : 0.0f;
+        if (!(mass > 0.0f)) {
+          continue;
+        }
+        contacts.group_points.append(point_i);
+        contacts.group_point_geo.append(contacts.point_geo[point_i]);
+        contacts.group_point_local.append(contacts.point_local[point_i]);
+        contacts.group_rest_offsets.append(contacts.clump_rest[point_i] - center);
+        contacts.group_masses.append(mass);
+        contacts.group_stiffnesses.append(contacts.clump_strength[point_i]);
+      }
+      contacts.group_offsets.append(int(contacts.group_points.size()));
+      contacts.group_rest_radii.append(rest_radius);
+      const int first_point = group[0];
+      contacts.group_break_strains.append(contacts.break_strain[first_point]);
+      contacts.group_break_fractions.append(contacts.break_fraction[first_point]);
+      (void)group_i;
+    }
+
+    if (contacts.group_points.is_empty()) {
+      return;
+    }
+    contacts.break_flags.reinitialize(contacts.group_points.size());
+    contacts.break_flags.fill(0);
+    grain_clump_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    contacts.clump_coloring = xpbd::color_constraints__all_independent(
+        contacts.group_rest_radii.size());
+    contacts.clump_set.emplace(OffsetIndices<int>(contacts.group_offsets.as_span()),
+                               contacts.group_points.as_span(),
+                               contacts.group_point_geo.as_span(),
+                               contacts.group_point_local.as_span(),
+                               contacts.group_rest_offsets.as_span(),
+                               contacts.group_masses.as_span(),
+                               contacts.group_stiffnesses.as_span(),
+                               contacts.group_rest_radii.as_span(),
+                               contacts.break_flags.as_mutable_span(),
+                               contacts.group_break_strains.as_span(),
+                               contacts.group_break_fractions.as_span());
+  }
+
+  /** Rebuilds the grain contact pairs at the current positions. */
+  void build_grain_contact_pairs()
+  {
+    GrainContacts &contacts = grain_contacts_;
+    contacts.point_pairs.reinitialize(0);
+    contacts.min_distances.reinitialize(0);
+    contacts.compliances.reinitialize(0);
+    contacts.frictions.reinitialize(0);
+    contacts.lambdas.reinitialize(0);
+    contacts.coloring = {};
+    contacts.constraint_set.reset();
+
+    const int points_num = contacts.point_geo.size();
+    if (points_num < 2) {
+      return;
+    }
+    float max_radius = 0.0f;
+    float max_thickness = 0.0f;
+    for (const int i : IndexRange(points_num)) {
+      max_radius = std::max(max_radius, contacts.point_radius[i]);
+      max_thickness = std::max(max_thickness, contacts.point_thickness[i]);
+    }
+    constexpr float probe_factor = 1.25f;
+    const float cell_size = (2.0f * max_radius + max_thickness) * probe_factor;
+    if (!(cell_size > 0.0f)) {
+      return;
+    }
+
+    const Span<float3> positions = contacts.positions;
+    const Span<float> radii = contacts.point_radius;
+    const Span<float> thickness = contacts.point_thickness;
+    const float cell_sq = cell_size * cell_size;
+
+    const auto is_candidate = [&](const int point_i0, const int point_i1,
+                                  const float r_sq) -> bool {
+      if (point_i1 <= point_i0 || r_sq >= cell_sq) {
+        return false;
+      }
+      const float contact_distance = radii[point_i0] + radii[point_i1] +
+                                     std::max(thickness[point_i0], thickness[point_i1]);
+      const float probe = contact_distance * probe_factor;
+      return r_sq < probe * probe;
+    };
+
+    xpbd::FluidParticleGrid grid;
+    grid.build(positions, cell_size);
+
+    Array<int> counts(points_num, 0);
+    threading::parallel_for(IndexRange(points_num), 1024, [&](const IndexRange range) {
+      for (const int point_i0 : range) {
+        int count = 0;
+        grid.foreach_neighbor(
+            point_i0, positions, [&](const int point_i1, const float3 &, const float r_sq) {
+              count += is_candidate(point_i0, point_i1, r_sq) ? 1 : 0;
+            });
+        counts[point_i0] = count;
+      }
+    });
+
+    Array<int> offsets(points_num + 1);
+    int offset = 0;
+    for (const int point_i : IndexRange(points_num)) {
+      offsets[point_i] = offset;
+      offset += counts[point_i];
+    }
+    offsets[points_num] = offset;
+    const int pairs_num = offset;
+    if (pairs_num == 0) {
+      return;
+    }
+
+    contacts.point_pairs.reinitialize(pairs_num);
+    contacts.min_distances.reinitialize(pairs_num);
+    contacts.compliances.reinitialize(pairs_num);
+    contacts.frictions.reinitialize(pairs_num);
+
+    threading::parallel_for(IndexRange(points_num), 1024, [&](const IndexRange range) {
+      for (const int point_i0 : range) {
+        int cursor = offsets[point_i0];
+        grid.foreach_neighbor(
+            point_i0, positions, [&](const int point_i1, const float3 &, const float r_sq) {
+              if (!is_candidate(point_i0, point_i1, r_sq)) {
+                return;
+              }
+              contacts.point_pairs[cursor] = int2(point_i0, point_i1);
+              contacts.min_distances[cursor] = radii[point_i0] + radii[point_i1] +
+                                               std::max(thickness[point_i0], thickness[point_i1]);
+              const float softness = std::max(contacts.point_softness[point_i0],
+                                              contacts.point_softness[point_i1]);
+              contacts.compliances[cursor] = softness * softness;
+              contacts.frictions[cursor] = math::sqrt(std::max(0.0f, contacts.point_friction[point_i0]) *
+                                                       std::max(0.0f, contacts.point_friction[point_i1]));
+              cursor++;
+            });
+      }
+    });
+
+    contacts.lambdas.reinitialize(pairs_num);
+    contacts.lambdas.fill(0.0f);
+    grain_contact_memory_ = std::make_unique<ResourceScope>(size_t(1) << 16);
+    contacts.coloring = xpbd::color_constraints__binary(contacts.point_pairs.as_span(),
+                                                        grain_contact_memory_->allocator());
+    contacts.constraint_set.emplace(contacts.affected_geo_indices,
+                                    contacts.point_pairs.as_span(),
+                                    contacts.min_distances.as_span(),
+                                    contacts.compliances.as_span(),
+                                    contacts.frictions.as_span(),
+                                    contacts.point_geo.as_span(),
+                                    contacts.point_local.as_span(),
+                                    contacts.point_inv_mass.as_span(),
+                                    error_scale_from_threshold(0.01f),
+                                    contacts.lambdas.as_mutable_span());
+  }
+
+  void simulate__update_grain_contacts(const int solver_refs_i)
+  {
+    GrainContacts &contacts = grain_contacts_;
+    if (contacts.is_empty()) {
+      return;
+    }
+    const Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    for (const int i : IndexRange(contacts.geometry_data_key.size())) {
+      const int data_key_i = contacts.geometry_data_key[i];
+      const Span<float3> positions = refs[data_key_i].positions;
+      contacts.positions.as_mutable_span()
+          .slice(contacts.geometry_start[i], contacts.geometry_size[i])
+          .copy_from(positions);
+    }
+    this->build_grain_contact_pairs();
+  }
+
+  /** Applies the restitution of the grain contacts after the position/velocity update. */
+  void simulate__grain_velocity_solve(const int solver_refs_i)
+  {
+    GrainContacts &contacts = grain_contacts_;
+    if (!contacts.constraint_set.has_value() || contacts.point_pairs.is_empty()) {
+      return;
+    }
+    Span<xpbd::GeometryRef> refs = geometries_.solver_refs[solver_refs_i];
+    const auto velocity_at = [&](const int global_i) -> float3 & {
+      return refs[contacts.point_geo[global_i]].velocities[contacts.point_local[global_i]];
+    };
+    for (const int pair_i : contacts.point_pairs.index_range()) {
+      const int global_i0 = contacts.point_pairs[pair_i][0];
+      const int global_i1 = contacts.point_pairs[pair_i][1];
+      const float restitution = 0.5f * (contacts.point_restitution[global_i0] +
+                                       contacts.point_restitution[global_i1]);
+      if (restitution <= 0.0f) {
+        continue;
+      }
+      const int geo_i0 = contacts.point_geo[global_i0];
+      const int geo_i1 = contacts.point_geo[global_i1];
+      const int point_i0 = contacts.point_local[global_i0];
+      const int point_i1 = contacts.point_local[global_i1];
+      const float3 delta = refs[geo_i1].positions[point_i1] - refs[geo_i0].positions[point_i0];
+      float length;
+      const float3 normal = math::normalize_and_get_length(delta, length);
+      if (length <= 1e-8f) {
+        continue;
+      }
+      const float inv_m0 = contacts.point_inv_mass[global_i0];
+      const float inv_m1 = contacts.point_inv_mass[global_i1];
+      if (!(inv_m0 + inv_m1 > 0.0f)) {
+        continue;
+      }
+      float3 &v0 = velocity_at(global_i0);
+      float3 &v1 = velocity_at(global_i1);
+      const float relative_normal = math::dot(v1 - v0, normal);
+      if (relative_normal >= 0.0f) {
+        continue;
+      }
+      const float impulse = -(1.0f + restitution) * relative_normal / (inv_m0 + inv_m1);
+      v0 -= impulse * inv_m0 * normal;
+      v1 += impulse * inv_m1 * normal;
+    }
+  }
+
+  /** Writes the clump state back into the geometry attributes. */
+  void write_back_grain_state()
+  {
+    GrainContacts &contacts = grain_contacts_;
+    if (contacts.is_empty()) {
+      return;
+    }
+    for (const int i : IndexRange(contacts.geometry_data_key.size())) {
+      const int data_key_i = contacts.geometry_data_key[i];
+      GeometryData &geo_data = *geometries_.data[data_key_i];
+      const IndexRange slice(contacts.geometry_start[i], contacts.geometry_size[i]);
+      bke::SpanAttributeWriter<int> id_writer =
+          geo_data.attributes.lookup_or_add_for_write_only_span<int>(attribute_names::grain_clump_id,
+                                                                    AttrDomain::Point);
+      bke::SpanAttributeWriter<float3> rest_writer =
+          geo_data.attributes.lookup_or_add_for_write_only_span<float3>(
+              attribute_names::grain_clump_rest, AttrDomain::Point);
+      bke::SpanAttributeWriter<float> cooldown_writer =
+          geo_data.attributes.lookup_or_add_for_write_only_span<float>(
+              attribute_names::grain_clump_cooldown, AttrDomain::Point);
+      if (!id_writer || !rest_writer || !cooldown_writer) {
+        continue;
+      }
+      id_writer.span.slice(slice).copy_from(contacts.clump_id.as_span().slice(slice));
+      rest_writer.span.slice(slice).copy_from(contacts.clump_rest.as_span().slice(slice));
+      cooldown_writer.span.slice(slice).copy_from(contacts.clump_cooldown.as_span().slice(slice));
+      id_writer.finish();
+      rest_writer.finish();
+      cooldown_writer.finish();
     }
   }
 
@@ -9311,6 +10151,9 @@ class XpbdSolverStep {
         constraint.constraint->reset_forces();
       }
     }
+    if (grain_contacts_.constraint_set.has_value()) {
+      grain_contacts_.constraint_set->reset_forces();
+    }
     /* The hair contacts are built once per frame and keep their multipliers across the substeps, so
      * reset them like every other constraint set. */
     if (hair_contacts_.constraint_set.has_value()) {
@@ -9410,6 +10253,48 @@ class XpbdSolverStep {
       xpbd::PointContactConstraintSet &constraint = *self_contacts_.constraint_set;
       for (const int color_i : self_contacts_.coloring.colors.index_range()) {
         const IndexMask &mask = self_contacts_.coloring.colors[color_i];
+        threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
+          const IndexMask sliced_mask = mask.slice(range);
+          xpbd::GaussSeidelUpdater updater{solver_refs};
+          constraint.solve_sequential(solve_params, updater, sliced_mask);
+          error_tls.local().total_error_squared += updater.total_error_squared();
+          error_tls.local().total_error_count += updater.total_error_count();
+        });
+      }
+    }
+
+    if (grain_contacts_.clump_set.has_value()) {
+      /* The clump groups are independent, but solving them on several threads gives slightly
+       * different floating point results depending on the scheduling. Clumps are optional and
+       * usually many small groups, so solve them serially: this keeps the result reproducible on
+       * every backend. */
+      xpbd::GrainClumpConstraintSet &constraint = *grain_contacts_.clump_set;
+      xpbd::GaussSeidelUpdater updater{solver_refs};
+      const IndexMask mask(grain_contacts_.group_rest_radii.size());
+      constraint.solve_sequential(solve_params, updater, mask);
+      error_tls.local().total_error_squared += updater.total_error_squared();
+      error_tls.local().total_error_count += updater.total_error_count();
+      if (!grain_clump_break_checked_) {
+        for (const int k : grain_contacts_.break_flags.index_range()) {
+          if (grain_contacts_.break_flags[k] == 0) {
+            continue;
+          }
+          const int point_i = grain_contacts_.group_points[k];
+          grain_contacts_.clump_id[point_i] = -1;
+          grain_contacts_.clump_cooldown[point_i] = grain_contacts_.reclump_delay;
+        }
+        grain_contacts_.clump_set->set_detect_break(false);
+        grain_clump_break_checked_ = true;
+      }
+    }
+
+    if (grain_contacts_.constraint_set.has_value()) {
+      /* Grain contacts span all granular geometries: one pass gives friction and non-penetration
+       * between grains of the same or of different pieces. Solved after the clump projection so
+       * the contacts have the last word about penetration. */
+      xpbd::GrainContactConstraintSet &constraint = *grain_contacts_.constraint_set;
+      for (const int color_i : grain_contacts_.coloring.colors.index_range()) {
+        const IndexMask &mask = grain_contacts_.coloring.colors[color_i];
         threading::parallel_for(mask.index_range(), 512, [&](const IndexRange range) {
           const IndexMask sliced_mask = mask.slice(range);
           xpbd::GaussSeidelUpdater updater{solver_refs};

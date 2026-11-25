@@ -105,6 +105,16 @@ class CrossEdgeLengthConstraintBundle {
   static const FlatBundleTypePtr &get_bundle_type();
 };
 
+/**
+ * Turns the points of a geometry into a granular material. The particles collide with friction and
+ * can optionally clump into temporary blocks that break apart and form again.
+ */
+class GrainBundle {
+ public:
+  static constexpr StringRefNull name = "Blender.Constraint.Grain";
+  static const FlatBundleTypePtr &get_bundle_type();
+};
+
 /** This is currently not used by built-in nodes but is used in essential assets. */
 class ForceBundle {
  public:

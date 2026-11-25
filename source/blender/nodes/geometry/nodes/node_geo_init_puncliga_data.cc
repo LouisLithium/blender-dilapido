@@ -23,6 +23,9 @@
 #include "BKE_mesh.hh"
 #include "BKE_pointcloud.hh"
 
+#include <limits>
+
+#include "BLI_hash.h"
 #include "BLI_math_vector.hh"
 #include "BLI_string_utf8.h"
 
@@ -38,6 +41,7 @@ enum class PuncligaType : int {
   SoftBody = 2,
   Hair = 3,
   Rigid = 4,
+  Grain = 5,
 };
 
 /**
@@ -51,6 +55,13 @@ enum class PuncligaEmission : int {
   None = 0,
   PerFrame = 1,
   PerSubstep = 2,
+};
+
+/** Which edges of a cloth are allowed to tear when they are stretched too far. */
+enum class PuncligaTearMode : int {
+  All = 0,
+  Custom = 1,
+  Voronoi = 2,
 };
 
 static const EnumPropertyItem puncliga_type_items[] = {
@@ -83,6 +94,31 @@ static const EnumPropertyItem puncliga_type_items[] = {
      N_("Simulate the points as quasi rigid pieces with a shape matching constraint. The points "
         "are usually a sphere packing of a mesh (`Distribute Points` in volume mode), and every "
         "piece is kept in its rest shape while the points still collide with each other")},
+    {int(PuncligaType::Grain),
+     "GRAIN",
+     0,
+     N_("Grain"),
+     N_("Simulate the points as granular material: frictional particle contacts, optionally with "
+        "temporary clumps that break apart and form new blocks after a cooldown")},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
+static const EnumPropertyItem puncliga_tear_mode_items[] = {
+    {int(PuncligaTearMode::All),
+     "ALL",
+     0,
+     N_("All"),
+     N_("Any edge of the cloth can tear")},
+    {int(PuncligaTearMode::Custom),
+     "CUSTOM",
+     0,
+     N_("Custom"),
+     N_("Only the edges selected by `Tear Edge Group` can tear")},
+    {int(PuncligaTearMode::Voronoi),
+     "VORONOI",
+     0,
+     N_("Voronoi"),
+     N_("Only tear along the borders of a Voronoi pattern, so the cloth splits into islands")},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -145,6 +181,21 @@ constexpr StringRefNull tether_compliance = "puncliga_tether_compliance";
 constexpr StringRefNull shape_matching = "puncliga_shape_matching";
 constexpr StringRefNull shape_group = "puncliga_shape_group";
 constexpr StringRefNull shape_stiffness = "puncliga_shape_stiffness";
+constexpr StringRefNull tear_threshold = "puncliga_tear_threshold";
+constexpr StringRefNull grain_softness = "puncliga_grain_softness";
+constexpr StringRefNull grain_restitution = "puncliga_grain_restitution";
+constexpr StringRefNull grain_clump = "puncliga_grain_clump";
+constexpr StringRefNull grain_clump_radius = "puncliga_grain_clump_radius";
+constexpr StringRefNull grain_clump_strength = "puncliga_grain_clump_strength";
+constexpr StringRefNull grain_break_strain = "puncliga_grain_break_strain";
+constexpr StringRefNull grain_break_fraction = "puncliga_grain_break_fraction";
+constexpr StringRefNull grain_reclump_delay = "puncliga_grain_reclump_delay";
+constexpr StringRefNull grain_clump_min_size = "puncliga_grain_clump_min_size";
+constexpr StringRefNull grain_clump_max_size = "puncliga_grain_clump_max_size";
+constexpr StringRefNull grain_clump_speed = "puncliga_grain_clump_speed";
+constexpr StringRefNull grain_clump_id = "puncliga_grain_clump_id";
+constexpr StringRefNull grain_clump_rest = "puncliga_grain_clump_rest";
+constexpr StringRefNull grain_clump_cooldown = "puncliga_grain_clump_cooldown";
 }  // namespace attribute_names
 
 /** The socket declares its options per type, see `.usage_by_menu()` below. */
@@ -166,6 +217,7 @@ static void node_declare(NodeDeclarationBuilder &b)
   const int soft = int(PuncligaType::SoftBody);
   const int hair = int(PuncligaType::Hair);
   const int rigid = int(PuncligaType::Rigid);
+  const int grain = int(PuncligaType::Grain);
 
   /* General properties first, then the panels of the individual types. */
   {
@@ -174,17 +226,18 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(0.0f)
         .min(0.0f)
         .description(
-            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, soft body: the "
-            "volume of the elements around the point, otherwise 0.1 kg)");
+            "Mass of one point in kg. 0 computes it (fluid: density * radius^3, grain: grain "
+            "density * sphere volume, soft body: the volume of the elements around the point, "
+            "otherwise 0.1 kg)");
     panel.add_input<decl::Float>("Friction"_ustr)
         .default_value(0.5f)
         .min(0.0f)
-        .description("Contact friction of the points against the colliders");
+        .description("Contact friction of the points against the colliders and against each other");
     panel.add_input<decl::Float>("Collision Radius"_ustr)
         .default_value(0.05f)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
-        .usage_by_menu("Type"_ustr, {cloth, fluid, soft, rigid})
+        .usage_by_menu("Type"_ustr, {cloth, fluid, soft, rigid, grain})
         .description("Radius of the points for the point/mesh collider contacts");
     panel.add_input<decl::Int>("Piece ID"_ustr)
         .default_value(0)
@@ -194,6 +247,30 @@ static void node_declare(NodeDeclarationBuilder &b)
             "the same type can be told apart after the simulation with it (the `Split Puncliga "
             "Data` group filters by it); every piece defaults to 0, so it can be ignored when there "
             "is only one");
+    panel.add_input<decl::Menu>("Emission"_ustr)
+        .static_items(puncliga_emission_items)
+        .default_value(MenuValue(int(PuncligaEmission::None)))
+        .usage_by_menu("Type"_ustr, {fluid, grain})
+        .description(
+            "Whether the geometry is only the initial state, or a source that emits new particles "
+            "(see the items for the difference between the two modes)");
+    panel.add_input<decl::Float>("Emission Spacing"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, {fluid, grain})
+        .description(
+            "Do not emit a particle when the nearest existing particle is closer than this "
+            "distance, and use it to decide how many copies a fast emitter needs per frame "
+            "(0 disables the check)");
+    panel.add_input<decl::Float>("Emission Velocity Jitter"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, {fluid, grain})
+        .description(
+            "Random per particle speed variation (fraction of the emitted velocity). A small value "
+            "smears the discrete batches of `Per Frame` into a continuous stream");
   }
   {
     auto &panel = b.add_panel("Cloth"_ustr).default_closed(false);
@@ -236,33 +313,43 @@ static void node_declare(NodeDeclarationBuilder &b)
         .default_value(false)
         .usage_by_menu("Type"_ustr, cloth)
         .description("Pin the points where `Pin` is below 0.5 instead");
-  }
-  {
-    auto &panel = b.add_panel("Fluid"_ustr).default_closed(false);
-    panel.add_input<decl::Menu>("Emission"_ustr)
-        .static_items(puncliga_emission_items)
-        .default_value(MenuValue(int(PuncligaEmission::None)))
-        .usage_by_menu("Type"_ustr, fluid)
+    panel.add_input<decl::Bool>("Tear"_ustr)
+        .default_value(false)
+        .usage_by_menu("Type"_ustr, cloth)
         .description(
-            "Whether the geometry of a fluid is only the initial state, or a source that emits new "
-            "particles (see the items for the difference between the two modes)");
-    panel.add_input<decl::Float>("Emission Spacing"_ustr)
-        .default_value(0.0f)
-        .min(0.0f)
-        .subtype(PROP_DISTANCE)
-        .usage_by_menu("Type"_ustr, fluid)
+            "Split the cloth along edges that are stretched beyond `Tear Threshold`. A torn edge "
+            "is no longer a connection between the two faces next to it, so the cloth can rip");
+    panel.add_input<decl::Menu>("Tear Mode"_ustr)
+        .static_items(puncliga_tear_mode_items)
+        .default_value(MenuValue(int(PuncligaTearMode::All)))
+        .usage_by_menu("Type"_ustr, cloth)
+        .description("Which edges are allowed to tear");
+    panel.add_input<decl::Float>("Tear Threshold"_ustr)
+        .default_value(0.5f)
+        .min(1e-4f)
+        .usage_by_menu("Type"_ustr, cloth)
         .description(
-            "Do not emit a particle when the nearest particle of the existing fluid is closer than "
-            "this distance. This is a density limit: it stops a static or slow emitter from stacking "
-            "new particles on top of the old ones (0 disables the check)");
-    panel.add_input<decl::Float>("Emission Velocity Jitter"_ustr)
+            "Relative strain (current length / rest length - 1) above which an edge tears; a "
+            "stiffer cloth needs a smaller value than a very soft one");
+    panel.add_input<decl::Float>("Tear Edge Group"_ustr)
         .default_value(0.0f)
         .min(0.0f)
         .max(1.0f)
-        .usage_by_menu("Type"_ustr, fluid)
+        .structure_type(StructureType::Field)
+        .usage_by_menu("Type"_ustr, cloth)
         .description(
-            "Random per particle speed variation (fraction of the emitted velocity). A small value "
-            "smears the discrete batches of `Per Frame` into a continuous stream");
+            "Only tear the edges where this field is above 0.5 (`Tear Mode = Custom`); a boolean "
+            "edge attribute or an edge group works");
+    panel.add_input<decl::Float>("Voronoi Scale"_ustr)
+        .default_value(0.5f)
+        .min(1e-4f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, cloth)
+        .description(
+            "Size of the Voronoi cells that form the untearable islands (`Tear Mode = Voronoi`)");
+  }
+  {
+    auto &panel = b.add_panel("Fluid"_ustr).default_closed(false);
     panel.add_input<decl::Float>("Rest Density"_ustr)
         .default_value(1000.0f)
         .min(1e-3f)
@@ -513,6 +600,94 @@ static void node_declare(NodeDeclarationBuilder &b)
             "smaller values let it deform. This is a position based projection, so the effective "
             "stiffness also depends on the constraint iterations");
   }
+  {
+    auto &panel = b.add_panel("Grain"_ustr).default_closed(false);
+    panel.add_input<decl::Float>("Grain Density"_ustr)
+        .default_value(1600.0f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description(
+            "Density of the granular material in kg/m^3, used to compute the mass of a point from "
+            "its sphere volume when `Mass` is zero");
+    panel.add_input<decl::Float>("Grain Linear Damping"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Velocity damping of the grains in 1/s");
+    panel.add_input<decl::Float>("Grain Contact Softness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Softness of the grain contacts; 0 is a hard contact, 1 is very soft");
+    panel.add_input<decl::Float>("Grain Contact Thickness"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Extra distance kept between two grains, on top of their radii");
+    panel.add_input<decl::Float>("Grain Restitution"_ustr)
+        .default_value(0.0f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Bounciness of the grain contacts");
+    panel.add_input<decl::Bool>("Clump"_ustr)
+        .default_value(false)
+        .usage_by_menu("Type"_ustr, grain)
+        .description(
+            "Let slow grains that are close form temporary blocks. A block is held in its rest "
+            "shape until it is deformed too much, then it tears and the pieces can clump again "
+            "after a cooldown");
+    panel.add_input<decl::Float>("Clump Radius"_ustr)
+        .default_value(0.05f)
+        .min(0.0f)
+        .subtype(PROP_DISTANCE)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Spatial cell size used to group grains into one block");
+    panel.add_input<decl::Float>("Clump Strength"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("How strongly a block keeps its rest shape");
+    panel.add_input<decl::Float>("Break Strain"_ustr)
+        .default_value(0.2f)
+        .min(0.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description(
+            "Relative deformation of a block above which it starts to break; 0 disables breaking");
+    panel.add_input<decl::Float>("Break Fraction"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .max(1.0f)
+        .usage_by_menu("Type"_ustr, grain)
+        .description(
+            "Fraction of a block's grains with the largest deformation that become free when the "
+            "block breaks");
+    panel.add_input<decl::Float>("Re-clump Delay"_ustr)
+        .default_value(0.5f)
+        .min(0.0f)
+        .subtype(PROP_TIME_ABSOLUTE)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Seconds that a broken grain stays free before it can join a new block");
+    panel.add_input<decl::Int>("Clump Min Size"_ustr)
+        .default_value(4)
+        .min(1)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Smallest number of grains that form a block");
+    panel.add_input<decl::Int>("Clump Max Size"_ustr)
+        .default_value(64)
+        .min(1)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Largest number of grains in one block");
+    panel.add_input<decl::Float>("Clump Speed"_ustr)
+        .default_value(1.0f)
+        .min(0.0f)
+        .subtype(PROP_VELOCITY)
+        .usage_by_menu("Type"_ustr, grain)
+        .description("Grains faster than this do not join a new block");
+  }
 
   b.add_output<decl::Geometry>("Geometry"_ustr).propagate_all();
 }
@@ -544,6 +719,51 @@ static void write_uniform(GeometrySet &geometry,
   }
   if (Curves *curves_id = geometry.get_curves_for_write()) {
     write(curves_id->geometry.wrap().attributes_for_write());
+  }
+}
+
+/** Writes the initial clump state of a granular material: no clump, rest at the current pose. */
+static void write_grain_clump_state(GeometrySet &geometry)
+{
+  const auto write = [](bke::MutableAttributeAccessor attributes,
+                        const int points_num,
+                        const Span<float3> positions) {
+    if (points_num == 0) {
+      return;
+    }
+    bke::SpanAttributeWriter<int> id_writer =
+        attributes.lookup_or_add_for_write_only_span<int>(attribute_names::grain_clump_id,
+                                                          bke::AttrDomain::Point);
+    bke::SpanAttributeWriter<float3> rest_writer =
+        attributes.lookup_or_add_for_write_only_span<float3>(attribute_names::grain_clump_rest,
+                                                             bke::AttrDomain::Point);
+    bke::SpanAttributeWriter<float> cooldown_writer =
+        attributes.lookup_or_add_for_write_only_span<float>(attribute_names::grain_clump_cooldown,
+                                                            bke::AttrDomain::Point);
+    if (!id_writer || !rest_writer || !cooldown_writer) {
+      return;
+    }
+    id_writer.span.fill(-1);
+    cooldown_writer.span.fill(0.0f);
+    if (positions.size() == points_num) {
+      rest_writer.span.copy_from(positions);
+    }
+    else {
+      rest_writer.span.fill(float3(0.0f));
+    }
+    id_writer.finish();
+    rest_writer.finish();
+    cooldown_writer.finish();
+  };
+  if (Mesh *mesh = geometry.get_mesh_for_write()) {
+    write(mesh->attributes_for_write(), mesh->verts_num, mesh->vert_positions());
+  }
+  if (PointCloud *pointcloud = geometry.get_pointcloud_for_write()) {
+    write(pointcloud->attributes_for_write(), pointcloud->totpoint, pointcloud->positions());
+  }
+  if (Curves *curves_id = geometry.get_curves_for_write()) {
+    bke::CurvesGeometry &curves = curves_id->geometry.wrap();
+    write(curves.attributes_for_write(), curves.points_num(), curves.positions());
   }
 }
 
@@ -934,6 +1154,102 @@ static void write_shape_matching(GeometrySet &geometry,
   }
 }
 
+/** Deterministic pseudo random value in 0..1 for one Voronoi cell and one component. */
+static float voronoi_cell_random(const int3 &cell, const uint32_t salt)
+{
+  const uint32_t hash = BLI_hash_int_3d(
+      uint32_t(cell.x) + salt * 73856093u,
+      uint32_t(cell.y) + salt * 19349663u,
+      uint32_t(cell.z) + salt * 83492791u);
+  return float(hash) / float(0xFFFFFFFFu);
+}
+
+/** Cell id of the jittered grid Voronoi site closest to the given rest position. */
+static int voronoi_cell_id(const float3 &position, const float scale)
+{
+  const float safe_scale = std::max(scale, 1e-6f);
+  const float3 query = position / safe_scale;
+  const int3 base = int3(int(std::floor(query.x)),
+                         int(std::floor(query.y)),
+                         int(std::floor(query.z)));
+  float best_distance_sq = std::numeric_limits<float>::max();
+  int3 best_cell = base;
+  for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        const int3 cell = base + int3(dx, dy, dz);
+        const float3 site = float3(cell.x, cell.y, cell.z) +
+                            float3(voronoi_cell_random(cell, 1),
+                                   voronoi_cell_random(cell, 2),
+                                   voronoi_cell_random(cell, 3));
+        const float distance_sq = math::length_squared(query - site);
+        if (distance_sq < best_distance_sq) {
+          best_distance_sq = distance_sq;
+          best_cell = cell;
+        }
+      }
+    }
+  }
+  return int(BLI_hash_int_3d(
+      uint32_t(best_cell.x), uint32_t(best_cell.y), uint32_t(best_cell.z)));
+}
+
+/**
+ * Writes the strain threshold of every edge of a cloth. The threshold is baked per edge so the
+ * simulation only has to compare the current length with the rest length; 0 means "this edge can
+ * not tear". The actual splitting happens in the asset, after the solve.
+ */
+static void write_cloth_tear(Mesh &mesh,
+                             const bool enabled,
+                             const PuncligaTearMode mode,
+                             const float threshold,
+                             const fn::Field<float> &edge_group_field,
+                             const float voronoi_scale)
+{
+  const int edge_num = mesh.edges_num;
+  if (edge_num == 0) {
+    return;
+  }
+  bke::SpanAttributeWriter<float> threshold_writer =
+      mesh.attributes_for_write().lookup_or_add_for_write_only_span<float>(
+          attribute_names::tear_threshold, bke::AttrDomain::Edge);
+  if (!threshold_writer) {
+    return;
+  }
+  if (!enabled) {
+    threshold_writer.span.fill(0.0f);
+    threshold_writer.finish();
+    return;
+  }
+
+  if (mode == PuncligaTearMode::All) {
+    threshold_writer.span.fill(threshold);
+  }
+  else if (mode == PuncligaTearMode::Custom) {
+    const bke::GeometryFieldContext field_context{mesh, bke::AttrDomain::Edge};
+    fn::FieldEvaluator evaluator{field_context, edge_num};
+    evaluator.add(edge_group_field);
+    evaluator.evaluate();
+    const VArray<float> edge_group = evaluator.get_evaluated<float>(0);
+    for (const int i : IndexRange(edge_num)) {
+      threshold_writer.span[i] = edge_group[i] > 0.5f ? threshold : 0.0f;
+    }
+  }
+  else if (mode == PuncligaTearMode::Voronoi) {
+    const Span<float3> positions = mesh.vert_positions();
+    Array<int> cell_ids(mesh.verts_num);
+    for (const int i : IndexRange(mesh.verts_num)) {
+      cell_ids[i] = voronoi_cell_id(positions[i], voronoi_scale);
+    }
+    const Span<int2> edges = mesh.edges();
+    for (const int i : IndexRange(edge_num)) {
+      const int2 &edge = edges[i];
+      threshold_writer.span[i] = cell_ids[edge[0]] != cell_ids[edge[1]] ? threshold : 0.0f;
+    }
+  }
+  threshold_writer.finish();
+}
+
 static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet geometry = params.extract_input<GeometrySet>("Geometry"_ustr);
@@ -955,6 +1271,10 @@ static void node_geo_exec(GeoNodeExecParams params)
     else if (type == int(PuncligaType::Rigid)) {
       /* A point represents one sphere of the packing. */
       const float density = params.get_input<float>("Rigid Density"_ustr);
+      mass = density * (4.0f / 3.0f) * 3.14159265358979323846f * radius * radius * radius;
+    }
+    else if (type == int(PuncligaType::Grain)) {
+      const float density = params.get_input<float>("Grain Density"_ustr);
       mass = density * (4.0f / 3.0f) * 3.14159265358979323846f * radius * radius * radius;
     }
     else {
@@ -1001,6 +1321,14 @@ static void node_geo_exec(GeoNodeExecParams params)
                            params.get_input<float>("Contact Thickness"_ustr));
       const bool invert = params.get_input<bool>("Invert Pin"_ustr);
       write_pin_mesh(geometry, params.extract_input<Field<float>>("Pin"_ustr), invert);
+      if (Mesh *mesh = geometry.get_mesh_for_write()) {
+        write_cloth_tear(*mesh,
+                         params.get_input<bool>("Tear"_ustr),
+                         PuncligaTearMode(params.get_input<int>("Tear Mode"_ustr)),
+                         params.get_input<float>("Tear Threshold"_ustr),
+                         params.extract_input<Field<float>>("Tear Edge Group"_ustr),
+                         params.get_input<float>("Voronoi Scale"_ustr));
+      }
       break;
     }
     case PuncligaType::Hair: {
@@ -1141,6 +1469,63 @@ static void node_geo_exec(GeoNodeExecParams params)
                            attribute_names::contact_thickness,
                            bke::AttrDomain::Point,
                            params.get_input<float>("Rigid Contact Thickness"_ustr));
+      break;
+    }
+    case PuncligaType::Grain: {
+      write_uniform<float>(geometry,
+                           attribute_names::grain_softness,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Grain Contact Softness"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_restitution,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Grain Restitution"_ustr));
+      write_uniform<bool>(geometry,
+                          attribute_names::grain_clump,
+                          bke::AttrDomain::Point,
+                          params.get_input<bool>("Clump"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_clump_radius,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Clump Radius"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_clump_strength,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Clump Strength"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_break_strain,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Break Strain"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_break_fraction,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Break Fraction"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_reclump_delay,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Re-clump Delay"_ustr));
+      write_uniform<int>(geometry,
+                         attribute_names::grain_clump_min_size,
+                         bke::AttrDomain::Point,
+                         params.get_input<int>("Clump Min Size"_ustr));
+      write_uniform<int>(geometry,
+                         attribute_names::grain_clump_max_size,
+                         bke::AttrDomain::Point,
+                         params.get_input<int>("Clump Max Size"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::grain_clump_speed,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Clump Speed"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::contact_thickness,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Grain Contact Thickness"_ustr));
+      write_uniform<float>(geometry,
+                           attribute_names::linear_damping,
+                           bke::AttrDomain::Point,
+                           params.get_input<float>("Grain Linear Damping"_ustr));
+      write_grain_clump_state(geometry);
+      write_rest_positions(geometry);
       break;
     }
     case PuncligaType::SoftBody: {
