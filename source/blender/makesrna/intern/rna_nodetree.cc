@@ -10769,6 +10769,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("GeometryNode", "GeometryNodeGridAdvect");
   define("GeometryNode", "GeometryNodeGridCurl");
   define("GeometryNode", "GeometryNodeGridDivergence");
+  define("GeometryNode", "GeometryNodeGridDownsample");
   define("GeometryNode", "GeometryNodeGridGradient");
   define("GeometryNode", "GeometryNodeGridInfo");
   define("GeometryNode", "GeometryNodeGridDilateAndErode");

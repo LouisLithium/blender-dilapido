@@ -128,6 +128,7 @@ set(SRC
   nodes/node_geo_grid_curl.cc
   nodes/node_geo_grid_dilate_erode.cc
   nodes/node_geo_grid_divergence.cc
+  nodes/node_geo_grid_downsample.cc
   nodes/node_geo_grid_gradient.cc
   nodes/node_geo_grid_info.cc
   nodes/node_geo_grid_laplacian.cc
