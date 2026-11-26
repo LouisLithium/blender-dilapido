@@ -268,6 +268,63 @@ int solver_radius(const Settings &settings)
   return std::max(3, settings.domain_padding);
 }
 
+/* -------------------------------------------------------------------- */
+/** \name Debug stage fingerprints
+ *
+ * Serial sums over the active values, printed only with `BLENDER_IGNIS_HASH=1`. Two runs of the same
+ * scene must print identical numbers; the first stage that differs localises a thread-order
+ * dependency. Walking the tree in its natural order keeps the fingerprint itself independent of the
+ * thread count.
+ * \{ */
+
+static double fingerprint(const openvdb::FloatGrid &grid)
+{
+  double sum = 0.0;
+  for (auto iter = grid.cbeginValueOn(); iter; ++iter) {
+    sum += double(iter.getValue());
+  }
+  return sum;
+}
+
+static double fingerprint(const openvdb::Vec3fGrid &grid)
+{
+  double sum = 0.0;
+  for (auto iter = grid.cbeginValueOn(); iter; ++iter) {
+    const openvdb::Vec3f value = iter.getValue();
+    sum += double(value.x()) + 3.0 * double(value.y()) + 7.0 * double(value.z());
+  }
+  return sum;
+}
+
+static double fingerprint_sq(const openvdb::Vec3fGrid &grid)
+{
+  double sum = 0.0;
+  for (auto iter = grid.cbeginValueOn(); iter; ++iter) {
+    const openvdb::Vec3f value = iter.getValue();
+    sum += double(value.x()) * double(value.x()) + double(value.y()) * double(value.y()) +
+           double(value.z()) * double(value.z());
+  }
+  return sum;
+}
+
+static void print_fingerprint(const char *stage, const int substep, const State &state)
+{
+  static const bool enabled = std::getenv("BLENDER_IGNIS_HASH") != nullptr;
+  if (!enabled) {
+    return;
+  }
+  printf("IGNIS_HASH %d %s d=%.17g t=%.17g f=%.17g v=%.17g p=%.17g nv=%lld v2=%.17g\n",
+         substep,
+         stage,
+         state.density ? fingerprint(*state.density) : 0.0,
+         state.temperature ? fingerprint(*state.temperature) : 0.0,
+         state.fuel ? fingerprint(*state.fuel) : 0.0,
+         state.velocity ? fingerprint(*state.velocity) : 0.0,
+         state.pressure ? fingerprint(*state.pressure) : 0.0,
+         state.velocity ? (long long)state.velocity->activeVoxelCount() : 0,
+         state.velocity ? fingerprint_sq(*state.velocity) : 0.0);
+}
+
 /** \{ */
 
 /* -------------------------------------------------------------------- */
@@ -716,39 +773,43 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
     }
     return grid->getConstAccessor();
   };
-  const std::optional<openvdb::FloatGrid::ConstAccessor> density_accessor =
-      grid_accessor(state.density);
-  const std::optional<openvdb::FloatGrid::ConstAccessor> temperature_accessor =
-      grid_accessor(state.temperature);
-  const std::optional<openvdb::FloatGrid::ConstAccessor> fuel_accessor =
-      grid_accessor(state.fuel);
-  const std::optional<openvdb::FloatGrid::ConstAccessor> flame_accessor =
-      grid_accessor(state.flame);
-  const std::optional<openvdb::FloatGrid::ConstAccessor> pressure_accessor =
-      grid_accessor(state.pressure);
 
-  auto read_field = [&](const int field, const float velocity_length, const Coord &coord) {
-    switch (field) {
-      case 1:
-        return pressure_accessor ? pressure_accessor->getValue(coord) : 0.0f;
-      case 2:
-        return density_accessor ? density_accessor->getValue(coord) : 0.0f;
-      case 3:
-        return temperature_accessor ? temperature_accessor->getValue(coord) : 0.0f;
-      case 4:
-        return fuel_accessor ? fuel_accessor->getValue(coord) : 0.0f;
-      case 5:
-        return flame_accessor ? flame_accessor->getValue(coord) : 0.0f;
-      case 6:
-        return velocity_length;
-      default:
-        return 1.0f;
-    }
-  };
-
+  Vector<float3> results;
+  results.resize(coords.size());
   threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
                           [&](const IndexRange range) {
-    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    /* Accessors cache a leaf pointer lazily, so one accessor may not be shared between threads: a
+     * torn cache silently reads the background value, which is what made the buoyancy term differ
+     * from run to run. Every chunk therefore owns its own set. */
+    openvdb::Vec3fGrid::ConstAccessor velocity = state.velocity->getConstAccessor();
+    const std::optional<openvdb::FloatGrid::ConstAccessor> density_accessor =
+        grid_accessor(state.density);
+    const std::optional<openvdb::FloatGrid::ConstAccessor> temperature_accessor =
+        grid_accessor(state.temperature);
+    const std::optional<openvdb::FloatGrid::ConstAccessor> fuel_accessor =
+        grid_accessor(state.fuel);
+    const std::optional<openvdb::FloatGrid::ConstAccessor> flame_accessor =
+        grid_accessor(state.flame);
+    const std::optional<openvdb::FloatGrid::ConstAccessor> pressure_accessor =
+        grid_accessor(state.pressure);
+    auto read_field = [&](const int field, const float velocity_length, const Coord &coord) {
+      switch (field) {
+        case 1:
+          return pressure_accessor ? pressure_accessor->getValue(coord) : 0.0f;
+        case 2:
+          return density_accessor ? density_accessor->getValue(coord) : 0.0f;
+        case 3:
+          return temperature_accessor ? temperature_accessor->getValue(coord) : 0.0f;
+        case 4:
+          return fuel_accessor ? fuel_accessor->getValue(coord) : 0.0f;
+        case 5:
+          return flame_accessor ? flame_accessor->getValue(coord) : 0.0f;
+        case 6:
+          return velocity_length;
+        default:
+          return 1.0f;
+      }
+    };
     for (const int64_t i : range) {
       const Coord &coord = coords[i];
       float3 value = from_vdb(velocity.getValue(coord));
@@ -807,9 +868,20 @@ void apply_forces(State &state, const Settings &settings, const float delta_time
         value *= 1.0f / (1.0f + drag * dt);
       }
       value *= damping_factor;
-      velocity.setValue(coord, to_vdb(value));
+      results[i] = value;
     }
   });
+
+  /* Write back serially. `setValue()` with an exactly zero value deactivates the voxel, which clears
+   * a bit in the leaf's shared 64-bit value mask; parallel writes to different voxels of the same
+   * leaf race on that mask word and silently drop each other's updates, so the field would depend on
+   * the thread scheduling (this is what made two identical runs drift apart). */
+  {
+    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    for (const int64_t i : coords.index_range()) {
+      velocity.setValue(coords[i], to_vdb(results[i]));
+    }
+  }
 }
 
 /** Curl and vorticity confinement: `f = epsilon * h * (N x omega)` with `N = grad |omega|`. */
@@ -1266,20 +1338,18 @@ void carve_solids(State &state, const SolidMask &mask)
   if (coords.is_empty()) {
     return;
   }
-  threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
-                          [&](const IndexRange range) {
-    openvdb::FloatGrid::Accessor density = state.density->getAccessor();
-    openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
-    openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
-    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
-    for (const int64_t i : range) {
-      const Coord &coord = coords[i];
-      density.setValue(coord, 0.0f);
-      temperature.setValue(coord, 0.0f);
-      fuel.setValue(coord, 0.0f);
-      velocity.setValue(coord, openvdb::Vec3f(0.0f));
-    }
-  });
+  /* Serial: a parallel `setValue()` on one leaf races on the leaf's shared value mask, which drops
+   * some of the writes depending on the thread scheduling. The list is only the carved solid cells. */
+  openvdb::FloatGrid::Accessor density = state.density->getAccessor();
+  openvdb::FloatGrid::Accessor temperature = state.temperature->getAccessor();
+  openvdb::FloatGrid::Accessor fuel = state.fuel->getAccessor();
+  openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+  for (const Coord &coord : coords) {
+    density.setValue(coord, 0.0f);
+    temperature.setValue(coord, 0.0f);
+    fuel.setValue(coord, 0.0f);
+    velocity.setValue(coord, openvdb::Vec3f(0.0f));
+  }
 }
 
 /**
@@ -1305,9 +1375,11 @@ void clamp_velocity_at_solids(State &state,
   for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
     coords.append(iter.getCoord());
   }
+  Vector<openvdb::Vec3f> values;
+  values.resize(coords.size());
   threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
                           [&](const IndexRange range) {
-    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    const openvdb::Vec3fGrid::ConstAccessor velocity = state.velocity->getConstAccessor();
     auto wall_velocity = [&](const Coord &coord) -> std::optional<float3> {
       const int8_t id = mask.id(coord);
       if (id == 0 || id > colliders.size()) {
@@ -1322,7 +1394,7 @@ void clamp_velocity_at_solids(State &state,
     for (const int64_t i : range) {
       const Coord &coord = coords[i];
       if (mask.is_solid(coord)) {
-        velocity.setValue(coord, openvdb::Vec3f(0.0f));
+        values[i] = openvdb::Vec3f(0.0f);
         continue;
       }
       openvdb::Vec3f value = velocity.getValue(coord);
@@ -1350,13 +1422,22 @@ void clamp_velocity_at_solids(State &state,
         const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 0, -1));
         value.z() = wall ? std::max(value.z(), wall->z) : std::max(value.z(), 0.0f);
       }
-      velocity.setValue(coord, value);
+      values[i] = value;
     }
   });
+
+  /* Serial write-back: parallel `setValue()` calls on different voxels of one leaf race on the
+   * leaf's shared value mask, which silently drops updates and makes the field depend on the thread
+   * scheduling. */
+  {
+    openvdb::Vec3fGrid::Accessor velocity = state.velocity->getAccessor();
+    for (const int64_t i : coords.index_range()) {
+      velocity.setValue(coords[i], values[i]);
+    }
+  }
 }
 
 /** \} */
-
 /** \name Pressure projection
  * \{ */
 
@@ -1624,8 +1705,9 @@ void project_velocity(State &state,
   };
   {
     const int64_t count_coords = int64_t(coords.size());
+    Vector<openvdb::Vec3f> corrected_values;
+    corrected_values.resize(coords.size());
     threading::parallel_for(IndexRange(count_coords), PARALLEL_CHUNK, [&](const IndexRange range) {
-      openvdb::Vec3fGrid::Accessor writer = state.velocity->getAccessor();
       for (const int64_t i : range) {
         const Coord &coord = coords[i];
         const double pressure_here = pressure_at(coord);
@@ -1634,9 +1716,15 @@ void project_velocity(State &state,
         const double pz = (pressure_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
         const openvdb::Vec3f corrected = velocity_dense[flat(coord)] - openvdb::Vec3f(px, py, pz);
         velocity_dense[flat(coord)] = corrected;
-        writer.setValue(coord, corrected);
+        corrected_values[i] = corrected;
       }
     });
+    /* Serial write-back, see `apply_forces`: parallel `setValue()` calls on one leaf race on the
+     * shared value mask. */
+    openvdb::Vec3fGrid::Accessor writer = state.velocity->getAccessor();
+    for (const int64_t i : coords.index_range()) {
+      writer.setValue(coords[i], corrected_values[i]);
+    }
   }
 
   /* Report the residual divergence on the cells that were actually constrained, so the projection can
@@ -2613,6 +2701,7 @@ Volume *solve_frame(const Volume *previous,
       }
     }
     ensure_velocity_topology(state);
+    print_fingerprint("source", substep, state);
     if (!solids_built) {
       ScopedTimer timer(ms_colliders);
       collider_masks = build_collider_masks(*state.density->transformPtr(),
@@ -2627,6 +2716,7 @@ Volume *solve_frame(const Volume *previous,
       apply_forces(state, settings, step_dt);
       apply_vorticity(state, settings, step_dt);
     }
+    print_fingerprint("forces", substep, state);
     {
       ScopedTimer timer(ms_velocity);
       if (state.velocity->activeVoxelCount() > 0) {
@@ -2636,6 +2726,7 @@ Volume *solve_frame(const Volume *previous,
             *state.velocity, advection, step_dt);
       }
     }
+    print_fingerprint("advect", substep, state);
     {
       ScopedTimer timer(ms_projection);
       /* The wall velocity has to be in the field before the projection: the divergence it creates
@@ -2646,6 +2737,7 @@ Volume *solve_frame(const Volume *previous,
       project_velocity(state, settings, r_stats, collider_masks.filled);
       clamp_velocity_at_solids(state, collider_masks.current, dynamic_colliders);
     }
+    print_fingerprint("project", substep, state);
     {
       ScopedTimer timer(ms_scalars);
       /* Density, temperature and fuel usually occupy exactly the same voxels, in which case one
@@ -2666,16 +2758,19 @@ Volume *solve_frame(const Volume *previous,
         });
       }
     }
+    print_fingerprint("scalars", substep, state);
     {
       ScopedTimer timer(ms_combustion);
       combust_and_decay(state, settings, step_dt);
       clip_to_bounds(state, settings);
     }
+    print_fingerprint("burn", substep, state);
     {
       ScopedTimer timer(ms_solids);
       limit_and_extrapolate_velocity(state, settings);
       carve_solids(state, collider_masks.carve);
     }
+    print_fingerprint("extrap", substep, state);
   }
 
   filter_flame(state, settings);
