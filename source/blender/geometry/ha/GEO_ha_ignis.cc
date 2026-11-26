@@ -385,7 +385,56 @@ HaShaderResource res(const int slot,
  * \{ */
 
 const char *GLSL_MASK_HELPERS =
-    "int ha_mask_at(ivec3 c) { int i = ha_at(c); return i < 0 ? 0 : mask[i]; }\n";
+    "int ha_mask_at(ivec3 c) { int i = ha_at(c); return i < 0 ? 0 : mask[i]; }\n"
+    "bool ha_fluid_cell(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return false; }\n"
+    "  int m = ha_mask_at(c);\n"
+    "  return (m & HA_DOMAIN) != 0 && (m & HA_SOLID) == 0;\n"
+    "}\n"
+    "vec3 ha_cell_vec(ivec3 c)\n"
+    "{\n"
+    "  if (!ha_inside(c)) { return vec3(0.0); }\n"
+    "  int base = ha_at(c) * 3;\n"
+    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
+    "}\n"
+    /* Staggered (MAC) faces: the average of the two cells, or the cell's own velocity when the
+     * neighbour is outside the fluid (an open outlet with a zero gradient). */
+    "float ha_face_x(ivec3 c)\n"
+    "{\n"
+    "  float v = ha_cell_vec(c).x;\n"
+    "  return ha_fluid_cell(c + ivec3(1, 0, 0)) ?\n"
+    "             0.5 * (v + ha_cell_vec(c + ivec3(1, 0, 0)).x) :\n"
+    "             v;\n"
+    "}\n"
+    "float ha_face_y(ivec3 c)\n"
+    "{\n"
+    "  float v = ha_cell_vec(c).y;\n"
+    "  return ha_fluid_cell(c + ivec3(0, 1, 0)) ?\n"
+    "             0.5 * (v + ha_cell_vec(c + ivec3(0, 1, 0)).y) :\n"
+    "             v;\n"
+    "}\n"
+    "float ha_face_z(ivec3 c)\n"
+    "{\n"
+    "  float v = ha_cell_vec(c).z;\n"
+    "  return ha_fluid_cell(c + ivec3(0, 0, 1)) ?\n"
+    "             0.5 * (v + ha_cell_vec(c + ivec3(0, 0, 1)).z) :\n"
+    "             v;\n"
+    "}\n"
+    /* Divergence of those faces. The face on the -side of a cell is the +face of its neighbour, or an
+     * outlet that carries the cell's own velocity. Both stencils are two sided, so a symmetric scene
+     * stays symmetric (the one sided version pushed the plume towards +X/+Y/+Z). */
+    "float ha_divergence(ivec3 c)\n"
+    "{\n"
+    "  vec3 v = ha_cell_vec(c);\n"
+    "  float xp = ha_face_x(c);\n"
+    "  float yp = ha_face_y(c);\n"
+    "  float zp = ha_face_z(c);\n"
+    "  float xm = ha_fluid_cell(c + ivec3(-1, 0, 0)) ? ha_face_x(c + ivec3(-1, 0, 0)) : v.x;\n"
+    "  float ym = ha_fluid_cell(c + ivec3(0, -1, 0)) ? ha_face_y(c + ivec3(0, -1, 0)) : v.y;\n"
+    "  float zm = ha_fluid_cell(c + ivec3(0, 0, -1)) ? ha_face_z(c + ivec3(0, 0, -1)) : v.z;\n"
+    "  return ((xp - xm) + (yp - ym) + (zp - zm)) / HA_VOXEL;\n"
+    "}\n";
 
 const char *GLSL_MASK_IN_HELPERS =
     "int ha_mask_in_at(ivec3 c) { int i = ha_at(c); return i < 0 ? 0 : mask_in[i]; }\n";
@@ -1020,14 +1069,10 @@ const char *KERNEL_UNKNOWN =
     "  ha_cell(index, c);\n"
     "  if (!ha_inside(c)) { return; }\n"
     "  int m = mask[index];\n"
-    "  bool here = ha_domain_cell(m);\n"
-    "  if (c.x + 1 >= HA_DX || c.y + 1 >= HA_DY || c.z + 1 >= HA_DZ) { here = false; }\n"
-    "  if (here) {\n"
-    "    here = ha_domain_cell(ha_mask_at(c + ivec3(1, 0, 0))) &&\n"
-    "           ha_domain_cell(ha_mask_at(c + ivec3(0, 1, 0))) &&\n"
-    "           ha_domain_cell(ha_mask_at(c + ivec3(0, 0, 1)));\n"
-    "  }\n"
-    "  mask[index] = here ? (m | HA_UNKNOWN) : (m & ~HA_UNKNOWN);\n"
+    /* Every fluid cell takes part: the staggered projection is symmetric on all six sides, so the
+     * old "the three forward neighbours must exist" rule (which made the domain one layer smaller on
+     * +X/+Y/+Z) is gone. */
+    "  mask[index] = ha_domain_cell(m) ? (m | HA_UNKNOWN) : (m & ~HA_UNKNOWN);\n"
     "}\n";
 
 /* Per projection brick lists: `KERNEL_BRICK_FLAG` marks the bricks that contain a cell of the given
@@ -1346,22 +1391,6 @@ const char *GLSL_CG_LIST =
     "}\n";
 
 const char *KERNEL_RHS =
-    "vec3 ha_vel_at(int mask_value, ivec3 c)\n"
-    "{\n"
-    "  if (!ha_inside(c) || (mask_value & HA_DOMAIN) == 0 || (mask_value & HA_SOLID) != 0) {\n"
-    "    return vec3(0.0);\n"
-    "  }\n"
-    "  int base = ha_at(c) * 3;\n"
-    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
-    "}\n"
-    "float ha_divergence(ivec3 c)\n"
-    "{\n"
-    "  vec3 v = ha_vel_at(ha_mask_at(c), c);\n"
-    "  return ((ha_vel_at(ha_mask_at(c + ivec3(1, 0, 0)), c + ivec3(1, 0, 0)).x - v.x) +\n"
-    "          (ha_vel_at(ha_mask_at(c + ivec3(0, 1, 0)), c + ivec3(0, 1, 0)).y - v.y) +\n"
-    "          (ha_vel_at(ha_mask_at(c + ivec3(0, 0, 1)), c + ivec3(0, 0, 1)).z - v.z)) /\n"
-    "         HA_VOXEL;\n"
-    "}\n"
     "void main()\n"
     "{\n"
     "  int index = ha_active_index();\n"
@@ -1632,42 +1661,38 @@ const char *KERNEL_REDUCE_RES =
     "}\n";
 
 const char *KERNEL_CG_GRADIENT =
-    "float ha_pressure_at(ivec3 c)\n"
+    "float ha_pressure_of(ivec3 c)\n"
     "{\n"
-    "  int i = ha_at(c);\n"
-    "  if (i < 0) { return 0.0; }\n"
-    "  return (mask[i] & HA_UNKNOWN) != 0 ? pressure[i] : 0.0;\n"
+    "  return ha_fluid_cell(c) ? pressure[ha_at(c)] : 0.0;\n"
     "}\n"
     "void main()\n"
     "{\n"
     "  int index = ha_active_index();\n"
     "  if (index >= HA_CELL_COUNT) { return; }\n"
     "  ha_init_neighbors(index);\n"
-    "  int m = mask[index];\n"
-    "  if ((m & HA_DOMAIN) == 0 || (m & HA_SOLID) != 0) { return; }\n"
     "  ivec3 c;\n"
     "  ha_cell(index, c);\n"
-    "  if (!ha_inside(c)) { return; }\n"
-    "  float p = ha_pressure_at(c);\n"
-    "  vec3 gradient = vec3(p - ha_pressure_at(c + ivec3(-1, 0, 0)),\n"
-    "                       p - ha_pressure_at(c + ivec3(0, -1, 0)),\n"
-    "                       p - ha_pressure_at(c + ivec3(0, 0, -1))) / HA_VOXEL;\n"
+    "  if (!ha_fluid_cell(c)) { return; }\n"
+    /* MAC correction: subtract the pressure gradient on the faces, then rebuild the cell velocity
+     * from its two corrected faces. No one sided stencil, so symmetry is preserved. */
+    "  float p = ha_pressure_of(c);\n"
+    "  vec3 v = ha_cell_vec(c);\n"
+    "  float xp = ha_face_x(c) - (ha_pressure_of(c + ivec3(1, 0, 0)) - p) / HA_VOXEL;\n"
+    "  float yp = ha_face_y(c) - (ha_pressure_of(c + ivec3(0, 1, 0)) - p) / HA_VOXEL;\n"
+    "  float zp = ha_face_z(c) - (ha_pressure_of(c + ivec3(0, 0, 1)) - p) / HA_VOXEL;\n"
+    "  float xm = (ha_fluid_cell(c + ivec3(-1, 0, 0)) ? ha_face_x(c + ivec3(-1, 0, 0)) : v.x) -\n"
+    "             (p - ha_pressure_of(c + ivec3(-1, 0, 0))) / HA_VOXEL;\n"
+    "  float ym = (ha_fluid_cell(c + ivec3(0, -1, 0)) ? ha_face_y(c + ivec3(0, -1, 0)) : v.y) -\n"
+    "             (p - ha_pressure_of(c + ivec3(0, -1, 0))) / HA_VOXEL;\n"
+    "  float zm = (ha_fluid_cell(c + ivec3(0, 0, -1)) ? ha_face_z(c + ivec3(0, 0, -1)) : v.z) -\n"
+    "             (p - ha_pressure_of(c + ivec3(0, 0, -1))) / HA_VOXEL;\n"
     "  int base = index * 3;\n"
-    "  velocity[base + 0] -= gradient.x;\n"
-    "  velocity[base + 1] -= gradient.y;\n"
-    "  velocity[base + 2] -= gradient.z;\n"
+    "  velocity[base + 0] = 0.5 * (xp + xm);\n"
+    "  velocity[base + 1] = 0.5 * (yp + ym);\n"
+    "  velocity[base + 2] = 0.5 * (zp + zm);\n"
     "}\n";
 
 const char *KERNEL_DIVERGENCE_AFTER =
-    "vec3 ha_vel_after(ivec3 c)\n"
-    "{\n"
-    "  if (!ha_inside(c) || (ha_mask_at(c) & HA_DOMAIN) == 0 ||\n"
-    "      (ha_mask_at(c) & HA_SOLID) != 0) {\n"
-    "    return vec3(0.0);\n"
-    "  }\n"
-    "  int base = ha_at(c) * 3;\n"
-    "  return vec3(velocity[base + 0], velocity[base + 1], velocity[base + 2]);\n"
-    "}\n"
     "void main()\n"
     "{\n"
     "  int index = ha_active_index();\n"
@@ -1680,10 +1705,7 @@ const char *KERNEL_DIVERGENCE_AFTER =
     "    if ((mask[j] & HA_UNKNOWN) == 0) { continue; }\n"
     "    ivec3 cj;\n"
     "    ha_cell(j, cj);\n"
-    "    vec3 v = ha_vel_after(cj);\n"
-    "    float divergence = ((ha_vel_after(cj + ivec3(1, 0, 0)).x - v.x) +\n"
-    "                        (ha_vel_after(cj + ivec3(0, 1, 0)).y - v.y) +\n"
-    "                        (ha_vel_after(cj + ivec3(0, 0, 1)).z - v.z)) / HA_VOXEL;\n"
+    "    float divergence = ha_divergence(cj);\n"
     "    sum += divergence * divergence;\n"
     "  }\n"
     "  partial[(index / HA_BRICK_CELLS) * 4 + 0] = sum;\n"
