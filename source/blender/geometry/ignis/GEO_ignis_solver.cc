@@ -307,13 +307,79 @@ static double fingerprint_sq(const openvdb::Vec3fGrid &grid)
   return sum;
 }
 
+/** Sum of |rho(x,y,z) - rho(-x,-y,z)| over the smoke: zero for a mirror symmetric field. */
+static double mirror_asymmetry(const State &state)
+{
+  if (!state.density) {
+    return 0.0;
+  }
+  const openvdb::FloatGrid::ConstAccessor density = state.density->getConstAccessor();
+  double sum = 0.0;
+  for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+    const openvdb::Coord &coord = iter.getCoord();
+    const openvdb::Coord mirrored(-coord.x(), -coord.y(), coord.z());
+    sum += std::abs(double(iter.getValue()) - double(density.getValue(mirrored)));
+  }
+  return sum;
+}
+
+/** Sum |v(p) - R(v(mirror p))| with R = diag(-1,-1,1): zero for a 180 degree rotation symmetry. */
+static double velocity_mirror_asymmetry(const State &state)
+{
+  if (!state.velocity) {
+    return 0.0;
+  }
+  const openvdb::Vec3fGrid::ConstAccessor velocity = state.velocity->getConstAccessor();
+  double sum = 0.0;
+  for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
+    const openvdb::Coord &coord = iter.getCoord();
+    const openvdb::Coord mirrored(-coord.x(), -coord.y(), coord.z());
+    const openvdb::Vec3f value = iter.getValue();
+    const openvdb::Vec3f other = velocity.getValue(mirrored);
+    const openvdb::Vec3f rotated(-other.x(), -other.y(), other.z());
+    sum += double((value - rotated).length());
+  }
+  return sum;
+}
+
 static void print_fingerprint(const char *stage, const int substep, const State &state)
 {
   static const bool enabled = std::getenv("BLENDER_IGNIS_HASH") != nullptr;
   if (!enabled) {
     return;
   }
-  printf("IGNIS_HASH %d %s d=%.17g t=%.17g f=%.17g v=%.17g p=%.17g nv=%lld v2=%.17g\n",
+  /* Density weighted centroid and mean velocity: a directional bias of the solver shows up here as
+   * a non-zero vx/vy long before it is visible in the plume. */
+  double mass = 0.0, cx = 0.0, cy = 0.0, cz = 0.0;
+  double mvx = 0.0, mvy = 0.0, mvz = 0.0;
+  if (state.density && state.temperature && state.velocity) {
+    const openvdb::Vec3fGrid::ConstAccessor velocity = state.velocity->getConstAccessor();
+    for (auto iter = state.density->cbeginValueOn(); iter; ++iter) {
+      const double w = double(iter.getValue());
+      if (w <= 0.0) {
+        continue;
+      }
+      const openvdb::Coord &coord = iter.getCoord();
+      const openvdb::Vec3f value = velocity.getValue(coord);
+      mass += w;
+      cx += w * double(coord.x());
+      cy += w * double(coord.y());
+      cz += w * double(coord.z());
+      mvx += w * double(value.x());
+      mvy += w * double(value.y());
+      mvz += w * double(value.z());
+    }
+    if (mass > 0.0) {
+      cx /= mass;
+      cy /= mass;
+      cz /= mass;
+      mvx /= mass;
+      mvy /= mass;
+      mvz /= mass;
+    }
+  }
+  printf("IGNIS_HASH %d %s d=%.17g t=%.17g f=%.17g v=%.17g p=%.17g nv=%lld v2=%.17g "
+         "m=%.6g c=(%.5f %.5f %.5f) vm=(%.6f %.6f %.6f) mir=%.6g vmir=%.6g\n",
          substep,
          stage,
          state.density ? fingerprint(*state.density) : 0.0,
@@ -322,7 +388,16 @@ static void print_fingerprint(const char *stage, const int substep, const State 
          state.velocity ? fingerprint(*state.velocity) : 0.0,
          state.pressure ? fingerprint(*state.pressure) : 0.0,
          state.velocity ? (long long)state.velocity->activeVoxelCount() : 0,
-         state.velocity ? fingerprint_sq(*state.velocity) : 0.0);
+         state.velocity ? fingerprint_sq(*state.velocity) : 0.0,
+         mass,
+         cx,
+         cy,
+         cz,
+         mvx,
+         mvy,
+         mvz,
+         mirror_asymmetry(state),
+         velocity_mirror_asymmetry(state));
 }
 
 /** \{ */
@@ -1703,6 +1778,19 @@ void project_velocity(State &state,
     const int j = unknown_at(coord);
     return j >= 0 ? pressure[j] : 0.0;
   };
+  if (std::getenv("BLENDER_IGNIS_HASH") != nullptr) {
+    /* Is the *pressure* mirror symmetric? A symmetric system must give a symmetric solution, so a
+     * non-zero value here points at the solve, zero points at the gradient step below. */
+    double pmir = 0.0;
+    double psum = 0.0;
+    for (const int i : IndexRange(count)) {
+      const Coord &coord = unknowns[i];
+      const int j = unknown_at(Coord(-coord.x(), -coord.y(), coord.z()));
+      pmir += std::abs(pressure[i] - (j >= 0 ? pressure[j] : 0.0));
+      psum += std::abs(pressure[i]);
+    }
+    printf("IGNIS_PMIR n=%d pmir=%.6g psum=%.6g\n", count, pmir, psum);
+  }
   {
     const int64_t count_coords = int64_t(coords.size());
     Vector<openvdb::Vec3f> corrected_values;
@@ -1846,6 +1934,14 @@ void limit_and_extrapolate_velocity(State &state, const Settings &settings)
 
   const int passes = std::max(0, settings.extrapolate);
   for (int pass = 0; pass < passes && !frontier.is_empty(); pass++) {
+    /* Fill from the previous layer only. Marking `filled` inside the loop below would let a cell
+     * average a neighbour that was filled earlier in the same pass; because `frontier` is walked in
+     * tree order (x fastest), that drags every value towards +X/+Y/+Z and the plume drifts sideways
+     * even when the flow is purely vertical. */
+    Vector<Coord> just_filled;
+    Vector<openvdb::Vec3f> just_filled_values;
+    just_filled.reserve(frontier.size());
+    just_filled_values.reserve(frontier.size());
     for (const Coord &coord : frontier) {
       openvdb::Vec3f sum(0.0f);
       int count = 0;
@@ -1857,9 +1953,13 @@ void limit_and_extrapolate_velocity(State &state, const Settings &settings)
         }
       }
       if (count > 0) {
-        writer.setValue(coord, sum / float(count));
-        filled[flat(coord)] = 1;
+        just_filled.append(coord);
+        just_filled_values.append(sum / float(count));
       }
+    }
+    for (const int64_t i : just_filled.index_range()) {
+      writer.setValue(just_filled[i], just_filled_values[i]);
+      filled[flat(just_filled[i])] = 1;
     }
     next.clear();
     for (const Coord &coord : frontier) {
@@ -2716,8 +2816,7 @@ Volume *solve_frame(const Volume *previous,
       apply_forces(state, settings, step_dt);
       apply_vorticity(state, settings, step_dt);
     }
-    print_fingerprint("forces", substep, state);
-    {
+    print_fingerprint("forces", substep, state);    {
       ScopedTimer timer(ms_velocity);
       if (state.velocity->activeVoxelCount() > 0) {
         Advection advection(*state.velocity);
