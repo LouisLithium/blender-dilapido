@@ -1566,7 +1566,6 @@ void project_velocity(State &state,
   const Coord dims(bmax.x() - bmin.x() + 1, bmax.y() - bmin.y() + 1, bmax.z() - bmin.z() + 1);
   const int64_t cells = int64_t(dims.x()) * int64_t(dims.y()) * int64_t(dims.z());
   Array<int> cell_index(cells, -1);
-  Array<int> unknown_index(cells, -1);
 
   auto flat = [&](const Coord &coord) {
     return int64_t(coord.x() - bmin.x()) +
@@ -1602,48 +1601,69 @@ void project_velocity(State &state,
     velocity_dense[flat(coord)] = velocity.getValue(coord);
   }
 
-  /* The divergence uses forward differences, so a cell can only be made divergence free when its
-   * three forward neighbours exist. Using the boundary cells too is what made the system
-   * inconsistent (their row picks up the opposite sign, see M66), so they are treated as the open
-   * boundary instead: they keep their divergence and the smoke can leave through them. */
-  Vector<Coord> unknowns;
-  unknowns.reserve(coords.size());
-  for (const Coord &coord : coords) {
-    if (index_at(coord.offsetBy(1, 0, 0)) < 0 || index_at(coord.offsetBy(0, 1, 0)) < 0 ||
-        index_at(coord.offsetBy(0, 0, 1)) < 0)
-    {
-      continue;
-    }
-    unknown_index[flat(coord)] = int(unknowns.size());
-    unknowns.append(coord);
-  }
-  const int count = int(unknowns.size());
+  /* Every cell of the band is part of the pressure system. The staggered stencil below is symmetric
+   * on all six sides, so the old "three forward neighbours" rule (which made the constrained set one
+   * layer smaller on +X/+Y/+Z and pushed the smoke towards +X/+Y/+Z) is not needed any more. */
+  const int count = int(coords.size());
   if (count == 0) {
     return;
   }
   if (std::getenv("BLENDER_IGNIS_DEBUG") != nullptr) {
-    printf("IGNIS_DEBUG projection: box=%dx%dx%d domain=%lld unknown=%d\n",
+    printf("IGNIS_DEBUG projection: box=%dx%dx%d domain=%lld staggered\n",
            dims.x(),
            dims.y(),
            dims.z(),
-           (long long)coords.size(),
-           count);
+           (long long)coords.size());
     fflush(stdout);
   }
-  auto unknown_at = [&](const Coord &coord) {
-    return in_box(coord) ? unknown_index[flat(coord)] : -1;
-  };
 
-  /* Outside the band the velocity counts as zero: that is the same free surface the pressure has. */
-  auto velocity_at = [&](const Coord &coord) {
-    const int i = index_at(coord);
-    return i >= 0 ? velocity_dense[flat(coord)] : openvdb::Vec3f(0.0f);
+  /* Staggered (MAC) velocities on the +face of every cell. A face whose neighbour is outside the
+   * band is an open outlet: the face keeps the cell's own velocity (zero gradient). The pressure
+   * solve uses the same convention on every side, so the operator and its right hand side agree. */
+  Array<double> face_x(cells, 0.0);
+  Array<double> face_y(cells, 0.0);
+  Array<double> face_z(cells, 0.0);
+  auto build_faces = [&]() {
+    threading::parallel_for(coords.index_range(), PARALLEL_CHUNK, [&](const IndexRange range) {
+      for (const int64_t c : range) {
+        const Coord &coord = coords[c];
+        const int64_t i = flat(coord);
+        const openvdb::Vec3f value = velocity_dense[i];
+        const Coord nx = coord.offsetBy(1, 0, 0);
+        const Coord ny = coord.offsetBy(0, 1, 0);
+        const Coord nz = coord.offsetBy(0, 0, 1);
+        const int ix = index_at(nx);
+        const int iy = index_at(ny);
+        const int iz = index_at(nz);
+        face_x[i] = ix >= 0 ?
+                        0.5 * (double(value.x()) + double(velocity_dense[flat(nx)].x())) :
+                        double(value.x());
+        face_y[i] = iy >= 0 ?
+                        0.5 * (double(value.y()) + double(velocity_dense[flat(ny)].y())) :
+                        double(value.y());
+        face_z[i] = iz >= 0 ?
+                        0.5 * (double(value.z()) + double(velocity_dense[flat(nz)].z())) :
+                        double(value.z());
+      }
+    });
   };
-  auto divergence_at = [&](auto &&velocity_fn, const Coord &coord) {
-    const openvdb::Vec3f value = velocity_fn(coord);
-    return double((velocity_fn(coord.offsetBy(1, 0, 0)).x() - value.x()) +
-                  (velocity_fn(coord.offsetBy(0, 1, 0)).y() - value.y()) +
-                  (velocity_fn(coord.offsetBy(0, 0, 1)).z() - value.z())) /
+  build_faces();
+
+  /* The face on the -side of a cell is the +face of its neighbour, or an outlet face. */
+  auto face_minus = [&](const Coord &coord, const int axis) {
+    const Coord neighbour = axis == 0 ? coord.offsetBy(-1, 0, 0) :
+                            axis == 1 ? coord.offsetBy(0, -1, 0) :
+                                        coord.offsetBy(0, 0, -1);
+    if (index_at(neighbour) >= 0) {
+      const int64_t j = flat(neighbour);
+      return axis == 0 ? face_x[j] : (axis == 1 ? face_y[j] : face_z[j]);
+    }
+    return double(velocity_dense[flat(coord)][axis]);
+  };
+  auto divergence_of = [&](const Coord &coord) {
+    const int64_t i = flat(coord);
+    return ((face_x[i] - face_minus(coord, 0)) + (face_y[i] - face_minus(coord, 1)) +
+            (face_z[i] - face_minus(coord, 2))) /
            voxel;
   };
 
@@ -1652,7 +1672,7 @@ void project_velocity(State &state,
   const double divergence_sq = parallel_sum(count, [&](const int64_t begin, const int64_t end) {
     double sum = 0.0;
     for (int64_t i = begin; i < end; i++) {
-      const double divergence = divergence_at(velocity_at, unknowns[int(i)]);
+      const double divergence = divergence_of(coords[int(i)]);
       rhs[i] = divergence * voxel * voxel;
       sum += divergence * divergence;
     }
@@ -1666,9 +1686,9 @@ void project_velocity(State &state,
     threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
       for (const int i : range) {
         double sum = -6.0 * x[i];
-        const Coord &coord = unknowns[i];
+        const Coord &coord = coords[i];
         for (const Coord &offset : offsets) {
-          const int j = unknown_at(coord + offset);
+          const int j = index_at(coord + offset);
           if (j >= 0) {
             sum += x[j];
           }
@@ -1704,7 +1724,7 @@ void project_velocity(State &state,
     threading::parallel_for(IndexRange(count), PARALLEL_CHUNK, [&](const IndexRange range) {
       const openvdb::FloatGrid::ConstAccessor previous = previous_grid.getConstAccessor();
       for (const int i : range) {
-        pressure[i] = double(previous.getValue(unknowns[i]));
+        pressure[i] = double(previous.getValue(coords[i]));
       }
     });
   }
@@ -1772,59 +1792,65 @@ void project_velocity(State &state,
   }
   r_stats.pressure_iterations = iterations;
 
-  /* `u -= grad p` with backward differences on every voxel of the band (the pressure of a voxel that
-   * is not part of the system is zero, which keeps the field smooth towards the open boundary). */
+  /* MAC correction: subtract the pressure gradient on the faces, then average the two corrected
+   * faces of a cell back to its centre. This is the standard staggered projection and has no
+   * one-sided stencil, so a symmetric scene stays symmetric. */
   auto pressure_at = [&](const Coord &coord) {
-    const int j = unknown_at(coord);
+    const int j = index_at(coord);
     return j >= 0 ? pressure[j] : 0.0;
   };
   if (std::getenv("BLENDER_IGNIS_HASH") != nullptr) {
     /* Is the *pressure* mirror symmetric? A symmetric system must give a symmetric solution, so a
-     * non-zero value here points at the solve, zero points at the gradient step below. */
+     * non-zero value here points at the solve, zero points at the correction below. */
     double pmir = 0.0;
     double psum = 0.0;
     for (const int i : IndexRange(count)) {
-      const Coord &coord = unknowns[i];
-      const int j = unknown_at(Coord(-coord.x(), -coord.y(), coord.z()));
+      const Coord &coord = coords[i];
+      const int j = index_at(Coord(-coord.x(), -coord.y(), coord.z()));
       pmir += std::abs(pressure[i] - (j >= 0 ? pressure[j] : 0.0));
       psum += std::abs(pressure[i]);
     }
     printf("IGNIS_PMIR n=%d pmir=%.6g psum=%.6g\n", count, pmir, psum);
   }
   {
-    const int64_t count_coords = int64_t(coords.size());
     Vector<openvdb::Vec3f> corrected_values;
     corrected_values.resize(coords.size());
-    threading::parallel_for(IndexRange(count_coords), PARALLEL_CHUNK, [&](const IndexRange range) {
+    threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
+                            [&](const IndexRange range) {
       for (const int64_t i : range) {
         const Coord &coord = coords[i];
-        const double pressure_here = pressure_at(coord);
-        const double px = (pressure_here - pressure_at(coord.offsetBy(-1, 0, 0))) / voxel;
-        const double py = (pressure_here - pressure_at(coord.offsetBy(0, -1, 0))) / voxel;
-        const double pz = (pressure_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
-        const openvdb::Vec3f corrected = velocity_dense[flat(coord)] - openvdb::Vec3f(px, py, pz);
-        velocity_dense[flat(coord)] = corrected;
-        corrected_values[i] = corrected;
+        const int64_t f = flat(coord);
+        const double p_here = pressure_at(coord);
+        const double x_plus = face_x[f] - (pressure_at(coord.offsetBy(1, 0, 0)) - p_here) / voxel;
+        const double x_minus = face_minus(coord, 0) -
+                               (p_here - pressure_at(coord.offsetBy(-1, 0, 0))) / voxel;
+        const double y_plus = face_y[f] - (pressure_at(coord.offsetBy(0, 1, 0)) - p_here) / voxel;
+        const double y_minus = face_minus(coord, 1) -
+                               (p_here - pressure_at(coord.offsetBy(0, -1, 0))) / voxel;
+        const double z_plus = face_z[f] - (pressure_at(coord.offsetBy(0, 0, 1)) - p_here) / voxel;
+        const double z_minus = face_minus(coord, 2) -
+                               (p_here - pressure_at(coord.offsetBy(0, 0, -1))) / voxel;
+        corrected_values[i] = openvdb::Vec3f(float(0.5 * (x_plus + x_minus)),
+                                            float(0.5 * (y_plus + y_minus)),
+                                            float(0.5 * (z_plus + z_minus)));
       }
     });
     /* Serial write-back, see `apply_forces`: parallel `setValue()` calls on one leaf race on the
      * shared value mask. */
     openvdb::Vec3fGrid::Accessor writer = state.velocity->getAccessor();
     for (const int64_t i : coords.index_range()) {
+      velocity_dense[flat(coords[i])] = corrected_values[i];
       writer.setValue(coords[i], corrected_values[i]);
     }
   }
 
-  /* Report the residual divergence on the cells that were actually constrained, so the projection can
+  /* Report the residual divergence, measured with the same staggered faces, so the projection can
    * be verified instead of trusted. */
-  auto corrected_at = [&](const Coord &coord) {
-    const int i = index_at(coord);
-    return i >= 0 ? velocity_dense[flat(coord)] : openvdb::Vec3f(0.0f);
-  };
+  build_faces();
   const double after_sq = parallel_sum(count, [&](const int64_t begin, const int64_t end) {
     double sum = 0.0;
     for (int64_t i = begin; i < end; i++) {
-      const double divergence = divergence_at(corrected_at, unknowns[int(i)]);
+      const double divergence = divergence_of(coords[int(i)]);
       sum += divergence * divergence;
     }
     return sum;
@@ -1835,7 +1861,7 @@ void project_velocity(State &state,
   pressure_grid->setTransform(state.velocity->transformPtr());
   openvdb::FloatGrid::Accessor pressure_writer = pressure_grid->getAccessor();
   for (const int i : IndexRange(count)) {
-    pressure_writer.setValue(unknowns[i], float(pressure[i]));
+    pressure_writer.setValue(coords[i], float(pressure[i]));
   }
   state.pressure = pressure_grid;
 }
