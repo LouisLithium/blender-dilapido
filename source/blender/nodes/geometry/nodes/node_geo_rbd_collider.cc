@@ -14,18 +14,27 @@
  *
  * The node writes the *union* of the keys the solvers read:
  *
- * | key                                | rigid body solver | XPBD solver |
- * |------------------------------------|-------------------|-------------|
- * | `Type` (bundle type)               | yes               | mesh only   |
- * | `geometry`, `friction`             | yes               | yes         |
- * | `convex`                           | yes               | -           |
- * | `deforming`                        | -                 | yes         |
- * | `is_boundary`, `use_edge_contacts` | -                 | yes         |
- * | `margin`, `compliance`             | -                 | yes         |
- * | `error_threshold`, `filter`        | -                 | yes         |
- * | `transform`, `sweep`               | -                 | yes         |
+ * | key                                | rigid body | Puncliga | Ignis | Textura | white water |
+ * |------------------------------------|------------|----------|-------|---------|-------------|
+ * | `Type` (bundle type)               | yes        | mesh     | both* | both    | both*       |
+ * | `geometry`                         | yes        | yes      | yes   | yes     | yes         |
+ * | `friction`                         | yes        | yes      | -     | yes     | -           |
+ * | `convex`                           | yes        | -        | -     | mesh*   | mesh        |
+ * | `deforming`                        | -          | yes      | yes   | -       | -           |
+ * | `is_boundary`                      | -          | yes      | -     | -       | -           |
+ * | `invert`                           | -          | -        | -     | yes     | -           |
+ * | `use_edge_contacts`, `margin`      | -          | yes      | -     | -       | -           |
+ * | `compliance`, `error_threshold`    | -          | yes      | -     | -       | -           |
+ * | `filter`                           | -          | yes      | -     | -       | -           |
+ * | `transform` (also baked)           | baked      | yes      | yes   | box     | baked       |
+ * | `sweep`                            | -          | yes      | -     | -       | -           |
  *
- * A solver ignores the keys it does not know, so one node does the job for all of them.
+ * `both*` means the bundle is collected but the box/convex shape is not built (the mesh is used),
+ * `mesh*` that the triangles are used, which is the hull only for a convex closed mesh.
+ *
+ * A solver ignores the keys it does not know, so one node does the job for all of them. The socket
+ * tooltips of the node repeat this per option, because a collider that silently does nothing in the
+ * solver being used is hard to notice.
  *
  * A native node rather than an asset, because a node group can not expose a menu with items (the
  * interface socket evaluates to an empty string), and because the collider type is a fixed enum.
@@ -56,21 +65,26 @@ static const EnumPropertyItem collider_type_items[] = {
      "MESH",
      0,
      N_("Mesh"),
-     N_("Collide with the triangles of the geometry. Works in every solver. A mesh is a shell, so "
-        "a body that ends up behind the surface can not be pushed back out")},
+     N_("Collide with the triangles of the geometry. The only type every solver understands (Rigid "
+        "Body, Puncliga, Ignis, Textura, White Water). A mesh is a shell, so a body that ends up "
+        "behind the surface can not be pushed back out")},
     {int(ColliderType::Box),
      "BOX",
      0,
      N_("Box"),
-     N_("Collide with a solid box around the bounds of the geometry. A box has volume, so a body "
-        "that sinks into it is pushed back out. Rigid body solver only")},
+     N_("Collide with a solid box around the bounds of the geometry. Has volume, so a body that "
+        "sinks into it is pushed back out. Used by the Rigid Body solver, Textura (an oriented box) "
+        "and White Water; Puncliga ignores a Box collider completely, and Ignis uses its mesh shell "
+        "instead of a solid box")},
     {int(ColliderType::Convex),
      "CONVEX",
      0,
      N_("Convex Hull"),
      N_("Collide with the solid convex hull of the geometry. Has volume like the box, but follows "
-        "the shape instead of the bounds, and is much cheaper than the triangle mesh. Rigid body "
-        "solver only")},
+        "the shape instead of the bounds, and is much cheaper than the triangle mesh. Only the Rigid "
+        "Body solver builds a real hull: Textura, Ignis and White Water use the triangles (which "
+        "are the hull only if the mesh is convex), and Puncliga ignores a Convex Hull collider "
+        "completely")},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -79,79 +93,96 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Geometry>("Geometry"_ustr)
       .description(
           "Collision geometry, in local space. Wire Object Info > Transform into Transform "
-          "to place it and to make it follow an animated object");
+          "to place it and to make it follow an animated object. Used by every solver "
+          "(Rigid Body, Puncliga, Ignis, Textura, White Water)");
   b.add_input<decl::Matrix>("Transform"_ustr)
       .description(
           "Transform of the collider. Wire Object Info > Transform into it: Object Info hands the "
-          "geometry over in *local* space, so a collider built straight from it never moves. The "
-          "solver also uses it to sweep the collider between frames (see Sweep)");
+          "geometry over in *local* space, so a collider built straight from it never moves. Every "
+          "solver gets it (it is baked into the geometry); Puncliga also uses it to sweep the "
+          "collider between frames and Ignis for the wall velocity of a moving collider");
   b.add_input<decl::Menu>("Type"_ustr)
       .static_items(collider_type_items)
       .default_value(MenuValue(int(ColliderType::Mesh)))
-      .description("Shape the solver uses for the collider");
+      .description(
+          "Shape the solver uses for the collider. Mesh works in every solver (Rigid Body, "
+          "Puncliga, Ignis, Textura, White Water); Box and Convex Hull are only understood by some "
+          "of them, see the items");
   b.add_input<decl::Float>("Friction"_ustr)
       .default_value(0.5f)
       .min(0.0f)
       .max(1.0f)
       .description(
           "Coulomb friction of the surface. The ground usually wants a high value "
-          "(around 0.8), a slide a low one");
+          "(around 0.8), a slide a low one. Used by the Rigid Body, Puncliga and Textura solvers; "
+          "Ignis ignores it (it uses the global Boundary Friction of `Ignis Dynamics` instead), and "
+          "White Water ignores it too");
   {
     auto &panel = b.add_panel("Physics"_ustr).default_closed(false);
     panel.add_input<decl::Bool>("Sweep"_ustr)
         .default_value(true)
         .description(
             "Move the collider through the substeps of a frame instead of leaving it at the pose "
-            "of the frame. Without this a fast collider (more than a particle radius per frame) "
-            "can "
-            "pass through everything between two frames. Requires Transform to be wired. Ignis "
-            "keeps the pose of the frame instead, so it does not sample the path");
+            "of the frame, so a fast collider can not pass through anything between two frames. "
+            "Puncliga only: the Rigid Body solver, Ignis, Textura and White Water always use the "
+            "pose of the frame (Ignis does not sample the path either). Requires Transform to be "
+            "wired");
     panel.add_input<decl::Bool>("Deforming"_ustr)
         .default_value(false)
         .description(
             "The geometry itself changes shape from frame to frame (animated vertices, a "
-            "mantaflow "
-            "cache, ...). The solver then interpolates the mesh between the previous and the "
-            "current frame for every substep. Expensive for dense meshes: it rebuilds the tree "
-            "per "
-            "substep");
+            "mantaflow cache, ...). Puncliga then interpolates the mesh between the previous and "
+            "the current frame for every substep (expensive for dense meshes: it rebuilds the tree "
+            "per substep), and Ignis uses the previous frame to measure how the collider moves. "
+            "Ignored by the Rigid Body solver (a shape can not deform), Textura and White Water "
+            "(they rebuild from the current frame mesh, without subframe interpolation)");
     panel.add_input<decl::Bool>("Boundary"_ustr)
         .default_value(false)
         .description(
-            "Invert the collider: points are kept *inside* it instead of being pushed out");
+            "Sample the surface with boundary particles instead of point vs triangle contacts, "
+            "which keeps a fluid from leaking through a coarse mesh. Puncliga only: the Rigid Body "
+            "solver, Ignis, Textura and White Water ignore it (Textura uses Invert for a hollow "
+            "container)");
     panel.add_input<decl::Bool>("Invert"_ustr)
         .default_value(false)
         .description(
             "Treat a closed collider as a hollow container: the interior becomes empty space the "
-            "material can occupy, and the surface acts as a wall on both sides. Used by the MPM "
-            "solver (`Textura Dynamics`); the boundary particles of the XPBD solver use the "
-            "Boundary option instead");
+            "material can occupy, and the surface acts as a wall on both sides. Textura only: the "
+            "Rigid Body solver, Ignis and White Water ignore it, and the boundary particles of "
+            "Puncliga use the Boundary option instead");
     panel.add_input<decl::Bool>("Edge Contacts"_ustr)
         .default_value(false)
         .description(
             "Also collide with the edges of the mesh, which closes the gaps left by point "
-            "vs face contacts on a coarse mesh");
+            "vs face contacts on a coarse mesh. Puncliga only: the Rigid Body solver, Ignis, "
+            "Textura and White Water ignore it");
     panel.add_input<decl::Float>("Margin"_ustr)
         .default_value(0.0f)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
-        .description("Extra distance around the surface, useful for very fast bodies");
+        .description(
+            "Extra distance around the surface, useful for very fast bodies. Puncliga only: the "
+            "Rigid Body solver, Ignis, Textura and White Water ignore it");
     panel.add_input<decl::Float>("Softness"_ustr)
         .default_value(0.0f)
         .min(0.0f)
         .max(1.0f)
         .description(
             "How soft the contact is; 0 is a hard constraint (stored as a compliance of "
-            "softness^5, like the Collider asset)");
+            "softness^5, like the Collider asset). Puncliga only: the Rigid Body solver, Ignis, "
+            "Textura and White Water ignore it");
     panel.add_input<decl::Float>("Error Threshold"_ustr)
         .default_value(1e-3f)
         .min(0.0f)
         .subtype(PROP_DISTANCE)
-        .description("Contact distance that counts as an error, used for the reported residual");
+        .description(
+            "Contact distance that counts as an error, used for the reported residual of the "
+            "Puncliga solver. The Rigid Body solver, Ignis, Textura and White Water ignore it");
     panel.add_input<decl::String>("Filter"_ustr)
         .description(
             "Only apply this collider to geometry with one of these tags (comma separated, empty "
-            "applies to everything)");
+            "applies to everything). Puncliga only: the Rigid Body solver has its own Filter input, "
+            "and Ignis, Textura and White Water apply every collider to everything");
   }
   b.add_output<decl::Bundle>("Collider"_ustr)
       .description(
