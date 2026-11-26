@@ -87,7 +87,8 @@ struct IgnisDeviceFrame {
   MutableSpan<int32_t> current_mask;
   /** Voxels that may be removed (interiors, plus the shell of colliders that do not move). */
   MutableSpan<int32_t> carve_mask;
-  /** Average velocity of each collider, three floats per entry (world units per second). */
+  /** Nine floats per collider: linear velocity (3), angular velocity (3) and the origin of the
+   * object (3), all in world units. The wall velocity of a cell is `v + omega x (p - origin)`. */
   Span<float> collider_velocities;
   MutableSpan<float> source;
 };

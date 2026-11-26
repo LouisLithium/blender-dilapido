@@ -104,7 +104,8 @@ static void node_declare(NodeDeclarationBuilder &b)
             "Move the collider through the substeps of a frame instead of leaving it at the pose "
             "of the frame. Without this a fast collider (more than a particle radius per frame) "
             "can "
-            "pass through everything between two frames. Requires Transform to be wired");
+            "pass through everything between two frames. Requires Transform to be wired. Ignis "
+            "keeps the pose of the frame instead, so it does not sample the path");
     panel.add_input<decl::Bool>("Deforming"_ustr)
         .default_value(false)
         .description(

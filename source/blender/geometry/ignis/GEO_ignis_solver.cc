@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Blender Authors
+﻿/* SPDX-FileCopyrightText: 2026 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
@@ -28,6 +28,7 @@
 #include "BLI_math_base.hh"
 #include "BLI_math_geom.h"
 #include "BLI_math_matrix.hh"
+#include "BLI_math_rotation.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_task.hh"
 
@@ -1166,9 +1167,8 @@ openvdb::CoordBBox solid_region(const State &state, const Settings &settings)
  * collider does not move.
  */
 struct ColliderMasks {
-  /** Union of the collider poses over the frame, used for the wall and the pressure domain. */
-  SolidMask swept;
-  /** The pose of the last substep, used to impose the collider velocity on the smoke. */
+  /** The pose of the frame, used to impose the collider velocity on the smoke and, together with
+   * the filled interior, to keep it out of the object. */
   SolidMask current;
   /** The current pose with the interior of the closed meshes filled in (the solid volume). */
   SolidMask filled;
@@ -1256,12 +1256,16 @@ static void fill_collider_interior(const SolidMask &shell,
   }
 
   /* A moving collider must not carve at all: the smoke it pushes out of the way has to stay in the
-   * domain. Deleting the cells it occupies (or the ones the swept shell touches) is what makes a
-   * falling object look like it eats the smoke. The pressure solve and the velocity clamp keep the
-   * smoke out of the solid volume instead; when the collider has passed, the smoke is still there. */
+   * domain. Deleting the cells it occupies (or the ones the shell touches) is what makes a falling
+   * object look like it eats the smoke. The pressure solve and the velocity clamp keep the smoke out
+   * of the solid volume instead; when the collider has passed, the smoke is still there.
+   *
+   * `moved` is measured from the geometry rather than from the velocity: a collider that only spins
+   * in place has a zero velocity at its origin, and carving it would delete the smoke it is in the
+   * middle of pushing around. */
   bool any_moving = false;
   for (const Collider &collider : colliders) {
-    if (math::length_squared(collider.velocity) > 0.0f) {
+    if (collider.moved) {
       any_moving = true;
       break;
     }
@@ -1281,10 +1285,15 @@ static void fill_collider_interior(const SolidMask &shell,
 /**
  * Rasterizes the colliders into a solid mask for the frame.
  *
- * Colliders are sampled at several poses between the previous and the current frame (when `Sweep`
- * is on), so a fast mover cannot jump over the smoke. Each cell stores the collider index + 1, which
- * lets the velocity pass know how the wall at that cell moves. `Deforming` interpolates the vertices
- * of the previous mesh instead of the object transform.
+ * Each cell stores the collider index + 1, which lets the velocity pass know how the wall at that
+ * cell moves. The motion of the collider is derived from the geometry (mesh vertices for
+ * `Deforming`, the transform otherwise), so a rotating or deformed collider is recognised as moving
+ * even when its origin does not translate. `Deforming` interpolates the vertices of the previous mesh
+ * of the *carve* decision instead of the object transform.
+ *
+ * This used to rasterize a union over interpolated poses ("sweep"), which the carve stopped using
+ * when moving colliders were made not to carve: the union was dead weight and cost up to 17 whole
+ * mesh rasterizations per frame. Only the pose of the frame is kept now.
  */
 ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
                                    MutableSpan<Collider> colliders,
@@ -1295,7 +1304,6 @@ ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
   if (colliders.is_empty() || region.empty()) {
     return masks;
   }
-  init_solid_mask(masks.swept, region);
   init_solid_mask(masks.current, region);
 
   /* A voxel is solid when its center is within half a voxel diagonal of the surface, so the shell
@@ -1327,7 +1335,7 @@ ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
                                                 math::invert(collider.transform) :
                                             float4x4::identity();
 
-    /* How far the collider moves this frame: it decides how many poses the swept mask needs. */
+    /* How far the collider moves this frame: it decides whether the smoke may be carved. */
     float max_motion = 0.0f;
     if (can_deform) {
       for (const int i : positions.index_range()) {
@@ -1341,12 +1349,26 @@ ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
       }
     }
 
-    /* Average motion per second, used to push the smoke out of the way. */
+    /* Linear and angular motion of the frame, used to push the smoke out of the way. The angular
+     * part matters for a collider that pivots in place: its origin does not move, but the surface
+     * sweeps the smoke around it. A deformed mesh has no single angular velocity; its mean vertex
+     * motion is used instead. */
     if (delta_time > 0.0f) {
       if (can_sweep_rigid) {
         const float3 current_origin = math::transform_point(collider.transform, float3(0.0f));
         const float3 previous_origin = math::transform_point(collider.previous_transform, float3(0.0f));
         collider.velocity = (current_origin - previous_origin) / delta_time;
+        /* `delta` maps the current pose back onto the previous one, so its inverse is the rotation
+         * of this frame. */
+        const math::AxisAngle axis_angle = math::to_axis_angle(
+            math::to_quaternion(math::invert(delta)));
+        const float angle = axis_angle.angle().radian();
+        if (std::isfinite(angle) && std::abs(angle) > 1e-6f) {
+          collider.angular_velocity = axis_angle.axis() * (angle / delta_time);
+        }
+        else {
+          collider.angular_velocity = float3(0.0f);
+        }
       }
       else if (can_deform) {
         float3 sum(0.0f);
@@ -1356,39 +1378,21 @@ ColliderMasks build_collider_masks(const openvdb::math::Transform &transform,
         if (!positions.is_empty()) {
           collider.velocity = sum / (float(positions.size()) * delta_time);
         }
+        collider.angular_velocity = float3(0.0f);
       }
     }
+    collider.moved = max_motion > 1e-4f ||
+                     math::length_squared(collider.velocity) > 1e-6f ||
+                     math::length_squared(collider.angular_velocity) > 1e-6f;
 
-    const int samples = (collider.sweep && (can_deform || can_sweep_rigid)) ?
-                            std::clamp(int(std::ceil(max_motion / std::max(voxel, 1e-5f))), 1, 16) :
-                            0;
-
-    for (int sample = 0; sample <= samples; sample++) {
-      const float t = samples == 0 ? 1.0f : float(sample) / float(samples);
-      float4x4 rigid = float4x4::identity();
-      if (can_sweep_rigid && sample < samples) {
-        rigid = math::interpolate(delta, float4x4::identity(), t);
-      }
-      for (const int3 &tri : corner_tris) {
-        const int i0 = corner_verts[tri.x];
-        const int i1 = corner_verts[tri.y];
-        const int i2 = corner_verts[tri.z];
-        float3 a, b, c;
-        if (can_deform) {
-          a = math::interpolate(previous_positions[i0], positions[i0], t);
-          b = math::interpolate(previous_positions[i1], positions[i1], t);
-          c = math::interpolate(previous_positions[i2], positions[i2], t);
-        }
-        else {
-          a = math::transform_point(rigid, positions[i0]);
-          b = math::transform_point(rigid, positions[i1]);
-          c = math::transform_point(rigid, positions[i2]);
-        }
-        mark_triangle(masks.swept, transform, a, b, c, radius, value);
-        if (sample == samples) {
-          mark_triangle(masks.current, transform, a, b, c, radius, value);
-        }
-      }
+    for (const int3 &tri : corner_tris) {
+      mark_triangle(masks.current,
+                    transform,
+                    positions[corner_verts[tri.x]],
+                    positions[corner_verts[tri.y]],
+                    positions[corner_verts[tri.z]],
+                    radius,
+                    value);
     }
   }
   fill_collider_interior(masks.current, colliders, masks.filled, masks.carve);
@@ -1445,6 +1449,8 @@ void clamp_velocity_at_solids(State &state,
   if (mask.empty()) {
     return;
   }
+  const openvdb::math::Transform &transform = *state.velocity->transformPtr();
+  const float voxel = float(transform.voxelSize()[0]);
   Vector<Coord> coords;
   coords.reserve(int(state.velocity->activeVoxelCount()));
   for (auto iter = state.velocity->cbeginValueOn(); iter; ++iter) {
@@ -1455,16 +1461,20 @@ void clamp_velocity_at_solids(State &state,
   threading::parallel_for(IndexRange(int64_t(coords.size())), PARALLEL_CHUNK,
                           [&](const IndexRange range) {
     const openvdb::Vec3fGrid::ConstAccessor velocity = state.velocity->getConstAccessor();
-    auto wall_velocity = [&](const Coord &coord) -> std::optional<float3> {
+    /* The wall velocity at a cell of the solid: the linear motion plus the rotation around the
+     * collider origin, so a collider that pivots in place drags the smoke along instead of being
+     * treated as a static wall. */
+    auto wall_velocity = [&](const Coord &coord, const float3 &point) -> std::optional<float3> {
       const int8_t id = mask.id(coord);
       if (id == 0 || id > colliders.size()) {
         return std::nullopt;
       }
-      const float3 wall = colliders[id - 1].velocity;
-      if (math::length_squared(wall) <= 0.0f) {
+      const Collider &collider = colliders[id - 1];
+      if (!collider.moved) {
         return std::nullopt;
       }
-      return wall;
+      const float3 center = math::transform_point(collider.transform, float3(0.0f));
+      return collider.velocity + math::cross(collider.angular_velocity, point - center);
     };
     for (const int64_t i : range) {
       const Coord &coord = coords[i];
@@ -1473,28 +1483,39 @@ void clamp_velocity_at_solids(State &state,
         continue;
       }
       openvdb::Vec3f value = velocity.getValue(coord);
-      if (mask.is_solid(coord.offsetBy(1, 0, 0))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(1, 0, 0));
+      const openvdb::Vec3d world = transform.indexToWorld(coord);
+      const float3 point(float(world.x()), float(world.y()), float(world.z()));
+      const float3 step_x(voxel, 0.0f, 0.0f);
+      const float3 step_y(0.0f, voxel, 0.0f);
+      const float3 step_z(0.0f, 0.0f, voxel);
+      const Coord px = coord.offsetBy(1, 0, 0);
+      const Coord mx = coord.offsetBy(-1, 0, 0);
+      const Coord py = coord.offsetBy(0, 1, 0);
+      const Coord my = coord.offsetBy(0, -1, 0);
+      const Coord pz = coord.offsetBy(0, 0, 1);
+      const Coord mz = coord.offsetBy(0, 0, -1);
+      if (mask.is_solid(px)) {
+        const std::optional<float3> wall = wall_velocity(px, point + step_x);
         value.x() = wall ? std::min(value.x(), wall->x) : std::min(value.x(), 0.0f);
       }
-      if (mask.is_solid(coord.offsetBy(-1, 0, 0))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(-1, 0, 0));
+      if (mask.is_solid(mx)) {
+        const std::optional<float3> wall = wall_velocity(mx, point - step_x);
         value.x() = wall ? std::max(value.x(), wall->x) : std::max(value.x(), 0.0f);
       }
-      if (mask.is_solid(coord.offsetBy(0, 1, 0))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 1, 0));
+      if (mask.is_solid(py)) {
+        const std::optional<float3> wall = wall_velocity(py, point + step_y);
         value.y() = wall ? std::min(value.y(), wall->y) : std::min(value.y(), 0.0f);
       }
-      if (mask.is_solid(coord.offsetBy(0, -1, 0))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, -1, 0));
+      if (mask.is_solid(my)) {
+        const std::optional<float3> wall = wall_velocity(my, point - step_y);
         value.y() = wall ? std::max(value.y(), wall->y) : std::max(value.y(), 0.0f);
       }
-      if (mask.is_solid(coord.offsetBy(0, 0, 1))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 0, 1));
+      if (mask.is_solid(pz)) {
+        const std::optional<float3> wall = wall_velocity(pz, point + step_z);
         value.z() = wall ? std::min(value.z(), wall->z) : std::min(value.z(), 0.0f);
       }
-      if (mask.is_solid(coord.offsetBy(0, 0, -1))) {
-        const std::optional<float3> wall = wall_velocity(coord.offsetBy(0, 0, -1));
+      if (mask.is_solid(mz)) {
+        const std::optional<float3> wall = wall_velocity(mz, point - step_z);
         value.z() = wall ? std::max(value.z(), wall->z) : std::max(value.z(), 0.0f);
       }
       values[i] = value;
@@ -2390,7 +2411,7 @@ static Volume *solve_frame_device(const Volume *previous,
   mask.reinitialize(int(cells));
   current_mask.reinitialize(int(cells));
   carve_mask.reinitialize(int(cells));
-  collider_velocities.reinitialize(int(colliders.size()) * 3);
+  collider_velocities.reinitialize(int(colliders.size()) * 9);
   source_values.reinitialize(int(cells * 7));
   scalars.fill(0.0f);
   velocity.fill(0.0f);
@@ -2465,10 +2486,17 @@ static Volume *solve_frame_device(const Volume *previous,
                                                      dt);
     solid_voxels = int(masks.filled.count());
     for (const int i : collider_data.index_range()) {
-      const float3 &velocity = collider_data[i].velocity;
-      collider_velocities[i * 3 + 0] = velocity.x;
-      collider_velocities[i * 3 + 1] = velocity.y;
-      collider_velocities[i * 3 + 2] = velocity.z;
+      const Collider &collider = collider_data[i];
+      const float3 center = math::transform_point(collider.transform, float3(0.0f));
+      collider_velocities[i * 9 + 0] = collider.velocity.x;
+      collider_velocities[i * 9 + 1] = collider.velocity.y;
+      collider_velocities[i * 9 + 2] = collider.velocity.z;
+      collider_velocities[i * 9 + 3] = collider.angular_velocity.x;
+      collider_velocities[i * 9 + 4] = collider.angular_velocity.y;
+      collider_velocities[i * 9 + 5] = collider.angular_velocity.z;
+      collider_velocities[i * 9 + 6] = center.x;
+      collider_velocities[i * 9 + 7] = center.y;
+      collider_velocities[i * 9 + 8] = center.z;
     }
     for (int64_t z = 0; z < dim_z; z++) {
       for (int64_t y = 0; y < dim_y; y++) {
@@ -3019,3 +3047,5 @@ Volume *solve_frame(const Volume * /*previous*/,
 #endif /* WITH_OPENVDB */
 
 }  // namespace blender::geometry::ignis
+
+

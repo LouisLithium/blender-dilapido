@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Blender Authors
+﻿/* SPDX-FileCopyrightText: 2026 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
@@ -1741,11 +1741,20 @@ const char *KERNEL_CLAMP_SOLIDS =
     "  if (!ha_inside(c)) { return false; }\n"
     "  int id = (solid_current[ha_at(c)] >> 8) & 0xff;\n"
     "  if (id == 0) { return false; }\n"
-    "  int offset = (id - 1) * 3;\n"
-    "  vx = collider_velocity[offset + 0];\n"
-    "  vy = collider_velocity[offset + 1];\n"
-    "  vz = collider_velocity[offset + 2];\n"
-    "  return (vx * vx + vy * vy + vz * vz) > 0.0;\n"
+    /* Per collider: linear velocity, angular velocity, origin of the object. The wall velocity of a
+     * cell is `v + omega x (p - origin)`, so a collider that pivots in place drags the smoke along. */
+    "  int offset = (id - 1) * 9;\n"
+    "  vec3 linear = vec3(collider_velocity[offset + 0], collider_velocity[offset + 1],\n"
+    "                     collider_velocity[offset + 2]);\n"
+    "  vec3 omega = vec3(collider_velocity[offset + 3], collider_velocity[offset + 4],\n"
+    "                    collider_velocity[offset + 5]);\n"
+    "  vec3 center = vec3(collider_velocity[offset + 6], collider_velocity[offset + 7],\n"
+    "                     collider_velocity[offset + 8]);\n"
+    "  vec3 wall = linear + cross(omega, ha_world(c) - center);\n"
+    "  vx = wall.x;\n"
+    "  vy = wall.y;\n"
+    "  vz = wall.z;\n"
+    "  return true;\n"
     "}\n"
     "void main()\n"
     "{\n"
@@ -3025,7 +3034,7 @@ bool HaIgnisSolver::allocate(const int64_t cells, const int64_t blocks, std::str
       !modes_.ensure(2) ||
       !mask_a_.ensure(cells) || !mask_b_.ensure(cells) || !solid_.ensure(cells) ||
       !solid_current_.ensure(cells) || !solid_carve_.ensure(cells) ||
-      !collider_velocity_.ensure(3 * 256))
+      !collider_velocity_.ensure(9 * 256))
   {
     r_reason = "device allocation failed (out of GPU memory)";
     return false;
@@ -3123,7 +3132,7 @@ bool HaIgnisSolver::bind(const IgnisDeviceFrame &frame, std::string &r_reason)
   solid_current_.upload(pool_solid_current.as_span());
   solid_carve_.upload(pool_solid_carve.as_span());
   if (frame.collider_velocities.is_empty()) {
-    Array<float> zeros(3 * 256, 0.0f);
+    Array<float> zeros(9 * 256, 0.0f);
     collider_velocity_.upload(zeros.as_span());
   }
   else {

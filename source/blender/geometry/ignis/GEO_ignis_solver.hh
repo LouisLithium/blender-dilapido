@@ -236,6 +236,14 @@ struct Collider {
   bool sweep = true;
   bool deforming = false;
   float3 velocity = float3(0.0f);
+  /** Angular velocity in rad/s around the origin of #transform (zero for a deforming mesh). */
+  float3 angular_velocity = float3(0.0f);
+  /**
+   * Whether the collider moved this frame (translated, rotated or deformed). This is measured from
+   * the geometry, not from #velocity: a collider that only rotates has a zero linear velocity at its
+   * origin, but it still must not carve the smoke and it still has to push it around.
+   */
+  bool moved = false;
 };
 
 /**
